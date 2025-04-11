@@ -47,3 +47,48 @@ type HealthCheck struct {
 	Interval int    `json:"interval"`
 	Timeout  int    `json:"timeout"`
 }
+
+type LoginResponse struct {
+	Token string `json:"token"`
+	User  User   `json:"user"`
+}
+
+type User struct {
+	UUID     string `json:"uuid"`
+	Email    string `json:"email"`
+	TeamUUID string `json:"team_uuid"`
+}
+
+type Team struct {
+	UUID        string `json:"uuid"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type Cluster struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type Project struct {
+	UUID        string `json:"uuid"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ClusterID   string `json:"cluster_id"`
+}
+
+type StackDeploy struct {
+	UUID            string                 `json:"uuid"`
+	Name            string                 `json:"name"`
+	Status          string                 `json:"status"`
+	ParameterValues map[string]interface{} `json:"parameter_values"`
+	Components      []Component            `json:"components"`
+}
+
+type Component struct {
+	Name    string `json:"name"`
+	GitRef  string `json:"git_ref"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}

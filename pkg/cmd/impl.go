@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/kubenesthq/cli/pkg/api"
-	"github.com/kubenesthq/cli/pkg/config"
+	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/config"
 	"github.com/manifoldco/promptui"
 )
 
@@ -16,9 +16,9 @@ func login() error {
 	client := api.NewClient()
 
 	prompt := promptui.Prompt{
-		Label: "Username",
+		Label: "Email",
 	}
-	username, err := prompt.Run()
+	email, err := prompt.Run()
 	if err != nil {
 		return err
 	}
@@ -32,12 +32,13 @@ func login() error {
 		return err
 	}
 
-	token, err := client.Login(username, password)
+	loginResp, err := client.Login(email, password)
 	if err != nil {
 		return err
 	}
 
-	config.SetToken(token)
+	config.SetToken(loginResp.Token)
+	config.SetTeamUUID(loginResp.User.TeamUUID)
 	color.Green("Successfully logged in!")
 	return nil
 }
@@ -48,107 +49,132 @@ func logout() error {
 	return nil
 }
 
-func setContext() error {
+func listTeams() error {
 	client := api.NewClient()
 	client.SetToken(config.GetConfig().Token)
 
-	// Get available clusters
+	teams, err := client.ListTeams()
+	if err != nil {
+		return err
+	}
+
+	if len(teams) == 0 {
+		color.Yellow("No teams found")
+		return nil
+	}
+
+	fmt.Println("\nTeams:")
+	fmt.Println("------")
+	for _, team := range teams {
+		fmt.Printf("Name: %s\n", team.Name)
+		fmt.Printf("UUID: %s\n", team.UUID)
+		if team.Description != "" {
+			fmt.Printf("Description: %s\n", team.Description)
+		}
+		fmt.Println("------")
+	}
+
+	return nil
+}
+
+func listClusters() error {
+	client := api.NewClient()
+	client.SetToken(config.GetConfig().Token)
+	client.SetTeamUUID(config.GetConfig().TeamUUID)
+
 	clusters, err := client.ListClusters()
 	if err != nil {
 		return err
 	}
 
-	clusterPrompt := promptui.Select{
-		Label: "Select Cluster",
-		Items: clusters,
-	}
-	_, cluster, err := clusterPrompt.Run()
-	if err != nil {
-		return err
-	}
-
-	// Get available projects
-	projects, err := client.ListProjects(cluster)
-	if err != nil {
-		return err
-	}
-
-	projectPrompt := promptui.Select{
-		Label: "Select Project",
-		Items: projects,
-	}
-	_, project, err := projectPrompt.Run()
-	if err != nil {
-		return err
-	}
-
-	config.SetContext(cluster, project)
-	color.Green("Context set to cluster %s, project %s", cluster, project)
-	return nil
-}
-
-func listApps() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
-
-	apps, err := client.ListApps()
-	if err != nil {
-		return err
-	}
-
-	if len(apps) == 0 {
-		color.Yellow("No applications found")
+	if len(clusters) == 0 {
+		color.Yellow("No clusters found")
 		return nil
 	}
 
-	fmt.Println("\nDeployed Applications:")
-	fmt.Println("---------------------")
-	for _, app := range apps {
-		fmt.Printf("Name: %s\n", app.Name)
-		fmt.Printf("ID: %s\n", app.ID)
-		fmt.Printf("Status: %s\n", app.Status)
-		fmt.Println("---------------------")
+	fmt.Println("\nClusters:")
+	fmt.Println("---------")
+	for _, cluster := range clusters {
+		fmt.Printf("Name: %s\n", cluster.Name)
+		fmt.Printf("UUID: %s\n", cluster.UUID)
+		fmt.Printf("Type: %s\n", cluster.Type)
+		fmt.Println("---------")
 	}
 
 	return nil
 }
 
-func deployApp() error {
+func listProjects() error {
 	client := api.NewClient()
 	client.SetToken(config.GetConfig().Token)
+	client.SetTeamUUID(config.GetConfig().TeamUUID)
 
-	prompt := promptui.Prompt{
-		Label: "Application Name",
-	}
-	name, err := prompt.Run()
+	projects, err := client.ListProjects()
 	if err != nil {
 		return err
 	}
 
-	prompt = promptui.Prompt{
-		Label: "Application Configuration File",
+	if len(projects) == 0 {
+		color.Yellow("No projects found")
+		return nil
 	}
-	configFile, err := prompt.Run()
+
+	fmt.Println("\nProjects:")
+	fmt.Println("---------")
+	for _, project := range projects {
+		fmt.Printf("Name: %s\n", project.Name)
+		fmt.Printf("UUID: %s\n", project.UUID)
+		if project.Description != "" {
+			fmt.Printf("Description: %s\n", project.Description)
+		}
+		fmt.Printf("Cluster ID: %s\n", project.ClusterID)
+		fmt.Println("---------")
+	}
+
+	return nil
+}
+
+func listStackDeploys() error {
+	client := api.NewClient()
+	client.SetToken(config.GetConfig().Token)
+	client.SetTeamUUID(config.GetConfig().TeamUUID)
+
+	stackdeploys, err := client.ListStackDeploys()
 	if err != nil {
 		return err
 	}
 
-	configData, err := os.ReadFile(configFile)
-	if err != nil {
-		return err
+	if len(stackdeploys) == 0 {
+		color.Yellow("No stackdeploys found")
+		return nil
 	}
 
-	var appConfig api.AppConfig
-	if err := json.Unmarshal(configData, &appConfig); err != nil {
-		return err
+	fmt.Println("\nStack Deploys:")
+	fmt.Println("-------------")
+	for _, sd := range stackdeploys {
+		fmt.Printf("Name: %s\n", sd.Name)
+		fmt.Printf("UUID: %s\n", sd.UUID)
+		fmt.Printf("Status: %s\n", sd.Status)
+
+		if len(sd.Components) > 0 {
+			fmt.Println("\nComponents:")
+			for _, comp := range sd.Components {
+				fmt.Printf("  - %s (%s)\n", comp.Name, comp.Status)
+				if comp.Message != "" {
+					fmt.Printf("    Message: %s\n", comp.Message)
+				}
+			}
+		}
+
+		if len(sd.ParameterValues) > 0 {
+			fmt.Println("\nParameters:")
+			for k, v := range sd.ParameterValues {
+				fmt.Printf("  - %s: %v\n", k, v)
+			}
+		}
+		fmt.Println("-------------")
 	}
 
-	appConfig.Name = name
-	if err := client.DeployApp(appConfig); err != nil {
-		return err
-	}
-
-	color.Green("Application %s deployed successfully!", name)
 	return nil
 }
 
@@ -164,13 +190,20 @@ func getLogs() error {
 	appPrompt := promptui.Select{
 		Label: "Select Application",
 		Items: apps,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}?",
+			Active:   "▶ {{ .Name | cyan }}",
+			Inactive: "  {{ .Name | cyan }}",
+			Selected: "▶ {{ .Name | red | cyan }}",
+		},
 	}
-	_, app, err := appPrompt.Run()
+	index, _, err := appPrompt.Run()
 	if err != nil {
 		return err
 	}
 
-	logs, err := client.GetLogs(app.ID)
+	selectedApp := apps[index]
+	logs, err := client.GetLogs(selectedApp.ID)
 	if err != nil {
 		return err
 	}
@@ -192,13 +225,20 @@ func execPod() error {
 	appPrompt := promptui.Select{
 		Label: "Select Application",
 		Items: apps,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}?",
+			Active:   "▶ {{ .Name | cyan }}",
+			Inactive: "  {{ .Name | cyan }}",
+			Selected: "▶ {{ .Name | red | cyan }}",
+		},
 	}
-	_, app, err := appPrompt.Run()
+	index, _, err := appPrompt.Run()
 	if err != nil {
 		return err
 	}
 
-	pods, err := client.ListPods(app.ID)
+	selectedApp := apps[index]
+	pods, err := client.ListPods(selectedApp.ID)
 	if err != nil {
 		return err
 	}
@@ -206,12 +246,19 @@ func execPod() error {
 	podPrompt := promptui.Select{
 		Label: "Select Pod",
 		Items: pods,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}?",
+			Active:   "▶ {{ .Name | cyan }}",
+			Inactive: "  {{ .Name | cyan }}",
+			Selected: "▶ {{ .Name | red | cyan }}",
+		},
 	}
-	_, pod, err := podPrompt.Run()
+	podIndex, _, err := podPrompt.Run()
 	if err != nil {
 		return err
 	}
 
+	selectedPod := pods[podIndex]
 	prompt := promptui.Prompt{
 		Label: "Command to execute",
 	}
@@ -220,7 +267,7 @@ func execPod() error {
 		return err
 	}
 
-	output, err := client.ExecCommand(app.ID, pod.Name, command)
+	output, err := client.ExecCommand(selectedApp.ID, selectedPod.Name, command)
 	if err != nil {
 		return err
 	}
@@ -242,13 +289,20 @@ func copyFiles() error {
 	appPrompt := promptui.Select{
 		Label: "Select Application",
 		Items: apps,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}?",
+			Active:   "▶ {{ .Name | cyan }}",
+			Inactive: "  {{ .Name | cyan }}",
+			Selected: "▶ {{ .Name | red | cyan }}",
+		},
 	}
-	_, app, err := appPrompt.Run()
+	index, _, err := appPrompt.Run()
 	if err != nil {
 		return err
 	}
 
-	pods, err := client.ListPods(app.ID)
+	selectedApp := apps[index]
+	pods, err := client.ListPods(selectedApp.ID)
 	if err != nil {
 		return err
 	}
@@ -256,12 +310,19 @@ func copyFiles() error {
 	podPrompt := promptui.Select{
 		Label: "Select Pod",
 		Items: pods,
+		Templates: &promptui.SelectTemplates{
+			Label:    "{{ . }}?",
+			Active:   "▶ {{ .Name | cyan }}",
+			Inactive: "  {{ .Name | cyan }}",
+			Selected: "▶ {{ .Name | red | cyan }}",
+		},
 	}
-	_, pod, err := podPrompt.Run()
+	podIndex, _, err := podPrompt.Run()
 	if err != nil {
 		return err
 	}
 
+	selectedPod := pods[podIndex]
 	directionPrompt := promptui.Select{
 		Label: "Direction",
 		Items: []string{"Upload", "Download"},
@@ -288,7 +349,7 @@ func copyFiles() error {
 	}
 
 	isUpload := direction == "Upload"
-	if err := client.CopyFile(app.ID, pod.Name, srcPath, destPath, isUpload); err != nil {
+	if err := client.CopyFile(selectedApp.ID, selectedPod.Name, srcPath, destPath, isUpload); err != nil {
 		return err
 	}
 

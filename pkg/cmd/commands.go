@@ -28,37 +28,49 @@ func NewLogoutCommand() *cobra.Command {
 	return cmd
 }
 
-// NewContextCommand creates the context command
-func NewContextCommand() *cobra.Command {
+// NewTeamsCommand creates the teams command
+func NewTeamsCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "context",
-		Short: "Set or view current context",
+		Use:   "teams",
+		Short: "List teams",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return setContext()
+			return listTeams()
 		},
 	}
 	return cmd
 }
 
-// NewAppsCommand creates the apps command
-func NewAppsCommand() *cobra.Command {
+// NewClustersCommand creates the clusters command
+func NewClustersCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "apps",
-		Short: "List deployed applications",
+		Use:   "clusters",
+		Short: "List clusters",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listApps()
+			return listClusters()
 		},
 	}
 	return cmd
 }
 
-// NewDeployCommand creates the deploy command
-func NewDeployCommand() *cobra.Command {
+// NewProjectsCommand creates the projects command
+func NewProjectsCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "deploy",
-		Short: "Deploy an application",
+		Use:   "projects",
+		Short: "List projects",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return deployApp()
+			return listProjects()
+		},
+	}
+	return cmd
+}
+
+// NewStackDeploysCommand creates the stackdeploys command
+func NewStackDeploysCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "stackdeploys",
+		Short: "List stackdeploys",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return listStackDeploys()
 		},
 	}
 	return cmd

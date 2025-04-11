@@ -11,8 +11,7 @@ import (
 type Config struct {
 	APIURL     string `json:"api_url"`
 	Token      string `json:"token"`
-	Cluster    string `json:"cluster"`
-	Project    string `json:"project"`
+	TeamUUID   string `json:"team_uuid"`
 	ConfigPath string `json:"-"`
 }
 
@@ -20,15 +19,15 @@ var (
 	config *Config
 )
 
-func init() {
+func Init() error {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	configPath := filepath.Join(home, ".kubenest")
 	if err := os.MkdirAll(configPath, 0755); err != nil {
-		panic(err)
+		return err
 	}
 
 	viper.SetConfigName("config")
@@ -42,9 +41,11 @@ func init() {
 
 	if err := viper.ReadInConfig(); err == nil {
 		if err := viper.Unmarshal(config); err != nil {
-			panic(err)
+			return err
 		}
 	}
+
+	return nil
 }
 
 func GetConfig() *Config {
@@ -66,13 +67,13 @@ func SetToken(token string) {
 	SaveConfig()
 }
 
-func SetContext(cluster, project string) {
-	config.Cluster = cluster
-	config.Project = project
+func SetTeamUUID(teamUUID string) {
+	config.TeamUUID = teamUUID
 	SaveConfig()
 }
 
 func ClearToken() {
 	config.Token = ""
+	config.TeamUUID = ""
 	SaveConfig()
 }

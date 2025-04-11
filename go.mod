@@ -1,4 +1,4 @@
-module github.com/kubenesthq/cli
+module kubenest.io/cli
 
 go 1.21
 

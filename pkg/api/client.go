@@ -8,13 +8,14 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/kubenesthq/cli/pkg/config"
+	"kubenest.io/cli/pkg/config"
 )
 
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	token      string
+	teamUUID   string
 }
 
 func NewClient() *Client {
@@ -26,6 +27,10 @@ func NewClient() *Client {
 
 func (c *Client) SetToken(token string) {
 	c.token = token
+}
+
+func (c *Client) SetTeamUUID(teamUUID string) {
+	c.teamUUID = teamUUID
 }
 
 func (c *Client) doRequest(method, path string, body interface{}) (*http.Response, error) {
@@ -47,43 +52,108 @@ func (c *Client) doRequest(method, path string, body interface{}) (*http.Respons
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
+	if c.teamUUID != "" {
+		req.Header.Set("X-Team-UUID", c.teamUUID)
+	}
 
 	return c.httpClient.Do(req)
 }
 
 // Login authenticates with the backend
-func (c *Client) Login(username, password string) (string, error) {
+func (c *Client) Login(email, password string) (*LoginResponse, error) {
 	type loginRequest struct {
-		Username string `json:"username"`
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 
-	resp, err := c.doRequest("POST", "/auth/login", loginRequest{
-		Username: username,
+	resp, err := c.doRequest("POST", "/api/v1/auth/login", loginRequest{
+		Email:    email,
 		Password: password,
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("login failed: %s", resp.Status)
+		return nil, fmt.Errorf("login failed: %s", resp.Status)
 	}
 
-	var result struct {
-		Token string `json:"token"`
-	}
+	var result LoginResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return result.Token, nil
+	return &result, nil
+}
+
+// ListTeams returns all teams for the authenticated user
+func (c *Client) ListTeams() ([]Team, error) {
+	resp, err := c.doRequest("GET", "/api/v1/teams", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var teams []Team
+	if err := json.NewDecoder(resp.Body).Decode(&teams); err != nil {
+		return nil, err
+	}
+
+	return teams, nil
+}
+
+// ListClusters returns all clusters for the current team
+func (c *Client) ListClusters() ([]Cluster, error) {
+	resp, err := c.doRequest("GET", "/api/v1/clusters", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var clusters []Cluster
+	if err := json.NewDecoder(resp.Body).Decode(&clusters); err != nil {
+		return nil, err
+	}
+
+	return clusters, nil
+}
+
+// ListProjects returns all projects for the current team
+func (c *Client) ListProjects() ([]Project, error) {
+	resp, err := c.doRequest("GET", "/api/v1/projects", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var projects []Project
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return nil, err
+	}
+
+	return projects, nil
+}
+
+// ListStackDeploys returns all stackdeploys for the current team
+func (c *Client) ListStackDeploys() ([]StackDeploy, error) {
+	resp, err := c.doRequest("GET", "/api/v1/stackdeploys", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var stackdeploys []StackDeploy
+	if err := json.NewDecoder(resp.Body).Decode(&stackdeploys); err != nil {
+		return nil, err
+	}
+
+	return stackdeploys, nil
 }
 
 // ListApps returns all deployed applications
 func (c *Client) ListApps() ([]App, error) {
-	resp, err := c.doRequest("GET", "/apps", nil)
+	resp, err := c.doRequest("GET", "/api/v1/apps", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -97,24 +167,9 @@ func (c *Client) ListApps() ([]App, error) {
 	return apps, nil
 }
 
-// DeployApp deploys a new application
-func (c *Client) DeployApp(appConfig AppConfig) error {
-	resp, err := c.doRequest("POST", "/apps", appConfig)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("deployment failed: %s", resp.Status)
-	}
-
-	return nil
-}
-
 // GetLogs retrieves application logs
 func (c *Client) GetLogs(appID string) (io.ReadCloser, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/apps/%s/logs", appID), nil)
+	resp, err := c.doRequest("GET", fmt.Sprintf("/api/v1/apps/%s/logs", appID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +188,7 @@ func (c *Client) ExecCommand(appID, podName, command string) (io.ReadCloser, err
 		Command string `json:"command"`
 	}
 
-	resp, err := c.doRequest("POST", fmt.Sprintf("/apps/%s/pods/%s/exec", appID, podName), execRequest{
+	resp, err := c.doRequest("POST", fmt.Sprintf("/api/v1/apps/%s/pods/%s/exec", appID, podName), execRequest{
 		Command: command,
 	})
 	if err != nil {
@@ -156,7 +211,7 @@ func (c *Client) CopyFile(appID, podName, srcPath, destPath string, isUpload boo
 	}
 	defer file.Close()
 
-	req, err := http.NewRequest("POST", fmt.Sprintf("%s/apps/%s/pods/%s/copy", c.baseURL, appID, podName), file)
+	req, err := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/apps/%s/pods/%s/copy", c.baseURL, appID, podName), file)
 	if err != nil {
 		return err
 	}
@@ -164,6 +219,9 @@ func (c *Client) CopyFile(appID, podName, srcPath, destPath string, isUpload boo
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	if c.teamUUID != "" {
+		req.Header.Set("X-Team-UUID", c.teamUUID)
 	}
 
 	query := req.URL.Query()
@@ -198,4 +256,20 @@ func (c *Client) CopyFile(appID, podName, srcPath, destPath string, isUpload boo
 	}
 
 	return nil
+}
+
+// ListPods returns all pods for a given application
+func (c *Client) ListPods(appID string) ([]Pod, error) {
+	resp, err := c.doRequest("GET", fmt.Sprintf("/api/v1/apps/%s/pods", appID), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var pods []Pod
+	if err := json.NewDecoder(resp.Body).Decode(&pods); err != nil {
+		return nil, err
+	}
+
+	return pods, nil
 }
