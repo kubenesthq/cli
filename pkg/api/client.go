@@ -89,6 +89,11 @@ func (c *Client) Get(ctx context.Context, endpoint string) (*http.Response, erro
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
 	req.Header.Set("Accept", "application/json")
 
+	// Set X-Team-UUID header for all endpoints except /api/v1/teams and /api/v1/auth/login
+	if c.teamUUID != "" && !isTeamsOrLoginEndpoint(endpoint) {
+		req.Header.Set("X-Team-UUID", c.teamUUID)
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute request: %w", err)
@@ -100,6 +105,11 @@ func (c *Client) Get(ctx context.Context, endpoint string) (*http.Response, erro
 	}
 
 	return resp, nil
+}
+
+// isTeamsOrLoginEndpoint returns true if the endpoint is /api/v1/teams or /api/v1/auth/login
+func isTeamsOrLoginEndpoint(endpoint string) bool {
+	return endpoint == "/api/v1/teams" || endpoint == "/api/v1/auth/login"
 }
 
 // Post performs a POST request to the specified endpoint

@@ -20,69 +20,6 @@ func NewLogoutCommand() *cobra.Command {
 	return cmd
 }
 
-// NewTeamsCommand creates the teams command
-func NewTeamsCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "teams",
-		Short: "List teams",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// TODO: Implement actual API call
-			teams := models.TeamList{
-				Items: []models.Team{
-					{
-						ID:          "team-1",
-						Name:        "Team 1",
-						Description: "First team",
-					},
-				},
-				Total: 1,
-			}
-
-			output, err := json.MarshalIndent(teams, "", "  ")
-			if err != nil {
-				return fmt.Errorf("failed to marshal teams: %v", err)
-			}
-
-			fmt.Println(string(output))
-			return nil
-		},
-	}
-	return cmd
-}
-
-// NewClustersCommand creates the clusters command
-func NewClustersCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "clusters",
-		Short: "List clusters",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// TODO: Implement actual API call
-			clusters := models.ClusterList{
-				Items: []models.Cluster{
-					{
-						ID:       "cluster-1",
-						Name:     "Cluster 1",
-						Provider: "aws",
-						Region:   "us-west-2",
-						Version:  "1.24",
-						Status:   "running",
-					},
-				},
-				Total: 1,
-			}
-
-			output, err := json.MarshalIndent(clusters, "", "  ")
-			if err != nil {
-				return fmt.Errorf("failed to marshal clusters: %v", err)
-			}
-
-			fmt.Println(string(output))
-			return nil
-		},
-	}
-	return cmd
-}
-
 // NewProjectsCommand creates the projects command
 func NewProjectsCommand() *cobra.Command {
 	cmd := &cobra.Command{

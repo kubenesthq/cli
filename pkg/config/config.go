@@ -7,9 +7,11 @@ import (
 )
 
 type Config struct {
-	APIURL   string `json:"api_url"`
-	Token    string `json:"token"`
-	TeamUUID string `json:"team_uuid"`
+	APIURL      string `json:"api_url"`
+	Token       string `json:"token"`
+	TeamUUID    string `json:"team_uuid"`
+	ClusterUUID string `json:"cluster_uuid,omitempty"`
+	ProjectUUID string `json:"project_uuid,omitempty"`
 }
 
 const (
