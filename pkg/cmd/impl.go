@@ -1,59 +1,79 @@
 package cmd
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"syscall"
 
 	"github.com/fatih/color"
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/config"
 	"github.com/manifoldco/promptui"
+	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
-func login() error {
-	client := api.NewClient()
+func login(cmd *cobra.Command, args []string) error {
+	reader := bufio.NewReader(os.Stdin)
 
-	prompt := promptui.Prompt{
-		Label: "Email",
+	fmt.Print("Enter API URL (default: https://api.kubenest.io): ")
+	apiURL, _ := reader.ReadString('\n')
+	apiURL = strings.TrimSpace(apiURL)
+	if apiURL == "" {
+		apiURL = "https://api.kubenest.io"
 	}
-	email, err := prompt.Run()
+	cfg, _ := config.LoadConfig()
+	cfg.APIURL = apiURL
+	config.SaveConfig(cfg)
+
+	fmt.Print("Enter email: ")
+	email, _ := reader.ReadString('\n')
+	email = strings.TrimSpace(email)
+
+	fmt.Print("Enter password: ")
+	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
 		return err
 	}
+	password := string(bytePassword)
+	fmt.Println()
 
-	prompt = promptui.Prompt{
-		Label: "Password",
-		Mask:  '*',
-	}
-	password, err := prompt.Run()
-	if err != nil {
-		return err
-	}
+	client, _ := api.NewClient()
 
 	loginResp, err := client.Login(email, password)
 	if err != nil {
 		return err
 	}
 
-	config.SetToken(loginResp.Token)
-	config.SetTeamUUID(loginResp.User.TeamUUID)
+	cfg.Token = loginResp.Token
+	// If loginResp.User.TeamUUID exists, set it. Otherwise, skip.
+	if loginResp.User.TeamUUID != "" {
+		cfg.TeamUUID = loginResp.User.TeamUUID
+	}
+	config.SaveConfig(cfg)
 	color.Green("Successfully logged in!")
 	return nil
 }
 
 func logout() error {
-	config.ClearToken()
+	cfg, _ := config.LoadConfig()
+	cfg.Token = ""
+	cfg.TeamUUID = ""
+	config.SaveConfig(cfg)
 	color.Green("Successfully logged out!")
 	return nil
 }
 
 func listTeams() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
 
-	teams, err := client.ListTeams()
+	teams, err := client.ListTeams(context.Background())
 	if err != nil {
 		return err
 	}
@@ -78,11 +98,12 @@ func listTeams() error {
 }
 
 func listClusters() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
-	client.SetTeamUUID(config.GetConfig().TeamUUID)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
+	client.SetTeamUUID(cfg.TeamUUID)
 
-	clusters, err := client.ListClusters()
+	clusters, err := client.ListClusters(context.Background())
 	if err != nil {
 		return err
 	}
@@ -105,11 +126,12 @@ func listClusters() error {
 }
 
 func listProjects() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
-	client.SetTeamUUID(config.GetConfig().TeamUUID)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
+	client.SetTeamUUID(cfg.TeamUUID)
 
-	projects, err := client.ListProjects()
+	projects, err := client.ListProjects(context.Background())
 	if err != nil {
 		return err
 	}
@@ -135,11 +157,12 @@ func listProjects() error {
 }
 
 func listStackDeploys() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
-	client.SetTeamUUID(config.GetConfig().TeamUUID)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
+	client.SetTeamUUID(cfg.TeamUUID)
 
-	stackdeploys, err := client.ListStackDeploys()
+	stackdeploys, err := client.ListStackDeploys(context.Background())
 	if err != nil {
 		return err
 	}
@@ -179,8 +202,9 @@ func listStackDeploys() error {
 }
 
 func getLogs() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
 
 	apps, err := client.ListApps()
 	if err != nil {
@@ -214,8 +238,9 @@ func getLogs() error {
 }
 
 func execPod() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
 
 	apps, err := client.ListApps()
 	if err != nil {
@@ -278,8 +303,9 @@ func execPod() error {
 }
 
 func copyFiles() error {
-	client := api.NewClient()
-	client.SetToken(config.GetConfig().Token)
+	client, _ := api.NewClient()
+	cfg, _ := config.LoadConfig()
+	client.SetToken(cfg.Token)
 
 	apps, err := client.ListApps()
 	if err != nil {

@@ -151,14 +151,45 @@ go build -o kubenest ./cmd/kubenest
 go test ./...
 ```
 
-## Contributing
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+# Contexts
 
-## License
+Design Principles for Kubenest CLI Contexts
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+Concept | Pattern
+Team | Acts like an org/account scope (think gh, aws)
+Cluster | Scope for all StackDeploy activity
+Project | Optional scope for namespaces/apps
+Defaults | Can be saved in CLI config or passed explicitly
+Overrides | Always allow --team, --cluster, --project flags for one-off calls
+
+
+# Set context
+kubenest context set-team acme
+kubenest context set-cluster dev-cluster
+kubenest context set-project web-app
+
+# See current context
+kubenest context show
+# 🖥️  Team: acme
+# 🧭  Cluster: dev-cluster
+# 📦  Project: web-app
+
+# Use context-aware commands
+kubenest stack list
+kubenest deploy list
+kubenest deploy create -f stackdeploy.yaml
+
+# One-off override
+kubenest deploy list --cluster staging-cluster
+
+
+🔧 Store context in CLI config file:
+
+```yaml
+# ~/.kubenest/config.yaml
+context:
+  team: acme
+  cluster: dev-cluster
+  project: web-app
+```
