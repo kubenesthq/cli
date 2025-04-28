@@ -125,3 +125,20 @@ type StackDeployProject struct {
 	UUID       string `json:"uuid"`
 	Name       string `json:"display_name"`
 }
+
+type StackDeployDetail struct {
+	UUID     string `json:"uuid"`
+	Name     string `json:"name"`
+	Stack    struct {
+		Name string `json:"name"`
+	} `json:"stack"`
+	Project struct {
+		UUID string `json:"uuid"`
+	} `json:"project"`
+	Namespace string `json:"namespace"`
+}
+
+type KubeconfigResponse struct {
+	Kubeconfig string `json:"kubeconfig"`
+	Namespace  string `json:"namespace"`
+}

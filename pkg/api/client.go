@@ -436,3 +436,31 @@ func (c *Client) GetUser(ctx context.Context) (*UserInfo, error) {
 	}
 	return &userInfo, nil
 }
+
+// GetStackDeployDetail fetches stackdeploy details by uuid
+func (c *Client) GetStackDeployDetail(ctx context.Context, uuid string) (*StackDeployDetail, error) {
+	resp, err := c.Get(ctx, "/api/v1/stackdeploys/"+uuid)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var detail StackDeployDetail
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
+// GetProjectKubeconfig fetches the kubeconfig for a project by uuid
+func (c *Client) GetProjectKubeconfig(ctx context.Context, projectUUID string) (string, string, error) {
+	resp, err := c.Get(ctx, "/api/v1/projects/"+projectUUID+"/kubeconfig")
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	var kc KubeconfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&kc); err != nil {
+		return "", "", err
+	}
+	return kc.Kubeconfig, kc.Namespace, nil
+}

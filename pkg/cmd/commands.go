@@ -16,18 +16,6 @@ func NewLogoutCommand() *cobra.Command {
 	return cmd
 }
 
-// NewLogsCommand creates the logs command
-func NewLogsCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "logs",
-		Short: "View application logs",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return getLogs()
-		},
-	}
-	return cmd
-}
-
 // NewExecCommand creates the exec command
 func NewExecCommand() *cobra.Command {
 	cmd := &cobra.Command{
