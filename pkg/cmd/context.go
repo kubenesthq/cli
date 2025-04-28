@@ -14,6 +14,82 @@ func NewContextCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "context",
 		Short: "Manage CLI context (team, cluster, project)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _ := config.LoadConfig()
+			client, _ := api.NewClient()
+			if cfg.Token != "" {
+				client.SetToken(cfg.Token)
+			}
+
+			// Print logged-in user info
+			userEmail := "(unknown)"
+			if cfg.UserEmail != "" {
+				userEmail = cfg.UserEmail
+				if cfg.UserFirstName != "" || cfg.UserLastName != "" {
+					userEmail = fmt.Sprintf("%s %s <%s>", cfg.UserFirstName, cfg.UserLastName, cfg.UserEmail)
+				}
+			} else if cfg.Token != "" {
+				userEmail = "(token present)"
+			}
+			fmt.Printf("Logged in as: %s\n", userEmail)
+
+			// Print team context
+			teamStr := "not set"
+			if cfg.TeamUUID != "" {
+				teamStr = cfg.TeamUUID
+				// Try to resolve team name
+				teams, err := client.ListTeams(context.Background())
+				if err == nil {
+					for _, t := range teams {
+						if t.UUID == cfg.TeamUUID {
+							teamStr = fmt.Sprintf("%s (%s)", t.Name, t.UUID)
+							break
+						}
+					}
+				}
+			}
+			fmt.Printf("Team:    %s\n", teamStr)
+
+			// Print cluster context
+			clusterStr := "not set"
+			if cfg.ClusterUUID != "" && cfg.TeamUUID != "" {
+				client.SetTeamUUID(cfg.TeamUUID)
+				clusters, err := client.ListClusters(context.Background())
+				if err == nil {
+					for _, c := range clusters {
+						if c.UUID == cfg.ClusterUUID {
+							clusterStr = fmt.Sprintf("%s (%s)", c.Name, c.UUID)
+							break
+						}
+					}
+				}
+				if clusterStr == "not set" {
+					clusterStr = cfg.ClusterUUID
+				}
+			}
+			fmt.Printf("Cluster: %s\n", clusterStr)
+
+			// Print project context
+			projectStr := "not set"
+			if cfg.ProjectUUID != "" && cfg.TeamUUID != "" {
+				client.SetTeamUUID(cfg.TeamUUID)
+				projects, err := client.ListProjects(context.Background())
+				if err == nil {
+					for _, p := range projects {
+						if p.UUID == cfg.ProjectUUID {
+							projectStr = fmt.Sprintf("%s (%s)", p.Name, p.UUID)
+							break
+						}
+					}
+				}
+				if projectStr == "not set" {
+					projectStr = cfg.ProjectUUID
+				}
+			}
+			fmt.Printf("Project: %s\n", projectStr)
+
+			return nil
+		},
 	}
 	cmd.AddCommand(newSetTeamCommand())
 	cmd.AddCommand(newSetClusterCommand())

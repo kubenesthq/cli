@@ -262,16 +262,17 @@ func (c *Client) ListStackDeploys(ctx context.Context) ([]StackDeploy, error) {
 	return stackdeploys, nil
 }
 
-// ListApps returns all deployed applications
-func (c *Client) ListApps() ([]App, error) {
-	respBody, err := c.doRequest("GET", "/api/v1/apps", nil)
+// ListApps returns all stackdeploy apps for the current team
+func (c *Client) ListApps(ctx context.Context) ([]StackDeployApp, error) {
+	resp, err := c.Get(ctx, "/api/v1/stackdeploys")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list apps: %w", err)
 	}
+	defer resp.Body.Close()
 
-	var apps []App
-	if err := json.Unmarshal(respBody, &apps); err != nil {
-		return nil, err
+	var apps []StackDeployApp
+	if err := json.NewDecoder(resp.Body).Decode(&apps); err != nil {
+		return nil, fmt.Errorf("failed to decode apps response: %w", err)
 	}
 
 	return apps, nil
@@ -413,4 +414,25 @@ func (c *Client) ListPods(appID string) ([]Pod, error) {
 	}
 
 	return pods, nil
+}
+
+type UserInfo struct {
+	UUID      string `json:"uuid"`
+	Email     string `json:"email"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+// GetUser fetches the current user's info
+func (c *Client) GetUser(ctx context.Context) (*UserInfo, error) {
+	resp, err := c.Get(ctx, "/api/v1/user")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var userInfo UserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, err
+	}
+	return &userInfo, nil
 }

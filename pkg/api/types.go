@@ -72,10 +72,15 @@ type Cluster struct {
 }
 
 type Project struct {
-	UUID        string `json:"uuid"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	ClusterID   string `json:"cluster_id"`
+	UUID        string        `json:"uuid"`
+	Name        string        `json:"display_name"`
+	Cluster     ProjectCluster `json:"cluster"`
+	CreatedAt   string        `json:"created_at"`
+}
+
+type ProjectCluster struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
 }
 
 type StackDeploy struct {
@@ -91,4 +96,32 @@ type Component struct {
 	GitRef  string `json:"git_ref"`
 	Status  string `json:"status"`
 	Message string `json:"message"`
+}
+
+type StackDeployApp struct {
+	UUID      string                `json:"uuid"`
+	Stack     StackDeployStack      `json:"stack"`
+	Cluster   StackDeployCluster    `json:"cluster"`
+	Project   StackDeployProject    `json:"project"`
+	Namespace string                `json:"namespace"`
+	Name      string                `json:"name"`
+	Status    string                `json:"status"`
+	CreatedAt string                `json:"created_at"`
+	UpdatedAt string                `json:"updated_at"`
+}
+
+type StackDeployStack struct {
+	UUID    string `json:"uuid"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type StackDeployCluster struct {
+	UUID string `json:"uuid"`
+	Name string `json:"name"`
+}
+
+type StackDeployProject struct {
+	UUID       string `json:"uuid"`
+	Name       string `json:"display_name"`
 }

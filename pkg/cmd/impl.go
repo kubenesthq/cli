@@ -146,10 +146,7 @@ func listProjects() error {
 	for _, project := range projects {
 		fmt.Printf("Name: %s\n", project.Name)
 		fmt.Printf("UUID: %s\n", project.UUID)
-		if project.Description != "" {
-			fmt.Printf("Description: %s\n", project.Description)
-		}
-		fmt.Printf("Cluster ID: %s\n", project.ClusterID)
+		fmt.Printf("Cluster: %s\n", project.Cluster.Name)
 		fmt.Println("---------")
 	}
 
@@ -206,7 +203,7 @@ func getLogs() error {
 	cfg, _ := config.LoadConfig()
 	client.SetToken(cfg.Token)
 
-	apps, err := client.ListApps()
+	apps, err := client.ListApps(context.Background())
 	if err != nil {
 		return err
 	}
@@ -227,7 +224,7 @@ func getLogs() error {
 	}
 
 	selectedApp := apps[index]
-	logs, err := client.GetLogs(selectedApp.ID)
+	logs, err := client.GetLogs(selectedApp.UUID)
 	if err != nil {
 		return err
 	}
@@ -242,7 +239,7 @@ func execPod() error {
 	cfg, _ := config.LoadConfig()
 	client.SetToken(cfg.Token)
 
-	apps, err := client.ListApps()
+	apps, err := client.ListApps(context.Background())
 	if err != nil {
 		return err
 	}
@@ -263,7 +260,7 @@ func execPod() error {
 	}
 
 	selectedApp := apps[index]
-	pods, err := client.ListPods(selectedApp.ID)
+	pods, err := client.ListPods(selectedApp.UUID)
 	if err != nil {
 		return err
 	}
@@ -292,7 +289,7 @@ func execPod() error {
 		return err
 	}
 
-	output, err := client.ExecCommand(selectedApp.ID, selectedPod.Name, command)
+	output, err := client.ExecCommand(selectedApp.UUID, selectedPod.Name, command)
 	if err != nil {
 		return err
 	}
@@ -307,7 +304,7 @@ func copyFiles() error {
 	cfg, _ := config.LoadConfig()
 	client.SetToken(cfg.Token)
 
-	apps, err := client.ListApps()
+	apps, err := client.ListApps(context.Background())
 	if err != nil {
 		return err
 	}
@@ -328,7 +325,7 @@ func copyFiles() error {
 	}
 
 	selectedApp := apps[index]
-	pods, err := client.ListPods(selectedApp.ID)
+	pods, err := client.ListPods(selectedApp.UUID)
 	if err != nil {
 		return err
 	}
@@ -375,7 +372,7 @@ func copyFiles() error {
 	}
 
 	isUpload := direction == "Upload"
-	if err := client.CopyFile(selectedApp.ID, selectedPod.Name, srcPath, destPath, isUpload); err != nil {
+	if err := client.CopyFile(selectedApp.UUID, selectedPod.Name, srcPath, destPath, isUpload); err != nil {
 		return err
 	}
 

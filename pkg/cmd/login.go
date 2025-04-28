@@ -45,6 +45,19 @@ func NewLoginCommand() *cobra.Command {
 				return fmt.Errorf("login failed: %v", err)
 			}
 			cfg.Token = loginResp.Token
+			client.SetToken(cfg.Token)
+			fmt.Printf("Token being used for GetUser: %q\n", cfg.Token)
+
+			// Fetch user info and store in config
+			userInfo, err := client.GetUser(cmd.Context())
+			if err != nil {
+				fmt.Printf("Failed to fetch user info: %v\n", err)
+			} else {
+				cfg.UserEmail = userInfo.Email
+				cfg.UserFirstName = userInfo.FirstName
+				cfg.UserLastName = userInfo.LastName
+			}
+
 			config.SaveConfig(cfg)
 
 			fmt.Println("Successfully logged in!")

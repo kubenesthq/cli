@@ -1,10 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
-	"fmt"
-
-	"kubenest.io/cli/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -15,69 +11,6 @@ func NewLogoutCommand() *cobra.Command {
 		Short: "Logout from Kubenest",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return logout()
-		},
-	}
-	return cmd
-}
-
-// NewProjectsCommand creates the projects command
-func NewProjectsCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "projects",
-		Short: "List projects",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// TODO: Implement actual API call
-			projects := models.ProjectList{
-				Items: []models.Project{
-					{
-						ID:          "project-1",
-						Name:        "Project 1",
-						Description: "First project",
-						TeamID:      "team-1",
-					},
-				},
-				Total: 1,
-			}
-
-			output, err := json.MarshalIndent(projects, "", "  ")
-			if err != nil {
-				return fmt.Errorf("failed to marshal projects: %v", err)
-			}
-
-			fmt.Println(string(output))
-			return nil
-		},
-	}
-	return cmd
-}
-
-// NewStackDeploysCommand creates the stackdeploys command
-func NewStackDeploysCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "stack-deploys",
-		Short: "List stack deployments",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// TODO: Implement actual API call
-			stackDeploys := models.StackDeployList{
-				Items: []models.StackDeploy{
-					{
-						ID:        "deploy-1",
-						Name:      "Deploy 1",
-						ProjectID: "project-1",
-						ClusterID: "cluster-1",
-						Status:    "running",
-					},
-				},
-				Total: 1,
-			}
-
-			output, err := json.MarshalIndent(stackDeploys, "", "  ")
-			if err != nil {
-				return fmt.Errorf("failed to marshal stack deploys: %v", err)
-			}
-
-			fmt.Println(string(output))
-			return nil
 		},
 	}
 	return cmd

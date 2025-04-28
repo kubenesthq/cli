@@ -12,6 +12,9 @@ type Config struct {
 	TeamUUID    string `json:"team_uuid"`
 	ClusterUUID string `json:"cluster_uuid,omitempty"`
 	ProjectUUID string `json:"project_uuid,omitempty"`
+	UserEmail   string `json:"email,omitempty"`
+	UserFirstName string `json:"first_name,omitempty"`
+	UserLastName  string `json:"last_name,omitempty"`
 }
 
 const (
