@@ -27,7 +27,7 @@ jobs:
       if: matrix.os == 'windows-latest'
       shell: pwsh
       run: |
-        go build -o kubenest.exe
+        go build -o kubenest.exe ./cmd/kubenest
         mkdir -p release
         mv kubenest.exe release/
 
@@ -35,7 +35,7 @@ jobs:
       if: matrix.os != 'windows-latest'
       shell: bash
       run: |
-        go build -o kubenest
+        go build -o kubenest ./cmd/kubenest
         mkdir -p release
         mv kubenest release/
 
