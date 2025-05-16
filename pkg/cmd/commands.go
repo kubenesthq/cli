@@ -39,3 +39,20 @@ func NewCopyCommand() *cobra.Command {
 	}
 	return cmd
 }
+
+func NewRootCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "kubenest",
+		Short: "Kubenest CLI - A command line interface for Kubenest",
+	}
+
+	// Add commands
+	cmd.AddCommand(NewLoginCommand())
+	cmd.AddCommand(NewLogoutCommand())
+	cmd.AddCommand(NewLogsCommand())
+	cmd.AddCommand(NewExecCommand())
+	cmd.AddCommand(NewCopyCommand())
+	cmd.AddCommand(NewStacksCommand()) // Add the new stacks command
+
+	return cmd
+}
