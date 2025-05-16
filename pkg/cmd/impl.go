@@ -501,7 +501,7 @@ func deployStack(stackUUID, deployFilePath string) error {
 	}
 
 	// Deploy the stack
-	deploy, err := client.DeployStack(context.Background(), stackUUID, content)
+	deploy, err := client.CreateStackDeploy(context.Background(), stackUUID, content)
 	if err != nil {
 		return fmt.Errorf("failed to deploy stack: %v", err)
 	}
@@ -564,7 +564,7 @@ func patchStackDeploy(stackDeployUUID, patchFilePath string) error {
 	}
 
 	// Apply the patch
-	deploy, err := client.PatchStackDeploy(context.Background(), stackDeployUUID, content)
+	deploy, err := client.UpdateStackDeploy(context.Background(), stackDeployUUID, content)
 	if err != nil {
 		return fmt.Errorf("failed to patch stack deployment: %v", err)
 	}

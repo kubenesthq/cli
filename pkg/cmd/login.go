@@ -12,7 +12,22 @@ import (
 func NewLoginCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Login to Kubenest",
+		Short: "Log in to Kubenest",
+		Long: `Log in to your Kubenest account.
+
+This command will prompt you for:
+- API URL (defaults to https://api.kubenest.io)
+- Email address
+- Password
+
+Your credentials will be stored locally for future use.
+
+Example:
+  $ kubenest login
+  Enter API URL [https://api.kubenest.io]: 
+  Enter email: user@example.com
+  Enter password: ********
+  Successfully logged in!`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			defaultAPIURL := "https://api.kubenest.io"
 			fmt.Printf("Enter API URL [%s]: ", defaultAPIURL)
