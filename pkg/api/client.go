@@ -11,6 +11,8 @@ import (
 	"os"
 	"path"
 	"time"
+
+	"kubenest.io/cli/pkg/models"
 )
 
 const (
@@ -463,4 +465,183 @@ func (c *Client) GetProjectKubeconfig(ctx context.Context, projectUUID string) (
 		return "", "", err
 	}
 	return kc.Kubeconfig, kc.Namespace, nil
+}
+
+// newRequest creates a new HTTP request with the given method, endpoint, and body
+func (c *Client) newRequest(method, endpoint string, body io.Reader) (*http.Request, error) {
+	url := *c.baseURL
+	url.Path = path.Join(url.Path, endpoint)
+
+	req, err := http.NewRequestWithContext(context.Background(), method, url.String(), body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+	req.Header.Set("Accept", "application/json")
+
+	if c.teamUUID != "" && !isTeamsOrLoginEndpoint(endpoint) {
+		req.Header.Set("X-Team-UUID", c.teamUUID)
+	}
+
+	return req, nil
+}
+
+// do performs the HTTP request and decodes the response into the provided value
+func (c *Client) do(ctx context.Context, req *http.Request, v interface{}) error {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error       string `json:"error"`
+			Code        int    `json:"code"`
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("request failed: %s (code: %d, description: %s)", errResp.Error, errResp.Code, errResp.Description)
+	}
+
+	if v != nil {
+		if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+			return fmt.Errorf("failed to decode response: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// CreateStack creates a new stack
+func (c *Client) CreateStack(ctx context.Context, content []byte) (*models.Stack, error) {
+	req, err := c.newRequest("POST", "/api/v1/stacks", bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	var stack models.Stack
+	if err := c.do(ctx, req, &stack); err != nil {
+		return nil, err
+	}
+	return &stack, nil
+}
+
+// UpdateStack updates an existing stack
+func (c *Client) UpdateStack(ctx context.Context, stackUUID string, content []byte) (*models.Stack, error) {
+	req, err := c.newRequest("PUT", fmt.Sprintf("/api/v1/stacks/%s", stackUUID), bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-yaml")
+
+	var stack models.Stack
+	if err := c.do(ctx, req, &stack); err != nil {
+		return nil, err
+	}
+	return &stack, nil
+}
+
+// DryRunStack performs a dry run of a stack
+func (c *Client) DryRunStack(ctx context.Context, stackUUID string, params []byte) (*models.DryRunResult, error) {
+	req, err := c.newRequest("POST", fmt.Sprintf("/api/v1/stacks/%s/dry-run", stackUUID), bytes.NewReader(params))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	var result models.DryRunResult
+	if err := c.do(ctx, req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStackDeploymentStatus checks the status of a stack deployment
+func (c *Client) GetStackDeploymentStatus(ctx context.Context, stackUUID string) (*models.StackDeploymentStatus, error) {
+	resp, err := c.Get(ctx, fmt.Sprintf("/api/v1/stacks/%s/status", stackUUID))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var status models.StackDeploymentStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// GetStack retrieves a stack by UUID
+func (c *Client) GetStack(ctx context.Context, stackUUID string) (*models.Stack, error) {
+	resp, err := c.Get(ctx, fmt.Sprintf("/api/v1/stacks/%s", stackUUID))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var stack models.Stack
+	if err := json.NewDecoder(resp.Body).Decode(&stack); err != nil {
+		return nil, err
+	}
+	return &stack, nil
+}
+
+// CreateStackDeploy creates a new stack deployment
+func (c *Client) CreateStackDeploy(ctx context.Context, stackUUID string, content []byte) (*models.StackDeploy, error) {
+	req, err := c.newRequest("POST", fmt.Sprintf("/api/v1/stacks/%s/deploy", stackUUID), bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	var deploy models.StackDeploy
+	if err := c.do(ctx, req, &deploy); err != nil {
+		return nil, err
+	}
+	return &deploy, nil
+}
+
+// UpdateStackDeploy updates an existing stack deployment
+func (c *Client) UpdateStackDeploy(ctx context.Context, stackDeployUUID string, content []byte) (*models.StackDeploy, error) {
+	req, err := c.newRequest("PUT", fmt.Sprintf("/api/v1/stackdeploys/%s", stackDeployUUID), bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	var deploy models.StackDeploy
+	if err := c.do(ctx, req, &deploy); err != nil {
+		return nil, err
+	}
+	return &deploy, nil
+}
+
+// DeleteStackDeploy deletes a stack deployment
+func (c *Client) DeleteStackDeploy(ctx context.Context, stackDeployUUID string) error {
+	req, err := c.newRequest("DELETE", fmt.Sprintf("/api/v1/stackdeploys/%s", stackDeployUUID), nil)
+	if err != nil {
+		return err
+	}
+
+	return c.do(ctx, req, nil)
+}
+
+// GetStackDeployStatus gets the status of a stack deployment
+func (c *Client) GetStackDeployStatus(ctx context.Context, stackDeployUUID string) (*models.StackDeployStatus, error) {
+	resp, err := c.Get(ctx, fmt.Sprintf("/api/v1/stackdeploys/%s/status", stackDeployUUID))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var status models.StackDeployStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
 }

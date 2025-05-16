@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/spf13/cobra"
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/config"
@@ -27,21 +26,7 @@ func main() {
 	}
 
 	// Create root command
-	rootCmd := &cobra.Command{
-		Use:   "kubenest",
-		Short: "Kubenest CLI",
-		Long:  "A command-line interface for managing Kubenest resources",
-	}
-
-	// Add commands
-	rootCmd.AddCommand(cmd.NewLoginCommand())
-	rootCmd.AddCommand(cmd.NewLogoutCommand())
-	rootCmd.AddCommand(cmd.NewTeamsCommand())
-	rootCmd.AddCommand(cmd.NewClustersCommand())
-	rootCmd.AddCommand(cmd.NewProjectsCommand())
-	rootCmd.AddCommand(cmd.NewAppsCommand())
-	rootCmd.AddCommand(cmd.NewAppLogsCommand())
-	rootCmd.AddCommand(cmd.NewContextCommand())
+	rootCmd := cmd.NewRootCommand()
 
 	// Execute root command
 	if err := rootCmd.Execute(); err != nil {

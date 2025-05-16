@@ -19,14 +19,14 @@ type TeamList struct {
 
 // Cluster represents a Kubernetes cluster
 type Cluster struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Provider    string    `json:"provider"`
-	Region      string    `json:"region"`
-	Version     string    `json:"version"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Provider  string    `json:"provider"`
+	Region    string    `json:"region"`
+	Version   string    `json:"version"`
+	Status    string    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ClusterList represents a list of clusters
@@ -53,13 +53,34 @@ type ProjectList struct {
 
 // StackDeploy represents a stack deployment
 type StackDeploy struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	ProjectID string    `json:"project_id"`
-	ClusterID string    `json:"cluster_id"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	UUID            string                 `json:"uuid"`
+	Name            string                 `json:"name"`
+	Status          string                 `json:"status"`
+	ParameterValues map[string]interface{} `json:"parameter_values"`
+	Components      []StackDeployComponent `json:"components"`
+	CreatedAt       string                 `json:"created_at"`
+	UpdatedAt       string                 `json:"updated_at"`
+}
+
+// StackDeployComponent represents a component in a stack deployment
+type StackDeployComponent struct {
+	Name      string `json:"name"`
+	GitRef    string `json:"git_ref,omitempty"`
+	Image     string `json:"image,omitempty"`
+	BuildSpec struct {
+		GitRef   string `json:"gitRef,omitempty"`
+		ImageTag string `json:"imageTag,omitempty"`
+	} `json:"buildSpec,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+}
+
+// StackDeployStatus represents the status of a stack deployment
+type StackDeployStatus struct {
+	Status    string `json:"status"`    // "pending", "in_progress", "completed", "failed"
+	Message   string `json:"message"`   // Status message or error message
+	Progress  int    `json:"progress"`  // Progress percentage (0-100)
+	Completed bool   `json:"completed"` // Whether the deployment is completed
 }
 
 // StackDeployList represents a list of stack deployments

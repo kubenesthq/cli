@@ -1,0 +1,38 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.23
+
+    - name: Build for ${{ matrix.os }}
+      run: |
+        if [ ${{ matrix.os }} == 'ubuntu-latest' ]; then
+          GOOS=linux GOARCH=amd64 go build -o kubenest-linux-amd64 ./cmd/kubenest
+        elif [ ${{ matrix.os }} == 'macos-latest' ]; then
+          GOOS=darwin GOARCH=arm64 go build -o kubenest-macos-arm64 ./cmd/kubenest
+        else
+          GOOS=windows GOARCH=amd64 go build -o kubenest-windows-amd64.exe ./cmd/kubenest
+        fi
+
+    - name: Create a release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: kubenest-*
