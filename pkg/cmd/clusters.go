@@ -20,9 +20,9 @@ func NewClustersCommand() *cobra.Command {
 			if cfg.TeamUUID == "" {
 				return fmt.Errorf("team context must be set. Use 'kubenest context set-team <team>' first.")
 			}
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 			client.SetTeamUUID(cfg.TeamUUID)
 			clusters, err := client.ListClusters(context.Background())

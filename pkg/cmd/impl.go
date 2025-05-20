@@ -42,7 +42,10 @@ func login(cmd *cobra.Command, args []string) error {
 	password := string(bytePassword)
 	fmt.Println()
 
-	client, _ := api.NewClient()
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	loginResp, err := client.Login(email, password)
 	if err != nil {
@@ -69,9 +72,10 @@ func logout() error {
 }
 
 func listTeams() error {
-	client, _ := api.NewClient()
-	cfg, _ := config.LoadConfig()
-	client.SetToken(cfg.Token)
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	teams, err := client.ListTeams(context.Background())
 	if err != nil {
@@ -98,10 +102,10 @@ func listTeams() error {
 }
 
 func listClusters() error {
-	client, _ := api.NewClient()
-	cfg, _ := config.LoadConfig()
-	client.SetToken(cfg.Token)
-	client.SetTeamUUID(cfg.TeamUUID)
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	clusters, err := client.ListClusters(context.Background())
 	if err != nil {
@@ -126,10 +130,10 @@ func listClusters() error {
 }
 
 func listProjects() error {
-	client, _ := api.NewClient()
-	cfg, _ := config.LoadConfig()
-	client.SetToken(cfg.Token)
-	client.SetTeamUUID(cfg.TeamUUID)
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	projects, err := client.ListProjects(context.Background())
 	if err != nil {
@@ -154,7 +158,10 @@ func listProjects() error {
 }
 
 func listStackDeploys() error {
-	client, _ := api.NewClient()
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 	cfg, _ := config.LoadConfig()
 	client.SetToken(cfg.Token)
 	client.SetTeamUUID(cfg.TeamUUID)
@@ -199,7 +206,10 @@ func listStackDeploys() error {
 }
 
 func getLogs() error {
-	client, _ := api.NewClient()
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 	cfg, _ := config.LoadConfig()
 	client.SetToken(cfg.Token)
 
@@ -235,9 +245,10 @@ func getLogs() error {
 }
 
 func execPod() error {
-	client, _ := api.NewClient()
-	cfg, _ := config.LoadConfig()
-	client.SetToken(cfg.Token)
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	apps, err := client.ListApps(context.Background())
 	if err != nil {
@@ -300,9 +311,10 @@ func execPod() error {
 }
 
 func copyFiles() error {
-	client, _ := api.NewClient()
-	cfg, _ := config.LoadConfig()
-	client.SetToken(cfg.Token)
+	client, err := api.NewClientFromConfig()
+	if err != nil {
+		return fmt.Errorf("failed to create client: %v", err)
+	}
 
 	apps, err := client.ListApps(context.Background())
 	if err != nil {

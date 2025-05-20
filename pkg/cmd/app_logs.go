@@ -28,8 +28,10 @@ func NewAppLogsCommand() *cobra.Command {
 				return fmt.Errorf("must specify --app <uuid>")
 			}
 			cfg, _ := config.LoadConfig()
-			client, _ := api.NewClient()
-			client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
+			}
 			client.SetTeamUUID(cfg.TeamUUID)
 
 			// 1. Fetch stackdeploy details

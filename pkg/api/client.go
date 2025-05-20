@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"time"
+	"kubenest.io/cli/pkg/config"
 )
 
 const (
@@ -93,6 +94,16 @@ func (c *Client) Get(ctx context.Context, endpoint string) (*http.Response, erro
 	if c.teamUUID != "" && !isTeamsOrLoginEndpoint(endpoint) {
 		req.Header.Set("X-Team-UUID", c.teamUUID)
 	}
+
+	// Print the equivalent curl command
+	curlCmd := "curl -X GET "
+	for key, values := range req.Header {
+		for _, value := range values {
+			curlCmd += fmt.Sprintf("-H '%s: %s' ", key, value)
+		}
+	}
+	curlCmd += fmt.Sprintf("'%s'", url.String())
+	fmt.Println("[DEBUG] Equivalent curl command:", curlCmd)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -463,4 +474,22 @@ func (c *Client) GetProjectKubeconfig(ctx context.Context, projectUUID string) (
 		return "", "", err
 	}
 	return kc.Kubeconfig, kc.Namespace, nil
+}
+
+// NewClientFromConfig creates a new API client using the stored configuration
+func NewClientFromConfig() (*Client, error) {
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	opts := []ClientOption{}
+	if cfg.APIURL != "" {
+		opts = append(opts, WithBaseURL(cfg.APIURL))
+	}
+	if cfg.Token != "" {
+		opts = append(opts, WithToken(cfg.Token))
+	}
+
+	return NewClient(opts...)
 }

@@ -39,7 +39,10 @@ func NewLoginCommand() *cobra.Command {
 				return err
 			}
 
-			client, _ := api.NewClient()
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
+			}
 			loginResp, err := client.Login(email, password)
 			if err != nil {
 				return fmt.Errorf("login failed: %v", err)

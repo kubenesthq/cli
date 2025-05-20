@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"kubenest.io/cli/pkg/api"
-	"kubenest.io/cli/pkg/config"
 )
 
 func NewTeamsCommand() *cobra.Command {
@@ -16,13 +15,9 @@ func NewTeamsCommand() *cobra.Command {
 		Use:   "teams",
 		Short: "List teams you are a part of",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.LoadConfig()
+			client, err := api.NewClientFromConfig()
 			if err != nil {
-				return fmt.Errorf("failed to load config: %w", err)
-			}
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 			teams, err := client.ListTeams(context.Background())
 			if err != nil {

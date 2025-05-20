@@ -16,9 +16,9 @@ func NewContextCommand() *cobra.Command {
 		Short: "Manage CLI context (team, cluster, project)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := config.LoadConfig()
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 
 			// Print logged-in user info
@@ -105,9 +105,9 @@ func newSetTeamCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			teamArg := args[0]
 			cfg, _ := config.LoadConfig()
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 			teams, err := client.ListTeams(context.Background())
 			if err != nil {
@@ -142,9 +142,9 @@ func newSetClusterCommand() *cobra.Command {
 			if cfg.TeamUUID == "" {
 				return errors.New("team context must be set first")
 			}
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 			client.SetTeamUUID(cfg.TeamUUID)
 			clusters, err := client.ListClusters(context.Background())
@@ -180,9 +180,9 @@ func newSetProjectCommand() *cobra.Command {
 			if cfg.TeamUUID == "" {
 				return errors.New("team context must be set first")
 			}
-			client, _ := api.NewClient()
-			if cfg.Token != "" {
-				client.SetToken(cfg.Token)
+			client, err := api.NewClientFromConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create client: %v", err)
 			}
 			client.SetTeamUUID(cfg.TeamUUID)
 			projects, err := client.ListProjects(context.Background())
