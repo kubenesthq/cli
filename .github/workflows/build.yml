@@ -1,0 +1,66 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.23
+
+    - name: Build for ${{ matrix.os }}
+      run: |
+        TAG=${GITHUB_REF##*/}
+        if [ ${{ matrix.os }} == 'ubuntu-latest' ]; then
+          GOOS=linux GOARCH=amd64 go build -o kubenest-${TAG} ./cmd/kubenest
+        elif [ ${{ matrix.os }} == 'macos-latest' ]; then
+          GOOS=darwin GOARCH=arm64 go build -o kubenest-${TAG}-macos-arm64 ./cmd/kubenest
+        else
+          GOOS=windows GOARCH=amd64 go build -o kubenest-${TAG}-windows-amd64.exe ./cmd/kubenest
+        fi
+
+    - name: Create a release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          kubenest-${{ github.ref_name }}
+          kubenest-${{ github.ref_name }}-macos-arm64
+          kubenest-${{ github.ref_name }}-windows-amd64.exe
+        body: |
+          ## Kubenest CLI ${{ github.ref_name }}
+
+          Download the CLI for your platform:
+
+          - **Linux**: [kubenest-${{ github.ref_name }}](./kubenest-${{ github.ref_name }})
+          - **macOS (Apple Silicon)**: [kubenest-${{ github.ref_name }}-macos-arm64](./kubenest-${{ github.ref_name }}-macos-arm64)
+          - **Windows**: [kubenest-${{ github.ref_name }}-windows-amd64.exe](./kubenest-${{ github.ref_name }}-windows-amd64.exe)
+
+          ### Usage
+
+          1. Download the binary for your OS from above.
+          2. Make it executable (Linux/macOS):
+             ```sh
+             chmod +x kubenest-${{ github.ref_name }}
+             ```
+          3. Move it to a directory in your PATH, e.g.:
+             ```sh
+             sudo mv kubenest-${{ github.ref_name }} /usr/local/bin/kubenest
+             ```
+          4. Run with:
+             ```sh
+             kubenest --help
+             ```
