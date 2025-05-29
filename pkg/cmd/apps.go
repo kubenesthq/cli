@@ -12,9 +12,10 @@ import (
 )
 
 func NewAppsCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "apps",
-		Short: "List apps (stackdeploys) for the current team context",
+	cmd := &cobra.Command{
+		Use:     "apps",
+		Aliases: []string{"app"},
+		Short:   "List apps for the current team context",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := config.LoadConfig()
 			if cfg.TeamUUID == "" {
@@ -42,4 +43,8 @@ func NewAppsCommand() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.AddCommand(NewAppExecCommand())
+
+	return cmd
 }

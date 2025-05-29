@@ -96,14 +96,16 @@ func (c *Client) Get(ctx context.Context, endpoint string) (*http.Response, erro
 	}
 
 	// Print the equivalent curl command
-	curlCmd := "curl -X GET "
-	for key, values := range req.Header {
-		for _, value := range values {
-			curlCmd += fmt.Sprintf("-H '%s: %s' ", key, value)
+	if os.Getenv("DEBUG") == "1" {
+		curlCmd := "curl -X GET "
+		for key, values := range req.Header {
+			for _, value := range values {
+				curlCmd += fmt.Sprintf("-H '%s: %s' ", key, value)
+			}
 		}
+		curlCmd += fmt.Sprintf("'%s'", url.String())
+		fmt.Println("[DEBUG] Equivalent curl command:", curlCmd)
 	}
-	curlCmd += fmt.Sprintf("'%s'", url.String())
-	fmt.Println("[DEBUG] Equivalent curl command:", curlCmd)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
