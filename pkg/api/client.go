@@ -495,3 +495,81 @@ func NewClientFromConfig() (*Client, error) {
 
 	return NewClient(opts...)
 }
+
+// DoRequestWithMethod allows making a request with a custom HTTP method (e.g., PATCH)
+func (c *Client) DoRequestWithMethod(method, endpoint string, body interface{}) ([]byte, error) {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyBytes, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request body: %w", err)
+		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+
+	req, err := http.NewRequest(method, c.baseURL.String()+endpoint, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", "application/json")
+	if c.teamUUID != "" {
+		req.Header.Set("X-Team-UUID", c.teamUUID)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to perform request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error       string `json:"error"`
+			Code        int    `json:"code"`
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(respBody, &errResp); err != nil {
+			return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(respBody))
+		}
+		return nil, fmt.Errorf("request failed: %s (code: %d, description: %s)", errResp.Error, errResp.Code, errResp.Description)
+	}
+
+	return respBody, nil
+}
+
+// GetStackDeployDetailWithComponents fetches stackdeploy details by uuid, including components
+func (c *Client) GetStackDeployDetailWithComponents(ctx context.Context, uuid string) (*StackDeployDetailWithComponents, error) {
+	resp, err := c.Get(ctx, "/api/v1/stackdeploys/"+uuid)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var detail StackDeployDetailWithComponents
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		return nil, err
+	}
+	return &detail, nil
+}
+
+// ListRegistries returns all registries for a given project
+func (c *Client) ListRegistries(ctx context.Context, projectUUID string) ([]Registry, error) {
+	resp, err := c.Get(ctx, "/api/v1/projects/"+projectUUID+"/registries")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list registries: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var registries []Registry
+	if err := json.NewDecoder(resp.Body).Decode(&registries); err != nil {
+		return nil, fmt.Errorf("failed to decode registries response: %w", err)
+	}
+
+	return registries, nil
+}

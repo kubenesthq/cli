@@ -92,10 +92,37 @@ type StackDeploy struct {
 }
 
 type Component struct {
-	Name    string `json:"name"`
-	GitRef  string `json:"git_ref"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	UUID       string   `json:"uuid"`
+	Name       string   `json:"name"`
+	Kind       string   `json:"kind,omitempty"`
+	Phase      string   `json:"phase"`
+	Status     string   `json:"status,omitempty"`
+	BuildMode  string   `json:"build_mode,omitempty"`
+	Image      string   `json:"image,omitempty"`
+	ImageTag   string   `json:"image_tag,omitempty"`
+	GitRef     string   `json:"git_ref,omitempty"`
+	GitURL     string   `json:"git_url,omitempty"`
+	Message    string   `json:"message,omitempty"`
+	CreatedAt  string   `json:"created_at,omitempty"`
+	UpdatedAt  string   `json:"updated_at,omitempty"`
+	Chart      *struct {
+		Name       string `json:"name"`
+		Version    string `json:"version"`
+		Repository string `json:"repository"`
+	} `json:"chart,omitempty"`
+	AppSpec    *AppSpec `json:"appSpec,omitempty"`
+}
+
+type AppSpec struct {
+	DisplayName    string `json:"displayName,omitempty"`
+	RegistrySecret string `json:"registrySecret,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	Image          string `json:"image,omitempty"`
+	HelmChart      *struct {
+		Name       string `json:"name"`
+		Version    string `json:"version"`
+		Repository string `json:"repository"`
+	} `json:"helmChart,omitempty"`
 }
 
 type StackDeployApp struct {
@@ -138,7 +165,41 @@ type StackDeployDetail struct {
 	Namespace string `json:"namespace"`
 }
 
+type Parameter struct {
+	Name         string      `json:"name"`
+	Description  string      `json:"description"`
+	Type         string      `json:"type"`
+	Value        interface{} `json:"value"`
+	DefaultValue interface{} `json:"defaultValue"`
+}
+
+type StackDeployDetailWithComponents struct {
+	UUID       string      `json:"uuid"`
+	Name       string      `json:"name"`
+	Stack      struct {
+		Name string `json:"name"`
+	} `json:"stack"`
+	Project struct {
+		UUID string `json:"uuid"`
+	} `json:"project"`
+	Namespace   string      `json:"namespace"`
+	Components  []Component `json:"components"`
+	Parameters  []Parameter `json:"parameters"`
+}
+
 type KubeconfigResponse struct {
 	Kubeconfig string `json:"kubeconfig"`
 	Namespace  string `json:"namespace"`
+}
+
+type Registry struct {
+	UUID      string `json:"uuid"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Username  string `json:"username"`
+	CreatedAt string `json:"created_at"`
+	CreatedBy struct {
+		UUID string `json:"uuid"`
+		Name string `json:"name"`
+	} `json:"created_by"`
 }

@@ -15,7 +15,7 @@ func NewAppsCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "apps",
 		Aliases: []string{"app"},
-		Short:   "List apps for the current team context",
+		Short:   "Manage apps for the current team context",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := config.LoadConfig()
 			if cfg.TeamUUID == "" {
@@ -45,6 +45,9 @@ func NewAppsCommand() *cobra.Command {
 	}
 
 	cmd.AddCommand(NewAppExecCommand())
+	cmd.AddCommand(DeployCommand())
+	cmd.AddCommand(InfoCommand())
+	cmd.AddCommand(CreateCommand())
 
 	return cmd
 }

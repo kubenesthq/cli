@@ -193,3 +193,9 @@ context:
   cluster: dev-cluster
   project: web-app
 ```
+
+# TODO
+- [ ] update release script
+- [ ] list project registries
+- [ ] create a project registry
+- [ ] create new app
