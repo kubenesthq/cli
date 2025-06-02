@@ -109,17 +109,12 @@ jobs:
         TAG=${GITHUB_REF##*/}
         # Copy the Linux AMD64 binary to the Docker build context
         cp dist/kubenest-${TAG}-linux-amd64 kubenest
-        # Create a minimal Dockerfile
-        cat <<EOF > Dockerfile
-        FROM gcr.io/distroless/static:nonroot
-        COPY kubenest /usr/local/bin/kubenest
-        USER nonroot
-        ENTRYPOINT ["/usr/local/bin/kubenest"]
-        EOF
+
         # Build the Docker image
-        docker build -t kubenest-cli:latest .
+        docker build --build-arg KUBENEST_VERSION=${TAG} -t kubenest-cli:latest -f Dockerfile .
+
         # Optionally, push to GitHub Container Registry
         echo ${{ secrets.GH_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-        docker tag kubenest-cli:latest ghcr.io/${{ github.repository_owner }}/kubenest-cli:latest
-        docker push ghcr.io/${{ github.repository_owner }}/kubenest-cli:latest
+        docker tag kubenest-cli:latest ghcr.io/${{ github.repository_owner }}/kubenest-cli:${TAG}
+        docker push ghcr.io/${{ github.repository_owner }}/kubenest-cli:${TAG}
         rm kubenest Dockerfile
