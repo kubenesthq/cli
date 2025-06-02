@@ -10,33 +10,54 @@ import (
 )
 
 func NewLoginCommand() *cobra.Command {
+	var (
+		email    string
+		password string
+		apiURL   string
+	)
+
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Login to Kubenest",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			defaultAPIURL := "https://api.kubenest.io"
-			fmt.Printf("Enter API URL [%s]: ", defaultAPIURL)
-			apiURL, err := term.ReadLine()
-			if err != nil {
-				return err
-			}
+
+			// Handle API URL
 			if apiURL == "" {
-				apiURL = defaultAPIURL
+				fmt.Printf("Enter API URL [%s]: ", defaultAPIURL)
+				inputURL, err := term.ReadLine()
+				if err != nil {
+					return err
+				}
+				if inputURL == "" {
+					apiURL = defaultAPIURL
+				} else {
+					apiURL = inputURL
+				}
 			}
+
 			cfg, _ := config.LoadConfig()
 			cfg.APIURL = apiURL
 			config.SaveConfig(cfg)
 
-			fmt.Print("Enter email: ")
-			email, err := term.ReadLine()
-			if err != nil {
-				return err
+			// Handle email
+			if email == "" {
+				fmt.Print("Enter email: ")
+				inputEmail, err := term.ReadLine()
+				if err != nil {
+					return err
+				}
+				email = inputEmail
 			}
 
-			fmt.Print("Enter password: ")
-			password, err := term.ReadPassword()
-			if err != nil {
-				return err
+			// Handle password
+			if password == "" {
+				fmt.Print("Enter password: ")
+				inputPassword, err := term.ReadPassword()
+				if err != nil {
+					return err
+				}
+				password = inputPassword
 			}
 
 			client, err := api.NewClientFromConfig()
@@ -67,5 +88,11 @@ func NewLoginCommand() *cobra.Command {
 			return nil
 		},
 	}
+
+	// Add flags for non-interactive usage
+	cmd.Flags().StringVar(&email, "email", "", "Email for login (for non-interactive use)")
+	cmd.Flags().StringVar(&password, "password", "", "Password for login (for non-interactive use)")
+	cmd.Flags().StringVar(&apiURL, "api-url", "", "API URL (for non-interactive use)")
+
 	return cmd
 }

@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -24,22 +24,22 @@ jobs:
       run: |
         TAG=${GITHUB_REF##*/}
         mkdir -p dist
-        
+
         # Linux AMD64
         GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-linux-amd64 ./cmd/kubenest
-        
+
         # Linux ARM64
         GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-linux-arm64 ./cmd/kubenest
-        
+
         # macOS AMD64 (Intel)
         GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-darwin-amd64 ./cmd/kubenest
-        
+
         # macOS ARM64 (Apple Silicon)
         GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-darwin-arm64 ./cmd/kubenest
-        
+
         # Windows AMD64
         GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-windows-amd64.exe ./cmd/kubenest
-        
+
         # Windows ARM64
         GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-windows-arm64.exe ./cmd/kubenest
 
@@ -59,30 +59,30 @@ jobs:
           Download the CLI for your platform:
 
           ### Linux
-          - **AMD64**: [kubenest-${{ github.ref_name }}-linux-amd64](./kubenest-${{ github.ref_name }}-linux-amd64)
-          - **ARM64**: [kubenest-${{ github.ref_name }}-linux-arm64](./kubenest-${{ github.ref_name }}-linux-arm64)
+          - **AMD64**: [kubenest-${{ github.ref_name }}-linux-amd64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-amd64)
+          - **ARM64**: [kubenest-${{ github.ref_name }}-linux-arm64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-arm64)
 
           ### macOS
-          - **Intel (AMD64)**: [kubenest-${{ github.ref_name }}-darwin-amd64](./kubenest-${{ github.ref_name }}-darwin-amd64)
-          - **Apple Silicon (ARM64)**: [kubenest-${{ github.ref_name }}-darwin-arm64](./kubenest-${{ github.ref_name }}-darwin-arm64)
+          - **Intel (AMD64)**: [kubenest-${{ github.ref_name }}-darwin-amd64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-darwin-amd64)
+          - **Apple Silicon (ARM64)**: [kubenest-${{ github.ref_name }}-darwin-arm64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-darwin-arm64)
 
           ### Windows
-          - **AMD64**: [kubenest-${{ github.ref_name }}-windows-amd64.exe](./kubenest-${{ github.ref_name }}-windows-amd64.exe)
-          - **ARM64**: [kubenest-${{ github.ref_name }}-windows-arm64.exe](./kubenest-${{ github.ref_name }}-windows-arm64.exe)
+          - **AMD64**: [kubenest-${{ github.ref_name }}-windows-amd64.exe](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-amd64.exe)
+          - **ARM64**: [kubenest-${{ github.ref_name }}-windows-arm64.exe](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-arm64.exe)
 
           ### Checksums
-          - [checksums.txt](./checksums.txt) - SHA256 checksums for all binaries
+          - [checksums.txt](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/checksums.txt) - SHA256 checksums for all binaries
 
           ### Installation
 
           #### Linux/macOS
           ```bash
           # Download the binary for your platform
-          curl -L -o kubenest https://github.com/kubenesthq/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-<platform>-<arch>
-          
+          curl -L -o kubenest https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-<platform>-<arch>
+
           # Make it executable
           chmod +x kubenest
-          
+
           # Move to PATH
           sudo mv kubenest /usr/local/bin/
           ```
@@ -90,7 +90,36 @@ jobs:
           #### Windows
           Download the `.exe` file for your architecture and add it to your PATH.
 
+          Example (PowerShell):
+          ```powershell
+          # Download the binary for your platform
+          Invoke-WebRequest -Uri "https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-amd64.exe" -OutFile "kubenest.exe"
+
+          # (Optional) Move to a directory in your PATH, e.g. C:\\Windows\\System32 or add the current directory to PATH
+          # Example: Move-Item -Path .\kubenest.exe -Destination C:\\Windows\\System32\\kubenest.exe
+          ```
+
           ### Usage
           ```bash
           kubenest --help
           ```
+
+    - name: Build minimal Docker image for kubenest CLI
+      run: |
+        TAG=${GITHUB_REF##*/}
+        # Copy the Linux AMD64 binary to the Docker build context
+        cp dist/kubenest-${TAG}-linux-amd64 kubenest
+        # Create a minimal Dockerfile
+        cat <<EOF > Dockerfile
+        FROM gcr.io/distroless/static:nonroot
+        COPY kubenest /usr/local/bin/kubenest
+        USER nonroot
+        ENTRYPOINT ["/usr/local/bin/kubenest"]
+        EOF
+        # Build the Docker image
+        docker build -t kubenest-cli:latest .
+        # Optionally, push to GitHub Container Registry
+        echo ${{ secrets.GH_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        docker tag kubenest-cli:latest ghcr.io/${{ github.repository_owner }}/kubenest-cli:latest
+        docker push ghcr.io/${{ github.repository_owner }}/kubenest-cli:latest
+        rm kubenest Dockerfile
