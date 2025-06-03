@@ -101,13 +101,32 @@ func CreateCommand() *cobra.Command {
 
 			// 4. Get parameter values
 			parameters := make(map[string]interface{})
+			var namespace string
+			if cfg.ProjectUUID != "" {
+				projects, err := client.ListProjects(context.Background())
+				if err == nil {
+					for _, p := range projects {
+						if p.UUID == cfg.ProjectUUID {
+							namespace = p.Namespace
+							break
+						}
+					}
+				}
+			}
+			if namespace == "" {
+				return fmt.Errorf("namespace not found for project %s", cfg.ProjectUUID)
+			}
 			for _, param := range stackInfo.Parameters {
 				var value interface{}
+				promptTitle := fmt.Sprintf("Enter value for %s", param.Name)
+				if param.DefaultValue != nil && param.DefaultValue != "" {
+					promptTitle = fmt.Sprintf("%s (default: %v)", promptTitle, param.DefaultValue)
+				}
 				switch param.Type {
-				case "string", "secret":
+				case "string":
 					var strValue string
 					input := huh.NewInput().
-						Title(fmt.Sprintf("Enter value for %s", param.Name)).
+						Title(promptTitle).
 						Value(&strValue).
 						Validate(func(s string) error {
 							if s == "" && param.DefaultValue == nil {
@@ -115,6 +134,9 @@ func CreateCommand() *cobra.Command {
 							}
 							return nil
 						})
+					if param.DefaultValue != nil && param.DefaultValue != "" {
+						input.Placeholder(fmt.Sprintf("%v", param.DefaultValue))
+					}
 					if err := input.Run(); err != nil {
 						return fmt.Errorf("failed to get parameter value: %w", err)
 					}
@@ -123,10 +145,32 @@ func CreateCommand() *cobra.Command {
 					} else {
 						value = strValue
 					}
+				case "secret":
+					var secretValue string
+					pwPrompt := huh.NewInput().EchoMode(huh.EchoModePassword).
+						Title(promptTitle).
+						Value(&secretValue).
+						Validate(func(s string) error {
+							if s == "" && param.DefaultValue == nil {
+								return fmt.Errorf("value cannot be empty")
+							}
+							return nil
+						})
+					if param.DefaultValue != nil && param.DefaultValue != "" {
+						pwPrompt.Placeholder(fmt.Sprintf("%v", param.DefaultValue))
+					}
+					if err := pwPrompt.Run(); err != nil {
+						return fmt.Errorf("failed to get parameter value: %w", err)
+					}
+					if secretValue == "" && param.DefaultValue != nil {
+						value = param.DefaultValue
+					} else {
+						value = secretValue
+					}
 				case "number":
 					var numStr string
 					input := huh.NewInput().
-						Title(fmt.Sprintf("Enter value for %s", param.Name)).
+						Title(promptTitle).
 						Value(&numStr).
 						Validate(func(s string) error {
 							if s == "" && param.DefaultValue == nil {
@@ -134,6 +178,9 @@ func CreateCommand() *cobra.Command {
 							}
 							return nil
 						})
+					if param.DefaultValue != nil && param.DefaultValue != "" {
+						input.Placeholder(fmt.Sprintf("%v", param.DefaultValue))
+					}
 					if err := input.Run(); err != nil {
 						return fmt.Errorf("failed to get parameter value: %w", err)
 					}
@@ -145,7 +192,59 @@ func CreateCommand() *cobra.Command {
 						if err != nil {
 							return fmt.Errorf("invalid number for %s: %v", param.Name, err)
 						}
-						value = numValue
+						// If the default value is int, use int
+						if _, ok := param.DefaultValue.(int); ok && numValue == float64(int(numValue)) {
+							value = int(numValue)
+						} else {
+							value = numValue
+						}
+					}
+				default:
+					// Fallback: if type is secret or name contains 'password', use password prompt
+					if param.Type == "secret" || (len(param.Name) >= 8 && (param.Name == "password" || param.Name[len(param.Name)-8:] == "password")) {
+						var secretValue string
+						pwPrompt := huh.NewInput().EchoMode(huh.EchoModePassword).
+							Title(promptTitle).
+							Value(&secretValue).
+							Validate(func(s string) error {
+								if s == "" && param.DefaultValue == nil {
+									return fmt.Errorf("value cannot be empty")
+								}
+								return nil
+							})
+						if param.DefaultValue != nil && param.DefaultValue != "" {
+							pwPrompt.Placeholder(fmt.Sprintf("%v", param.DefaultValue))
+						}
+						if err := pwPrompt.Run(); err != nil {
+							return fmt.Errorf("failed to get parameter value: %w", err)
+						}
+						if secretValue == "" && param.DefaultValue != nil {
+							value = param.DefaultValue
+						} else {
+							value = secretValue
+						}
+					} else {
+						var strValue string
+						input := huh.NewInput().
+							Title(promptTitle).
+							Value(&strValue).
+							Validate(func(s string) error {
+								if s == "" && param.DefaultValue == nil {
+									return fmt.Errorf("value cannot be empty")
+								}
+								return nil
+							})
+						if param.DefaultValue != nil && param.DefaultValue != "" {
+							input.Placeholder(fmt.Sprintf("%v", param.DefaultValue))
+						}
+						if err := input.Run(); err != nil {
+							return fmt.Errorf("failed to get parameter value: %w", err)
+						}
+						if strValue == "" && param.DefaultValue != nil {
+							value = param.DefaultValue
+						} else {
+							value = strValue
+						}
 					}
 				}
 				parameters[param.Name] = value
@@ -296,13 +395,14 @@ func CreateCommand() *cobra.Command {
 				"context": map[string]interface{}{
 					"clusterUUID": cfg.ClusterUUID,
 					"projectUUID": cfg.ProjectUUID,
-					"namespace":   fmt.Sprintf("%s-%s", cfg.ProjectUUID[:8], appName),
+					"namespace":   namespace,
 				},
 				"components": components,
 			}
-
-			payloadJSON, _ := json.MarshalIndent(payload, "", "  ")
-			fmt.Printf("\nApp creation payload:\n%s\n\n", string(payloadJSON))
+			if os.Getenv("DEBUG") == "1" {
+				payloadJSON, _ := json.MarshalIndent(payload, "", "  ")
+				fmt.Printf("\nApp creation payload:\n%s\n\n", string(payloadJSON))
+			}
 
 			if err := confirmInput.Run(); err != nil {
 				return fmt.Errorf("failed to get confirmation: %w", err)
@@ -310,12 +410,6 @@ func CreateCommand() *cobra.Command {
 
 			if !confirm {
 				fmt.Println("App creation cancelled")
-				return nil
-			}
-
-			// 7. Make the API call if DEBUG is not set
-			if os.Getenv("DEBUG") == "1" {
-				fmt.Println("DEBUG mode: Skipping API call")
 				return nil
 			}
 

@@ -195,7 +195,12 @@ context:
 ```
 
 # TODO
-- [ ] update release script
-- [ ] list project registries
-- [ ] create a project registry
-- [ ] create new app
+- [x] update release script
+- [x] list project registries
+- [x] create a project registry
+- [x] delete project registry
+- [x] create new app
+- [x] delete app
+- [ ] how to show context explicitly
+- [ ] store more info in context
+- [ ] name validation for app/registry/project

@@ -7,9 +7,9 @@ type App struct {
 }
 
 type Pod struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Ready   bool   `json:"ready"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Ready    bool   `json:"ready"`
 	Restarts int    `json:"restarts"`
 }
 
@@ -72,10 +72,11 @@ type Cluster struct {
 }
 
 type Project struct {
-	UUID        string        `json:"uuid"`
-	Name        string        `json:"display_name"`
-	Cluster     ProjectCluster `json:"cluster"`
-	CreatedAt   string        `json:"created_at"`
+	UUID      string         `json:"uuid"`
+	Name      string         `json:"display_name"`
+	Namespace string         `json:"namespace"`
+	Cluster   ProjectCluster `json:"cluster"`
+	CreatedAt string         `json:"created_at"`
 }
 
 type ProjectCluster struct {
@@ -92,25 +93,25 @@ type StackDeploy struct {
 }
 
 type Component struct {
-	UUID       string   `json:"uuid"`
-	Name       string   `json:"name"`
-	Kind       string   `json:"kind,omitempty"`
-	Phase      string   `json:"phase"`
-	Status     string   `json:"status,omitempty"`
-	BuildMode  string   `json:"build_mode,omitempty"`
-	Image      string   `json:"image,omitempty"`
-	ImageTag   string   `json:"image_tag,omitempty"`
-	GitRef     string   `json:"git_ref,omitempty"`
-	GitURL     string   `json:"git_url,omitempty"`
-	Message    string   `json:"message,omitempty"`
-	CreatedAt  string   `json:"created_at,omitempty"`
-	UpdatedAt  string   `json:"updated_at,omitempty"`
-	Chart      *struct {
+	UUID      string `json:"uuid"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind,omitempty"`
+	Phase     string `json:"phase"`
+	Status    string `json:"status,omitempty"`
+	BuildMode string `json:"build_mode,omitempty"`
+	Image     string `json:"image,omitempty"`
+	ImageTag  string `json:"image_tag,omitempty"`
+	GitRef    string `json:"git_ref,omitempty"`
+	GitURL    string `json:"git_url,omitempty"`
+	Message   string `json:"message,omitempty"`
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+	Chart     *struct {
 		Name       string `json:"name"`
 		Version    string `json:"version"`
 		Repository string `json:"repository"`
 	} `json:"chart,omitempty"`
-	AppSpec    *AppSpec `json:"appSpec,omitempty"`
+	AppSpec *AppSpec `json:"appSpec,omitempty"`
 }
 
 type AppSpec struct {
@@ -126,15 +127,15 @@ type AppSpec struct {
 }
 
 type StackDeployApp struct {
-	UUID      string                `json:"uuid"`
-	Stack     StackDeployStack      `json:"stack"`
-	Cluster   StackDeployCluster    `json:"cluster"`
-	Project   StackDeployProject    `json:"project"`
-	Namespace string                `json:"namespace"`
-	Name      string                `json:"name"`
-	Status    string                `json:"status"`
-	CreatedAt string                `json:"created_at"`
-	UpdatedAt string                `json:"updated_at"`
+	UUID      string             `json:"uuid"`
+	Stack     StackDeployStack   `json:"stack"`
+	Cluster   StackDeployCluster `json:"cluster"`
+	Project   StackDeployProject `json:"project"`
+	Namespace string             `json:"namespace"`
+	Name      string             `json:"name"`
+	Status    string             `json:"status"`
+	CreatedAt string             `json:"created_at"`
+	UpdatedAt string             `json:"updated_at"`
 }
 
 type StackDeployStack struct {
@@ -149,14 +150,14 @@ type StackDeployCluster struct {
 }
 
 type StackDeployProject struct {
-	UUID       string `json:"uuid"`
-	Name       string `json:"display_name"`
+	UUID string `json:"uuid"`
+	Name string `json:"display_name"`
 }
 
 type StackDeployDetail struct {
-	UUID     string `json:"uuid"`
-	Name     string `json:"name"`
-	Stack    struct {
+	UUID  string `json:"uuid"`
+	Name  string `json:"name"`
+	Stack struct {
 		Name string `json:"name"`
 	} `json:"stack"`
 	Project struct {
@@ -174,17 +175,17 @@ type Parameter struct {
 }
 
 type StackDeployDetailWithComponents struct {
-	UUID       string      `json:"uuid"`
-	Name       string      `json:"name"`
-	Stack      struct {
+	UUID  string `json:"uuid"`
+	Name  string `json:"name"`
+	Stack struct {
 		Name string `json:"name"`
 	} `json:"stack"`
 	Project struct {
 		UUID string `json:"uuid"`
 	} `json:"project"`
-	Namespace   string      `json:"namespace"`
-	Components  []Component `json:"components"`
-	Parameters  []Parameter `json:"parameters"`
+	Namespace  string      `json:"namespace"`
+	Components []Component `json:"components"`
+	Parameters []Parameter `json:"parameters"`
 }
 
 type KubeconfigResponse struct {

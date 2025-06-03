@@ -12,8 +12,9 @@ import (
 )
 
 func NewProjectsCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "projects",
+		Aliases: []string{"project"},
 		Short: "List projects for the current team context",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _ := config.LoadConfig()
@@ -42,4 +43,6 @@ func NewProjectsCommand() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.AddCommand(newRegistryCommand())
+	return cmd
 }

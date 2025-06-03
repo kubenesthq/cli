@@ -573,3 +573,45 @@ func (c *Client) ListRegistries(ctx context.Context, projectUUID string) ([]Regi
 
 	return registries, nil
 }
+
+// AddRegistry creates a new registry for a given project
+func (c *Client) AddRegistry(ctx context.Context, projectUUID, name, url, username, password string) error {
+	type RegistryCreateRequest struct {
+		Name     string `json:"name"`
+		URL      string `json:"url"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	body := RegistryCreateRequest{
+		Name:     name,
+		URL:      url,
+		Username: username,
+		Password: password,
+	}
+	endpoint := "/api/v1/projects/" + projectUUID + "/registries"
+	_, err := c.Post(endpoint, body)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteRegistry deletes a registry by UUID for a given project
+func (c *Client) DeleteRegistry(ctx context.Context, projectUUID, registryUUID string) error {
+	endpoint := "/api/v1/projects/" + projectUUID + "/registries/" + registryUUID
+	_, err := c.Delete(endpoint)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteApp deletes an app (stackdeploy) by UUID
+func (c *Client) DeleteApp(ctx context.Context, appUUID string) error {
+	endpoint := "/api/v1/stackdeploys/" + appUUID
+	_, err := c.Delete(endpoint)
+	if err != nil {
+		return err
+	}
+	return nil
+}

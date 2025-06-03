@@ -48,6 +48,6 @@ func NewAppsCommand() *cobra.Command {
 	cmd.AddCommand(DeployCommand())
 	cmd.AddCommand(InfoCommand())
 	cmd.AddCommand(CreateCommand())
-
+	cmd.AddCommand(DeleteAppCommand())
 	return cmd
 }
