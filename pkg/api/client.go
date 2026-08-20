@@ -28,6 +28,8 @@ type Client struct {
 	token      string
 	// debugw receives redacted request traces when KUBENEST_DEBUG=1.
 	debugw io.Writer
+	// sleep paces device-token polling; replaced in tests.
+	sleep sleepFn
 }
 
 type Option func(*Client)
@@ -60,6 +62,7 @@ func New(controlPlane string, opts ...Option) (*Client, error) {
 		baseURL:    base,
 		httpClient: &http.Client{Timeout: defaultTimeout},
 		debugw:     os.Stderr,
+		sleep:      realSleep,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -73,57 +76,30 @@ func (c *Client) BaseURL() string { return c.baseURL.String() }
 // SetToken replaces the bearer credential (after login).
 func (c *Client) SetToken(token string) { c.token = token }
 
-// Token is the login response of POST /api/v1/login.
-type Token struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
+// BundleListEntry is one row of the bundle catalog (GET /api/v1/bundles).
+type BundleListEntry struct {
+	Version  string   `json:"version"`
+	HATiers  []string `json:"ha_tiers"`
+	Profiles []string `json:"profiles"`
 }
 
-// Login authenticates with email and password and returns the bearer token.
-// The control plane expects OAuth2 password-form encoding with the email in
-// the username field.
-func (c *Client) Login(ctx context.Context, email, password string) (Token, error) {
-	form := url.Values{}
-	form.Set("username", email)
-	form.Set("password", password)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.endpoint("/api/v1/login"), strings.NewReader(form.Encode()))
+// ListBundles returns the bundle catalog this control plane offers. It is
+// also the cheapest authenticated call, used to check a stored token still
+// works.
+func (c *Client) ListBundles(ctx context.Context) ([]BundleListEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/api/v1/bundles"), nil)
 	if err != nil {
-		return Token{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	var tok Token
-	if err := c.do(req, &tok); err != nil {
-		return Token{}, err
-	}
-	if tok.AccessToken == "" {
-		return Token{}, fmt.Errorf("control plane returned no access token")
-	}
-	return tok, nil
-}
-
-// User is the shape of GET /api/v1/user/me/.
-type User struct {
-	Email string `json:"email"`
-	Name  string `json:"name"`
-}
-
-// CurrentUser returns the identity the stored credential belongs to.
-func (c *Client) CurrentUser(ctx context.Context) (User, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/api/v1/user/me/"), nil)
-	if err != nil {
-		return User{}, err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 
-	var u User
-	if err := c.do(req, &u); err != nil {
-		return User{}, err
+	var out struct {
+		Data []BundleListEntry `json:"data"`
 	}
-	return u, nil
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return out.Data, nil
 }
 
 func (c *Client) endpoint(p string) string {

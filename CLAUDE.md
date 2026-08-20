@@ -32,7 +32,10 @@ linux/darwin/windows × amd64/arm64 with CGO disabled. Keep the build pure Go.
 ```
 cmd/kubenest/       thin main
 pkg/cmd/            cobra command tree (root, login, platform, backup)
-pkg/config/         ~/.kubenest/config.json — 0600 file, 0700 dir, enforced on save
+pkg/config/         ~/.kubenest/{config,credentials}.json — 0600 files in a
+                    0700 dir, enforced on save; credentials.json holds the
+                    knp_* CLI token keyed by control-plane URL (contract
+                    v1.12.0 — the plaintext exists nowhere else)
 pkg/api/            control-plane HTTP client (login, current user)
 pkg/sshx/           SSH transport: --ssh-key / ssh-agent / ~/.ssh/config
 pkg/converge/       convergence checks: pass / converging / fail — the ONLY
