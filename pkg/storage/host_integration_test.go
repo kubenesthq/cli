@@ -86,13 +86,23 @@ func TestStorageOnRealHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("scaffolding: installing k3s %s", k3sVersion)
+	// --disable local-storage: the bundled local-path provisioner ships as a
+	// second DEFAULT StorageClass, which Verify refuses. The real installer
+	// (kn-7k8 stage 3) must pass the same flag.
 	res, err := client.Run(ctx, fmt.Sprintf(
-		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --disable traefik", k3sVersion))
+		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --disable traefik --disable local-storage", k3sVersion))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.ExitCode != 0 {
 		t.Fatalf("k3s install: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+	// Shared-host case: if k3s predates this run WITHOUT that flag, demote
+	// local-path so the cluster looks like a platform install. Scaffolding
+	// only — on a kn-7k8-built cluster local-path does not exist at all.
+	if _, err := client.Run(ctx,
+		`sudo -n k3s kubectl get storageclass local-path >/dev/null 2>&1 && sudo -n k3s kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=false --overwrite || true`); err != nil {
+		t.Fatal(err)
 	}
 	nodeReady, err := m.Limits.Timeouts.For("node-ready")
 	if err != nil {

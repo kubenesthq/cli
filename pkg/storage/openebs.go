@@ -171,6 +171,7 @@ func Verify(ctx context.Context, r k3s.Runner, m *manifest.Manifest, rep converg
 
 type storageClassDoc struct {
 	Metadata struct {
+		Name        string            `json:"name"`
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
 	Provisioner       string `json:"provisioner"`
@@ -183,35 +184,60 @@ type storageClassDoc struct {
 func storageClassProbe(r k3s.Runner) converge.Probe {
 	object := "storageclass " + StorageClassName
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get storageclass "+StorageClassName+" -o json")
+		out, err := k3s.Kubectl(ctx, r, "get storageclass -o json")
 		if err != nil {
+			return false, converge.State{Object: object, Status: "unobservable"}, err
+		}
+		var list struct {
+			Items []storageClassDoc `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(out), &list); err != nil {
+			return false, converge.State{Object: object, Status: "unparsable"}, err
+		}
+
+		var ours *storageClassDoc
+		var otherDefaults []string
+		for i, sc := range list.Items {
+			isDefault := sc.Metadata.Annotations["storageclass.kubernetes.io/is-default-class"] == "true"
+			if sc.Metadata.Name == StorageClassName {
+				ours = &list.Items[i]
+			} else if isDefault {
+				otherDefaults = append(otherDefaults, sc.Metadata.Name)
+			}
+		}
+		if ours == nil {
 			return false, converge.State{
 				Object: object,
 				Status: "not found",
 				Detail: "the auto-deploy manifest kubenest-storageclass.yaml has not applied yet",
-			}, err
+			}, nil
 		}
-		var sc storageClassDoc
-		if err := json.Unmarshal([]byte(out), &sc); err != nil {
-			return false, converge.State{Object: object, Status: "unparsable"}, err
-		}
+
 		var wrong []string
-		if sc.Provisioner != CSIDriverName {
-			wrong = append(wrong, fmt.Sprintf("provisioner is %s, want %s", sc.Provisioner, CSIDriverName))
+		if ours.Provisioner != CSIDriverName {
+			wrong = append(wrong, fmt.Sprintf("provisioner is %s, want %s", ours.Provisioner, CSIDriverName))
 		}
-		if sc.Parameters.Volgroup != VolumeGroup {
-			wrong = append(wrong, fmt.Sprintf("volgroup is %q, want %s", sc.Parameters.Volgroup, VolumeGroup))
+		if ours.Parameters.Volgroup != VolumeGroup {
+			wrong = append(wrong, fmt.Sprintf("volgroup is %q, want %s", ours.Parameters.Volgroup, VolumeGroup))
 		}
-		if sc.VolumeBindingMode != "WaitForFirstConsumer" {
+		if ours.VolumeBindingMode != "WaitForFirstConsumer" {
 			wrong = append(wrong, "volumeBindingMode must be WaitForFirstConsumer for node-local volumes")
 		}
-		if sc.Metadata.Annotations["storageclass.kubernetes.io/is-default-class"] != "true" {
+		if ours.Metadata.Annotations["storageclass.kubernetes.io/is-default-class"] != "true" {
 			wrong = append(wrong, "not the default class (annotation storageclass.kubernetes.io/is-default-class)")
+		}
+		// Two defaults make PVC binding order-dependent. On k3s the usual
+		// intruder is the bundled local-path provisioner — the platform k3s
+		// install disables it (--disable local-storage, kn-7k8 stage 3).
+		if len(otherDefaults) > 0 {
+			wrong = append(wrong, fmt.Sprintf(
+				"another StorageClass is also marked default (%s) — install k3s with --disable local-storage, or clear its is-default-class annotation",
+				strings.Join(otherDefaults, ", ")))
 		}
 		if len(wrong) > 0 {
 			return false, converge.State{Object: object, Status: "misconfigured", Detail: strings.Join(wrong, "; ")}, nil
 		}
-		return true, converge.State{Object: object, Status: "default", Detail: "provisioner " + CSIDriverName + ", volgroup " + VolumeGroup}, nil
+		return true, converge.State{Object: object, Status: "the one default", Detail: "provisioner " + CSIDriverName + ", volgroup " + VolumeGroup}, nil
 	}
 }
 

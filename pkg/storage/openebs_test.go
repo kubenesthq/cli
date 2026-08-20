@@ -152,22 +152,23 @@ func TestInstallFailureNamesTheStuckObject(t *testing.T) {
 	}
 }
 
-const scCmd = "sudo -n k3s kubectl get storageclass " + StorageClassName + " -o json"
+const scCmd = "sudo -n k3s kubectl get storageclass -o json"
+
+const goodSC = `{"metadata":{"name":"kubenest-local","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},
+	"provisioner":"local.csi.openebs.io","volumeBindingMode":"WaitForFirstConsumer",
+	"parameters":{"volgroup":"kubenest-vg"}}`
 
 func TestVerifyPassesOnTheCorrectDefaultStorageClass(t *testing.T) {
-	good := `{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},
-		"provisioner":"local.csi.openebs.io","volumeBindingMode":"WaitForFirstConsumer",
-		"parameters":{"volgroup":"kubenest-vg"}}`
-	r := &prefixRunner{t: t, replies: []prefixReply{{scCmd, sshx.Result{Stdout: good}}}}
+	r := &prefixRunner{t: t, replies: []prefixReply{{scCmd, sshx.Result{Stdout: `{"items":[` + goodSC + `]}`}}}}
 	if err := Verify(context.Background(), r, testManifest(t), nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestVerifyFailureSaysWhatIsMisconfigured(t *testing.T) {
-	wrong := `{"metadata":{"annotations":{}},
+	wrong := `{"items":[{"metadata":{"name":"kubenest-local","annotations":{}},
 		"provisioner":"kubernetes.io/no-provisioner","volumeBindingMode":"Immediate",
-		"parameters":{"volgroup":"other-vg"}}`
+		"parameters":{"volgroup":"other-vg"}}]}`
 	r := &prefixRunner{t: t, replies: []prefixReply{{scCmd, sshx.Result{Stdout: wrong}}}}
 	err := Verify(context.Background(), r, testManifest(t), nil)
 	if err == nil {
@@ -176,6 +177,25 @@ func TestVerifyFailureSaysWhatIsMisconfigured(t *testing.T) {
 	for _, want := range []string{"provisioner", "volgroup", "WaitForFirstConsumer", "default"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("failure %q does not name the %s problem", err, want)
+		}
+	}
+}
+
+// Two default StorageClasses make PVC binding order-dependent. The usual
+// intruder on k3s is the bundled local-path provisioner; Verify must refuse
+// it and name the platform fix (--disable local-storage, kn-7k8 stage 3).
+func TestVerifyRefusesASecondDefaultStorageClass(t *testing.T) {
+	twoDefaults := `{"items":[` + goodSC + `,
+		{"metadata":{"name":"local-path","annotations":{"storageclass.kubernetes.io/is-default-class":"true"}},
+		 "provisioner":"rancher.io/local-path","volumeBindingMode":"WaitForFirstConsumer","parameters":{}}]}`
+	r := &prefixRunner{t: t, replies: []prefixReply{{scCmd, sshx.Result{Stdout: twoDefaults}}}}
+	err := Verify(context.Background(), r, testManifest(t), nil)
+	if err == nil {
+		t.Fatal("a cluster with two default StorageClasses verified")
+	}
+	for _, want := range []string{"local-path", "--disable local-storage"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("failure %q does not carry %q", err, want)
 		}
 	}
 }
