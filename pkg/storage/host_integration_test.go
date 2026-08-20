@@ -86,11 +86,13 @@ func TestStorageOnRealHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("scaffolding: installing k3s %s", k3sVersion)
-	// --disable local-storage: the bundled local-path provisioner ships as a
-	// second DEFAULT StorageClass, which Verify refuses. The real installer
-	// (kn-7k8 stage 3) must pass the same flag.
+	// Flags mirror the platform's k3s stage (kn-7k8 stage 3): --cluster-init
+	// for embedded etcd on every tier (decision A), --disable traefik (the
+	// bundle pins its own, kn-pgu), --disable local-storage (the bundled
+	// local-path provisioner ships as a second DEFAULT StorageClass, which
+	// Verify refuses).
 	res, err := client.Run(ctx, fmt.Sprintf(
-		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --disable traefik --disable local-storage", k3sVersion))
+		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --cluster-init --disable traefik --disable local-storage", k3sVersion))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +159,7 @@ func TestStorageOnRealHost(t *testing.T) {
 		t.Fatalf("data did not survive the pod restart; reader saw: %q", logs)
 	}
 
-	out, err := k3s.Kubectl(ctx, client, "get storageclass -o jsonpath={range .items[*]}{.metadata.name}={.metadata.annotations.storageclass\\.kubernetes\\.io/is-default-class}{\"\\n\"}{end}")
+	out, err := k3s.Kubectl(ctx, client, `get storageclass -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}'`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +252,7 @@ func waitFor(t *testing.T, ctx context.Context, r k3s.Runner, name string, deadl
 // podSucceededProbe observes one pod until phase Succeeded.
 func podSucceededProbe(r k3s.Runner, name string) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get pod "+name+" -n default -o jsonpath={.status.phase}")
+		out, err := k3s.Kubectl(ctx, r, "get pod "+name+" -n default -o jsonpath='{.status.phase}'")
 		if err != nil {
 			return false, converge.State{Object: "pod " + name, Status: "unobservable"}, err
 		}
@@ -264,7 +266,9 @@ func podSucceededProbe(r k3s.Runner, name string) converge.Probe {
 
 func nodeReadyProbe(r k3s.Runner) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get nodes -o jsonpath={.items[*].status.conditions[?(@.type==\"Ready\")].status}")
+		// Single-quoted for the remote shell: jsonpath's ?() and quotes are
+		// bash syntax errors when bare.
+		out, err := k3s.Kubectl(ctx, r, `get nodes -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'`)
 		if err != nil {
 			return false, converge.State{Object: "nodes", Status: "unobservable"}, err
 		}
