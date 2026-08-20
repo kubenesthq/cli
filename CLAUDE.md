@@ -35,6 +35,9 @@ pkg/cmd/            cobra command tree (root, login, platform, backup)
 pkg/config/         ~/.kubenest/config.json — 0600 file, 0700 dir, enforced on save
 pkg/api/            control-plane HTTP client (login, current user)
 pkg/sshx/           SSH transport: --ssh-key / ssh-agent / ~/.ssh/config
+pkg/converge/       convergence checks: pass / converging / fail — the ONLY
+                    way the CLI waits on cluster state
+pkg/manifest/       bundle manifest loader (limits.timeouts — every deadline)
 pkg/version/        version vars stamped via -ldflags by the release workflow
 ```
 

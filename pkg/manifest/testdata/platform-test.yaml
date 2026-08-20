@@ -1,0 +1,20 @@
+# Test fixture shaped like bundle.mdx's platform-1.0.yaml.
+bundle: "1.0"
+
+core:
+  k3s: v1.33.1+k3s1
+  traefik: 34.0.0
+
+ha-tiers: [single-server, ha]
+
+limits:
+  resources:
+    floor: { cpu: 2, memory: 3.7Gi, disk: 36Gi }
+  timeouts:
+    node-ready:        5m
+    component-ready:  10m
+    node-drain:       15m
+    node-reboot:      20m
+    install-total:    30m
+    upgrade-per-node: 30m
+    restore-drill:     2h
