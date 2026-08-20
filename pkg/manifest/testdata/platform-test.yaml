@@ -4,6 +4,7 @@ bundle: "1.0"
 core:
   k3s: v1.33.1+k3s1
   traefik: 34.0.0
+  openebs-lvm-localpv: 1.10.0
 
 ha-tiers: [single-server, ha]
 

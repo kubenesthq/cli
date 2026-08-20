@@ -95,3 +95,55 @@ func TestChangingTheManifestChangesTheDeadline(t *testing.T) {
 		t.Errorf("deadlines = %s and %s, want 50ms and 10s straight from the files", d1, d2)
 	}
 }
+
+func TestCoreVersionReadsThePin(t *testing.T) {
+	m, err := Load("testdata/platform-test.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := m.Core.Version("openebs-lvm-localpv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != "1.10.0" {
+		t.Errorf("core.openebs-lvm-localpv = %q, want 1.10.0", v)
+	}
+}
+
+// A missing component pin is an error, never a default — the same rule as
+// timeouts, for the same reason.
+func TestMissingCorePinIsAnErrorNotADefault(t *testing.T) {
+	m, err := Load("testdata/platform-test.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Core.Version("velero")
+	if err == nil {
+		t.Fatal("Version(velero) = nil error for an unpinned component")
+	}
+	if !strings.Contains(err.Error(), "core.velero") {
+		t.Errorf("error %q does not name the missing manifest key core.velero", err)
+	}
+}
+
+// The REAL authored manifest in kubenest-contracts must parse with core pins
+// intact — the manifest is the contract artifact, and this is the file the
+// installer will actually read. Skipped when the contracts checkout is not
+// beside this repo.
+func TestRealPlatformManifestCarriesCorePins(t *testing.T) {
+	real := filepath.Join("..", "..", "..", "kubenest-contracts", "bundles", "platform-1.0.yaml")
+	if _, err := os.Stat(real); err != nil {
+		t.Skipf("contracts checkout not present: %v", err)
+	}
+	m, err := Load(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := m.Core.Version("openebs-lvm-localpv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v == "" {
+		t.Error("core.openebs-lvm-localpv is empty in the real manifest")
+	}
+}

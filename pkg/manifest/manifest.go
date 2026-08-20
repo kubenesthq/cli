@@ -23,7 +23,26 @@ import (
 type Manifest struct {
 	// Bundle is the platform version this manifest pins, e.g. "1.0".
 	Bundle string `yaml:"bundle"`
-	Limits Limits `yaml:"limits"`
+	// Core maps each core component to its pinned version — Helm chart
+	// version for chart-installed components, upstream release tag otherwise
+	// (the pin rule in bundle-manifest.schema.json).
+	Core   Components `yaml:"core"`
+	Limits Limits     `yaml:"limits"`
+}
+
+// Components maps component name to pinned version.
+type Components map[string]string
+
+// Version returns the pin for a named component. A missing component is an
+// error for the same reason a missing timeout is: the manifest is the record
+// of what the platform installs, and a version constant in code would
+// silently unrecord it.
+func (c Components) Version(name string) (string, error) {
+	v, ok := c[name]
+	if !ok {
+		return "", fmt.Errorf("bundle manifest does not pin core.%s: the bundle decides every version, add the pin to the manifest rather than defaulting in code", name)
+	}
+	return v, nil
 }
 
 type Limits struct {
