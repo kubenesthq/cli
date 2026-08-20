@@ -41,7 +41,14 @@ pkg/sshx/           SSH transport: --ssh-key / ssh-agent / ~/.ssh/config
 pkg/converge/       convergence checks: pass / converging / fail — the ONLY
                     way the CLI waits on cluster state
 pkg/manifest/       bundle manifest loader (limits.timeouts — every deadline)
+pkg/k3s/            the ONE apply mechanism: manifests + HelmChart CRs into
+                    k3s's auto-deploy dir over SSH; kubectl probe helpers
+pkg/component/      platform component installers (S3 shape: render from
+                    manifest → apply → converge.Wait → verify) — gatewayapi,
+                    traefik (+ the kubenest-gateway defaults), certmanager
 pkg/version/        version vars stamped via -ldflags by the release workflow
+e2e/                real-host acceptance suite (build tag e2e) — needs a node
+                    from `ephemeral-env.sh up --profile host`
 ```
 
 ## Invariants — tests enforce these; keep them true

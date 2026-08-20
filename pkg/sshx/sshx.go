@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/user"
@@ -269,11 +270,27 @@ type Result struct {
 
 // Run executes one command on the host and waits for it.
 func (c *Client) Run(ctx context.Context, command string) (Result, error) {
+	return c.run(ctx, command, nil)
+}
+
+// RunInput executes one command with stdin streamed from r. Use this for
+// large payloads (manifests, file content): stdin flows over the channel in
+// arbitrarily many packets, whereas the command string itself travels in a
+// single SSH exec request with a hard packet-size cap — inlining content
+// there fails somewhere past a couple hundred KB.
+func (c *Client) RunInput(ctx context.Context, command string, stdin io.Reader) (Result, error) {
+	return c.run(ctx, command, stdin)
+}
+
+func (c *Client) run(ctx context.Context, command string, stdin io.Reader) (Result, error) {
 	sess, err := c.conn.NewSession()
 	if err != nil {
 		return Result{}, err
 	}
 	defer sess.Close()
+	if stdin != nil {
+		sess.Stdin = stdin
+	}
 
 	var stdout, stderr limitedBuffer
 	sess.Stdout = &stdout
