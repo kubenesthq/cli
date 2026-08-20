@@ -19,7 +19,7 @@
 //	./scripts/ephemeral-env.sh up --profile host
 //	source lab/hetzner/.lab-env.sh
 //	cd kubenest-cli && go test -tags host -timeout 45m -run TestBackupOnRealHost -v ./pkg/backup \
-//	  -host "$KN_LAB_NODE0_IP" -ssh-user "$KN_LAB_SSH_USER" -ssh-key "$KN_LAB_SSH_KEY" \
+//	  -host "$KUBENEST_LAB_NODE1_IP" -ssh-user "$KUBENEST_LAB_SSH_USER" -ssh-key ~/.ssh/id_ed25519 \
 //	  -bundle ../kubenest-contracts/bundles/platform-1.0.yaml
 //	./scripts/ephemeral-env.sh down --profile host   # ALWAYS — it bills by the hour
 //
@@ -162,11 +162,11 @@ func TestBackupOnRealHost(t *testing.T) {
 
 	// The schedule on the cluster is the manifest's (decision E), not a
 	// constant's: daily at 02:00, retention 14 × 24h.
-	cron := kubectlOut(t, ctx, client, "get schedule daily -n velero -o jsonpath={.spec.schedule}")
+	cron := kubectlOut(t, ctx, client, "get schedule daily -n velero -o jsonpath='{.spec.schedule}'")
 	if cron != "0 2 * * *" {
 		t.Errorf("schedule cron = %q, want 0 2 * * *", cron)
 	}
-	ttl := kubectlOut(t, ctx, client, "get schedule daily -n velero -o jsonpath={.spec.template.ttl}")
+	ttl := kubectlOut(t, ctx, client, "get schedule daily -n velero -o jsonpath='{.spec.template.ttl}'")
 	if ttl != "336h0m0s" {
 		t.Errorf("schedule ttl = %q, want 336h0m0s", ttl)
 	}
@@ -178,14 +178,26 @@ func TestBackupOnRealHost(t *testing.T) {
 	}
 
 	// Volume data went through file-system backup: the proof pod's PVC has a
-	// Completed PodVolumeBackup under this backup, and nothing failed.
+	// Completed PodVolumeBackup under this backup. The hard assert is scoped
+	// to the proof namespace — MinIO's own volume also gets a PVB (the
+	// "bucket" living in-cluster is a test artifact; a customer's bucket is
+	// external), and its state is logged, not gating.
 	pvbPhases := kubectlOut(t, ctx, client,
-		"get podvolumebackups -n velero -l velero.io/backup-name="+name+" -o jsonpath={range .items[*]}{.spec.pod.namespace}/{.spec.volume}={.status.phase}{\"\\n\"}{end}")
-	if !strings.Contains(pvbPhases, proofNamespace+"/") || !strings.Contains(pvbPhases, "=Completed") {
-		t.Errorf("no Completed PodVolumeBackup for the proof volume under %s; got:\n%s", name, pvbPhases)
+		"get podvolumebackups -n velero -l velero.io/backup-name="+name+` -o jsonpath='{range .items[*]}{.spec.pod.namespace}/{.spec.volume}={.status.phase}{"\n"}{end}'`)
+	t.Logf("pod volume backups under %s:\n%s", name, pvbPhases)
+	proofDone := false
+	for _, line := range strings.Split(strings.TrimSpace(pvbPhases), "\n") {
+		if !strings.HasPrefix(line, proofNamespace+"/") {
+			continue
+		}
+		if strings.HasSuffix(line, "=Completed") {
+			proofDone = true
+		} else {
+			t.Errorf("proof volume backup not Completed: %s", line)
+		}
 	}
-	if strings.Contains(pvbPhases, "=Failed") {
-		t.Errorf("a PodVolumeBackup failed under %s:\n%s", name, pvbPhases)
+	if !proofDone {
+		t.Errorf("no Completed PodVolumeBackup for the proof volume under %s; got:\n%s", name, pvbPhases)
 	}
 
 	// Asserted from the BUCKET's side: velero's manifest object for this
@@ -291,7 +303,7 @@ spec:
           command: ["sh", "-c", %q]
 `, name, namespace, mcImage, command))
 	waitFor(t, ctx, r, name+"-done", deadline, func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get job "+name+" -n "+namespace+" -o jsonpath={.status.succeeded}")
+		out, err := k3s.Kubectl(ctx, r, "get job "+name+" -n "+namespace+" -o jsonpath='{.status.succeeded}'")
 		if err != nil {
 			return false, converge.State{Object: "job " + name, Status: "unobservable"}, err
 		}
@@ -347,7 +359,9 @@ func podsReadyIn(r k3s.Runner, namespace string) converge.Probe {
 
 func nodeReadyProbe(r k3s.Runner) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get nodes -o jsonpath={.items[*].status.conditions[?(@.type==\"Ready\")].status}")
+		// Single-quoted for the remote shell: jsonpath's ?() and quotes are
+		// shell syntax otherwise.
+		out, err := k3s.Kubectl(ctx, r, `get nodes -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'`)
 		if err != nil {
 			return false, converge.State{Object: "nodes", Status: "unobservable"}, err
 		}

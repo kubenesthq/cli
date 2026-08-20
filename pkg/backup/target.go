@@ -285,7 +285,7 @@ func EnsureSchedule(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest
 
 	object := "schedule " + name + " in " + Namespace
 	res, err := converge.Wait(ctx, func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get schedule "+name+" -n "+Namespace+" -o jsonpath={.status.phase}")
+		out, err := k3s.Kubectl(ctx, r, "get schedule "+name+" -n "+Namespace+" -o jsonpath='{.status.phase}'")
 		if err != nil {
 			return false, converge.State{Object: object, Status: "not found yet"}, err
 		}

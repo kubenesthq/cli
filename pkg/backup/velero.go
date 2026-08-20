@@ -133,7 +133,9 @@ func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep c
 // carries `backup: unconfigured` (fleet wiring is kn-j5s, wave 3) — and it
 // is not an error here for the same reason it does not block the install.
 func Unconfigured(ctx context.Context, r k3s.Runner) (bool, error) {
-	out, err := k3s.Kubectl(ctx, r, "get backupstoragelocations -n "+Namespace+" -o jsonpath={.items[*].metadata.name}")
+	// Single-quoted for the remote shell — jsonpath braces and globs are
+	// shell syntax otherwise.
+	out, err := k3s.Kubectl(ctx, r, "get backupstoragelocations -n "+Namespace+" -o jsonpath='{.items[*].metadata.name}'")
 	if err != nil {
 		return false, err
 	}
