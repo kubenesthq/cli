@@ -7,11 +7,11 @@
 //
 // Run from the umbrella workspace:
 //
-//	./scripts/ephemeral-env.sh up --profile host
+//	./scripts/ephemeral-env.sh up --profile host --nodes 1
 //	source lab/hetzner/.lab-env.sh
 //	cd kubenest-cli && go test -tags host -timeout 30m -run TestStorageOnRealHost -v ./pkg/storage \
-//	  -host "$KN_LAB_NODE0_IP" -ssh-user "$KN_LAB_SSH_USER" -ssh-key "$KN_LAB_SSH_KEY" \
-//	  -storage-device "$KN_LAB_NODE0_STORAGE_DEVICE" \
+//	  -host "$KUBENEST_LAB_NODE1_IP" -ssh-user "$KUBENEST_LAB_SSH_USER" -ssh-key ~/.ssh/id_ed25519 \
+//	  -storage-device "$KUBENEST_LAB_NODE1_STORAGE_DEVICE" \
 //	  -bundle ../kubenest-contracts/bundles/platform-1.0.yaml
 //	./scripts/ephemeral-env.sh down --profile host   # ALWAYS — it bills by the hour
 //
