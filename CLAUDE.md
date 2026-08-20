@@ -1,84 +1,63 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
-## Project Overview
+## What this is
 
-This is the Kubenest CLI - a command-line interface for managing applications deployed on Kubernetes clusters through the Kubenest platform. It's built in Go using the Cobra CLI framework.
+The KubeNest **platform CLI**: `kubenest login`, `kubenest platform
+install|uninstall|upgrade`, `kubenest backup ...`. It installs the pinned
+platform bundle onto Ubuntu 24.04 hosts over SSH. The spec is
+`kubenest-docs/content/platform/install.mdx` — read it before changing
+behavior; the docs are the contract.
 
-## Build Commands
+The pre-2026 app-layer commands (apps, deploy, exec, logs, registry, teams)
+were **removed in 2026-08** (frozen scope, decision D1; they targeted a
+backend API that no longer exists — teams/X-Team-UUID). Do not reintroduce or
+extend them.
+
+## Build and test
 
 ```bash
-# Build the CLI binary
-go build -o kubenest ./cmd/kubenest
-
-# Build with optimizations (smaller binary)
-go build -ldflags="-s -w" -o kubenest ./cmd/kubenest
-
-# Cross-compile for different platforms
-GOOS=linux GOARCH=amd64 go build -o kubenest-linux-amd64 ./cmd/kubenest
-GOOS=darwin GOARCH=arm64 go build -o kubenest-darwin-arm64 ./cmd/kubenest
-GOOS=windows GOARCH=amd64 go build -o kubenest-windows-amd64.exe ./cmd/kubenest
+go build ./...
+go test -race ./...
+go vet ./...
+gofmt -l .          # must print nothing
 ```
 
-## Architecture
+CI (`.github/workflows/ci.yml`) also cross-compiles for
+linux/darwin/windows × amd64/arm64 with CGO disabled. Keep the build pure Go.
 
-### Entry Point
-- `cmd/kubenest/main.go` - Main entry point that initializes config, creates API client, and sets up Cobra commands
+## Layout
 
-### Core Packages
-- `pkg/api/` - HTTP client for Kubenest API communication with authentication and team context
-- `pkg/config/` - Configuration management (stored in `~/.kubenest/config.json`)
-- `pkg/cmd/` - Command implementations for all CLI operations
-- `pkg/models/` - Data structures for API responses
-- `pkg/service/` - Business logic layer
-- `pkg/term/` - Terminal utilities
-- `pkg/utils/` - Shared utilities
+```
+cmd/kubenest/       thin main
+pkg/cmd/            cobra command tree (root, login, platform, backup)
+pkg/config/         ~/.kubenest/config.json — 0600 file, 0700 dir, enforced on save
+pkg/api/            control-plane HTTP client (login, current user)
+pkg/sshx/           SSH transport: --ssh-key / ssh-agent / ~/.ssh/config
+pkg/version/        version vars stamped via -ldflags by the release workflow
+```
 
-### Context System
-The CLI uses a hierarchical context system:
-- **Team** - Acts like an org/account scope
-- **Cluster** - Scope for all deployment activity  
-- **Project** - Optional scope for namespaces/apps
+## Invariants — tests enforce these; keep them true
 
-Context can be set via commands (`kubenest context`) or overridden with flags (`--team`, `--cluster`, `--project`).
+1. **Key material never leaves the machine.** `pkg/sshx` key bytes are
+   unprintable and unserializable (`redact.go`); `pkg/api` and `pkg/sshx`
+   must never import each other (`arch_test.go`). The debug trace redacts
+   `Authorization`. Never add a code path that logs or uploads a credential.
+2. **Acceptance checks are convergence checks, never snapshots.** Anything
+   that waits on cluster state goes through `pkg/converge` and reports
+   `pass` / `converging` / `fail` — no other outcomes. `CrashLoopBackOff`
+   and `Pending` are transient until the deadline.
+3. **Deadlines come from the bundle manifest's `limits.timeouts`, never
+   constants in code.** A missing timeout key is an error, not a default.
+4. **Failure messages name a fix.** "traefik is Pending, no node matches its
+   node selector" is a fix; "install failed" is not.
+5. **Skeleton commands exit non-zero.** Unimplemented paths say so; they
+   never pretend success.
 
-### Authentication
-- Token-based authentication stored in config
-- API requests include `Authorization: Bearer <token>` header
-- Team context sent via `X-Team-UUID` header (except for `/teams` and `/login` endpoints)
+## Release
 
-### API Client Features
-- Configurable base URL (defaults to https://api.kubenest.io)
-- Request timeout configuration
-- Debug mode with curl command output (set `DEBUG=1`)
-- Automatic JSON marshaling/unmarshaling
-- Error response parsing
-
-## Key Commands
-- `login/logout` - Authentication
-- `context` - Set/view team, cluster, project context
-- `teams/clusters/projects` - Resource listing
-- `apps` - Application management
-- `logs` - Application log viewing
-- `exec` - Execute commands in pods (planned)
-- `copy` - File copy to/from pods (planned)
-
-## Configuration
-Config stored in `~/.kubenest/config.json` with fields:
-- `api_url` - Backend API URL
-- `token` - Authentication token
-- `team_uuid`, `cluster_uuid`, `project_uuid` - Context UUIDs
-- User info fields for display
-
-## Dependencies
-- Cobra for CLI framework
-- Kubernetes client libraries for potential future features
-- Standard HTTP client for API communication
-- Terminal utilities for interactive prompts
-
-## Release Process
-- GitHub Actions workflow triggers on version tags (`v*`)
-- Builds for 6 platforms: Linux/macOS/Windows on AMD64/ARM64
-- Creates GitHub release with binaries and checksums
-- Uses Go 1.24 toolchain
+Tag `v*` triggers `.github/workflows/build.yml`: tests, six binaries,
+`checksums.txt`, keyless cosign signature over the checksums, SLSA provenance
+per binary. Actions are pinned to commit SHAs — keep them pinned when
+updating.

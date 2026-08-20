@@ -1,120 +1,107 @@
-name: Build and Release
+name: Release
+
+# Tag-triggered release: cross-platform binaries, SHA-256 checksums, a keyless
+# cosign signature over the checksums, and SLSA build provenance for every
+# binary. This CLI installs software onto production hosts as root — an
+# unsigned curl-able binary is not defensible, so every artifact is verifiable
+# back to this workflow run.
 
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      contents: write
-
+      contents: write      # create the GitHub release
+      id-token: write      # keyless signing + provenance (OIDC)
+      attestations: write  # SLSA provenance
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.24'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
 
-    - name: Build binaries
-      run: |
-        TAG=${GITHUB_REF##*/}
-        mkdir -p dist
+      - name: Test before releasing
+        run: go vet ./... && go test -race ./...
 
-        # Linux AMD64
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-linux-amd64 ./cmd/kubenest
+      - name: Build binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          TAG=${GITHUB_REF##*/}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w \
+            -X kubenest.io/cli/pkg/version.Version=${TAG} \
+            -X kubenest.io/cli/pkg/version.Commit=${COMMIT} \
+            -X kubenest.io/cli/pkg/version.Date=${DATE}"
+          mkdir -p dist
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              ext=""
+              [ "$os" = "windows" ] && ext=".exe"
+              GOOS=$os GOARCH=$arch go build -trimpath -ldflags="$LDFLAGS" \
+                -o "dist/kubenest-${TAG}-${os}-${arch}${ext}" ./cmd/kubenest
+            done
+          done
 
-        # Linux ARM64
-        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-linux-arm64 ./cmd/kubenest
+      - name: Checksums
+        run: cd dist && sha256sum * > checksums.txt
 
-        # macOS AMD64 (Intel)
-        GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-darwin-amd64 ./cmd/kubenest
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-        # macOS ARM64 (Apple Silicon)
-        GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-darwin-arm64 ./cmd/kubenest
+      - name: Sign checksums (keyless)
+        run: |
+          cosign sign-blob --yes dist/checksums.txt \
+            --output-signature dist/checksums.txt.sig \
+            --output-certificate dist/checksums.txt.pem
 
-        # Windows AMD64
-        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-windows-amd64.exe ./cmd/kubenest
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/kubenest-*
 
-        # Windows ARM64
-        GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o dist/kubenest-${TAG}-windows-arm64.exe ./cmd/kubenest
+      - name: Create release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: dist/*
+          body: |
+            ## KubeNest CLI ${{ github.ref_name }}
 
-    - name: Create checksums
-      run: |
-        cd dist
-        sha256sum * > checksums.txt
+            Binaries for Linux, macOS and Windows (amd64/arm64) are attached,
+            with SHA-256 checksums, a Sigstore signature and SLSA build
+            provenance.
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          dist/*
-        body: |
-          ## Kubenest CLI ${{ github.ref_name }}
+            ### Verify what you downloaded
 
-          Download the CLI for your platform:
+            ```bash
+            # 1. Integrity: the binary matches its checksum
+            sha256sum -c --ignore-missing checksums.txt
 
-          ### Linux
-          - **AMD64**: [kubenest-${{ github.ref_name }}-linux-amd64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-amd64)
-          - **ARM64**: [kubenest-${{ github.ref_name }}-linux-arm64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-arm64)
+            # 2. Authenticity: the checksums were signed by this repo's release workflow
+            cosign verify-blob checksums.txt \
+              --signature checksums.txt.sig \
+              --certificate checksums.txt.pem \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/\.github/workflows/build\.yml@.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-          ### macOS
-          - **Intel (AMD64)**: [kubenest-${{ github.ref_name }}-darwin-amd64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-darwin-amd64)
-          - **Apple Silicon (ARM64)**: [kubenest-${{ github.ref_name }}-darwin-arm64](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-darwin-arm64)
+            # 3. Provenance: the binary was built by this workflow from this commit
+            gh attestation verify kubenest-${{ github.ref_name }}-linux-amd64 --repo ${{ github.repository }}
+            ```
 
-          ### Windows
-          - **AMD64**: [kubenest-${{ github.ref_name }}-windows-amd64.exe](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-amd64.exe)
-          - **ARM64**: [kubenest-${{ github.ref_name }}-windows-arm64.exe](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-arm64.exe)
+            ### Install
 
-          ### Checksums
-          - [checksums.txt](https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/checksums.txt) - SHA256 checksums for all binaries
-
-          ### Installation
-
-          #### Linux/macOS
-          ```bash
-          # Download the binary for your platform
-          curl -L -o kubenest https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-<platform>-<arch>
-
-          # Make it executable
-          chmod +x kubenest
-
-          # Move to PATH
-          sudo mv kubenest /usr/local/bin/
-          ```
-
-          #### Windows
-          Download the `.exe` file for your architecture and add it to your PATH.
-
-          Example (PowerShell):
-          ```powershell
-          # Download the binary for your platform
-          Invoke-WebRequest -Uri "https://github.com/${{ github.repository_owner }}/cli/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-windows-amd64.exe" -OutFile "kubenest.exe"
-
-          # (Optional) Move to a directory in your PATH, e.g. C:\\Windows\\System32 or add the current directory to PATH
-          # Example: Move-Item -Path .\kubenest.exe -Destination C:\\Windows\\System32\\kubenest.exe
-          ```
-
-          ### Usage
-          ```bash
-          kubenest --help
-          ```
-
-    - name: Build minimal Docker image for kubenest CLI
-      run: |
-        TAG=${GITHUB_REF##*/}
-        # Copy the Linux AMD64 binary to the Docker build context
-        cp dist/kubenest-${TAG}-linux-amd64 kubenest
-
-        # Build the Docker image
-        docker build --build-arg KUBENEST_VERSION=${TAG} -t kubenest-cli:latest -f Dockerfile .
-
-        # Optionally, push to GitHub Container Registry
-        echo ${{ secrets.GH_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-        docker tag kubenest-cli:latest ghcr.io/${{ github.repository_owner }}/kubenest-cli:${TAG}
-        docker push ghcr.io/${{ github.repository_owner }}/kubenest-cli:${TAG}
-        rm kubenest Dockerfile
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-amd64
+            chmod +x kubenest-${{ github.ref_name }}-linux-amd64
+            sudo mv kubenest-${{ github.ref_name }}-linux-amd64 /usr/local/bin/kubenest
+            kubenest --version
+            ```

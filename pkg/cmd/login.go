@@ -2,97 +2,124 @@ package cmd
 
 import (
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
+
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/term"
 )
 
+// NewLoginCommand authenticates against the control plane and stores the
+// credential in ~/.kubenest/config.json (0600).
+//
+// Today the credential is the control plane's bearer JWT obtained with email
+// and password. When the control plane ships the revocable, scoped CLI token
+// (kn-odqp), only obtainToken below changes; storage and every caller stay
+// as they are.
 func NewLoginCommand() *cobra.Command {
 	var (
-		email    string
-		password string
-		apiURL   string
+		controlPlane  string
+		email         string
+		passwordStdin bool
 	)
 
 	cmd := &cobra.Command{
-		Use:   "login",
-		Short: "Login to Kubenest",
+		Use:   "login --control-plane https://api.your-domain.com",
+		Short: "Authenticate to your KubeNest control plane",
+		Long: `Authenticate to your KubeNest control plane and store the credential in
+~/.kubenest/config.json, readable only by you.
+
+Non-interactive use: pass --email and pipe the password to --password-stdin.
+The password itself is never accepted as a flag — flags leak into shell
+history and process listings.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			defaultAPIURL := "https://api.kubenest.io"
-
-			// Handle API URL
-			if apiURL == "" {
-				fmt.Printf("Enter API URL [%s]: ", defaultAPIURL)
-				inputURL, err := term.ReadLine()
-				if err != nil {
-					return err
-				}
-				if inputURL == "" {
-					apiURL = defaultAPIURL
-				} else {
-					apiURL = inputURL
-				}
+			cfg, err := config.Load()
+			if err != nil {
+				return err
 			}
 
-			cfg, _ := config.LoadConfig()
-			cfg.APIURL = apiURL
-			config.SaveConfig(cfg)
+			if controlPlane == "" {
+				controlPlane = cfg.ControlPlaneURL
+			}
+			if controlPlane == "" {
+				return fmt.Errorf("no control plane given: kubenest login --control-plane https://api.your-domain.com")
+			}
 
-			// Handle email
+			client, err := api.New(controlPlane)
+			if err != nil {
+				return err
+			}
+
 			if email == "" {
-				fmt.Print("Enter email: ")
-				inputEmail, err := term.ReadLine()
+				fmt.Fprint(cmd.OutOrStdout(), "Email: ")
+				email, err = term.ReadLine()
 				if err != nil {
 					return err
 				}
-				email = inputEmail
 			}
 
-			// Handle password
-			if password == "" {
-				fmt.Print("Enter password: ")
-				inputPassword, err := term.ReadPassword()
+			var password string
+			switch {
+			case passwordStdin:
+				raw, err := io.ReadAll(cmd.InOrStdin())
 				if err != nil {
 					return err
 				}
-				password = inputPassword
+				password = strings.TrimRight(string(raw), "\r\n")
+			default:
+				fmt.Fprint(cmd.OutOrStdout(), "Password: ")
+				password, err = term.ReadPassword()
+				if err != nil {
+					return err
+				}
+			}
+			if email == "" || password == "" {
+				return fmt.Errorf("email and password are required")
 			}
 
-			client, err := api.NewClientFromConfig()
+			tok, err := client.Login(cmd.Context(), email, password)
 			if err != nil {
-				return fmt.Errorf("failed to create client: %v", err)
+				return err
 			}
-			loginResp, err := client.Login(email, password)
-			if err != nil {
-				return fmt.Errorf("login failed: %v", err)
-			}
-			cfg.Token = loginResp.Token
-			client.SetToken(cfg.Token)
-			fmt.Printf("Token being used for GetUser: %q\n", cfg.Token)
+			client.SetToken(tok.AccessToken)
 
-			// Fetch user info and store in config
-			userInfo, err := client.GetUser(cmd.Context())
-			if err != nil {
-				fmt.Printf("Failed to fetch user info: %v\n", err)
-			} else {
-				cfg.UserEmail = userInfo.Email
-				cfg.UserFirstName = userInfo.FirstName
-				cfg.UserLastName = userInfo.LastName
+			cfg.ControlPlaneURL = client.BaseURL()
+			cfg.Token = tok.AccessToken
+			cfg.UserEmail = email
+			if err := config.Save(cfg); err != nil {
+				return fmt.Errorf("credential obtained but could not be stored: %w", err)
 			}
 
-			config.SaveConfig(cfg)
-
-			fmt.Println("Successfully logged in!")
+			fmt.Fprintf(cmd.OutOrStdout(), "Logged in to %s as %s\n", cfg.ControlPlaneURL, email)
 			return nil
 		},
 	}
 
-	// Add flags for non-interactive usage
-	cmd.Flags().StringVar(&email, "email", "", "Email for login (for non-interactive use)")
-	cmd.Flags().StringVar(&password, "password", "", "Password for login (for non-interactive use)")
-	cmd.Flags().StringVar(&apiURL, "api-url", "", "API URL (for non-interactive use)")
-
+	cmd.Flags().StringVar(&controlPlane, "control-plane", "", "control plane URL, e.g. https://api.your-domain.com")
+	cmd.Flags().StringVar(&email, "email", "", "email (for non-interactive use)")
+	cmd.Flags().BoolVar(&passwordStdin, "password-stdin", false, "read the password from stdin (for non-interactive use)")
 	return cmd
+}
+
+// NewLogoutCommand discards the stored credential.
+func NewLogoutCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "logout",
+		Short: "Discard the stored control-plane credential",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			cfg.Token = ""
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "Logged out.")
+			return nil
+		},
+	}
 }

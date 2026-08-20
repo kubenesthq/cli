@@ -1,206 +1,60 @@
-# Kubenest CLI
+# KubeNest CLI
 
-A command-line interface for managing applications deployed on Kubernetes clusters through the Kubenest platform.
+`kubenest` installs and operates the **KubeNest Platform**: a pinned, tested
+bundle of everything a Kubernetes cluster needs above the control plane —
+ingress, certificates, storage, backup, upgrade orchestration and OS patching —
+installed as one versioned unit onto Ubuntu hosts you supply.
 
-## Features
+Full documentation: [docs.kubenest.io/platform](https://docs.kubenest.io/platform/install)
 
-- 🔐 Authentication
-  - Login/Logout
-  - Token-based authentication
-- 🎯 Context Management
-  - Set cluster and project context
-- 📦 Application Management
-  - List deployed applications
-  - Deploy new applications
-  - View application logs
-- 🐳 Container Operations
-  - Execute commands in pods
-  - Copy files to/from pods
-
-## Installation
-
-### Prerequisites
-
-- Go 1.21 or later
-- Access to a Kubenest backend instance
-
-### Building from Source
+## What it does
 
 ```bash
-# Clone the repository
-git clone https://github.com/kubenesthq/cli.git
-cd cli
+# Authenticate to your control plane once
+kubenest login --control-plane https://api.your-domain.com
 
-# Build the CLI
+# Install the platform bundle onto your hosts, over SSH
+kubenest platform install \
+  --bundle 1.4 \
+  --name prod-1 \
+  --server 10.0.1.10 \
+  --agent  10.0.1.11 \
+  --agent  10.0.1.12 \
+  --ha single-server \
+  --profile observability \
+  --ssh-user ubuntu \
+  --ssh-key ~/.ssh/id_ed25519
+```
+
+Two properties the design guarantees, enforced by tests rather than promised:
+
+- **Your SSH keys never leave your machine.** They come from `--ssh-key`,
+  ssh-agent or `~/.ssh/config`; they are never uploaded to the control plane
+  and never written to logs.
+- **Acceptance checks converge, they don't snapshot.** Every check waits for
+  its condition within a deadline from the bundle manifest and reports
+  `pass`, `converging` or `fail` — a component that retries its way to healthy
+  is a pass, not a false alarm.
+
+## Install
+
+Download a release binary — each one ships with SHA-256 checksums, a Sigstore
+signature and SLSA build provenance. Verification instructions are on every
+[release page](https://github.com/kubenesthq/cli/releases).
+
+## Build from source
+
+```bash
 go build -o kubenest ./cmd/kubenest
-
-# Move the binary to your PATH (optional)
-sudo mv kubenest /usr/local/bin/
-```
-
-## Configuration
-
-The CLI stores its configuration in `~/.kubenest/config.json`. This file contains:
-- API URL
-- Authentication token
-- Current cluster and project context
-
-## Usage
-
-### Authentication
-
-```bash
-# Login to Kubenest
-kubenest login
-
-# Logout from Kubenest
-kubenest logout
-```
-
-### Context Management
-
-```bash
-# Set or view current context (cluster and project)
-kubenest context
-```
-
-### Application Management
-
-```bash
-# List all deployed applications
-kubenest apps
-
-# Deploy a new application
-kubenest deploy
-
-# View application logs
-kubenest logs
-```
-
-### Container Operations
-
-```bash
-# Execute a command in a pod
-kubenest exec
-
-# Copy files to/from a pod
-kubenest copy
-```
-
-## Application Configuration
-
-When deploying applications, you can use a JSON configuration file with the following structure:
-
-```json
-{
-  "name": "my-app",
-  "image": "nginx:latest",
-  "replicas": 2,
-  "ports": [
-    {
-      "containerPort": 80,
-      "protocol": "TCP",
-      "servicePort": 80
-    }
-  ],
-  "env": {
-    "ENV_VAR": "value"
-  },
-  "volumes": [
-    {
-      "name": "data",
-      "mountPath": "/data",
-      "size": "1Gi"
-    }
-  ],
-  "resources": {
-    "cpu": "500m",
-    "memory": "512Mi"
-  },
-  "healthCheck": {
-    "path": "/health",
-    "port": 80,
-    "interval": 30,
-    "timeout": 10
-  }
-}
-```
-
-## Development
-
-### Project Structure
-
-```
-.
-├── cmd/
-│   └── kubenest/        # CLI entry point
-├── pkg/
-│   ├── api/            # API client and types
-│   ├── cmd/            # Command implementations
-│   └── config/         # Configuration management
-└── go.mod              # Go module definition
-```
-
-### Building and Testing
-
-```bash
-# Build the CLI
-go build -o kubenest ./cmd/kubenest
-
-# Run tests
 go test ./...
 ```
 
+## Status
 
-# Contexts
+The command surface (`login`, `platform install|uninstall|upgrade`, `backup`)
+is final and documented; the installer implementation is landing. Skeleton
+subcommands exit non-zero and say so — they never pretend success.
 
-Design Principles for Kubenest CLI Contexts
-
-Concept | Pattern
-Team | Acts like an org/account scope (think gh, aws)
-Cluster | Scope for all StackDeploy activity
-Project | Optional scope for namespaces/apps
-Defaults | Can be saved in CLI config or passed explicitly
-Overrides | Always allow --team, --cluster, --project flags for one-off calls
-
-
-# Set context
-kubenest context set-team acme
-kubenest context set-cluster dev-cluster
-kubenest context set-project web-app
-
-# See current context
-kubenest context show
-# 🖥️  Team: acme
-# 🧭  Cluster: dev-cluster
-# 📦  Project: web-app
-
-# Use context-aware commands
-kubenest stack list
-kubenest deploy list
-kubenest deploy create -f stackdeploy.yaml
-
-# One-off override
-kubenest deploy list --cluster staging-cluster
-
-
-🔧 Store context in CLI config file:
-
-```yaml
-# ~/.kubenest/config.yaml
-context:
-  team: acme
-  cluster: dev-cluster
-  project: web-app
-```
-
-# TODO
-- [x] update release script
-- [x] list project registries
-- [x] create a project registry
-- [x] delete project registry
-- [x] create new app
-- [x] delete app
-- [ ] how to show context explicitly
-- [ ] store more info in context
-- [ ] name validation for app/registry/project
+The pre-2026 application-layer commands (`apps`, `deploy`, `exec`, `logs`,
+`registry`, `teams`) were removed: they targeted a control-plane API that no
+longer exists. They remain in git history.
