@@ -126,6 +126,59 @@ func TestMissingCorePinIsAnErrorNotADefault(t *testing.T) {
 	}
 }
 
+func TestBackupSectionParses(t *testing.T) {
+	m, err := Load("testdata/platform-test.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := m.Backup.Plugin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Provider != "aws" || p.Version != "v1.14.2" {
+		t.Errorf("plugin = %+v, want aws v1.14.2", p)
+	}
+	w, err := m.Backup.Defaults.Workload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Interval.Duration() != 24*time.Hour || w.Keep != 14 {
+		t.Errorf("workload-backup = %s × %d, want 24h × 14", w.Interval.Duration(), w.Keep)
+	}
+	if d := m.Backup.Defaults.DatastoreSnapshot; d.Interval.Duration() != time.Hour || d.Keep != 24 {
+		t.Errorf("datastore-snapshot = %s × %d, want 1h × 24", d.Interval.Duration(), d.Keep)
+	}
+	// Days are an interval unit the schema allows and ParseDuration does not.
+	if r := m.Backup.Defaults.RestoreDrill; r.Interval.Duration() != 7*24*time.Hour {
+		t.Errorf("restore-drill interval = %s, want 168h", r.Interval.Duration())
+	}
+}
+
+// A manifest without the backup section still parses (older fixtures, other
+// installers), but ACCESSING the plugin or the defaults is an error — the
+// same missing-is-an-error rule as pins and timeouts.
+func TestMissingBackupSectionIsAnErrorOnAccessNotParse(t *testing.T) {
+	m, err := Parse([]byte("bundle: \"1.0\"\nlimits:\n  timeouts:\n    component-ready: 10m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Backup.Plugin(); err == nil || !strings.Contains(err.Error(), "object-store-plugin") {
+		t.Errorf("Plugin() on a manifest without backup: err = %v, want one naming backup.object-store-plugin", err)
+	}
+	if _, err := m.Backup.Defaults.Workload(); err == nil || !strings.Contains(err.Error(), "workload-backup") {
+		t.Errorf("Workload() on a manifest without backup: err = %v, want one naming backup.defaults.workload-backup", err)
+	}
+}
+
+func TestIntervalRejectsWhatTheSchemaRejects(t *testing.T) {
+	for _, bad := range []string{"day", "1w", "-1h", "0h", "1.5h", "h", ""} {
+		doc := "bundle: \"1.0\"\nlimits:\n  timeouts:\n    component-ready: 10m\nbackup:\n  defaults:\n    workload-backup: { interval: \"" + bad + "\", keep: 1 }\n"
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("interval %q parsed without error", bad)
+		}
+	}
+}
+
 // The REAL authored manifest in kubenest-contracts must parse with core pins
 // intact — the manifest is the contract artifact, and this is the file the
 // installer will actually read. Skipped when the contracts checkout is not
@@ -145,5 +198,16 @@ func TestRealPlatformManifestCarriesCorePins(t *testing.T) {
 	}
 	if v == "" {
 		t.Error("core.openebs-lvm-localpv is empty in the real manifest")
+	}
+	// The backup seam (contracts v1.15.0): plugin pin, workload defaults and
+	// the backup deadline must all be present in the shipped manifest.
+	if _, err := m.Backup.Plugin(); err != nil {
+		t.Errorf("real manifest: %v", err)
+	}
+	if _, err := m.Backup.Defaults.Workload(); err != nil {
+		t.Errorf("real manifest: %v", err)
+	}
+	if _, err := m.Limits.Timeouts.For("backup"); err != nil {
+		t.Errorf("real manifest: %v", err)
 	}
 }

@@ -18,4 +18,14 @@ limits:
     node-reboot:      20m
     install-total:    30m
     upgrade-per-node: 30m
+    backup:            1h
     restore-drill:     2h
+
+backup:
+  object-store-plugin:
+    provider: aws
+    version: v1.14.2
+  defaults:
+    datastore-snapshot: { interval: 1h, keep: 24 }
+    workload-backup: { interval: 24h, keep: 14 }
+    restore-drill: { interval: 7d }

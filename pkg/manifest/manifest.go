@@ -14,6 +14,7 @@ package manifest
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -28,6 +29,7 @@ type Manifest struct {
 	// (the pin rule in bundle-manifest.schema.json).
 	Core   Components `yaml:"core"`
 	Limits Limits     `yaml:"limits"`
+	Backup Backup     `yaml:"backup"`
 }
 
 // Components maps component name to pinned version.
@@ -85,6 +87,101 @@ func (t Timeouts) For(name string) (time.Duration, error) {
 	}
 	return d, nil
 }
+
+// Backup is the manifest's backup section: the pinned object-store plugin
+// and the default schedules (decision E, 2026-08-20).
+type Backup struct {
+	ObjectStorePlugin ObjectStorePlugin `yaml:"object-store-plugin"`
+	Defaults          BackupDefaults    `yaml:"defaults"`
+}
+
+// ObjectStorePlugin pins the Velero object-store plugin the installer ships
+// as an init container. One plugin serves every S3-compatible target; its
+// major.minor pairs with the Velero app version (upstream compatibility
+// matrix), which is why it is pinned beside the schedules and not hardcoded.
+type ObjectStorePlugin struct {
+	Provider string `yaml:"provider"`
+	Version  string `yaml:"version"`
+}
+
+// Plugin returns the pinned object-store plugin. A manifest without one
+// cannot configure any backup target, and the version must not fall back to
+// a constant for the same reason as every other pin.
+func (b Backup) Plugin() (ObjectStorePlugin, error) {
+	p := b.ObjectStorePlugin
+	if p.Provider == "" || p.Version == "" {
+		return ObjectStorePlugin{}, fmt.Errorf("bundle manifest does not pin backup.object-store-plugin: the bundle decides the plugin and its version, add the pin to the manifest rather than defaulting in code")
+	}
+	return p, nil
+}
+
+// BackupDefaults carries the default cadences and retention (decision E:
+// datastore snapshot hourly / 24 kept, workload backup daily / 14 kept,
+// drill weekly).
+type BackupDefaults struct {
+	DatastoreSnapshot BackupSchedule `yaml:"datastore-snapshot"`
+	WorkloadBackup    BackupSchedule `yaml:"workload-backup"`
+	RestoreDrill      DrillSchedule  `yaml:"restore-drill"`
+}
+
+// Workload returns the workload-backup schedule. Missing means the manifest
+// is not carrying its defaults — an error, not a fallback.
+func (d BackupDefaults) Workload() (BackupSchedule, error) {
+	s := d.WorkloadBackup
+	if s.Interval <= 0 || s.Keep <= 0 {
+		return BackupSchedule{}, fmt.Errorf("bundle manifest has no backup.defaults.workload-backup: the bundle decides the schedule and retention, add them to the manifest rather than defaulting in code")
+	}
+	return s, nil
+}
+
+// BackupSchedule is one cadence-plus-retention pair. Keep counts backups:
+// retention is Keep × Interval.
+type BackupSchedule struct {
+	Interval Interval `yaml:"interval"`
+	Keep     int      `yaml:"keep"`
+}
+
+// DrillSchedule is the restore-drill cadence (wave 3 reads it; parsed now so
+// the section round-trips whole).
+type DrillSchedule struct {
+	Interval Interval `yaml:"interval"`
+}
+
+// Interval is a backup cadence. The manifest schema allows Nm, Nh and Nd —
+// days exist here (restore-drill: 7d) and time.ParseDuration does not speak
+// them, which is why this is not Timeouts' parser.
+type Interval time.Duration
+
+// UnmarshalYAML parses an interval per the schema pattern ^[0-9]+(m|h|d)$.
+func (i *Interval) UnmarshalYAML(node *yaml.Node) error {
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	if len(raw) < 2 {
+		return fmt.Errorf("%q is not an interval (want e.g. \"1h\", \"24h\", \"7d\")", raw)
+	}
+	unit := time.Duration(0)
+	switch raw[len(raw)-1] {
+	case 'm':
+		unit = time.Minute
+	case 'h':
+		unit = time.Hour
+	case 'd':
+		unit = 24 * time.Hour
+	default:
+		return fmt.Errorf("%q is not an interval (want e.g. \"1h\", \"24h\", \"7d\")", raw)
+	}
+	n, err := strconv.Atoi(raw[:len(raw)-1])
+	if err != nil || n <= 0 {
+		return fmt.Errorf("%q is not an interval (want a positive count then m, h or d)", raw)
+	}
+	*i = Interval(time.Duration(n) * unit)
+	return nil
+}
+
+// Duration returns the interval as a time.Duration.
+func (i Interval) Duration() time.Duration { return time.Duration(i) }
 
 // Load reads and parses a bundle manifest file.
 func Load(path string) (*Manifest, error) {
