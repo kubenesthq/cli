@@ -17,8 +17,8 @@ import (
 //
 // Today the credential is the control plane's bearer JWT obtained with email
 // and password. When the control plane ships the revocable, scoped CLI token
-// (kn-odqp), only obtainToken below changes; storage and every caller stay
-// as they are.
+// (kn-odqp), only the api.Client.Login exchange changes; storage and every
+// caller stay as they are.
 func NewLoginCommand() *cobra.Command {
 	var (
 		controlPlane  string
