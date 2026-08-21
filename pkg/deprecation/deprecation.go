@@ -170,25 +170,37 @@ func Scan(ctx context.Context, r Runner, bundle *manifest.Manifest, acknowledged
 	return report, nil
 }
 
-// plutoOutput is pluto's JSON, of which this reads only the fields the gate
-// needs. Unknown fields are ignored; a MISSING items key is not, because an
-// empty document and a clean cluster must never look the same.
+// plutoOutput is pluto's JSON, of which this reads only what the gate needs.
+//
+// The field names are pluto's own, captured from the pinned binary running
+// against a real cluster rather than transcribed from documentation. That
+// distinction earned its keep: the first version of this parser guessed
+// api_version / replacement_api_version / kind at the top level and was wrong
+// about every one of them, and the only reason a customer never saw a
+// falsely-clean scan is that this package fails closed.
 type plutoOutput struct {
-	Items *[]plutoItem `json:"items"`
+	Items []plutoItem `json:"items"`
+	// TargetVersions echoes what pluto scanned against. Its presence is how
+	// this parser knows it is looking at pluto's output at all, and the k8s
+	// entry is how it knows the scan targeted the version the upgrade is
+	// moving to.
+	TargetVersions map[string]string `json:"target-versions"`
 }
 
 type plutoItem struct {
-	Name       string `json:"name"`
-	Namespace  string `json:"namespace"`
-	Kind       string `json:"kind"`
-	APIVersion string `json:"api_version"`
-	Deprecated bool   `json:"deprecated"`
-	Removed    bool   `json:"removed"`
-	// Version metadata, whose key names differ across pluto's output modes;
-	// both spellings are read so a pin bump cannot silently blank them.
-	Replacement  string `json:"replacement_api_version"`
-	DeprecatedIn string `json:"deprecated_in"`
-	RemovedIn    string `json:"removed_in"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+	// API carries the version metadata; pluto nests it and hyphenates it.
+	API struct {
+		Version        string `json:"version"`
+		Kind           string `json:"kind"`
+		DeprecatedIn   string `json:"deprecated-in"`
+		RemovedIn      string `json:"removed-in"`
+		ReplacementAPI string `json:"replacement-api"`
+		Component      string `json:"component"`
+	} `json:"api"`
+	Deprecated bool `json:"deprecated"`
+	Removed    bool `json:"removed"`
 }
 
 func parse(raw, target string) (Report, error) {
@@ -200,22 +212,29 @@ func parse(raw, target string) (Report, error) {
 	if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
 		return Report{}, fmt.Errorf("parsing scanner output: %w", err)
 	}
-	if out.Items == nil {
-		// A document with no `items` key is not a clean cluster — it is a
-		// shape this parser does not recognise.
-		return Report{}, fmt.Errorf("scanner output has no items field")
+
+	// A clean cluster emits NO items key at all — only target-versions. So
+	// "no items" cannot be the signal that something went wrong; the signal
+	// is the absence of the echo that proves pluto ran and what it scanned
+	// against.
+	scanned, ok := out.TargetVersions["k8s"]
+	if !ok {
+		return Report{}, fmt.Errorf("scanner output carries no target-versions.k8s, so there is no evidence it scanned anything")
+	}
+	if scanned != target {
+		return Report{}, fmt.Errorf("the scan reports it targeted Kubernetes %s but the upgrade moves to %s", scanned, target)
 	}
 
 	report := Report{TargetVersion: target}
-	for _, item := range *out.Items {
+	for _, item := range out.Items {
 		f := Finding{
 			Namespace:    item.Namespace,
-			Kind:         item.Kind,
+			Kind:         item.API.Kind,
 			Name:         item.Name,
-			APIVersion:   item.APIVersion,
-			Replacement:  item.Replacement,
-			DeprecatedIn: item.DeprecatedIn,
-			RemovedIn:    item.RemovedIn,
+			APIVersion:   item.API.Version,
+			Replacement:  item.API.ReplacementAPI,
+			DeprecatedIn: item.API.DeprecatedIn,
+			RemovedIn:    item.API.RemovedIn,
 			Removed:      item.Removed,
 		}
 		switch {

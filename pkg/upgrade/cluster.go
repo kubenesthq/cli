@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/k3s"
 )
 
@@ -74,15 +75,21 @@ type InClusterDrills struct {
 // which the gate refuses — a cluster that has never drilled has no evidence
 // that its restore works.
 func (d InClusterDrills) LastRestoreDrill(ctx context.Context) (DrillStatus, error) {
+	// The object and its key come from the package that WRITES them
+	// (pkg/backup, kn-f9lm) rather than from strings repeated here. A
+	// consumer that carries its own copy of a producer's names is a
+	// consumer that will one day read an object nobody writes any more and
+	// report "no drill has ever run" about a cluster that drills weekly.
 	namespace, name := d.Namespace, d.Name
 	if namespace == "" {
-		namespace = "velero"
+		namespace = backup.Namespace
 	}
 	if name == "" {
-		name = "kubenest-restore-drill-result"
+		name = backup.DrillResultName
 	}
-	out, err := k3s.Kubectl(ctx, d.Runner,
-		fmt.Sprintf("get configmap %s -n %s -o jsonpath='{.data.result\\.json}' --ignore-not-found", name, namespace))
+	out, err := k3s.Kubectl(ctx, d.Runner, fmt.Sprintf(
+		"get configmap %s -n %s -o jsonpath='{.data.%s}' --ignore-not-found",
+		name, namespace, strings.ReplaceAll(backup.DrillResultDataKey, ".", `\.`)))
 	if err != nil {
 		return DrillStatus{}, err
 	}

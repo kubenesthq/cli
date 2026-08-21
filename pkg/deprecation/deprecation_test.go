@@ -31,13 +31,22 @@ upgrade:
 	return m
 }
 
-// A cluster whose workloads use APIs the target removes. This is the shape
-// pluto emits; the fixture is the contract between the pin and this parser.
+// CAPTURED FROM THE PINNED BINARY, not transcribed from documentation.
+// pluto v5.24.3 run against a real cluster and real manifests on 2026-08-21;
+// the field names are nested under `api` and hyphenated, which an earlier
+// invented fixture got wrong in every particular. A fixture for an adopted
+// tool is only worth what its provenance is worth.
 const plutoFindings = `{"items":[
- {"name":"api-gateway","namespace":"payments","kind":"Ingress","api_version":"networking.k8s.io/v1beta1","replacement_api_version":"networking.k8s.io/v1","deprecated":true,"removed":true,"deprecated_in":"v1.19.0","removed_in":"v1.22.0"},
- {"name":"worker","namespace":"payments","kind":"HorizontalPodAutoscaler","api_version":"autoscaling/v2beta2","replacement_api_version":"autoscaling/v2","deprecated":true,"removed":true,"deprecated_in":"v1.23.0","removed_in":"v1.26.0"},
- {"name":"nightly-report","namespace":"internal","kind":"CronJob","api_version":"batch/v1beta1","replacement_api_version":"batch/v1","deprecated":true,"removed":false,"deprecated_in":"v1.21.0","removed_in":"v1.25.0"}
-]}`
+ {"name":"api-gateway","filePath":"/tmp/x.yaml","namespace":"payments","api":{"version":"networking.k8s.io/v1beta1","kind":"Ingress","deprecated-in":"v1.19.0","removed-in":"v1.22.0","replacement-api":"networking.k8s.io/v1","replacement-available-in":"v1.19.0","component":"k8s"},"deprecated":true,"removed":true,"replacementAvailable":true},
+ {"name":"worker","filePath":"/tmp/x.yaml","namespace":"payments","api":{"version":"autoscaling/v2beta2","kind":"HorizontalPodAutoscaler","deprecated-in":"v1.23.0","removed-in":"v1.26.0","replacement-api":"autoscaling/v2","replacement-available-in":"v1.23.0","component":"k8s"},"deprecated":true,"removed":true,"replacementAvailable":true},
+ {"name":"nightly-report","filePath":"/tmp/x.yaml","namespace":"internal","api":{"version":"batch/v1beta1","kind":"CronJob","deprecated-in":"v1.21.0","removed-in":"v1.25.0","replacement-api":"batch/v1","replacement-available-in":"v1.21.0","component":"k8s"},"deprecated":true,"removed":false,"replacementAvailable":true}
+],"target-versions":{"cert-manager":"v1.5.3","istio":"v1.11.0","k8s":"v1.36.3"}}`
+
+// What pluto ACTUALLY emits for a cluster with nothing to report: no items
+// key at all. Treating that as an unparseable shape — as this package first
+// did — refuses every healthy cluster, which is the opposite of the failure
+// the fail-closed rule exists to prevent.
+const plutoClean = `{"target-versions":{"cert-manager":"v1.5.3","istio":"v1.11.0","k8s":"v1.36.3"}}`
 
 func runner(t *testing.T, scanOutput string, overrides map[string]sshx.Result) *componenttest.FakeRunner {
 	t.Helper()
@@ -93,7 +102,7 @@ func TestRemovedAPIsBlockAndNameTheResource(t *testing.T) {
 
 // A clean cluster passes.
 func TestNoFindingsPasses(t *testing.T) {
-	report, err := deprecation.Scan(context.Background(), runner(t, `{"items":[]}`, nil), bundle(t), nil, "v1.36.3+k3s1")
+	report, err := deprecation.Scan(context.Background(), runner(t, plutoClean, nil), bundle(t), nil, "v1.36.3+k3s1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +123,9 @@ func TestTheScanFailsClosed(t *testing.T) {
 		},
 		"the scanner emits something else": {
 			"detect-all-in-cluster": {Stdout: `{"unexpected":"shape"}`},
+		},
+		"the scan targeted a different Kubernetes version": {
+			"detect-all-in-cluster": {Stdout: `{"target-versions":{"k8s":"v1.29.0"}}`},
 		},
 		"the scanner emits unparsable output": {
 			"detect-all-in-cluster": {Stdout: "panic: runtime error"},
@@ -181,7 +193,7 @@ func TestAcknowledgementIsPerResource(t *testing.T) {
 // The scan targets the Kubernetes version the BUNDLE moves to, not the one
 // the cluster is on.
 func TestTheScanTargetsTheKubernetesVersionBeingMovedTo(t *testing.T) {
-	fake := runner(t, `{"items":[]}`, nil)
+	fake := runner(t, plutoClean, nil)
 	if _, err := deprecation.Scan(context.Background(), fake, bundle(t), nil, "v1.36.3+k3s1"); err != nil {
 		t.Fatal(err)
 	}

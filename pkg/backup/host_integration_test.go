@@ -27,7 +27,8 @@
 //	cd kubenest-cli && go test -tags host -timeout 45m -run TestBackupOnRealHost -v ./pkg/backup \
 //	  -host "$KUBENEST_LAB_NODE1_IP" -ssh-user "$KUBENEST_LAB_SSH_USER" -ssh-key ~/.ssh/id_ed25519 \
 //	  -s3-host "$KUBENEST_LAB_NODE2_IP" -s3-private "$KUBENEST_LAB_NODE2_PRIVATE_IP" \
-//	  -bundle ../kubenest-contracts/bundles/platform-1.0.yaml
+//	  -known-hosts /tmp/kn-f9lm-known-hosts \
+//	  -bundle "$PWD/../kubenest-contracts/bundles/platform-1.0.yaml"
 //	./scripts/ephemeral-env.sh down --profile host   # ALWAYS — it bills by the hour
 //
 // The k3s install below is TEST SCAFFOLDING at the version the bundle pins
@@ -59,6 +60,7 @@ var (
 	s3Private  = flag.String("s3-private", "", "private address of the external S3 test node")
 	sshUser    = flag.String("ssh-user", "root", "SSH user on the node")
 	sshKey     = flag.String("ssh-key", "", "SSH private key path")
+	knownHosts = flag.String("known-hosts", "", "isolated known_hosts path for ephemeral gate nodes")
 	bundlePath = flag.String("bundle", "", "bundle manifest path (platform-1.0.yaml)")
 )
 
@@ -91,21 +93,22 @@ func TestBackupOnRealHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ep, err := sshx.Resolve(*hostAddr, sshx.Options{User: *sshUser, KeyPath: *sshKey})
+	sshOptions := sshx.Options{User: *sshUser, KeyPath: *sshKey, KnownHostsPath: *knownHosts}
+	ep, err := sshx.Resolve(*hostAddr, sshOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := sshx.Dial(ctx, ep, sshx.Options{KeyPath: *sshKey})
+	client, err := sshx.Dial(ctx, ep, sshOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	s3Endpoint, err := sshx.Resolve(*s3HostAddr, sshx.Options{User: *sshUser, KeyPath: *sshKey})
+	s3Endpoint, err := sshx.Resolve(*s3HostAddr, sshOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s3Client, err := sshx.Dial(ctx, s3Endpoint, sshx.Options{KeyPath: *sshKey})
+	s3Client, err := sshx.Dial(ctx, s3Endpoint, sshOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +151,7 @@ func TestBackupOnRealHost(t *testing.T) {
 	apply(t, ctx, s3Client, minioManifests())
 	waitFor(t, ctx, s3Client, "minio-ready", componentReady, podsReadyIn(s3Client, minioNamespace))
 	runJob(t, ctx, s3Client, "make-bucket", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc mb -p t/%s", minioNamespace, minioUser, minioPassword, bucket))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc mb -p --ignore-existing t/%s", minioNamespace, minioUser, minioPassword, bucket))
 
 	proof := fmt.Sprintf("kn-mzn-proof-%d", time.Now().Unix())
 	apply(t, ctx, client, proofManifests(proof))
@@ -178,9 +181,17 @@ func TestBackupOnRealHost(t *testing.T) {
 	if err := backup.ConfigureDatastoreSnapshots(ctx, client, m, target, reporter); err != nil {
 		t.Fatalf("ConfigureDatastoreSnapshots: %v", err)
 	}
+	datastoreSchedule, err := m.Backup.Defaults.Datastore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDatastoreCron, err := backup.Cron(datastoreSchedule.Interval.Duration())
+	if err != nil {
+		t.Fatal(err)
+	}
 	datastoreConfig := remoteOut(t, ctx, client, "sudo -n cat /etc/rancher/k3s/config.yaml.d/30-kubenest-backup.yaml")
-	if !strings.Contains(datastoreConfig, "etcd-snapshot-schedule-cron: 0 * * * *") ||
-		!strings.Contains(datastoreConfig, "etcd-snapshot-retention: 24") {
+	if !strings.Contains(datastoreConfig, "etcd-snapshot-schedule-cron: "+wantDatastoreCron) ||
+		!strings.Contains(datastoreConfig, fmt.Sprintf("etcd-snapshot-retention: %d", datastoreSchedule.Keep)) {
 		t.Fatalf("datastore schedule is not hourly/24-kept:\n%s", datastoreConfig)
 	}
 	runJob(t, ctx, s3Client, "check-datastore-proof", minioNamespace, componentReady,
@@ -338,7 +349,7 @@ func installDrillOperator(t *testing.T, ctx context.Context, r k3s.Runner, versi
 	t.Helper()
 	apply(t, ctx, r, fmt.Sprintf(`apiVersion: helm.cattle.io/v1
 kind: HelmChart
-metadata: {name: kubenest-agent, namespace: kube-system}
+metadata: {name: operator, namespace: kube-system}
 spec:
   chart: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2
   version: %s

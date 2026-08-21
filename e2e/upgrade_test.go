@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/k3s"
@@ -224,14 +225,17 @@ func TestUpgradeGate(t *testing.T) {
 		// not a stub in the code path.
 		result := fmt.Sprintf(`{"status":"passed","completed_at":%q,"backup":"gate-fixture","duration_seconds":42}`,
 			time.Now().UTC().Format(time.RFC3339))
+		// The object, namespace and key are pkg/backup's — the package that
+		// writes them for real — so this fixture cannot drift from what the
+		// drill actually produces.
 		doc := fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: kubenest-restore-drill
-  namespace: velero
+  name: %s
+  namespace: %s
 data:
-  result: '%s'
-`, result)
+  %s: '%s'
+`, backup.DrillResultName, backup.Namespace, backup.DrillResultDataKey, result)
 		if err := kubectlApplyDoc(ctx, server.Runner, doc); err != nil {
 			t.Fatal(err)
 		}
@@ -248,6 +252,14 @@ data:
 	var upgraded bool
 
 	t.Run("the upgrade completes with zero downtime for the replicated workload", func(t *testing.T) {
+		// The readiness gate requires every node to have been Ready for
+		// limits.timeouts.node-ready before an upgrade starts, so a cluster
+		// installed a minute ago cannot be upgraded — deliberately: a node
+		// flapping in and out of Ready passes a single sample and then fails
+		// mid-drain. The gate is right, so the test waits it out rather than
+		// weakening it.
+		waitForNodeDwell(t, ctx, server.Runner, fetchBundle(t, client, to))
+
 		probe := pollWorkload(t, server.Runner, env.server+":30080")
 
 		s := upgradeSession(t, env, client, from, to, nil)
@@ -428,6 +440,41 @@ func upgradeSession(t *testing.T, env upgradeEnv, client *api.Client, from, to s
 		t.Fatal(err)
 	}
 	return s
+}
+
+// waitForNodeDwell waits until every node has been Ready for the bundle's
+// node-ready window, which is what the readiness gate requires.
+func waitForNodeDwell(t *testing.T, ctx context.Context, r k3s.Runner, bundle *manifest.Manifest) {
+	t.Helper()
+	dwell, err := bundle.Limits.Timeouts.For("node-ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := `get nodes -o jsonpath={range.items[*]}{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}`
+	deadline := time.Now().Add(dwell + 5*time.Minute)
+	for time.Now().Before(deadline) {
+		out, err := k3s.Kubectl(ctx, r, query)
+		if err == nil {
+			steady, seen := true, 0
+			for _, line := range strings.Split(strings.Trim(out, "'"), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				seen++
+				since, parseErr := time.Parse(time.RFC3339, line)
+				if parseErr != nil || time.Since(since) < dwell {
+					steady = false
+				}
+			}
+			if steady && seen > 0 {
+				t.Logf("every node has been Ready for at least %s", dwell)
+				return
+			}
+		}
+		time.Sleep(20 * time.Second)
+	}
+	t.Fatalf("nodes never settled for %s", dwell)
 }
 
 func clusterIDFor(t *testing.T, ctx context.Context, client *api.Client, name string) string {
