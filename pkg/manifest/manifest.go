@@ -1,11 +1,12 @@
 // Package manifest reads the bundle manifest — the versioned record of what a
 // platform release contains (see docs.kubenest.io/platform/bundle).
 //
-// This package deliberately parses only what the CLI consumes today:
-// limits.timeouts, the deadlines for every convergence check. Limits are part
-// of the bundle, not constants in the code: a missing timeout key is an
-// error here, never a hardcoded default. The shipped manifest carries the
-// defaults; the code carries none.
+// This package parses only what the CLI consumes: the core pins, the tested
+// OS matrix, the HA tiers, the profile set, and limits — the deadlines for
+// every convergence check and the sizing thresholds preflight enforces.
+// Limits are part of the bundle, not constants in the code: a missing timeout
+// or a missing floor is an error here, never a hardcoded default. The shipped
+// manifest carries the defaults; the code carries none.
 //
 // The manifest schema itself is owned by kubenest-contracts (kn-boj); the
 // field names here follow bundle.mdx and must track that schema.
@@ -27,9 +28,15 @@ type Manifest struct {
 	// Core maps each core component to its pinned version — Helm chart
 	// version for chart-installed components, upstream release tag otherwise
 	// (the pin rule in bundle-manifest.schema.json).
-	Core   Components `yaml:"core"`
-	Limits Limits     `yaml:"limits"`
-	Backup Backup     `yaml:"backup"`
+	Core Components `yaml:"core"`
+	// OS is the tested OS matrix; preflight refuses a node outside it.
+	OS OS `yaml:"os"`
+	// HATiers are the tiers this bundle offers. Asking for one it does not
+	// offer is a refusal, not a silent downgrade to single-server.
+	HATiers  []string `yaml:"ha-tiers"`
+	Limits   Limits   `yaml:"limits"`
+	Backup   Backup   `yaml:"backup"`
+	Profiles Profiles `yaml:"profiles"`
 }
 
 // Components maps component name to pinned version.
@@ -48,7 +55,10 @@ func (c Components) Version(name string) (string, error) {
 }
 
 type Limits struct {
-	Timeouts Timeouts `yaml:"timeouts"`
+	// Resources are the sizing thresholds preflight compares every node
+	// against, in binary units (see limits.go).
+	Resources Resources `yaml:"resources"`
+	Timeouts  Timeouts  `yaml:"timeouts"`
 }
 
 // Timeouts maps a wait's name (node-ready, component-ready, install-total, …)
