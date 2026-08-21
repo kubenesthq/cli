@@ -37,7 +37,9 @@ type Manifest struct {
 	Limits  Limits   `yaml:"limits"`
 	Backup  Backup   `yaml:"backup"`
 	// Upgrade is the tooling pinned for moving between bundle versions.
-	Upgrade  Upgrade  `yaml:"upgrade"`
+	Upgrade Upgrade `yaml:"upgrade"`
+	// Health is the thresholds fleet health is evaluated against (kn-j5s).
+	Health   Health   `yaml:"health"`
 	Profiles Profiles `yaml:"profiles"`
 }
 

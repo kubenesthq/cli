@@ -178,3 +178,32 @@ func (c *Client) InstallJournal(ctx context.Context, clusterID string) ([]Instal
 	}
 	return out.InstallJournal, nil
 }
+
+// ClusterBundle is the cluster's recorded bundle: what is installed on it,
+// which profiles, which tier, and who owns the volume group.
+//
+// An upgrade reads it rather than being told: the record is the authority on
+// what the cluster IS, and an upgrade that took its starting point from a
+// command-line argument could move a cluster it had misidentified.
+type ClusterBundle struct {
+	BundleVersion        string                `json:"bundle_version"`
+	Profiles             []string              `json:"profiles"`
+	HATier               string                `json:"ha_tier"`
+	VolumeGroupOwnership string                `json:"volume_group_ownership"`
+	InstallJournal       []InstallJournalEntry `json:"install_journal"`
+}
+
+// BundleRecord reads the cluster's recorded bundle.
+func (c *Client) BundleRecord(ctx context.Context, clusterID string) (ClusterBundle, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/bundle"), nil)
+	if err != nil {
+		return ClusterBundle{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	var out ClusterBundle
+	if err := c.do(req, &out); err != nil {
+		return ClusterBundle{}, err
+	}
+	return out, nil
+}

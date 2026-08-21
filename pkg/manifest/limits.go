@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -231,4 +232,57 @@ func (u Upgrade) Scanner() (DeprecationScanner, error) {
 		return DeprecationScanner{}, fmt.Errorf("bundle manifest does not pin upgrade.deprecation-scanner (tool, version and dataset): the scan is the gate that stops an upgrade taking a customer's product down, and it may not be skipped because a pin is missing")
 	}
 	return s, nil
+}
+
+// Health is the thresholds fleet health is evaluated against (kn-j5s). They
+// live in the manifest and not in code for the same reason preflight's do:
+// they are provisional, they must be replaceable per bundle release without
+// shipping a backend, and a missing threshold must be an error rather than a
+// silent default.
+type Health struct {
+	Backup HealthBackup `yaml:"backup"`
+}
+
+// HealthBackup carries the ages at which backup facts start meaning
+// something.
+type HealthBackup struct {
+	MaxBackupAge            Duration `yaml:"max-backup-age"`
+	MaxRestoreDrillAge      Duration `yaml:"max-restore-drill-age"`
+	UnconfiguredTargetGrace Duration `yaml:"unconfigured-target-grace"`
+}
+
+// Duration is a Go duration string from the manifest ("336h").
+type Duration time.Duration
+
+// UnmarshalYAML parses the duration form.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	var raw string
+	if err := node.Decode(&raw); err != nil {
+		return err
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("%q is not a duration (want e.g. \"336h\")", raw)
+	}
+	if parsed <= 0 {
+		return fmt.Errorf("%q must be positive", raw)
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// Duration returns the value as a time.Duration.
+func (d Duration) Duration() time.Duration { return time.Duration(d) }
+
+// MaxRestoreDrillAge is the age past which a passed restore drill stops being
+// evidence about this cluster.
+//
+// It is read from the manifest rather than decided here so the freshness rule
+// cannot desync between the backend that alerts on it and the upgrade gate
+// that refuses on it — one threshold, one place (kn-f9lm, contracts v1.21.0).
+func (h Health) MaxRestoreDrillAge() (time.Duration, error) {
+	if h.Backup.MaxRestoreDrillAge.Duration() <= 0 {
+		return 0, fmt.Errorf("bundle manifest has no health.backup.max-restore-drill-age: the upgrade gate and the fleet-health alert must read the same threshold, so it comes from the manifest rather than from a default in either")
+	}
+	return h.Backup.MaxRestoreDrillAge.Duration(), nil
 }
