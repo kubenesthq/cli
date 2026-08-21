@@ -125,3 +125,33 @@ func (c *Client) PutBundleRecord(ctx context.Context, clusterID string, record B
 	req.Header.Set("Content-Type", "application/json")
 	return c.do(req, nil)
 }
+
+// ClusterHealth is the "has this cluster reported in?" view: the status the
+// control plane shows, and whether a fleet-telemetry heartbeat has arrived.
+//
+// Both are needed, and the heartbeat is the load-bearing one. Status alone is
+// not a reliable answer during an install: every install-stage event moves a
+// cluster to `installing`, so a stage that runs AFTER the agent connects
+// (record, verify) puts a connected cluster back into `installing` until the
+// next heartbeat. The heartbeat timestamp cannot be moved backwards by an
+// event, which is why the acceptance check reads it.
+type ClusterHealth struct {
+	Name          string     `json:"name"`
+	Status        string     `json:"status"`
+	LastHeartbeat *time.Time `json:"last_heartbeat"`
+}
+
+// ClusterHealth reads one cluster's status and last heartbeat.
+func (c *Client) ClusterHealth(ctx context.Context, clusterID string) (ClusterHealth, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)), nil)
+	if err != nil {
+		return ClusterHealth{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	var out ClusterHealth
+	if err := c.do(req, &out); err != nil {
+		return ClusterHealth{}, err
+	}
+	return out, nil
+}

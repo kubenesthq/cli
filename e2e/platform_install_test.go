@@ -52,6 +52,10 @@ type gateEnv struct {
 	token        string
 	bundle       string
 	cluster      string
+	// storageDevice is the lab volume. The lab node ships a blank attached
+	// volume and no kubenest-vg, which is install.mdx's Option 2 — the
+	// installer creates the volume group, and uninstall may remove it.
+	storageDevice string
 }
 
 func gateEnvironment(t *testing.T) gateEnv {
@@ -64,6 +68,8 @@ func gateEnvironment(t *testing.T) gateEnv {
 		token:        os.Getenv("KUBENEST_CLI_TOKEN"),
 		bundle:       envOr("KUBENEST_BUNDLE", "1.0"),
 		cluster:      envOr("KUBENEST_GATE_CLUSTER", "gate-single-server"),
+
+		storageDevice: os.Getenv("KUBENEST_LAB_NODE1_STORAGE_DEVICE"),
 	}
 	if env.server == "" {
 		t.Skip("KUBENEST_LAB_SERVER_IP not set: run ./scripts/ephemeral-env.sh up --profile host and source lab/hetzner/.lab-env.sh")
@@ -112,12 +118,13 @@ func session(t *testing.T, env gateEnv, journalPath string, bundle *manifest.Man
 
 func gateOptions(env gateEnv) install.Options {
 	return install.Options{
-		Bundle:  env.bundle,
-		Name:    env.cluster,
-		Servers: []string{env.server},
-		HATier:  "single-server",
-		SSHUser: env.sshUser,
-		SSHKey:  env.sshKey,
+		Bundle:        env.bundle,
+		Name:          env.cluster,
+		Servers:       []string{env.server},
+		HATier:        "single-server",
+		SSHUser:       env.sshUser,
+		SSHKey:        env.sshKey,
+		StorageDevice: env.storageDevice,
 	}
 }
 
@@ -172,16 +179,20 @@ func TestPlatformInstallGate(t *testing.T) {
 		}
 	})
 
-	t.Run("the cluster is connected in the control plane", func(t *testing.T) {
+	t.Run("the cluster has reported in", func(t *testing.T) {
 		if clusterID == "" {
 			t.Skip("install did not complete")
 		}
-		cluster, err := bootstrap.GetCluster(ctx, clusterID)
+		health, err := bootstrap.ClusterHealth(ctx, clusterID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cluster.Status != "connected" {
-			t.Errorf("cluster status is %q, want connected — stage 13 asserted this, so a difference here means it regressed after the install", cluster.Status)
+		t.Logf("cluster status=%s last_heartbeat=%v", health.Status, health.LastHeartbeat)
+		if health.LastHeartbeat == nil {
+			t.Error("no fleet-telemetry heartbeat: stage 13 asserted one arrived, so a difference here means it regressed after the install")
+		}
+		if health.Status == "install_failed" || health.Status == "error" {
+			t.Errorf("cluster status is %q after a successful install", health.Status)
 		}
 	})
 

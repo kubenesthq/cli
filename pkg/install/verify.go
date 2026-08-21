@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
@@ -262,17 +263,26 @@ func verifyClusterReportsIn(ctx context.Context, s *Session) error {
 	clusterID := s.Journal.Cluster.ClusterID
 
 	probe := func(ctx context.Context) (bool, converge.State, error) {
-		cluster, err := s.API.GetCluster(ctx, clusterID)
+		health, err := s.API.ClusterHealth(ctx, clusterID)
 		if err != nil {
 			return false, converge.State{Object: "cluster " + clusterID, Status: "the control plane is not answering"}, err
 		}
-		state := converge.State{Object: "cluster " + cluster.Name, Status: cluster.Status}
-		if cluster.Status == "connected" {
-			return true, state, nil
+		state := converge.State{Object: "cluster " + health.Name, Status: health.Status}
+		switch health.Status {
+		case "install_failed", "error":
+			// Still an observation, not a verdict: a stage that failed and
+			// was fixed leaves this status until the next transition.
+			state.Detail = "the control plane still records a failed install"
+			return false, state, nil
 		}
-		state.Detail = "the agent dials the hub outbound; the cluster shows connected once its first heartbeat arrives"
-		return false, state, nil
+		if health.LastHeartbeat == nil {
+			state.Detail = "no fleet-telemetry heartbeat yet; the agent dials the hub outbound, so check that the cluster can reach it"
+			return false, state, nil
+		}
+		state.Status = health.Status + ", first heartbeat " + health.LastHeartbeat.Format(time.RFC3339)
+		return true, state, nil
 	}
+
 	res, err := converge.Wait(ctx, probe, converge.Options{
 		Name: "cluster-connected", Deadline: deadline, Reporter: s.Reporter,
 	})
