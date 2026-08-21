@@ -46,16 +46,35 @@ func TestInstallFlagsValidate(t *testing.T) {
 	}
 }
 
-func TestSkeletonCommandsFailLoudly(t *testing.T) {
+// `platform upgrade` is still a skeleton and must say so rather than pretend.
+func TestUpgradeSkeletonFailsLoudly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	root := NewRootCommand()
-	root.SetArgs([]string{"platform", "install",
-		"--bundle", "1.0", "--name", "x", "--server", "10.0.0.1", "--ha", "single-server"})
+	root.SetArgs([]string{"platform", "upgrade"})
 	err := root.Execute()
 	if err == nil {
 		t.Fatal("a skeleton command must exit non-zero, not pretend success")
 	}
 	if !strings.Contains(err.Error(), "not available") {
 		t.Errorf("skeleton error should say the command is not available yet, got: %v", err)
+	}
+}
+
+// Install is implemented, and its first refusal is the one the page leads
+// with: a control plane is required. The cluster is registered before
+// anything is written to a machine, so an install with nowhere to register
+// stops before it touches a host.
+func TestInstallRequiresAControlPlane(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := NewRootCommand()
+	root.SetArgs([]string{"platform", "install",
+		"--bundle", "1.0", "--name", "x", "--server", "10.0.0.1", "--ha", "single-server"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("install without a control plane must refuse")
+	}
+	if !strings.Contains(err.Error(), "kubenest login") {
+		t.Errorf("the refusal must name the fix, got: %v", err)
 	}
 }
 

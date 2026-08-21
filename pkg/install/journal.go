@@ -296,3 +296,28 @@ func sortedCopy(in []string) []string {
 	slices.Sort(out)
 	return out
 }
+
+// JournalDir is where every cluster's journal lives.
+func JournalDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".kubenest", journalDirName), nil
+}
+
+// ReadJournal loads a journal without checking it against a request. Used by
+// uninstall, which does not have an install request to compare — it has a
+// cluster it is taking apart.
+func ReadJournal(path string) (*Journal, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var j Journal
+	if err := json.Unmarshal(data, &j); err != nil {
+		return nil, fmt.Errorf("read install journal %s: %w", path, err)
+	}
+	j.path = path
+	return &j, nil
+}

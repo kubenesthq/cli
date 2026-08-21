@@ -20,8 +20,12 @@ func errNotYetImplemented(what string) error {
 // InstallFlags is the flag surface of `kubenest platform install`, exactly as
 // documented on the install page.
 type InstallFlags struct {
-	Bundle        string
-	Name          string
+	Bundle string
+	Name   string
+	// Org is only needed when the credential can see more than one
+	// organization; registering a customer's cluster under the wrong one is
+	// a support call, not a typo.
+	Org           string
 	Servers       []string
 	Agents        []string
 	HATier        string
@@ -102,13 +106,14 @@ machine.`,
 			if err := f.Validate(); err != nil {
 				return err
 			}
-			return errNotYetImplemented("kubenest platform install")
+			return runInstall(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
 
 	fs := cmd.Flags()
 	fs.StringVar(&f.Bundle, "bundle", "", "platform bundle version to install (required)")
 	fs.StringVar(&f.Name, "name", "", "cluster name, recorded against the control plane (required)")
+	fs.StringVar(&f.Org, "org", "", "organization slug or id (only needed when your credential can see more than one)")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (repeat three times for --ha ha)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (repeatable)")
 	fs.StringVar(&f.HATier, "ha", "", "HA tier: single-server or ha (required, permanent)")
@@ -124,6 +129,8 @@ func newPlatformUninstallCommand() *cobra.Command {
 	var (
 		confirm     bool
 		destroyData bool
+		name        string
+		f           InstallFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "uninstall --confirm",
@@ -134,16 +141,27 @@ to a known state.
 Uninstall never destroys data by default: persistent volumes survive. Pass
 --destroy-data to remove them too — and even then the kubenest-vg volume
 group is only removed if the installer created it. A volume group you created
-yourself is never removed, on either path.`,
+yourself is never removed, on either path.
+
+The node list and the volume-group ownership come from the install journal.
+Without one, pass --server and --agent for the hosts to clean; no volume
+group is removed in that case, because ownership that cannot be established
+is treated as yours.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !confirm {
 				return fmt.Errorf("uninstall removes the platform from every node of the cluster: pass --confirm to proceed")
 			}
-			return errNotYetImplemented("kubenest platform uninstall")
+			return runUninstall(cmd.Context(), cmd.OutOrStdout(), name, destroyData, f)
 		},
 	}
-	cmd.Flags().BoolVar(&confirm, "confirm", false, "confirm removal (required)")
-	cmd.Flags().BoolVar(&destroyData, "destroy-data", false, "also remove persistent volumes (never removes a volume group you created yourself)")
+	fs := cmd.Flags()
+	fs.BoolVar(&confirm, "confirm", false, "confirm removal (required)")
+	fs.BoolVar(&destroyData, "destroy-data", false, "also remove persistent volumes (never removes a volume group you created yourself)")
+	fs.StringVar(&name, "name", "", "cluster name; defaults to the only install journal on this machine")
+	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without an install journal)")
+	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without an install journal)")
+	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")
+	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	return cmd
 }
 

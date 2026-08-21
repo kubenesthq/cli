@@ -2,9 +2,12 @@ package install
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -333,4 +336,20 @@ func annotateDeadline(ctx context.Context, stage string, total time.Duration, er
 		return err
 	}
 	return fmt.Errorf("the install-total deadline of %s expired while stage %s was still running (last state: %w)", total, stage, err)
+}
+
+// NewRunID mints the identifier for one installer process: constant across
+// its stages, new on every resume. It is what separates "resumed after a fix"
+// from "retry storm" in the record without inferring from timestamps.
+//
+// Random hex rather than a UUID library: the CLI cross-compiles for six
+// platforms and a dependency for sixteen bytes of randomness is not worth it.
+func NewRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail in practice; a time-based fallback keeps
+		// an install from dying over a run label.
+		return "run-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b[:])
 }
