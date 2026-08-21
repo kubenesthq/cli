@@ -57,6 +57,7 @@ func TestStorageLocationSpeaksS3Compatible(t *testing.T) {
 			Default       bool   `yaml:"default"`
 			ObjectStorage struct {
 				Bucket string `yaml:"bucket"`
+				Prefix string `yaml:"prefix"`
 			} `yaml:"objectStorage"`
 			Credential struct {
 				Name string `yaml:"name"`
@@ -71,6 +72,9 @@ func TestStorageLocationSpeaksS3Compatible(t *testing.T) {
 	s := doc.Spec
 	if s.Provider != "aws" || !s.Default || s.ObjectStorage.Bucket != "kubenest-backups" {
 		t.Errorf("spec = %+v", s)
+	}
+	if s.ObjectStorage.Prefix != "workload" {
+		t.Errorf("workload prefix = %q, want workload", s.ObjectStorage.Prefix)
 	}
 	if s.Credential.Name != TargetSecretName || s.Credential.Key != "cloud" {
 		t.Errorf("credential ref = %+v, want the per-location secret reference", s.Credential)
@@ -115,8 +119,44 @@ func TestStorageLocationOnAWSKeepsSDKDefaults(t *testing.T) {
 	if _, ok := doc.Spec.Config["checksumAlgorithm"]; ok {
 		t.Error("checksumAlgorithm must be left to the SDK on AWS itself")
 	}
-	if doc.Spec.ObjectStorage["prefix"] != "prod-1" {
-		t.Errorf("prefix = %q, want prod-1", doc.Spec.ObjectStorage["prefix"])
+	if doc.Spec.ObjectStorage["prefix"] != "prod-1/workload" {
+		t.Errorf("prefix = %q, want prod-1/workload", doc.Spec.ObjectStorage["prefix"])
+	}
+}
+
+func TestTargetPartitionsWorkloadAndDatastoreObjects(t *testing.T) {
+	target := testTarget()
+	target.Prefix = "/prod-1/"
+
+	loc, err := target.storageLocationManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var location struct {
+		Spec struct {
+			ObjectStorage map[string]string `yaml:"objectStorage"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(loc, &location); err != nil {
+		t.Fatal(err)
+	}
+
+	secret, err := target.datastoreSecretManifest(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var datastore struct {
+		StringData map[string]string `yaml:"stringData"`
+	}
+	if err := yaml.Unmarshal(secret, &datastore); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := location.Spec.ObjectStorage["prefix"]; got != "prod-1/workload" {
+		t.Errorf("Velero prefix = %q, want prod-1/workload", got)
+	}
+	if got := datastore.StringData["etcd-s3-folder"]; got != "prod-1/datastore" {
+		t.Errorf("etcd folder = %q, want prod-1/datastore", got)
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -157,7 +156,7 @@ func (t Target) datastoreRestoreConfig() ([]byte, error) {
 		"etcd-s3-access-key":      t.AccessKeyID,
 		"etcd-s3-secret-key":      t.SecretAccessKey,
 		"etcd-s3-bucket":          t.Bucket,
-		"etcd-s3-folder":          path.Join(strings.Trim(t.Prefix, "/"), "datastore"),
+		"etcd-s3-folder":          t.backupPrefix("datastore"),
 		"etcd-s3-region":          t.Region,
 		"etcd-s3-insecure":        u.Scheme == "http",
 		"etcd-s3-skip-ssl-verify": false,

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
-	"path"
 	"strconv"
 	"strings"
 
@@ -37,7 +36,7 @@ func (t Target) datastoreSecretManifest(keep int) ([]byte, error) {
 		return nil, fmt.Errorf("--endpoint %q contains a path; put object prefixes in --prefix so k3s and Velero share one endpoint", t.Endpoint)
 	}
 
-	folder := path.Join(strings.Trim(t.Prefix, "/"), "datastore")
+	folder := t.backupPrefix("datastore")
 	values := map[string]string{
 		"etcd-s3-endpoint":        u.Host,
 		"etcd-s3-access-key":      t.AccessKeyID,

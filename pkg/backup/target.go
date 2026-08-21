@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -37,7 +38,9 @@ type Target struct {
 	Endpoint string
 	Bucket   string
 	Region   string
-	// Prefix is an optional directory within the bucket.
+	// Prefix is an optional cluster-level directory within the bucket. Workload
+	// and datastore backups use sibling subdirectories below it so Velero never
+	// sees k3s snapshot objects in its own storage root.
 	Prefix string
 
 	AccessKeyID     string
@@ -74,6 +77,10 @@ func (t Target) s3URL() string {
 		return t.Endpoint
 	}
 	return "https://" + t.Endpoint
+}
+
+func (t Target) backupPrefix(kind string) string {
+	return path.Join(strings.Trim(t.Prefix, "/"), kind)
 }
 
 // onAWS reports whether the endpoint is AWS itself. Everything else — MinIO,
@@ -117,9 +124,9 @@ func (t Target) storageLocationManifest() ([]byte, error) {
 		config["s3ForcePathStyle"] = "true"
 		config["checksumAlgorithm"] = ""
 	}
-	objectStorage := map[string]any{"bucket": t.Bucket}
-	if t.Prefix != "" {
-		objectStorage["prefix"] = t.Prefix
+	objectStorage := map[string]any{
+		"bucket": t.Bucket,
+		"prefix": t.backupPrefix("workload"),
 	}
 	return yaml.Marshal(map[string]any{
 		"apiVersion": "velero.io/v1",
