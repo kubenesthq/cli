@@ -24,7 +24,7 @@ import (
 // bundle, and the transport flags become optional overrides.
 type backupConn struct {
 	Cluster    string
-	Server     string
+	Servers    []string
 	SSHUser    string
 	SSHKey     string
 	BundlePath string
@@ -33,7 +33,7 @@ type backupConn struct {
 func (c *backupConn) register(cmd *cobra.Command) {
 	fs := cmd.Flags()
 	fs.StringVar(&c.Cluster, "cluster", "", "cluster name (required)")
-	fs.StringVar(&c.Server, "server", "", "the cluster's server node address (required until the cluster record resolves it)")
+	fs.StringArrayVar(&c.Servers, "server", nil, "control-plane node address (repeat for every server; required until the cluster record resolves it)")
 	fs.StringVar(&c.SSHUser, "ssh-user", "", "SSH user on the server node")
 	fs.StringVar(&c.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	fs.StringVar(&c.BundlePath, "bundle-manifest", "", "path to the cluster's bundle manifest (required until the cluster record resolves it)")
@@ -43,8 +43,8 @@ func (c *backupConn) validate() error {
 	if c.Cluster == "" {
 		return fmt.Errorf("--cluster is required")
 	}
-	if c.Server == "" {
-		return fmt.Errorf("--server is required: the cluster record that will resolve --cluster to an address is not built yet")
+	if len(c.Servers) == 0 {
+		return fmt.Errorf("at least one --server is required: the cluster record that will resolve --cluster to addresses is not built yet")
 	}
 	if c.BundlePath == "" {
 		return fmt.Errorf("--bundle-manifest is required: schedules, retention and deadlines all come from the bundle manifest, never from defaults in this binary")
@@ -58,7 +58,7 @@ func (c *backupConn) dial(cmd *cobra.Command) (*manifest.Manifest, *sshx.Client,
 	if err != nil {
 		return nil, nil, err
 	}
-	ep, err := sshx.Resolve(c.Server, sshx.Options{User: c.SSHUser, KeyPath: c.SSHKey})
+	ep, err := sshx.Resolve(c.Servers[0], sshx.Options{User: c.SSHUser, KeyPath: c.SSHKey})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -103,8 +103,10 @@ history. They travel only over the SSH connection to your own server node.
 The target is proven, not assumed: the command waits until Velero has
 reached the bucket with those credentials and marked the location
 Available, then installs the default backup schedule from the bundle
-manifest. Until a target is set the cluster reports backup: unconfigured —
-loud, but never blocking.`,
+manifest. It also configures every supplied k3s server for scheduled embedded-
+etcd snapshots, restarts changed servers serially, and proves an S3 snapshot
+upload before returning. Until a target is set the cluster reports backup:
+unconfigured — loud, but never blocking.`,
 		Example: `  KUBENEST_BACKUP_ACCESS_KEY_ID=… KUBENEST_BACKUP_SECRET_ACCESS_KEY=… \
   kubenest backup set-target --cluster prod-1 \
     --endpoint s3.ap-south-1.amazonaws.com \
@@ -129,6 +131,27 @@ loud, but never blocking.`,
 			rep := converge.NewTextReporter(cmd.OutOrStdout())
 			if err := backup.Configure(cmd.Context(), client, bundle, target, rep); err != nil {
 				return err
+			}
+			if err := backup.ConfigureDatastoreSnapshots(cmd.Context(), client, bundle, target, rep); err != nil {
+				return fmt.Errorf("configure datastore snapshots on %s: %w", conn.Servers[0], err)
+			}
+			for _, address := range conn.Servers[1:] {
+				ep, err := sshx.Resolve(address, sshx.Options{User: conn.SSHUser, KeyPath: conn.SSHKey})
+				if err != nil {
+					return err
+				}
+				node, err := sshx.Dial(cmd.Context(), ep, sshx.Options{KeyPath: conn.SSHKey})
+				if err != nil {
+					return err
+				}
+				configureErr := backup.ConfigureDatastoreSnapshots(cmd.Context(), node, bundle, target, rep)
+				closeErr := node.Close()
+				if configureErr != nil {
+					return fmt.Errorf("configure datastore snapshots on %s: %w", address, configureErr)
+				}
+				if closeErr != nil {
+					return fmt.Errorf("close SSH connection to %s: %w", address, closeErr)
+				}
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "backup target for %s configured and verified: bucket %s via %s\n", conn.Cluster, target.Bucket, target.Endpoint)
 			return nil

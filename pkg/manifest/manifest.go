@@ -146,6 +146,28 @@ func (d BackupDefaults) Workload() (BackupSchedule, error) {
 	return s, nil
 }
 
+// Datastore returns the embedded-etcd snapshot cadence and retention.
+// Every HA tier uses this one mechanism (decision A); there is deliberately
+// no SQLite fallback or binary default.
+func (d BackupDefaults) Datastore() (BackupSchedule, error) {
+	s := d.DatastoreSnapshot
+	if s.Interval <= 0 || s.Keep <= 0 {
+		return BackupSchedule{}, fmt.Errorf("bundle manifest has no backup.defaults.datastore-snapshot: the bundle decides the schedule and retention, add them to the manifest rather than defaulting in code")
+	}
+	return s, nil
+}
+
+// Drill returns the verified restore-drill cadence. The drill runner reads
+// this value from in-cluster configuration written by the CLI; it never
+// carries a second weekly constant.
+func (d BackupDefaults) Drill() (DrillSchedule, error) {
+	s := d.RestoreDrill
+	if s.Interval <= 0 {
+		return DrillSchedule{}, fmt.Errorf("bundle manifest has no backup.defaults.restore-drill: the bundle decides the cadence, add it to the manifest rather than defaulting in code")
+	}
+	return s, nil
+}
+
 // BackupSchedule is one cadence-plus-retention pair. Keep counts backups:
 // retention is Keep × Interval.
 type BackupSchedule struct {

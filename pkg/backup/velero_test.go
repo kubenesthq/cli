@@ -49,11 +49,15 @@ func testManifest() *manifest.Manifest {
 		Limits: manifest.Limits{Timeouts: manifest.Timeouts{
 			"component-ready": 300 * time.Millisecond,
 			"backup":          300 * time.Millisecond,
+			"restore-drill":   300 * time.Millisecond,
+			"node-ready":      300 * time.Millisecond,
 		}},
 		Backup: manifest.Backup{
 			ObjectStorePlugin: manifest.ObjectStorePlugin{Provider: "aws", Version: "v1.14.2"},
 			Defaults: manifest.BackupDefaults{
-				WorkloadBackup: manifest.BackupSchedule{Interval: manifest.Interval(24 * time.Hour), Keep: 14},
+				DatastoreSnapshot: manifest.BackupSchedule{Interval: manifest.Interval(time.Hour), Keep: 24},
+				WorkloadBackup:    manifest.BackupSchedule{Interval: manifest.Interval(24 * time.Hour), Keep: 14},
+				RestoreDrill:      manifest.DrillSchedule{Interval: manifest.Interval(7 * 24 * time.Hour)},
 			},
 		},
 	}

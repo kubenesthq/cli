@@ -519,7 +519,19 @@ func stageBackup(ctx context.Context, s *Session) error {
 	if err := stages.NewComponentError("velero", backup.Configure(ctx, server, s.Bundle, target, s.Reporter)); err != nil {
 		return err
 	}
-	return stages.NewComponentError("velero", backup.EnsureSchedule(ctx, server, s.Bundle, s.Reporter))
+	// Every tier uses embedded etcd (decision A), so every control-plane
+	// server gets the same manifest-owned snapshot schedule and S3 target.
+	// Restart serially and prove one upload per server; a half-configured HA
+	// cluster would report backups while leaving two members unprotected.
+	for _, node := range s.Nodes {
+		if node.Role != RoleServer {
+			continue
+		}
+		if err := backup.ConfigureDatastoreSnapshots(ctx, node.Runner, s.Bundle, target, s.Reporter); err != nil {
+			return stages.NewComponentError("k3s", fmt.Errorf("datastore snapshots on %s: %w", node.Address, err))
+		}
+	}
+	return nil
 }
 
 // stageDay2 places system-upgrade-controller and kured.

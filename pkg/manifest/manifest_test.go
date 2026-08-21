@@ -145,11 +145,19 @@ func TestBackupSectionParses(t *testing.T) {
 	if w.Interval.Duration() != 24*time.Hour || w.Keep != 14 {
 		t.Errorf("workload-backup = %s × %d, want 24h × 14", w.Interval.Duration(), w.Keep)
 	}
-	if d := m.Backup.Defaults.DatastoreSnapshot; d.Interval.Duration() != time.Hour || d.Keep != 24 {
+	d, err := m.Backup.Defaults.Datastore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Interval.Duration() != time.Hour || d.Keep != 24 {
 		t.Errorf("datastore-snapshot = %s × %d, want 1h × 24", d.Interval.Duration(), d.Keep)
 	}
 	// Days are an interval unit the schema allows and ParseDuration does not.
-	if r := m.Backup.Defaults.RestoreDrill; r.Interval.Duration() != 7*24*time.Hour {
+	r, err := m.Backup.Defaults.Drill()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Interval.Duration() != 7*24*time.Hour {
 		t.Errorf("restore-drill interval = %s, want 168h", r.Interval.Duration())
 	}
 }
@@ -167,6 +175,12 @@ func TestMissingBackupSectionIsAnErrorOnAccessNotParse(t *testing.T) {
 	}
 	if _, err := m.Backup.Defaults.Workload(); err == nil || !strings.Contains(err.Error(), "workload-backup") {
 		t.Errorf("Workload() on a manifest without backup: err = %v, want one naming backup.defaults.workload-backup", err)
+	}
+	if _, err := m.Backup.Defaults.Datastore(); err == nil || !strings.Contains(err.Error(), "datastore-snapshot") {
+		t.Errorf("Datastore() on a manifest without backup: err = %v, want one naming backup.defaults.datastore-snapshot", err)
+	}
+	if _, err := m.Backup.Defaults.Drill(); err == nil || !strings.Contains(err.Error(), "restore-drill") {
+		t.Errorf("Drill() on a manifest without backup: err = %v, want one naming backup.defaults.restore-drill", err)
 	}
 }
 

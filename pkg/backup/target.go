@@ -233,7 +233,10 @@ func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t T
 		return err
 	}
 
-	return EnsureSchedule(ctx, r, bundle, rep)
+	if err := EnsureSchedule(ctx, r, bundle, rep); err != nil {
+		return err
+	}
+	return EnsureDrillConfiguration(ctx, r, bundle)
 }
 
 // EnsureSchedule applies the default workload Schedule — cadence and
