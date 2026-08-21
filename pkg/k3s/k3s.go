@@ -229,3 +229,91 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// workloadList is the slice of Deployments/DaemonSets the readiness check reads.
+type workloadList struct {
+	Items []struct {
+		Kind     string `json:"kind"`
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Status struct {
+			Conditions []struct {
+				Type    string `json:"type"`
+				Status  string `json:"status"`
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+			} `json:"conditions"`
+			DesiredNumberScheduled *int32 `json:"desiredNumberScheduled"`
+			NumberReady            *int32 `json:"numberReady"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+// CheckWorkloadsReady observes whether every Deployment and DaemonSet in a
+// namespace is up.
+//
+// It looks at WORKLOADS rather than at every pod, and the distinction is
+// load-bearing: a namespace that runs one-shot Jobs accumulates their pods,
+// and a Job pod that failed once and was retried stays Failed forever.
+// Requiring every pod to be Ready therefore fails permanently on a namespace
+// whose component is perfectly healthy — observed in system-upgrade after a
+// node upgrade, where the controller's own apply Jobs leave failed pods
+// behind by design.
+func CheckWorkloadsReady(ctx context.Context, r Runner, namespace string) (bool, converge.State, error) {
+	out, err := Kubectl(ctx, r, "get deployments,daemonsets -n "+namespace+" -o json")
+	if err != nil {
+		return false, converge.State{Object: "workloads in " + namespace, Status: "unobservable"}, err
+	}
+	var list workloadList
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return false, converge.State{Object: "workloads in " + namespace, Status: "unparsable"}, err
+	}
+	if len(list.Items) == 0 {
+		return false, converge.State{
+			Object: "namespace " + namespace,
+			Status: "no workloads yet",
+			Detail: "the helm-install job has not created them yet",
+		}, nil
+	}
+	for _, w := range list.Items {
+		object := strings.ToLower(w.Kind) + " " + w.Metadata.Name + " in " + namespace
+		if w.Status.DesiredNumberScheduled != nil {
+			desired, ready := *w.Status.DesiredNumberScheduled, int32(0)
+			if w.Status.NumberReady != nil {
+				ready = *w.Status.NumberReady
+			}
+			if desired == 0 || ready < desired {
+				return false, converge.State{
+					Object: object,
+					Status: fmt.Sprintf("%d/%d Ready", ready, desired),
+				}, nil
+			}
+			continue
+		}
+		available := false
+		detail := ""
+		for _, c := range w.Status.Conditions {
+			if c.Type == "Available" {
+				available = c.Status == "True"
+				if !available {
+					detail = c.Reason + ": " + c.Message
+				}
+			}
+		}
+		if !available {
+			return false, converge.State{Object: object, Status: "not Available", Detail: detail}, nil
+		}
+	}
+	return true, converge.State{
+		Object: "workloads in " + namespace,
+		Status: fmt.Sprintf("%d Ready", len(list.Items)),
+	}, nil
+}
+
+// WorkloadsReadyProbe wraps CheckWorkloadsReady as a converge.Probe.
+func WorkloadsReadyProbe(r Runner, namespace string) converge.Probe {
+	return func(ctx context.Context) (bool, converge.State, error) {
+		return CheckWorkloadsReady(ctx, r, namespace)
+	}
+}

@@ -105,7 +105,7 @@ func verifyComponentsRunning(ctx context.Context, s *Session) error {
 
 	probe := func(ctx context.Context) (bool, converge.State, error) {
 		for _, ns := range namespaces {
-			done, state, err := k3s.CheckPodsReady(ctx, server, ns)
+			done, state, err := k3s.CheckWorkloadsReady(ctx, server, ns)
 			if err != nil || !done {
 				return false, state, err
 			}

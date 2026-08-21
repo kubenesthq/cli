@@ -122,7 +122,7 @@ func verifyComponents(ctx context.Context, s *Session, server k3s.Runner) error 
 	namespaces := []string{traefik.Namespace, certmanager.Namespace, storage.Namespace, backup.Namespace, day2.Namespace}
 	probe := func(ctx context.Context) (bool, converge.State, error) {
 		for _, ns := range namespaces {
-			done, state, err := k3s.CheckPodsReady(ctx, server, ns)
+			done, state, err := k3s.CheckWorkloadsReady(ctx, server, ns)
 			if err != nil || !done {
 				return false, state, err
 			}
