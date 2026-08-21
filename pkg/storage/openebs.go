@@ -16,6 +16,11 @@ const (
 	// section; the pinned chart version lives there and only there.
 	ComponentKey = "openebs-lvm-localpv"
 
+	// ChartResourceName is the HelmChart resource this package creates, so a
+	// caller comparing what is installed against the bundle's pins reads the
+	// name from here rather than guessing it.
+	ChartResourceName = ComponentKey
+
 	// ChartRepo is recorded in the bundle manifest's chart-repo facts
 	// (verified 2026-08-20).
 	ChartRepo = "https://openebs.github.io/lvm-localpv"

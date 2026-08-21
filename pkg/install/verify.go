@@ -10,6 +10,7 @@ import (
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/certmanager"
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/component/traefik"
@@ -350,16 +351,34 @@ func verifyRecordMatchesReality(ctx context.Context, s *Session) error {
 
 // chartComponents maps a manifest core key to the HelmChart resource name the
 // installer used.
+//
+// Each name comes from the installer package that writes it, never from a
+// literal here. A literal is how this check told the operator that "nothing
+// on the cluster installs openebs-lvm-localpv" about a cluster that had it —
+// the check was wrong, and a check that cries wolf about the record is worse
+// than no check, because the record is the thing every day-2 operation
+// trusts.
 func chartComponents(s *Session) map[string]string {
-	out := map[string]string{
-		"traefik":             "kubenest-traefik",
-		"cert-manager":        "kubenest-cert-manager",
-		"openebs-lvm-localpv": "kubenest-openebs",
-		"velero":              "kubenest-velero",
-		"kured":               "kured",
+	out := map[string]string{}
+	add := func(key string, chart k3s.HelmChart, err error) {
+		if err != nil || chart.Name == "" {
+			return
+		}
+		out[key] = chart.Name
 	}
-	if s.Creds != nil {
-		out["kubenest-agent"] = "kubenest-agent"
+	traefikChart, err := traefik.Chart(s.Bundle)
+	add("traefik", traefikChart, err)
+	certChart, err := certmanager.Chart(s.Bundle)
+	add("cert-manager", certChart, err)
+	veleroChart, err := backup.Chart(s.Bundle)
+	add("velero", veleroChart, err)
+	kuredChart, err := day2.Chart(s.Bundle)
+	add("kured", kuredChart, err)
+	out[storage.ComponentKey] = storage.ChartResourceName
+
+	if creds, ok := s.Creds.(*api.AgentCredentials); ok && creds != nil {
+		agentChart, err := agent.Chart(s.Bundle, creds)
+		add("kubenest-agent", agentChart, err)
 	}
 	return out
 }
