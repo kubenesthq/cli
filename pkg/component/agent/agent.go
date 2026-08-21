@@ -33,6 +33,24 @@ import (
 // manifestName is the file the HelmChart resource is written to.
 const manifestName = "kubenest-agent"
 
+// releaseName is the Helm release, and it is SHORT for a reason that is not
+// style. The chart names its metrics service
+// <release>-kubenest-operator-2-controller-manager-metrics-service, and
+// Kubernetes refuses any object name over 63 characters. "kubenest-agent"
+// produces 69 and the install fails at the moment helm creates that service —
+// observed on a real two-node cluster. "operator" produces 62, lands inside
+// the limit, and is what production has always used (AGENTS.md section 5).
+const releaseName = "operator"
+
+// DeploymentName is the operator's Deployment, derived from the release name.
+// Exported because the installer, the upgrade and the acceptance checks all
+// need to name the same object.
+const DeploymentName = releaseName + "-kubenest-operator-2-controller-manager"
+
+// ReleaseName is the Helm release the agent is installed as. Callers that
+// need to find it on a cluster read it from here rather than repeating it.
+func ReleaseName() string { return releaseName }
+
 // Values renders the chart values for one cluster's agent.
 //
 // Three bootstrap dependencies of the operator chart are decided here, and
@@ -115,7 +133,9 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 	ref := stripTag(creds.Operator.ChartRef, version)
 
 	return k3s.HelmChart{
-		Name:            manifestName,
+		// The HelmChart resource name IS the Helm release name, which is why
+		// this is the short one and not manifestName.
+		Name:            releaseName,
 		Chart:           ref,
 		Version:         version,
 		TargetNamespace: namespace,
@@ -158,7 +178,7 @@ func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, creds
 	}
 
 	res, err := converge.Wait(ctx,
-		component.ConditionProbe(r, "deployment/kubenest-agent-kubenest-operator-2-controller-manager", chart.TargetNamespace, "Available"),
+		component.ConditionProbe(r, "deployment/"+DeploymentName, chart.TargetNamespace, "Available"),
 		converge.Options{Name: "kubenest-agent", Deadline: deadline, Reporter: rep})
 	if err != nil {
 		return err

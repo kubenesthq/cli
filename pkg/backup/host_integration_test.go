@@ -6,20 +6,27 @@
 //
 //   - Velero installs UNCONFIGURED and that state is visible, not blocking
 //     (install.mdx / backup-restore.mdx: `backup: unconfigured`).
-//   - A customer-supplied S3-compatible target (a real in-cluster MinIO —
+//   - A customer-supplied S3-compatible target (real MinIO on a second host —
 //     the S3 API over the wire, not a mock) is configured and PROVEN:
 //     Velero validates the location Available with the supplied credentials.
 //   - The default schedule from the manifest lands: daily 02:00, ttl 336h.
 //   - `backup now` completes and the backup — including PVC volume data via
 //     file-system backup — actually lands in the bucket, asserted from the
 //     bucket's side with mc, not from Velero's word alone.
+//   - The weekly drill restores that backup into scratch, compares objects and
+//     real PVC bytes, records a pass, and removes scratch.
+//   - Corrupting the selected backup records an actionable FAILED drill rather
+//     than passing or waiting out the two-hour deadline.
+//   - Hourly/24-kept embedded-etcd snapshots reach the same external target,
+//     and the documented S3 disaster restore recovers a mutated sentinel.
 //
 // Run from the umbrella workspace:
 //
-//	./scripts/ephemeral-env.sh up --profile host
-//	source lab/hetzner/.lab-env.sh
+//	# Provision two isolated hosts: node 1 is the cluster, node 2 is the
+//	# external S3 service that remains reachable while node 1's k3s is stopped.
 //	cd kubenest-cli && go test -tags host -timeout 45m -run TestBackupOnRealHost -v ./pkg/backup \
 //	  -host "$KUBENEST_LAB_NODE1_IP" -ssh-user "$KUBENEST_LAB_SSH_USER" -ssh-key ~/.ssh/id_ed25519 \
+//	  -s3-host "$KUBENEST_LAB_NODE2_IP" -s3-private "$KUBENEST_LAB_NODE2_PRIVATE_IP" \
 //	  -bundle ../kubenest-contracts/bundles/platform-1.0.yaml
 //	./scripts/ephemeral-env.sh down --profile host   # ALWAYS — it bills by the hour
 //
@@ -48,6 +55,8 @@ import (
 
 var (
 	hostAddr   = flag.String("host", "", "target node address")
+	s3HostAddr = flag.String("s3-host", "", "second node hosting the external S3 test service")
+	s3Private  = flag.String("s3-private", "", "private address of the external S3 test node")
 	sshUser    = flag.String("ssh-user", "root", "SSH user on the node")
 	sshKey     = flag.String("ssh-key", "", "SSH private key path")
 	bundlePath = flag.String("bundle", "", "bundle manifest path (platform-1.0.yaml)")
@@ -64,11 +73,12 @@ const (
 	bucket         = "kubenest-backups"
 	minioUser      = "kubenest-e2e"
 	minioPassword  = "kubenest-e2e-secret"
+	minioNodePort  = 30900
 )
 
 func TestBackupOnRealHost(t *testing.T) {
-	if *hostAddr == "" || *bundlePath == "" {
-		t.Skip("needs -host and -bundle (see the file comment)")
+	if *hostAddr == "" || *s3HostAddr == "" || *s3Private == "" || *bundlePath == "" {
+		t.Skip("needs -host, -s3-host, -s3-private and -bundle (see the file comment)")
 	}
 	ctx := context.Background()
 
@@ -91,6 +101,16 @@ func TestBackupOnRealHost(t *testing.T) {
 	}
 	defer client.Close()
 
+	s3Endpoint, err := sshx.Resolve(*s3HostAddr, sshx.Options{User: *sshUser, KeyPath: *sshKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3Client, err := sshx.Dial(ctx, s3Endpoint, sshx.Options{KeyPath: *sshKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3Client.Close()
+
 	reporter := converge.NewTextReporter(testWriter{t})
 
 	// --- Test scaffolding: k3s at the bundle's pinned version (kn-7k8's
@@ -99,20 +119,16 @@ func TestBackupOnRealHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("scaffolding: ensuring k3s %s", k3sVersion)
-	res, err := client.Run(ctx, fmt.Sprintf(
-		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --disable traefik", k3sVersion))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.ExitCode != 0 {
-		t.Fatalf("k3s install: exit %d: %s", res.ExitCode, res.Stderr)
-	}
 	nodeReady, err := m.Limits.Timeouts.For("node-ready")
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("scaffolding: ensuring embedded-etcd k3s %s on cluster node", k3sVersion)
+	ensureK3s(t, ctx, client, k3sVersion)
 	waitFor(t, ctx, client, "node-ready", nodeReady, nodeReadyProbe(client))
+	t.Logf("scaffolding: ensuring isolated k3s %s for external S3", k3sVersion)
+	ensureK3s(t, ctx, s3Client, k3sVersion)
+	waitFor(t, ctx, s3Client, "s3-node-ready", nodeReady, nodeReadyProbe(s3Client))
 
 	// --- The component under test: install, UNCONFIGURED. ---
 	if err := backup.Install(ctx, client, m, reporter); err != nil {
@@ -129,9 +145,9 @@ func TestBackupOnRealHost(t *testing.T) {
 
 	// --- Scaffolding: MinIO as the customer-supplied S3-compatible bucket,
 	// plus a workload whose PVC data must reach it. ---
-	apply(t, ctx, client, minioManifests())
-	waitFor(t, ctx, client, "minio-ready", componentReady, podsReadyIn(client, minioNamespace))
-	runJob(t, ctx, client, "make-bucket", minioNamespace, componentReady,
+	apply(t, ctx, s3Client, minioManifests())
+	waitFor(t, ctx, s3Client, "minio-ready", componentReady, podsReadyIn(s3Client, minioNamespace))
+	runJob(t, ctx, s3Client, "make-bucket", minioNamespace, componentReady,
 		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc mb -p t/%s", minioNamespace, minioUser, minioPassword, bucket))
 
 	proof := fmt.Sprintf("kn-mzn-proof-%d", time.Now().Unix())
@@ -142,7 +158,7 @@ func TestBackupOnRealHost(t *testing.T) {
 
 	// --- Configure the target and prove it. ---
 	target := backup.Target{
-		Endpoint: fmt.Sprintf("http://minio.%s.svc:9000", minioNamespace),
+		Endpoint: fmt.Sprintf("http://%s:%d", *s3Private, minioNodePort),
 		Bucket:   bucket,
 		Region:   "main",
 
@@ -159,6 +175,27 @@ func TestBackupOnRealHost(t *testing.T) {
 	if unconfigured {
 		t.Fatal("configured cluster still reports unconfigured")
 	}
+	if err := backup.ConfigureDatastoreSnapshots(ctx, client, m, target, reporter); err != nil {
+		t.Fatalf("ConfigureDatastoreSnapshots: %v", err)
+	}
+	datastoreConfig := remoteOut(t, ctx, client, "sudo -n cat /etc/rancher/k3s/config.yaml.d/30-kubenest-backup.yaml")
+	if !strings.Contains(datastoreConfig, "etcd-snapshot-schedule-cron: 0 * * * *") ||
+		!strings.Contains(datastoreConfig, "etcd-snapshot-retention: 24") {
+		t.Fatalf("datastore schedule is not hourly/24-kept:\n%s", datastoreConfig)
+	}
+	runJob(t, ctx, s3Client, "check-datastore-proof", minioNamespace, componentReady,
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && test -n \"$(mc find t/%s/datastore --type f --print '{{.Key}}')\"", minioNamespace, minioUser, minioPassword, bucket))
+
+	// Install the exact bundle-pinned operator. Its WebSocket target is
+	// deliberately unreachable in this slice; reconnection must not stop the
+	// leader-elected restore scheduler from doing cluster-local work.
+	agentVersion, err := m.Core.Version("kubenest-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installDrillOperator(t, ctx, client, agentVersion)
+	waitFor(t, ctx, client, "operator-running", componentReady, podsRunningIn(client, "kubenest-system"))
+	waitFor(t, ctx, client, "restore-proof-source-ready", componentReady, podsReadyIn(client, "kubenest-restore-drill-source"))
 
 	// The schedule on the cluster is the manifest's (decision E), not a
 	// constant's: daily at 02:00, retention 14 × 24h.
@@ -203,8 +240,71 @@ func TestBackupOnRealHost(t *testing.T) {
 	// Asserted from the BUCKET's side: velero's manifest object for this
 	// backup exists in object storage. mc stat exits non-zero on a missing
 	// object, failing the job.
-	runJob(t, ctx, client, "check-bucket", minioNamespace, componentReady,
+	runJob(t, ctx, s3Client, "check-bucket", minioNamespace, componentReady,
 		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc stat t/%s/backups/%s/velero-backup.json", minioNamespace, minioUser, minioPassword, bucket, name))
+
+	// --- Weekly path, invoked now: restore objects AND bytes, persist proof,
+	// then tear scratch down. This is the same path the scheduler invokes. ---
+	passed, err := backup.RequestDrill(ctx, client, m, reporter)
+	if err != nil {
+		t.Fatalf("verified restore drill: %v", err)
+	}
+	if passed.Status != "passed" || passed.Backup != name || passed.Verification == nil {
+		t.Fatalf("restore drill did not persist a full pass: %#v", passed)
+	}
+	if passed.Verification.Objects.Restored != passed.Verification.Objects.Matched ||
+		passed.Verification.PVCData.Restored == 0 ||
+		passed.Verification.PVCData.Restored != passed.Verification.PVCData.Matched {
+		t.Fatalf("restore drill did not match every object and PVC data set: %#v", passed.Verification)
+	}
+	assertNoScratch(t, ctx, client)
+
+	// Corrupt the newest backup's metadata in the real object store. The
+	// Backup CR remains Completed, forcing the drill to prove it can read the
+	// bytes rather than trusting status metadata.
+	runJob(t, ctx, s3Client, "corrupt-backup", minioNamespace, componentReady,
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && printf '{corrupt' >/tmp/bad && mc cp /tmp/bad t/%s/backups/%s/velero-backup.json && test \"$(mc cat t/%s/backups/%s/velero-backup.json)\" = '{corrupt'", minioNamespace, minioUser, minioPassword, bucket, name, bucket, name))
+	failedResult, drillErr := backup.RequestDrill(ctx, client, m, reporter)
+	if drillErr == nil {
+		t.Fatal("corrupted backup passed the verified restore drill")
+	}
+	if failedResult.Status != "failed" || failedResult.Failure == nil || failedResult.Failure.Stage == "" || failedResult.Failure.ReasonCode == "" {
+		t.Fatalf("corrupted backup failure was not actionable: result=%#v err=%v", failedResult, drillErr)
+	}
+	t.Logf("corruption failed loudly: stage=%s reason=%s", failedResult.Failure.Stage, failedResult.Failure.ReasonCode)
+	assertNoScratch(t, ctx, client)
+
+	// --- Datastore runbook gate: snapshot a known object to external S3,
+	// mutate it, stop k3s, reset from S3, and assert the old value returns. ---
+	apply(t, ctx, client, `apiVersion: v1
+kind: ConfigMap
+metadata: {name: kn-f9lm-datastore-sentinel, namespace: default}
+data: {value: before-restore}
+`)
+	res, err := client.Run(ctx, "sudo -n k3s etcd-snapshot save --name kn-f9lm-runbook --s3")
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("save runbook datastore snapshot: err=%v exit=%d stderr=%s", err, res.ExitCode, res.Stderr)
+	}
+	snapshot := remoteOut(t, ctx, client,
+		"sudo -n k3s etcd-snapshot list --s3 | awk '$1 ~ /^kn-f9lm-runbook-/ {print $1}' | tail -1")
+	if snapshot == "" {
+		t.Fatal("runbook snapshot was not listed from S3")
+	}
+	kubectlOrFatal(t, ctx, client,
+		`patch configmap kn-f9lm-datastore-sentinel -n default --type merge -p '{"data":{"value":"after-snapshot"}}'`)
+	startedRestore := time.Now()
+	if err := backup.RestoreDatastoreSnapshotFromS3(ctx,
+		[]backup.DatastoreServer{{Name: *hostAddr, Runner: client}}, m, target, snapshot, reporter); err != nil {
+		t.Fatalf("restore datastore from S3: %v", err)
+	}
+	if got := kubectlOut(t, ctx, client,
+		"get configmap kn-f9lm-datastore-sentinel -n default -o jsonpath='{.data.value}'"); got != "before-restore" {
+		t.Fatalf("datastore restore returned sentinel %q, want before-restore", got)
+	}
+	if remoteOut(t, ctx, client, "sudo -n test ! -e /etc/rancher/k3s/config.yaml.d/40-kubenest-restore.yaml && printf removed") != "removed" {
+		t.Fatal("temporary datastore restore credentials remained on the server")
+	}
+	t.Logf("S3 datastore restore passed in %s using %s", time.Since(startedRestore).Round(time.Second), snapshot)
 
 	// --- Idempotence: re-running install and configure converges on the
 	// already-good state instead of breaking it. ---
@@ -219,7 +319,51 @@ func TestBackupOnRealHost(t *testing.T) {
 	// and stays). The host is torn down by ephemeral-env down — never leave
 	// it billing.
 	kubectlOrFatal(t, ctx, client, "delete namespace "+proofNamespace+" --ignore-not-found")
-	kubectlOrFatal(t, ctx, client, "delete namespace "+minioNamespace+" --ignore-not-found")
+	kubectlOrFatal(t, ctx, s3Client, "delete namespace "+minioNamespace+" --ignore-not-found")
+}
+
+func ensureK3s(t *testing.T, ctx context.Context, r k3s.Runner, version string) {
+	t.Helper()
+	res, err := r.Run(ctx, fmt.Sprintf(
+		"command -v k3s >/dev/null || curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=%q sh -s - server --cluster-init --disable traefik", version))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("k3s install: exit %d: %s", res.ExitCode, res.Stderr)
+	}
+}
+
+func installDrillOperator(t *testing.T, ctx context.Context, r k3s.Runner, version string) {
+	t.Helper()
+	apply(t, ctx, r, fmt.Sprintf(`apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata: {name: kubenest-agent, namespace: kube-system}
+spec:
+  chart: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2
+  version: %s
+  targetNamespace: kubenest-system
+  createNamespace: true
+  valuesContent: |-
+    bootstrap:
+      argocd: {enabled: false}
+      certManager: {enabled: false}
+      gitea: {enabled: false}
+      vault: {enabled: false}
+    kubenest:
+      backendURL: ws://127.0.0.1:1/ws/operator
+      clusterID: 00000000-0000-0000-0000-00000000f9a1
+      jwtSecret: real-cluster-gate-only
+`, version))
+}
+
+func assertNoScratch(t *testing.T, ctx context.Context, r k3s.Runner) {
+	t.Helper()
+	left := kubectlOut(t, ctx, r,
+		"get namespaces -l kubenest.io/restore-drill=scratch -o jsonpath='{.items[*].metadata.name}'")
+	if left != "" {
+		t.Fatalf("restore drill left scratch namespaces behind: %s", left)
+	}
 }
 
 func minioManifests() string {
@@ -253,9 +397,10 @@ apiVersion: v1
 kind: Service
 metadata: {name: minio, namespace: %[1]s}
 spec:
+  type: NodePort
   selector: {app: minio}
-  ports: [{port: 9000, targetPort: 9000}]
-`, minioNamespace, minioImage, minioUser, minioPassword)
+  ports: [{port: 9000, targetPort: 9000, nodePort: %[5]d}]
+`, minioNamespace, minioImage, minioUser, minioPassword, minioNodePort)
 }
 
 func proofManifests(proof string) string {
@@ -355,6 +500,38 @@ func waitFor(t *testing.T, ctx context.Context, r k3s.Runner, name string, deadl
 
 func podsReadyIn(r k3s.Runner, namespace string) converge.Probe {
 	return k3s.PodsReadyProbe(r, namespace)
+}
+
+func podsRunningIn(r k3s.Runner, namespace string) converge.Probe {
+	return func(ctx context.Context) (bool, converge.State, error) {
+		out, err := k3s.Kubectl(ctx, r,
+			"get pods -n "+namespace+` -o jsonpath='{.items[*].status.phase}'`)
+		if err != nil {
+			return false, converge.State{Object: "pods in " + namespace, Status: "unobservable"}, err
+		}
+		phases := strings.Fields(out)
+		if len(phases) > 0 {
+			for _, phase := range phases {
+				if phase != "Running" {
+					return false, converge.State{Object: "pods in " + namespace, Status: strings.Join(phases, " ")}, nil
+				}
+			}
+			return true, converge.State{Object: "pods in " + namespace, Status: "Running"}, nil
+		}
+		return false, converge.State{Object: "pods in " + namespace, Status: "none"}, nil
+	}
+}
+
+func remoteOut(t *testing.T, ctx context.Context, r k3s.Runner, command string) string {
+	t.Helper()
+	res, err := r.Run(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("remote command failed with exit %d: %s", res.ExitCode, res.Stderr)
+	}
+	return strings.TrimSpace(res.Stdout)
 }
 
 func nodeReadyProbe(r k3s.Runner) converge.Probe {

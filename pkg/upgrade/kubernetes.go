@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -285,7 +286,7 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manif
 	}
 	patch := fmt.Sprintf(`{"spec":{"version":%q}}`, version)
 	if _, err := k3s.Kubectl(ctx, r,
-		fmt.Sprintf("patch helmchart kubenest-agent -n kube-system --type merge -p %s", shellQuote(patch))); err != nil {
+		fmt.Sprintf("patch helmchart %s -n kube-system --type merge -p %s", agent.ReleaseName(), shellQuote(patch))); err != nil {
 		return fmt.Errorf("moving the agent chart to %s: %w", version, err)
 	}
 
@@ -302,9 +303,9 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manif
 // and the deployment to be Available again.
 func agentUpgradedProbe(r k3s.Runner, version string) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get helmchart kubenest-agent -n kube-system -o jsonpath='{.spec.version}'")
+		out, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.version}'")
 		if err != nil {
-			return false, converge.State{Object: "helmchart kubenest-agent", Status: "unobservable"}, err
+			return false, converge.State{Object: "helmchart " + agent.ReleaseName(), Status: "unobservable"}, err
 		}
 		if got := strings.Trim(strings.TrimSpace(out), "'"); got != version {
 			return false, converge.State{
@@ -313,7 +314,7 @@ func agentUpgradedProbe(r k3s.Runner, version string) converge.Probe {
 			}, nil
 		}
 		out, err = k3s.Kubectl(ctx, r,
-			"get deployment -n kubenest-system -l app.kubernetes.io/name=kubenest-operator-2 -o jsonpath='{.items[*].status.conditions[?(@.type==\"Available\")].status}'")
+			"get deployment "+agent.DeploymentName+" -n kubenest-system -o jsonpath='{.status.conditions[?(@.type==\"Available\")].status}'")
 		if err != nil {
 			return false, converge.State{Object: "the agent deployment", Status: "unobservable"}, err
 		}

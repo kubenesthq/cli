@@ -21,14 +21,27 @@ const (
 )
 
 type DrillResult struct {
-	Status      string `json:"status"`
-	CompletedAt string `json:"completed_at"`
-	Backup      string `json:"backup"`
-	Failure     *struct {
+	Status          string             `json:"status"`
+	CompletedAt     string             `json:"completed_at"`
+	Backup          string             `json:"backup"`
+	DurationSeconds float64            `json:"duration_seconds"`
+	Verification    *DrillVerification `json:"verification,omitempty"`
+	Failure         *struct {
 		Stage      string `json:"stage"`
 		ReasonCode string `json:"reason_code"`
 		Detail     string `json:"detail"`
 	} `json:"failure,omitempty"`
+}
+
+type DrillVerification struct {
+	Mode    string           `json:"mode"`
+	Objects DrillMatchCounts `json:"objects"`
+	PVCData DrillMatchCounts `json:"pvc_data"`
+}
+
+type DrillMatchCounts struct {
+	Restored int `json:"restored"`
+	Matched  int `json:"matched"`
 }
 
 // RequestDrill asks the always-on operator to run the latest-backup drill and

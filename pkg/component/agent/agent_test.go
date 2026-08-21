@@ -63,6 +63,13 @@ func TestChartUsesTheMintedRefAndTheBundlePin(t *testing.T) {
 	if chart.Repo != "" {
 		t.Errorf("an oci:// chart carries its own registry, got repo %q", chart.Repo)
 	}
+	if chart.Name != "operator" {
+		t.Errorf("release name is %q — the chart's metrics service is <release>-kubenest-operator-2-controller-manager-metrics-service, and Kubernetes refuses names over 63 characters", chart.Name)
+	}
+	if len(chart.Name+"-kubenest-operator-2-controller-manager-metrics-service") > 63 {
+		t.Errorf("the metrics service name would be %d characters, over Kubernetes' 63-character limit",
+			len(chart.Name+"-kubenest-operator-2-controller-manager-metrics-service"))
+	}
 	if chart.TargetNamespace != "kubenest-system" {
 		t.Errorf("namespace is %q, want the minted one", chart.TargetNamespace)
 	}
