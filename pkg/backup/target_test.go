@@ -253,8 +253,12 @@ func TestConfigureWritesTheManifestSchedule(t *testing.T) {
 		var schedule struct {
 			Metadata map[string]string `yaml:"metadata"`
 			Spec     struct {
-				Schedule string            `yaml:"schedule"`
-				Template map[string]string `yaml:"template"`
+				Schedule string `yaml:"schedule"`
+				Template struct {
+					StorageLocation    string   `yaml:"storageLocation"`
+					TTL                string   `yaml:"ttl"`
+					ExcludedNamespaces []string `yaml:"excludedNamespaces"`
+				} `yaml:"template"`
 			} `yaml:"spec"`
 		}
 		if err := yaml.Unmarshal([]byte(doc), &schedule); err != nil {
@@ -266,11 +270,14 @@ func TestConfigureWritesTheManifestSchedule(t *testing.T) {
 		if schedule.Spec.Schedule != "0 2 * * *" {
 			t.Errorf("cron = %q, want 0 2 * * *", schedule.Spec.Schedule)
 		}
-		if schedule.Spec.Template["ttl"] != "336h0m0s" {
-			t.Errorf("ttl = %q, want 336h0m0s (14 × 24h)", schedule.Spec.Template["ttl"])
+		if schedule.Spec.Template.TTL != "336h0m0s" {
+			t.Errorf("ttl = %q, want 336h0m0s (14 × 24h)", schedule.Spec.Template.TTL)
 		}
-		if schedule.Spec.Template["storageLocation"] != StorageLocationName {
-			t.Errorf("storageLocation = %q", schedule.Spec.Template["storageLocation"])
+		if schedule.Spec.Template.StorageLocation != StorageLocationName {
+			t.Errorf("storageLocation = %q", schedule.Spec.Template.StorageLocation)
+		}
+		if got := strings.Join(schedule.Spec.Template.ExcludedNamespaces, ","); got != "velero,kube-system,kube-public,kube-node-lease,kubenest-system" {
+			t.Errorf("excludedNamespaces = %q", got)
 		}
 		return
 	}

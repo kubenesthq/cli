@@ -368,7 +368,7 @@ spec:
   createNamespace: true
   valuesContent: |-
     bootstrap:
-      argocd: {enabled: false}
+      argocd: {enabled: true}
       certManager: {enabled: false}
       gitea: {enabled: false}
       vault: {enabled: false}

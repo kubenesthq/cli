@@ -20,6 +20,9 @@ func bundle(t *testing.T) *manifest.Manifest {
 	return m
 }
 
+// tokenFilePath is where the join credential lives on a node.
+const tokenFilePath = "/etc/rancher/kubenest-join-token"
+
 const readyNode = `{"items":[{"metadata":{"name":"node-1"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}`
 
 // The three flags are not style. --cluster-init is decision A (embedded etcd
@@ -132,14 +135,24 @@ func TestJoinTokenNeverAppearsOnACommandLine(t *testing.T) {
 			t.Errorf("a joining server must use --token-file: %s", c)
 		}
 	}
-	var removed bool
+	// And it must NOT be removed. k3s bakes --token-file into the systemd
+	// unit, so the file is read on every start of the service, not only at
+	// join. Removing it leaves a node that works until its first restart and
+	// then hangs forever waiting for a file that no longer exists — observed
+	// on a real cluster during an upgrade, and it would happen on any reboot.
 	for _, c := range fake.Commands() {
-		if strings.Contains(c, "rm -f /etc/rancher/kubenest-join-token") {
-			removed = true
+		if strings.Contains(c, "rm -f") && strings.Contains(c, tokenFilePath) {
+			t.Errorf("the token file must persist: k3s reads it on every restart, not only at join:\n  %s", c)
 		}
 	}
-	if !removed {
-		t.Error("the staged token file must be removed once k3s has its own copy")
+	var staged bool
+	for _, c := range fake.Commands() {
+		if strings.Contains(c, "install -m 0600") && strings.Contains(c, tokenFilePath) {
+			staged = true
+		}
+	}
+	if !staged {
+		t.Error("the token must be staged as a root-only 0600 file")
 	}
 }
 

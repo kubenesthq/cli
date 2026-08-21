@@ -36,10 +36,31 @@ var serverFlags = []string{"--cluster-init", "--disable", "traefik", "--disable"
 // it rather than on a string literal it copied.
 func ServerFlags() []string { return append([]string(nil), serverFlags...) }
 
-// tokenFile is where a joining node's cluster token is staged. Root-only, and
-// removed as soon as the installer has read it — the token is never passed on
-// a command line, because a command line is visible in the target host's
-// process list.
+// tokenFile is where a joining node's cluster token lives. Root-only, and
+// PERMANENT — see below.
+//
+// The token never travels on a command line, because a command line is
+// visible in the target host's process list. It goes to a 0600 file owned by
+// root and is passed as --token-file.
+//
+// AND IT MUST STAY THERE. k3s bakes the --token-file flag into the systemd
+// unit it writes, so the file is read again on every start of the service,
+// not only at join. Deleting it after a successful join — which this code did
+// — leaves a node that works perfectly until the first time it restarts, and
+// then hangs forever on:
+//
+//	Waiting for file "/etc/rancher/kubenest-join-token" to be created
+//
+// Found on a real two-node cluster during an upgrade: the agent drained,
+// restarted onto the new version, and never came back. The same would happen
+// on a kured reboot, or any reboot at all. A node that installs cleanly and
+// dies at its first restart is precisely the day-2 failure this product
+// exists to prevent, and no unit test would have shown it.
+//
+// k3s's own installer stores the token on disk too (K3S_TOKEN lands in the
+// service's environment file), so this is the upstream shape rather than a
+// concession: a joining node needs its credential at every start, and the
+// protection that matters is the file's ownership and mode.
 const tokenFile = "/etc/rancher/kubenest-join-token"
 
 // ServerOptions configures one control-plane node's install.
@@ -86,7 +107,6 @@ func InstallServer(ctx context.Context, r Runner, bundle *manifest.Manifest, opt
 		if err := writeTokenFile(ctx, r, opts.Token); err != nil {
 			return err
 		}
-		defer removeTokenFile(context.WithoutCancel(ctx), r)
 		args = append(args, "--server", opts.JoinURL, "--token-file", tokenFile)
 	}
 
@@ -121,8 +141,6 @@ func InstallAgent(ctx context.Context, r Runner, bundle *manifest.Manifest, serv
 	if err := writeTokenFile(ctx, r, token); err != nil {
 		return err
 	}
-	defer removeTokenFile(context.WithoutCancel(ctx), r)
-
 	return runInstaller(ctx, r, version, []string{"agent", "--server", serverURL, "--token-file", tokenFile})
 }
 
@@ -195,12 +213,6 @@ func writeTokenFile(ctx context.Context, r Runner, token string) error {
 		return fmt.Errorf("staging the cluster token: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
 	}
 	return nil
-}
-
-func removeTokenFile(ctx context.Context, r Runner) {
-	// Best effort: k3s keeps its own copy under /var/lib/rancher once
-	// installed, so this file has no further purpose.
-	_, _ = r.Run(ctx, "sudo -n rm -f "+tokenFile)
 }
 
 // waitNodeReady waits for THIS node to report Ready, within the bundle's

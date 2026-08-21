@@ -28,6 +28,20 @@ const TargetSecretName = "kubenest-backup-target"
 // default schedule and for `kubenest backup now`.
 const StorageLocationName = "default"
 
+// workloadExcludedNamespaces belong to the cluster/platform itself. Their
+// authoritative recovery mechanism is the embedded-etcd snapshot; including
+// their short-lived Helm jobs, old ReplicaSet pods and Velero's own scratch
+// volumes in a filesystem backup makes healthy customer backups fail during
+// normal platform reconciliation. The dedicated restore-proof source is not
+// in this list and is therefore backed up with customer namespaces.
+var workloadExcludedNamespaces = []string{
+	Namespace,
+	"kube-system",
+	"kube-public",
+	"kube-node-lease",
+	"kubenest-system",
+}
+
 // Target is one cluster's S3-compatible backup destination, customer
 // supplied: endpoint, bucket and credentials are theirs (backup-restore.mdx
 // "Configuring a target").
@@ -324,8 +338,9 @@ func EnsureSchedule(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest
 		"spec": map[string]any{
 			"schedule": cron,
 			"template": map[string]any{
-				"storageLocation": StorageLocationName,
-				"ttl":             ttl.String(),
+				"storageLocation":    StorageLocationName,
+				"ttl":                ttl.String(),
+				"excludedNamespaces": workloadExcludedNamespaces,
 			},
 		},
 	})
@@ -389,8 +404,9 @@ func TakeBackup(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, na
 			"namespace": Namespace,
 		},
 		"spec": map[string]any{
-			"storageLocation": StorageLocationName,
-			"ttl":             ttl.String(),
+			"storageLocation":    StorageLocationName,
+			"ttl":                ttl.String(),
+			"excludedNamespaces": workloadExcludedNamespaces,
 		},
 	})
 	if err != nil {
