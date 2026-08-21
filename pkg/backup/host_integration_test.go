@@ -41,6 +41,7 @@ package backup_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"strings"
@@ -217,7 +218,8 @@ func TestBackupOnRealHost(t *testing.T) {
 	}
 	installDrillOperator(t, ctx, client, agentVersion)
 	waitFor(t, ctx, client, "operator-running", componentReady, podsRunningIn(client, "kubenest-system"))
-	waitFor(t, ctx, client, "restore-proof-source-ready", componentReady, podsReadyIn(client, "kubenest-restore-drill-source"))
+	waitFor(t, ctx, client, "restore-proof-source-ready", componentReady,
+		restoreProofReadyForImage(client, "ghcr.io/kubenesthq/operatorv2:"+agentVersion))
 
 	// The schedule on the cluster is the manifest's (decision E), not a
 	// constant's: daily at 02:00, retention 14 × 24h.
@@ -385,6 +387,83 @@ func assertNoScratch(t *testing.T, ctx context.Context, r k3s.Runner) {
 		"get namespaces -l kubenest.io/restore-drill=scratch -o jsonpath='{.items[*].metadata.name}'")
 	if left != "" {
 		t.Fatalf("restore drill left scratch namespaces behind: %s", left)
+	}
+}
+
+func restoreProofReadyForImage(r k3s.Runner, image string) converge.Probe {
+	type proofPod struct {
+		Metadata struct {
+			CreationTimestamp string `json:"creationTimestamp"`
+		} `json:"metadata"`
+		Spec struct {
+			Containers []struct {
+				Image string `json:"image"`
+			} `json:"containers"`
+		} `json:"spec"`
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	type proofConfig struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	return func(ctx context.Context) (bool, converge.State, error) {
+		state := converge.State{Object: "restore proof source", Status: "not ready"}
+		raw, err := k3s.Kubectl(ctx, r,
+			"get pod kubenest-restore-proof -n kubenest-restore-drill-source -o json")
+		if err != nil {
+			return false, state, err
+		}
+		var pod proofPod
+		if err := json.Unmarshal([]byte(raw), &pod); err != nil {
+			return false, state, err
+		}
+		if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Image != image {
+			state.Status = "waiting for bundle-pinned proof image"
+			return false, state, nil
+		}
+		ready := false
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == "Ready" && condition.Status == "True" {
+				ready = true
+				break
+			}
+		}
+		if !ready {
+			state.Status = "bundle-pinned proof pod is not Ready"
+			return false, state, nil
+		}
+
+		raw, err = k3s.Kubectl(ctx, r,
+			"get configmap kubenest-restore-proof -n kubenest-restore-drill-source -o json")
+		if err != nil {
+			return false, state, err
+		}
+		var config proofConfig
+		if err := json.Unmarshal([]byte(raw), &config); err != nil {
+			return false, state, err
+		}
+		readyAt, err := time.Parse(time.RFC3339, config.Metadata.Annotations["kubenest.io/restore-drill-ready-at"])
+		if err != nil {
+			state.Status = "waiting for proof readiness timestamp"
+			return false, state, nil
+		}
+		createdAt, err := time.Parse(time.RFC3339, pod.Metadata.CreationTimestamp)
+		if err != nil {
+			return false, state, err
+		}
+		if readyAt.Before(createdAt) {
+			state.Status = "proof readiness predates the pinned pod"
+			return false, state, nil
+		}
+		state.Status = "Ready"
+		state.Detail = image
+		return true, state, nil
 	}
 }
 
