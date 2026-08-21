@@ -219,7 +219,7 @@ func TestBackupOnRealHost(t *testing.T) {
 	installDrillOperator(t, ctx, client, agentVersion)
 	waitFor(t, ctx, client, "operator-running", componentReady, podsRunningIn(client, "kubenest-system"))
 	waitFor(t, ctx, client, "restore-proof-source-ready", componentReady,
-		restoreProofReadyForImage(client, "ghcr.io/kubenesthq/operatorv2:"+agentVersion))
+		restoreProofReadyForOperator(client))
 
 	// The schedule on the cluster is the manifest's (decision E), not a
 	// constant's: daily at 02:00, retention 14 × 24h.
@@ -390,7 +390,7 @@ func assertNoScratch(t *testing.T, ctx context.Context, r k3s.Runner) {
 	}
 }
 
-func restoreProofReadyForImage(r k3s.Runner, image string) converge.Probe {
+func restoreProofReadyForOperator(r k3s.Runner) converge.Probe {
 	type proofPod struct {
 		Metadata struct {
 			CreationTimestamp string `json:"creationTimestamp"`
@@ -414,6 +414,17 @@ func restoreProofReadyForImage(r k3s.Runner, image string) converge.Probe {
 	}
 	return func(ctx context.Context) (bool, converge.State, error) {
 		state := converge.State{Object: "restore proof source", Status: "not ready"}
+		image, err := k3s.Kubectl(ctx, r,
+			"get deployment operator-kubenest-operator-2-controller-manager -n kubenest-system "+
+				"-o jsonpath='{.spec.template.spec.containers[0].image}'")
+		if err != nil {
+			return false, state, err
+		}
+		image = strings.TrimSpace(image)
+		if image == "" {
+			state.Status = "waiting for deployed operator image"
+			return false, state, nil
+		}
 		raw, err := k3s.Kubectl(ctx, r,
 			"get pod kubenest-restore-proof -n kubenest-restore-drill-source -o json")
 		if err != nil {
