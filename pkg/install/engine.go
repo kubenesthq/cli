@@ -273,6 +273,16 @@ func Execute(ctx context.Context, s *Session, stages []Stage) (Result, error) {
 		if runErr != nil {
 			runErr = annotateDeadline(ctx, stage.Name, total, runErr)
 			reason := ReasonCode(stage.Name)
+			// WHICH component failed, not which one the stage happens to
+			// list first. platform-networking installs the Gateway API CRDs
+			// and Traefik; platform-day2 installs system-upgrade-controller
+			// and kured. The failing call tags its own error, and that tag
+			// wins over the stage's declared component for the failed
+			// event and the failed journal entry alike.
+			if actual := ComponentOf(runErr); actual != "" {
+				event.Component = actual
+				stage.Component = actual
+			}
 			// Everything that leaves this process — the wire event and the
 			// journal — is sanitized. The text comes from component
 			// installers and remote shells, so "no secrets, no raw command

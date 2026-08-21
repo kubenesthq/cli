@@ -107,7 +107,7 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 	// install see the same thirteen stages.
 	session.Emitter = install.Emitters{
 		install.TextEmitter{W: out},
-		install.ControlPlaneEmitter{Client: client, Session: session},
+		install.NewControlPlaneEmitter(client, session),
 	}
 
 	fmt.Fprintf(out, "Installing platform bundle %s on %d node(s), %s tier.\n",

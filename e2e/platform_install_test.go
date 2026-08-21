@@ -112,7 +112,7 @@ func session(t *testing.T, env gateEnv, journalPath string, bundle *manifest.Man
 	}
 	s.Emitter = install.Emitters{
 		install.TextEmitter{W: testWriter{t}},
-		install.ControlPlaneEmitter{Client: client, Session: s},
+		install.NewControlPlaneEmitter(client, s),
 	}
 	return s, client
 }

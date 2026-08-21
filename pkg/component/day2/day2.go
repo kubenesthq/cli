@@ -61,14 +61,20 @@ var ReleaseBaseURL = "https://github.com/rancher/system-upgrade-controller/relea
 const UpgradePlanCRD = "plans.upgrade.cattle.io"
 
 // Install places both day-2 components and waits for each to be Ready.
+//
+// The halves are also exported separately, because the installer has to be
+// able to say WHICH of them failed: a stage-level component name reports
+// system-upgrade-controller when kured is what broke, and a record that names
+// the wrong thing is worse than one that names nothing.
 func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep converge.Reporter) error {
-	if err := installUpgradeController(ctx, r, bundle, rep); err != nil {
+	if err := InstallUpgradeController(ctx, r, bundle, rep); err != nil {
 		return err
 	}
-	return installKured(ctx, r, bundle, rep)
+	return InstallKured(ctx, r, bundle, rep)
 }
 
-func installUpgradeController(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep converge.Reporter) error {
+// InstallUpgradeController places system-upgrade-controller and its CRDs.
+func InstallUpgradeController(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep converge.Reporter) error {
 	version, err := bundle.Core.Version("system-upgrade-controller")
 	if err != nil {
 		return err
@@ -131,7 +137,8 @@ func Chart(bundle *manifest.Manifest) (k3s.HelmChart, error) {
 	}, nil
 }
 
-func installKured(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep converge.Reporter) error {
+// InstallKured places kured.
+func InstallKured(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep converge.Reporter) error {
 	chart, err := Chart(bundle)
 	if err != nil {
 		return err
