@@ -75,6 +75,8 @@ func NewPlatformCommand() *cobra.Command {
 		newPlatformInstallCommand(),
 		newPlatformUninstallCommand(),
 		newPlatformUpgradeCommand(),
+		newPlatformRollbackCommand(),
+		newPlatformDiffCommand(),
 	)
 	return cmd
 }
@@ -166,12 +168,88 @@ is treated as yours.`,
 }
 
 func newPlatformUpgradeCommand() *cobra.Command {
+	var f UpgradeFlags
+
 	cmd := &cobra.Command{
 		Use:   "upgrade",
 		Short: "Upgrade the cluster to a newer platform bundle",
+		Long: `Move a cluster from its current platform bundle to a newer one, as one
+versioned unit: every component, and Kubernetes itself.
+
+Components first, Kubernetes last. Everything before the kubernetes stage is a
+Helm release and reverts in seconds; Kubernetes does not roll back at all, so
+reverting it means restoring the datastore snapshot taken before anything
+changed. Putting the irreversible step last means most failures cost seconds.
+
+Every pre-flight gate runs before anything is touched, and the one that
+matters most scans your live workloads for APIs the target Kubernetes version
+removes. If it finds any, the upgrade is blocked and the report names them: an
+upgrade that cleanly upgrades the cluster and takes your product down has
+actively harmed you.`,
+		Example: `  kubenest platform upgrade --cluster prod-1 --to 1.1
+
+  # Accept one finding you have judged safe. There is no blanket override.
+  kubenest platform upgrade --cluster prod-1 --to 1.1 \
+    --acknowledge payments/Ingress/legacy-gateway`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotYetImplemented("kubenest platform upgrade")
+			if f.Cluster == "" {
+				return fmt.Errorf("--cluster is required: which cluster to upgrade")
+			}
+			if f.To == "" {
+				return fmt.Errorf("--to is required: the bundle version to upgrade to (see `kubenest platform diff`)")
+			}
+			return runUpgrade(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
+	fs := cmd.Flags()
+	fs.StringVar(&f.Cluster, "cluster", "", "cluster to upgrade (required)")
+	fs.StringVar(&f.To, "to", "", "bundle version to upgrade to (required)")
+	fs.StringArrayVar(&f.Acknowledge, "acknowledge", nil, "accept one deprecated-API finding by namespace/Kind/name (repeatable; there is deliberately no blanket override)")
+	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without a local install journal)")
+	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")
+	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")
+	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
+	return cmd
+}
+
+func newPlatformRollbackCommand() *cobra.Command {
+	var (
+		f       UpgradeFlags
+		confirm bool
+	)
+	cmd := &cobra.Command{
+		Use:   "rollback",
+		Short: "Return a cluster to the bundle it was upgraded from",
+		Long: `Return a cluster to the bundle it was upgraded from.
+
+What that means depends on where the upgrade stopped, and the two are not the
+same thing:
+
+  Before the kubernetes stage — every component is a Helm release and reverts
+  to its previous revision in seconds. Nothing is lost.
+
+  After it — Kubernetes does not downgrade, so this restores the datastore
+  snapshot taken before the upgrade began. That is a genuine restore with a
+  service interruption, and it does NOT touch your persistent volumes:
+  database contents and uploaded files survive, because rolling application
+  data back to the start of the window would discard every transaction since.
+
+The mechanism is reported before anything happens, and the expensive one asks
+for confirmation.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if f.Cluster == "" {
+				return fmt.Errorf("--cluster is required: which cluster to roll back")
+			}
+			return runRollback(cmd.Context(), cmd.OutOrStdout(), cmd.InOrStdin(), f, confirm)
+		},
+	}
+	fs := cmd.Flags()
+	fs.StringVar(&f.Cluster, "cluster", "", "cluster to roll back (required)")
+	fs.StringVar(&f.To, "to", "", "the bundle version the upgrade was moving to; defaults to the journal's")
+	fs.BoolVar(&confirm, "confirm", false, "confirm a datastore restore, which interrupts service")
+	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without a local install journal)")
+	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")
+	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")
+	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	return cmd
 }

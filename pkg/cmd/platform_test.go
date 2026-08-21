@@ -46,17 +46,30 @@ func TestInstallFlagsValidate(t *testing.T) {
 	}
 }
 
-// `platform upgrade` is still a skeleton and must say so rather than pretend.
-func TestUpgradeSkeletonFailsLoudly(t *testing.T) {
+// Every platform command is implemented now. What is asserted here is that
+// each still refuses loudly rather than pretending: a command that cannot do
+// its job must exit non-zero and say why.
+func TestUpgradeRefusesWithoutItsRequiredFlags(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := NewRootCommand()
-	root.SetArgs([]string{"platform", "upgrade"})
-	err := root.Execute()
-	if err == nil {
-		t.Fatal("a skeleton command must exit non-zero, not pretend success")
-	}
-	if !strings.Contains(err.Error(), "not available") {
-		t.Errorf("skeleton error should say the command is not available yet, got: %v", err)
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"platform", "upgrade"}, "--cluster is required"},
+		{[]string{"platform", "upgrade", "--cluster", "prod-1"}, "--to is required"},
+		{[]string{"platform", "rollback"}, "--cluster is required"},
+		{[]string{"platform", "diff", "--from", "1.0"}, "--from and --to"},
+		{[]string{"cluster", "set-window"}, "--cluster is required"},
+	} {
+		root := NewRootCommand()
+		root.SetArgs(c.args)
+		err := root.Execute()
+		if err == nil {
+			t.Fatalf("%v must refuse", c.args)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v: want %q, got: %v", c.args, c.want, err)
+		}
 	}
 }
 

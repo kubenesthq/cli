@@ -27,18 +27,28 @@ import (
 // fail cost seconds because of where the irreversible step sits, not because
 // of any recovery machinery.
 func Plan(s *Session) []stages.Stage {
-	bind := func(f func(context.Context, *Session) error) stages.StageFunc {
-		return func(ctx context.Context) error { return f(ctx, s) }
+	// Every stage checks the maintenance window before it starts. THE RULE:
+	// no new stage starts once the window has closed, but the stage in
+	// progress finishes — abandoning a half-completed stage to respect a
+	// clock leaves the cluster in a worse state than the overrun does.
+	// windowExempt says which stages are never paused and why.
+	bind := func(name string, f func(context.Context, *Session) error) stages.StageFunc {
+		return func(ctx context.Context) error {
+			if err := s.windowStillOpen(name); err != nil {
+				return err
+			}
+			return f(ctx, s)
+		}
 	}
 	return []stages.Stage{
-		{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
-		{Name: StageBackup, Component: "velero", AlwaysRun: true, Run: bind(stageBackup)},
-		{Name: StageComponents, Run: bind(stageComponents)},
-		{Name: StageProfiles, Run: bind(stageProfiles)},
-		{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
-		{Name: StageKubernetes, Component: "k3s", Run: bind(stageKubernetes)},
-		{Name: StageVerify, AlwaysRun: true, Run: bind(stageVerify)},
-		{Name: StageRecord, Run: bind(stageRecord)},
+		{Name: StagePreflight, AlwaysRun: true, Run: bind(StagePreflight, stagePreflight)},
+		{Name: StageBackup, Component: "velero", AlwaysRun: true, Run: bind(StageBackup, stageBackup)},
+		{Name: StageComponents, Run: bind(StageComponents, stageComponents)},
+		{Name: StageProfiles, Run: bind(StageProfiles, stageProfiles)},
+		{Name: StageAgent, Component: "kubenest-agent", Run: bind(StageAgent, stageAgent)},
+		{Name: StageKubernetes, Component: "k3s", Run: bind(StageKubernetes, stageKubernetes)},
+		{Name: StageVerify, AlwaysRun: true, Run: bind(StageVerify, stageVerify)},
+		{Name: StageRecord, Run: bind(StageRecord, stageRecord)},
 	}
 }
 

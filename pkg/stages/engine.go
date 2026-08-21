@@ -29,6 +29,9 @@ type Controller interface {
 	TotalDeadline() (time.Duration, error)
 	// Logf writes narrative that is not a stage transition.
 	Logf(format string, args ...any)
+	// ResumeAdvice is what to do after a clean pause, in the operation's own
+	// words. Empty when the operation has no pause path.
+	ResumeAdvice() string
 	// Exits are the supported ways on from a failure, in the operation's own
 	// words — an install offers resume or uninstall, an upgrade offers
 	// resume or rollback. Every failure message prints them, because a
@@ -48,6 +51,8 @@ type Result struct {
 	Skipped []string
 	// Ran names the stages this process executed.
 	Ran []string
+	// Paused names the stage a clean pause stopped before, empty otherwise.
+	Paused string
 }
 
 // StageError is a failed stage: which stage, which component, what to do
@@ -171,6 +176,22 @@ func Execute(ctx context.Context, c Controller, sequence []Stage) (Result, error
 		}
 
 		runErr := stage.Run(ctx)
+		if errors.Is(runErr, ErrPaused) {
+			// A pause is not a failure: no terminal entry, no failed event,
+			// no failed cluster state. The stage's `started` entry stands,
+			// which is what "in progress" looks like, and a resume re-runs
+			// it because it never completed.
+			reason := strings.TrimPrefix(runErr.Error(), ErrPaused.Error()+": ")
+			c.Logf("  %s", reason)
+			result.Elapsed = time.Since(started)
+			result.Paused = stage.Name
+			return result, &PausedError{
+				Stage:       stage.Name,
+				Reason:      reason,
+				JournalPath: journal.Path(),
+				Resume:      c.ResumeAdvice(),
+			}
+		}
 		if runErr != nil {
 			runErr = annotateDeadline(ctx, stage.Name, total, runErr)
 			reason := ReasonCode(stage.Name)
@@ -265,3 +286,44 @@ func NewRunID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// ErrPaused ends a sequence WITHOUT failing it.
+//
+// It exists for one situation, and the reasoning generalises: an upgrade's
+// maintenance window closes mid-run. The rule there is that no new stage
+// starts but the stage in progress finishes, because abandoning a
+// half-completed stage to respect a clock leaves the cluster worse than the
+// overrun does. A pause is not a failure — nothing is wrong, the operation
+// simply stopped where it was told to — so it must not mark the cluster
+// failed, must not emit a failed transition, and must not write a terminal
+// journal entry. The stage's `started` entry stands, which is exactly what
+// "in progress" looks like, and a resume re-runs it because it never
+// completed.
+var ErrPaused = errors.New("paused")
+
+// Paused wraps a reason as a pause. The reason is printed to the operator.
+func Paused(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrPaused, fmt.Sprintf(format, args...))
+}
+
+// PausedError reports a sequence that stopped cleanly rather than failing.
+type PausedError struct {
+	Stage       string
+	Reason      string
+	JournalPath string
+	// Resume is what to do to continue, in the operation's own words.
+	Resume string
+}
+
+func (e *PausedError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "paused before stage %s: %s\n", e.Stage, e.Reason)
+	fmt.Fprintf(&b, "\nNothing is wrong and nothing was left half-done. Completed stages are recorded\nin %s.\n", e.JournalPath)
+	if e.Resume != "" {
+		fmt.Fprintf(&b, "%s\n", e.Resume)
+	}
+	return b.String()
+}
+
+// Is makes errors.Is(err, ErrPaused) true for a PausedError.
+func (e *PausedError) Is(target error) bool { return target == ErrPaused }

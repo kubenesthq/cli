@@ -23,6 +23,7 @@
 package upgrade
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/window"
 )
@@ -232,4 +234,156 @@ func (s *Session) now() time.Time {
 // JournalPath is where this cluster's UPGRADE journal lives.
 func JournalPath(cluster string) (string, error) {
 	return stages.JournalPath(Kind, cluster)
+}
+
+// windowExempt names the stages the window never pauses before, and why each
+// one is exempt:
+//
+//	preflight  it is where the window is checked as a gate in the first
+//	           place, so pausing before it would be circular.
+//	backup     a rollback depends on the snapshot it takes; that is not
+//	           skipped for a clock.
+//	verify     pausing between the kubernetes stage and the verification of
+//	           it would leave a cluster upgraded and unverified until the
+//	           next window.
+//	record     the same, for the recording that follows verification.
+//
+// Everything expensive — components, profiles, the agent, and Kubernetes
+// itself — sits between backup and verify, and is not exempt.
+func windowExempt(stage string) bool {
+	switch stage {
+	case StagePreflight, StageBackup, StageVerify, StageRecord:
+		return true
+	}
+	return false
+}
+
+// windowStillOpen implements the maintenance-window rule for a stage that has
+// not started yet.
+func (s *Session) windowStillOpen(stage string) error {
+	if s.Window == nil || windowExempt(stage) {
+		return nil
+	}
+	if s.Window.Contains(s.now()) {
+		return nil
+	}
+	next := "the next window"
+	if at, ok := s.Window.NextOpen(s.now()); ok {
+		next = at.Format("Mon 2 Jan 15:04 MST")
+	}
+	return stages.Paused(
+		"the maintenance window %s has closed, so no new stage is starting. The stage that was running finished; the cluster is mid-upgrade and reports itself as such. The upgrade resumes at %s",
+		s.Window, next)
+}
+
+// ResumeAdvice is what to do after a clean pause.
+func (s *Session) ResumeAdvice() string {
+	return "Re-run the identical command inside the window and it will continue from here;\ncompleted stages are skipped."
+}
+
+// Connect opens a connection to every node. It is separate from the session
+// so a rollback can use the same session shape without running an upgrade.
+func (s *Session) Connect(ctx context.Context) error {
+	opts := sshx.Options{User: s.Opts.SSHUser, KeyPath: s.Opts.SSHKey, DialTimeout: 15 * time.Second}
+	dial := func(address string, server bool) error {
+		endpoint, err := sshx.Resolve(address, opts)
+		if err != nil {
+			return fmt.Errorf("%s: %w", address, err)
+		}
+		client, err := sshx.Dial(ctx, endpoint, opts)
+		if err != nil {
+			return fmt.Errorf("%s: %w", address, err)
+		}
+		s.closers = append(s.closers, client)
+		s.Nodes = append(s.Nodes, Node{Address: address, Server: server, Runner: client})
+		return nil
+	}
+	for _, address := range s.Opts.Servers {
+		if err := dial(address, true); err != nil {
+			return err
+		}
+	}
+	for _, address := range s.Opts.Agents {
+		if err := dial(address, false); err != nil {
+			return err
+		}
+	}
+	// The drill evidence comes from the cluster itself — the same object the
+	// agent reads to build its heartbeat, so the CLI and the control plane
+	// look at one source of truth rather than two representations of it.
+	if server, err := s.Server(); err == nil && s.Drills == nil {
+		s.Drills = InClusterDrills{Runner: server}
+	}
+	return s.loadRecord()
+}
+
+// loadRecord reads back what an earlier run of this upgrade remembered.
+func (s *Session) loadRecord() error {
+	if err := s.Jnl.DecodeState(&s.Record); err != nil {
+		return err
+	}
+	if s.Record.FromBundle == "" {
+		s.Record.FromBundle = s.From.Bundle
+		s.Record.ToBundle = s.Opts.To
+	}
+	return nil
+}
+
+// RollbackPlan describes what a rollback would do, without doing it.
+func (s *Session) RollbackPlan() RollbackPlan {
+	return PlanRollback(s.Jnl, s.From, s.To, s.Record)
+}
+
+// Rollback executes a plan. It never runs automatically: a failed stage
+// leaves the cluster where it is and prints both exits, because automatic
+// teardown destroys the evidence needed to diagnose the failure and can
+// itself fail.
+func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
+	server, err := s.Server()
+	if err != nil {
+		return err
+	}
+	switch plan.Mechanism {
+	case MechanismNothing:
+		return nil
+	case MechanismComponents:
+		if err := RevertComponents(ctx, server, s.From, s.Reporter, s.Logf); err != nil {
+			return err
+		}
+	case MechanismRestore:
+		s.Logf("  restoring datastore snapshot %s", plan.Snapshot)
+		if err := RestoreSnapshot(ctx, server, plan.Snapshot); err != nil {
+			return err
+		}
+		// The one residual worth naming: a PVC created during the upgrade
+		// window is gone from the restored cluster while its volume still
+		// exists on disk. Harmless until someone needs the space and cannot
+		// work out what is using it.
+		if orphans, err := OrphanedVolumes(ctx, server); err == nil && len(orphans) > 0 {
+			s.Logf("\n  %d volume(s) are now orphaned — their claims were created during the upgrade", len(orphans))
+			s.Logf("  window and do not exist in the restored cluster. Their DATA IS INTACT:")
+			for _, o := range orphans {
+				s.Logf("    %s", o)
+			}
+			s.Logf("  Reclaim or re-bind them deliberately; nothing here deletes them.")
+		}
+	}
+
+	// The cluster is back on the bundle it came from, and the record must
+	// say so: a record that claims the new version after a rollback is worse
+	// than no record, because every day-2 operation trusts it.
+	if s.API != nil && s.Jnl.ClusterID != "" {
+		if err := s.API.PutBundleRecord(ctx, s.Jnl.ClusterID, api.BundleRecord{
+			BundleVersion:        s.Record.FromBundle,
+			Profiles:             s.Cluster.Profiles,
+			HATier:               s.Cluster.HATier,
+			VolumeGroupOwnership: s.Cluster.VolumeGroupOwnership,
+			InstallJournal:       terminalEntries(s.Jnl),
+		}); err != nil {
+			return fmt.Errorf("the cluster was rolled back but its record could not be updated: %w", err)
+		}
+	}
+	// The upgrade journal has served its purpose; leaving it would make the
+	// next attempt resume into a cluster that no longer matches it.
+	return s.Jnl.Remove()
 }

@@ -133,6 +133,10 @@ func (s *Session) TotalDeadline() (time.Duration, error) {
 	return s.Bundle.Limits.Timeouts.For("install-total")
 }
 
+// ResumeAdvice is empty: an install has no pause path — it runs to
+// completion or it fails.
+func (s *Session) ResumeAdvice() string { return "" }
+
 // Exits are the two supported ways on from a failed install (install.mdx,
 // "When it fails").
 func (s *Session) Exits() []string { return exits }

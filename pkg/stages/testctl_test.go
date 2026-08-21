@@ -31,6 +31,8 @@ func (c *testController) TotalDeadline() (time.Duration, error) {
 	}
 	return c.total, nil
 }
+func (c *testController) ResumeAdvice() string { return "" }
+
 func (c *testController) Exits() []string {
 	return []string{
 		"resume     fix what the error names, then run the identical command again\n             (completed stages are skipped)",

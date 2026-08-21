@@ -33,6 +33,7 @@ uploaded to the control plane and never written to logs.`,
 		NewLoginCommand(),
 		NewLogoutCommand(),
 		NewPlatformCommand(),
+		NewClusterCommand(),
 		NewBackupCommand(),
 	)
 	return root

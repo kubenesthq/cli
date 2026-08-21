@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -204,6 +205,55 @@ func (c *Client) BundleRecord(ctx context.Context, clusterID string) (ClusterBun
 	var out ClusterBundle
 	if err := c.do(req, &out); err != nil {
 		return ClusterBundle{}, err
+	}
+	return out, nil
+}
+
+// MaintenanceWindow is the cluster's recurring window: the one definition
+// shared by everything that must not act outside it — bundle upgrades
+// (kn-fuo) and OS reboots (kn-nqj).
+//
+// The timezone is an IANA name and never an offset: offsets move twice a year
+// and a window that silently shifts by an hour is worse than no window, since
+// the customer set their local time and local is what they meant.
+type MaintenanceWindow struct {
+	Days     []string `json:"days"`
+	Start    string   `json:"start"`
+	End      string   `json:"end"`
+	Timezone string   `json:"timezone"`
+}
+
+// PutMaintenanceWindow sets the cluster's window.
+func (c *Client) PutMaintenanceWindow(ctx context.Context, clusterID string, w MaintenanceWindow) error {
+	body, err := json.Marshal(w)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/maintenance-window"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.do(req, nil)
+}
+
+// MaintenanceWindow reads the cluster's window. A cluster with none set
+// returns the zero value and no error: no window means any time is inside it.
+func (c *Client) MaintenanceWindow(ctx context.Context, clusterID string) (MaintenanceWindow, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/maintenance-window"), nil)
+	if err != nil {
+		return MaintenanceWindow{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	var out MaintenanceWindow
+	if err := c.do(req, &out); err != nil {
+		var apiErr *Error
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+			return MaintenanceWindow{}, nil
+		}
+		return MaintenanceWindow{}, err
 	}
 	return out, nil
 }
