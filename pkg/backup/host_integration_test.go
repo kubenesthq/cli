@@ -397,6 +397,18 @@ func assertNoScratch(t *testing.T, ctx context.Context, r k3s.Runner) {
 }
 
 func restoreProofReadyForOperator(r k3s.Runner) converge.Probe {
+	type operatorPodList struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Containers []struct {
+					Image string `json:"image"`
+				} `json:"containers"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
 	type proofPod struct {
 		Metadata struct {
 			CreationTimestamp string `json:"creationTimestamp"`
@@ -431,7 +443,34 @@ func restoreProofReadyForOperator(r k3s.Runner) converge.Probe {
 			state.Status = "waiting for deployed operator image"
 			return false, state, nil
 		}
+		holder, err := k3s.Kubectl(ctx, r,
+			"get lease kubenest-operator-leader-election -n kubenest-system "+
+				"-o jsonpath='{.spec.holderIdentity}'")
+		if err != nil {
+			return false, state, err
+		}
 		raw, err := k3s.Kubectl(ctx, r,
+			"get pods -n kubenest-system -l control-plane=controller-manager -o json")
+		if err != nil {
+			return false, state, err
+		}
+		var operators operatorPodList
+		if err := json.Unmarshal([]byte(raw), &operators); err != nil {
+			return false, state, err
+		}
+		pinnedLeader := false
+		for _, operator := range operators.Items {
+			if strings.HasPrefix(strings.TrimSpace(holder), operator.Metadata.Name+"_") &&
+				len(operator.Spec.Containers) == 1 && operator.Spec.Containers[0].Image == image {
+				pinnedLeader = true
+				break
+			}
+		}
+		if !pinnedLeader {
+			state.Status = "waiting for bundle-pinned operator to hold the leader lease"
+			return false, state, nil
+		}
+		raw, err = k3s.Kubectl(ctx, r,
 			"get pod kubenest-restore-proof -n kubenest-restore-drill-source -o json")
 		if err != nil {
 			return false, state, err
