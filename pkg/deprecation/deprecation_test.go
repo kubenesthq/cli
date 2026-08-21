@@ -119,7 +119,7 @@ func TestTheScanFailsClosed(t *testing.T) {
 			"detect-all-in-cluster": {Stdout: "panic: runtime error"},
 		},
 		"the scanner cannot be installed": {
-			"test -x":  {Stdout: "absent\n"},
+			"test -x":   {Stdout: "absent\n"},
 			"mktemp -d": {ExitCode: 1, Stderr: "curl: (6) Could not resolve host"},
 		},
 	}
@@ -141,7 +141,7 @@ func TestTheScanFailsClosed(t *testing.T) {
 // not the confidence the bundle promised.
 func TestAScannerThatIsNotThePinnedVersionIsRefused(t *testing.T) {
 	overrides := map[string]sshx.Result{
-		"test -x":         {Stdout: "absent\n"},
+		"test -x":          {Stdout: "absent\n"},
 		"pluto-v5.24.3 ve": {Stdout: "Version:5.19.0\n"},
 	}
 	_, err := deprecation.Scan(context.Background(), runner(t, plutoFindings, overrides), bundle(t), nil, "v1.36.3+k3s1")
