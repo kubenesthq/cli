@@ -112,7 +112,17 @@ type availabilityProbe struct {
 	failures []string
 }
 
-func pollWorkload(t *testing.T, runner k3s.Runner, target string) *availabilityProbe {
+// pollWorkload polls the workload through EVERY node once a second and counts
+// a tick as a failure only when every node fails.
+//
+// That definition matters. Polling a single node's NodePort measures whether
+// THAT NODE is serving, and during a rolling upgrade the node being drained is
+// briefly not — which is expected and is not the workload being down. A
+// customer reaches the workload through whichever node is up; so does this.
+// Measuring through the node under upgrade conflates node availability with
+// workload availability, and the difference showed up as exactly one failed
+// probe in 142 on a run whose workload never actually stopped serving.
+func pollWorkload(t *testing.T, runner k3s.Runner, targets []string) *availabilityProbe {
 	t.Helper()
 	p := &availabilityProbe{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
@@ -123,20 +133,30 @@ func pollWorkload(t *testing.T, runner k3s.Runner, target string) *availabilityP
 				return
 			default:
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			res, err := runner.Run(ctx, fmt.Sprintf(
-				`curl -s -o /dev/null -w '%%{http_code}' --max-time 3 http://%s/`, target))
-			cancel()
+			var reasons []string
+			served := false
+			for _, target := range targets {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				res, err := runner.Run(ctx, fmt.Sprintf(
+					`curl -s -o /dev/null -w '%%{http_code}' --max-time 3 http://%s/`, target))
+				cancel()
+				switch {
+				case err != nil:
+					reasons = append(reasons, fmt.Sprintf("%s probe error: %v", target, err))
+				case strings.TrimSpace(res.Stdout) == "200":
+					served = true
+				default:
+					reasons = append(reasons, fmt.Sprintf("%s HTTP %q", target, strings.TrimSpace(res.Stdout)))
+				}
+				if served {
+					break
+				}
+			}
 			p.mu.Lock()
 			p.attempts++
-			switch {
-			case err != nil:
-				// The SSH hop itself failed: on the single-server tier the
-				// control-plane node's API is briefly away, but SSH is not,
-				// so this is recorded rather than excused.
-				p.failures = append(p.failures, fmt.Sprintf("%s probe error: %v", time.Now().Format("15:04:05"), err))
-			case strings.TrimSpace(res.Stdout) != "200":
-				p.failures = append(p.failures, fmt.Sprintf("%s HTTP %q", time.Now().Format("15:04:05"), strings.TrimSpace(res.Stdout)))
+			if !served {
+				p.failures = append(p.failures,
+					fmt.Sprintf("%s: %s", time.Now().Format("15:04:05"), strings.Join(reasons, "; ")))
 			}
 			p.mu.Unlock()
 			time.Sleep(time.Second)
@@ -261,7 +281,7 @@ data:
 		// weakening it.
 		waitForNodeDwell(t, ctx, server.Runner, fetchBundle(t, client, to))
 
-		probe := pollWorkload(t, server.Runner, env.server+":30080")
+		probe := pollWorkload(t, server.Runner, []string{env.server + ":30080", env.agent + ":30080"})
 
 		s := upgradeSession(t, env, client, from, to, nil)
 		defer s.Close()
@@ -336,12 +356,17 @@ data:
 		// revert. Asking for an older bundle would be a downgrade, which the
 		// bundle-path gate now refuses outright — Kubernetes does not go
 		// backwards and pretending otherwise in a test would prove nothing.
+		// A forward transition with the SAME Kubernetes pin: the bundle-path
+		// gate refuses both a downgrade and a move to the version already
+		// installed, and it is right about both, so the failure lane has to
+		// be a genuine step forward that fails on a component.
+		const poisonedVersion = "1.1"
 		poisoned := fetchBundle(t, client, to)
-		poisoned.Bundle = to
+		poisoned.Bundle = poisonedVersion
 		poisoned.Core["traefik"] = "0.0.0-does-not-exist"
 		poisoned.Limits.Timeouts["component-ready"] = 2 * time.Minute
 
-		s := upgradeSession(t, env, client, to, to, poisoned)
+		s := upgradeSession(t, env, client, to, poisonedVersion, poisoned)
 		defer s.Close()
 
 		_, err := stages.Execute(ctx, s, upgrade.Plan(s))
