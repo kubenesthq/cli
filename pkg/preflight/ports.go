@@ -35,6 +35,11 @@ var nodePorts = []portSpec{
 // preflight leaves nothing running.
 const listenerWindow = 25 * time.Second
 
+// listenerMarker identifies the probe's processes so they can be stopped by
+// name when it is done. It has to be distinctive: pkill against a loose
+// pattern on a customer's node is not something to be casual about.
+const listenerMarker = "kubenest-preflight-port-probe"
+
 // checkPorts proves the node-to-node paths are open, by actually opening a
 // listener on the target and connecting to it from every peer.
 //
@@ -123,8 +128,9 @@ func probeOneTarget(ctx context.Context, opts Options, target Node, peers []Node
 	// Start the listeners. Ports already in use are NOT an error: on a
 	// resumed install k3s itself is listening on 6443 and 10250, and
 	// connecting to the real service proves the same thing the probe would.
-	start := fmt.Sprintf("nohup python3 -c %s %s %s >/dev/null 2>&1 & echo started",
-		shellQuote(listenerScript), shellQuote(strings.Join(tcp, ",")), shellQuote(strings.Join(udp, ",")))
+	start := fmt.Sprintf("nohup python3 -c %s %s %s %s >/dev/null 2>&1 & echo started",
+		shellQuote(listenerScript), shellQuote(strings.Join(tcp, ",")),
+		shellQuote(strings.Join(udp, ",")), shellQuote(listenerMarker))
 	if _, err := run(ctx, target.Runner, start); err != nil {
 		rep.add(Result{
 			Check: CheckPorts, Node: target.Address, Outcome: Fail,
@@ -139,6 +145,12 @@ func probeOneTarget(ctx context.Context, opts Options, target Node, peers []Node
 		return
 	case <-time.After(750 * time.Millisecond):
 	}
+
+	// The listeners MUST be gone before anything installs, because the ports
+	// they hold are the ports k3s binds. Observed on a real host: the probe
+	// still owned 6443 when the k3s stage started, and k3s died with
+	// "address already in use" — an install failed by its own preflight.
+	defer stopListeners(context.WithoutCancel(ctx), target, specs)
 
 	var blocked []string
 	for _, peer := range peers {
@@ -175,6 +187,36 @@ func probeOneTarget(ctx context.Context, opts Options, target Node, peers []Node
 		Check: CheckPorts, Node: target.Address, Outcome: Pass,
 		Detail: fmt.Sprintf("reachable from %d peer(s) on %s", len(peers), describePorts(specs)),
 	})
+}
+
+// stopListeners ends the probe on a target and waits for its ports to be free
+// again. A listener that has been signalled is not the same as a port that is
+// free, and the next thing to want these ports is k3s itself.
+func stopListeners(ctx context.Context, target Node, specs []portSpec) {
+	_, _ = run(ctx, target.Runner, "pkill -f "+shellQuote(listenerMarker)+" || true")
+
+	var tcpPorts []string
+	for _, s := range specs {
+		if s.Proto == "tcp" {
+			tcpPorts = append(tcpPorts, strconv.Itoa(s.Port))
+		}
+	}
+	if len(tcpPorts) == 0 {
+		return
+	}
+	pattern := ":(" + strings.Join(tcpPorts, "|") + ")$"
+	for i := 0; i < 10; i++ {
+		out, err := run(ctx, target.Runner,
+			"ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "+shellQuote(pattern)+" && echo held || echo free")
+		if err != nil || strings.TrimSpace(out) == "free" {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func purposeOf(spec string) string {

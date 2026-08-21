@@ -79,10 +79,10 @@ func (d InClusterDrills) LastRestoreDrill(ctx context.Context) (DrillStatus, err
 		namespace = "velero"
 	}
 	if name == "" {
-		name = "kubenest-restore-drill"
+		name = "kubenest-restore-drill-result"
 	}
 	out, err := k3s.Kubectl(ctx, d.Runner,
-		fmt.Sprintf("get configmap %s -n %s -o jsonpath='{.data.result}' --ignore-not-found", name, namespace))
+		fmt.Sprintf("get configmap %s -n %s -o jsonpath='{.data.result\\.json}' --ignore-not-found", name, namespace))
 	if err != nil {
 		return DrillStatus{}, err
 	}
