@@ -201,3 +201,34 @@ func sortStrings(s []string) {
 		}
 	}
 }
+
+// Upgrade is the tooling pinned with the release for moving between bundles.
+type Upgrade struct {
+	DeprecationScanner DeprecationScanner `yaml:"deprecation-scanner"`
+}
+
+// DeprecationScanner pins the pre-flight API deprecation scan (decision D,
+// 2026-08-20): pluto, adopted not rebuilt.
+//
+// The DATASET pin is the load-bearing one. A scanner whose deprecation data
+// drifts reports confidence it has not earned — it will tell a customer their
+// workloads are clean against a Kubernetes version whose removals it has
+// never heard of, which is worse than not scanning at all, because they will
+// believe it.
+type DeprecationScanner struct {
+	Tool    string `yaml:"tool"`
+	Version string `yaml:"version"`
+	Dataset string `yaml:"dataset"`
+}
+
+// Scanner returns the pinned deprecation scanner. A manifest without one
+// cannot gate an upgrade, and the missing pin is an error rather than a
+// silent skip: skipping the scan is the one outcome that must never happen
+// quietly.
+func (u Upgrade) Scanner() (DeprecationScanner, error) {
+	s := u.DeprecationScanner
+	if s.Tool == "" || s.Version == "" || s.Dataset == "" {
+		return DeprecationScanner{}, fmt.Errorf("bundle manifest does not pin upgrade.deprecation-scanner (tool, version and dataset): the scan is the gate that stops an upgrade taking a customer's product down, and it may not be skipped because a pin is missing")
+	}
+	return s, nil
+}

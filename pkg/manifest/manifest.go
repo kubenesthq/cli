@@ -33,9 +33,11 @@ type Manifest struct {
 	OS OS `yaml:"os"`
 	// HATiers are the tiers this bundle offers. Asking for one it does not
 	// offer is a refusal, not a silent downgrade to single-server.
-	HATiers  []string `yaml:"ha-tiers"`
-	Limits   Limits   `yaml:"limits"`
-	Backup   Backup   `yaml:"backup"`
+	HATiers []string `yaml:"ha-tiers"`
+	Limits  Limits   `yaml:"limits"`
+	Backup  Backup   `yaml:"backup"`
+	// Upgrade is the tooling pinned for moving between bundle versions.
+	Upgrade  Upgrade  `yaml:"upgrade"`
 	Profiles Profiles `yaml:"profiles"`
 }
 

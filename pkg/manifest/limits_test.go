@@ -170,6 +170,28 @@ func TestShippedManifestCarriesPreflightThresholds(t *testing.T) {
 			t.Error(err)
 		}
 	}
+
+	// The upgrade gate that matters most cannot run without its pins, and
+	// the dataset pin is what stops the scan going stale.
+	scanner, err := m.Upgrade.Scanner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanner.Tool != "pluto" {
+		t.Errorf("shipped scanner is %q, want pluto (decision D)", scanner.Tool)
+	}
+	if scanner.Dataset == "" {
+		t.Error("the shipped manifest must pin the deprecation dataset")
+	}
+}
+
+// A manifest with no scanner pin is an error, not a skipped gate: skipping
+// the deprecation scan is the one outcome that must never happen quietly.
+func TestMissingScannerPinIsAnError(t *testing.T) {
+	m := loadFixture(t, "bundle: \"1.0\"\nlimits:\n  timeouts:\n    node-ready: 5m\n")
+	if _, err := m.Upgrade.Scanner(); err == nil {
+		t.Error("a manifest with no upgrade.deprecation-scanner must be an error")
+	}
 }
 
 func loadFixture(t *testing.T, doc string) *manifest.Manifest {
