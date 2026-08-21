@@ -131,9 +131,21 @@ func (c *Client) do(req *http.Request, out any) error {
 
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:
-		return fmt.Errorf("not authenticated (or the session expired): run `kubenest login --control-plane %s`", c.BaseURL())
+		return &Error{
+			Method: req.Method, Path: req.URL.Path, Status: resp.StatusCode,
+			Code:   apiErrorCode(body),
+			Detail: apiErrorDetail(resp.StatusCode, body),
+			msg: fmt.Sprintf("not authenticated (or the session expired): run `kubenest login --control-plane %s`",
+				c.BaseURL()),
+		}
 	case resp.StatusCode >= 400:
-		return fmt.Errorf("%s %s: %s", req.Method, req.URL.Path, apiErrorDetail(resp.StatusCode, body))
+		detail := apiErrorDetail(resp.StatusCode, body)
+		return &Error{
+			Method: req.Method, Path: req.URL.Path, Status: resp.StatusCode,
+			Code:   apiErrorCode(body),
+			Detail: detail,
+			msg:    fmt.Sprintf("%s %s: %s", req.Method, req.URL.Path, detail),
+		}
 	}
 
 	if out == nil {
@@ -143,6 +155,42 @@ func (c *Client) do(req *http.Request, out any) error {
 		return fmt.Errorf("control plane returned an unexpected response (%s): %w", resp.Status, err)
 	}
 	return nil
+}
+
+// Error is a non-2xx response from the control plane. It carries the pieces a
+// caller needs to decide what to do — status, the contract's machine-readable
+// `code`, and the human detail — while its Error() string stays exactly what
+// it was before, so existing messages are unchanged.
+//
+// Callers match with errors.As. Matching on the message text is the thing this
+// type exists to stop: the register stage has to tell "that name is taken" from
+// "the control plane is broken", and those differ only in the body.
+type Error struct {
+	Method string
+	Path   string
+	Status int
+	// Code is the contract's machine-readable error code when the body carries
+	// one — token_expired, token_revoked, insufficient_scope. Empty otherwise.
+	Code   string
+	Detail string
+	msg    string
+}
+
+func (e *Error) Error() string { return e.msg }
+
+// apiErrorCode extracts the contract's {"detail": {"error": "..."}} code.
+// FastAPI's detail is a string for house exceptions and an object for the
+// CLI-auth ones, so this returns "" for the string form rather than guessing.
+func apiErrorCode(body []byte) string {
+	var e struct {
+		Detail struct {
+			Error string `json:"error"`
+		} `json:"detail"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return e.Detail.Error
+	}
+	return ""
 }
 
 // apiErrorDetail extracts FastAPI's {"detail": ...} when present.
