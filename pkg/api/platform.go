@@ -155,3 +155,26 @@ func (c *Client) ClusterHealth(ctx context.Context, clusterID string) (ClusterHe
 	}
 	return out, nil
 }
+
+// InstallJournal reads the SERVER-side install journal for a cluster: the
+// terminal transitions the backend persisted, in order.
+//
+// This is what an acceptance check should assert against. A CLI that checks
+// its own error object proves only that it is internally consistent; reading
+// the record back proves the whole chain — the CLI emitted, the backend
+// persisted, and the record names the stage and component that failed.
+func (c *Client) InstallJournal(ctx context.Context, clusterID string) ([]InstallJournalEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/bundle"), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	var out struct {
+		InstallJournal []InstallJournalEntry `json:"install_journal"`
+	}
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return out.InstallJournal, nil
+}

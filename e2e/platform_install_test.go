@@ -216,11 +216,46 @@ func TestPlatformInstallGate(t *testing.T) {
 		if !strings.Contains(err.Error(), "uninstall --confirm") {
 			t.Errorf("the failure must print both supported exits:\n%v", err)
 		}
-		if health, err := bootstrap.ClusterHealth(ctx, s.Journal.Cluster.ClusterID); err == nil {
-			t.Logf("control plane records the cluster as %q", health.Status)
-			if health.Status != "install_failed" {
-				t.Errorf("a failed install must mark the cluster install_failed, got %q — telemetry has to see it, so a support call about it is never a surprise", health.Status)
-			}
+		// The control plane's own record, not the CLI's error object. A CLI
+		// asserting on itself proves only that it is internally consistent;
+		// reading the record back proves the whole kn-w051 chain — the CLI
+		// emitted, the backend persisted, and the record names the stage and
+		// the component. An API error here is FATAL: a check that passes
+		// when the thing it checks is unreachable is worse than no check.
+		clusterID := s.Journal.Cluster.ClusterID
+		if clusterID == "" {
+			t.Fatal("the failed run registered no cluster, so there is no server-side record to assert against")
+		}
+		health, err := bootstrap.ClusterHealth(ctx, clusterID)
+		if err != nil {
+			t.Fatalf("reading the cluster back: %v", err)
+		}
+		t.Logf("control plane records the cluster as %q", health.Status)
+		if health.Status != "install_failed" {
+			t.Errorf("a failed install must mark the cluster install_failed, got %q — telemetry has to see it, so a support call about it is never a surprise", health.Status)
+		}
+
+		journal, err := bootstrap.InstallJournal(ctx, clusterID)
+		if err != nil {
+			t.Fatalf("reading the server-side install journal: %v", err)
+		}
+		if len(journal) == 0 {
+			t.Fatal("the server-side install journal is empty: the stage events never reached the control plane")
+		}
+		last := journal[len(journal)-1]
+		t.Logf("server journal last entry: stage=%s component=%s status=%s reason_code=%s",
+			last.Stage, last.Component, last.Status, last.ReasonCode)
+		if last.Stage != install.StageBackup {
+			t.Errorf("server journal's last entry is stage %q, want platform-backup", last.Stage)
+		}
+		if last.Component != "velero" {
+			t.Errorf("server journal names component %q, want velero", last.Component)
+		}
+		if last.Status != api.StageFailed {
+			t.Errorf("server journal records status %q, want failed", last.Status)
+		}
+		if last.ReasonCode != "PLATFORM_BACKUP_FAILED" {
+			t.Errorf("server journal records reason_code %q, want PLATFORM_BACKUP_FAILED", last.ReasonCode)
 		}
 	})
 
