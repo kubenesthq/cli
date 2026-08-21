@@ -254,13 +254,19 @@ func Execute(ctx context.Context, s *Session, stages []Stage) (Result, error) {
 		if runErr != nil {
 			runErr = annotateDeadline(ctx, stage.Name, total, runErr)
 			reason := ReasonCode(stage.Name)
-			s.emit(ctx, withStatus(event, StatusFailed, reason, runErr.Error()))
+			// Everything that leaves this process — the wire event and the
+			// journal — is sanitized. The text comes from component
+			// installers and remote shells, so "no secrets, no raw command
+			// output" (install_journal_entry.json) has to be enforced at the
+			// sink, not trusted at the source.
+			detail := Sanitize(runErr.Error())
+			s.emit(ctx, withStatus(event, StatusFailed, reason, detail))
 			// The journal write must happen even though the install is
 			// failing: the record of WHERE it failed is the whole resume
 			// path. A journal error here is reported alongside, not instead.
 			if jErr := s.Journal.Append(Entry{
 				Stage: stage.Name, Status: StatusFailed, Component: stage.Component,
-				Detail: runErr.Error(), RunID: s.RunID,
+				Detail: detail, RunID: s.RunID,
 			}); jErr != nil {
 				s.Logf("warning: could not write the install journal: %v", jErr)
 			}
