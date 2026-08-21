@@ -283,11 +283,13 @@ func TestBackupOnRealHost(t *testing.T) {
 	}
 	assertNoScratch(t, ctx, client)
 
-	// Corrupt the newest backup's metadata in the real object store. The
+	// Corrupt the newest backup's resource archive in the real object store. The
 	// Backup CR remains Completed, forcing the drill to prove it can read the
-	// bytes rather than trusting status metadata.
+	// bytes rather than trusting status metadata. velero-backup.json is only a
+	// manifest; the restore reads <backup>.tar.gz, so corrupt the load-bearing
+	// object rather than a sidecar Velero can legitimately ignore.
 	runJob(t, ctx, s3Client, "corrupt-backup", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && printf '{corrupt' >/tmp/bad && mc cp /tmp/bad t/%s/workload/backups/%s/velero-backup.json && test \"$(mc cat t/%s/workload/backups/%s/velero-backup.json)\" = '{corrupt'", minioNamespace, minioUser, minioPassword, bucket, name, bucket, name))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && printf '{corrupt' >/tmp/bad && mc cp /tmp/bad t/%s/workload/backups/%s/%s.tar.gz && test \"$(mc cat t/%s/workload/backups/%s/%s.tar.gz)\" = '{corrupt'", minioNamespace, minioUser, minioPassword, bucket, name, name, bucket, name, name))
 	failedResult, drillErr := backup.RequestDrill(ctx, client, m, reporter)
 	if drillErr == nil {
 		t.Fatal("corrupted backup passed the verified restore drill")
