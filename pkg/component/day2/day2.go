@@ -111,7 +111,12 @@ func InstallUpgradeController(ctx context.Context, r k3s.Runner, bundle *manifes
 		return err
 	}
 
-	res, err = converge.Wait(ctx, k3s.PodsReadyProbe(r, Namespace), converge.Options{
+	// Its WORKLOAD, not every pod in the namespace: system-upgrade-controller
+	// runs a Job per node per upgrade and keeps their pods, and one that
+	// failed an attempt stays Failed forever. Waiting on every pod means
+	// this component can never be reinstalled or reverted on a cluster that
+	// has ever been upgraded — which is every cluster this matters for.
+	res, err = converge.Wait(ctx, k3s.WorkloadsReadyProbe(r, Namespace), converge.Options{
 		Name: "system-upgrade-controller", Deadline: deadline, Reporter: rep,
 	})
 	if err != nil {
