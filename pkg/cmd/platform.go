@@ -76,6 +76,7 @@ func NewPlatformCommand() *cobra.Command {
 		newPlatformUninstallCommand(),
 		newPlatformUpgradeCommand(),
 		newPlatformRollbackCommand(),
+		newPlatformRestoreCommand(),
 		newPlatformDiffCommand(),
 	)
 	return cmd

@@ -78,9 +78,40 @@ func NewBackupCommand() *cobra.Command {
 	cmd.AddCommand(
 		newBackupSetTargetCommand(),
 		newBackupNowCommand(),
-		newBackupSkeletonCommand("drill", "Run a verified restore drill", "kubenest backup drill"),
+		newBackupDrillCommand(),
 		newBackupSkeletonCommand("restore", "Restore from a backup", "kubenest backup restore"),
 	)
+	return cmd
+}
+
+func newBackupDrillCommand() *cobra.Command {
+	var conn backupConn
+	cmd := &cobra.Command{
+		Use:   "drill",
+		Short: "Run the verified latest-backup restore drill now",
+		Long: `Request the same real restore path the weekly scheduler uses: the newest
+completed Velero backup is restored into an isolated scratch namespace, the
+proof objects and PVC bytes are compared, cleanup is awaited, and the shared
+fleet result is updated. A failed drill exits non-zero with its actionable
+stage and reason code.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := conn.validate(); err != nil {
+				return err
+			}
+			bundle, client, err := conn.dial(cmd)
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+			result, err := backup.RequestDrill(cmd.Context(), client, bundle, converge.NewTextReporter(cmd.OutOrStdout()))
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "restore drill passed for backup %s at %s\n", result.Backup, result.CompletedAt)
+			return nil
+		},
+	}
+	conn.register(cmd)
 	return cmd
 }
 
