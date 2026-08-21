@@ -387,6 +387,14 @@ data:
 	})
 
 	t.Run("uninstall leaves a known-clean machine", func(t *testing.T) {
+		// A failed gate whose cluster has been torn down cannot be
+		// diagnosed, and every diagnosis so far has cost another fifteen
+		// minutes to reproduce. KUBENEST_GATE_KEEP leaves the cluster up
+		// after a failure; the HOST is still torn down by whoever brought it
+		// up, which is the part that bills.
+		if t.Failed() && os.Getenv("KUBENEST_GATE_KEEP") != "" {
+			t.Skip("KUBENEST_GATE_KEEP is set and the gate failed: leaving the cluster up for diagnosis")
+		}
 		nodes := connectAllNodes(t, env)
 		if err := uninstallAll(ctx, t, nodes); err != nil {
 			t.Fatal(err)
