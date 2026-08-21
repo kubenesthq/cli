@@ -2,7 +2,6 @@ package install
 
 import (
 	"context"
-	"io"
 	"time"
 
 	"kubenest.io/cli/pkg/preflight"
@@ -44,8 +43,13 @@ func (s *Session) dialAll(ctx context.Context) []preflight.Node {
 			nodes = append(nodes, node)
 			return
 		}
-		s.closers = append(s.closers, io.Closer(client))
-		node.Runner = client
+		// Wrapped so a dropped connection is redialled rather than turning
+		// every later observation into the same dead-socket error. See
+		// reconnect.go — this was a real failure on the host gate, not a
+		// hypothetical.
+		runner := newReconnectingRunner(address, opts, client)
+		s.closers = append(s.closers, runner)
+		node.Runner = runner
 		nodes = append(nodes, node)
 	}
 	for _, address := range s.Opts.Servers {

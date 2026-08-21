@@ -35,6 +35,7 @@ import (
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/uninstall"
 )
 
@@ -61,7 +62,7 @@ type gateEnv struct {
 func gateEnvironment(t *testing.T) gateEnv {
 	t.Helper()
 	env := gateEnv{
-		server:       os.Getenv("KUBENEST_LAB_SERVER_IP"),
+		server:       envOr("KUBENEST_LAB_SERVER_IP", os.Getenv("KUBENEST_LAB_NODE1_IP")),
 		sshUser:      envOr("KUBENEST_LAB_SSH_USER", "ubuntu"),
 		sshKey:       os.Getenv("KUBENEST_LAB_SSH_KEY"),
 		controlPlane: os.Getenv("KUBENEST_CONTROL_PLANE"),
@@ -72,7 +73,7 @@ func gateEnvironment(t *testing.T) gateEnv {
 		storageDevice: os.Getenv("KUBENEST_LAB_NODE1_STORAGE_DEVICE"),
 	}
 	if env.server == "" {
-		t.Skip("KUBENEST_LAB_SERVER_IP not set: run ./scripts/ephemeral-env.sh up --profile host and source lab/hetzner/.lab-env.sh")
+		t.Skip("KUBENEST_LAB_SERVER_IP / KUBENEST_LAB_NODE1_IP not set: run ./scripts/ephemeral-env.sh up --profile host and source lab/hetzner/.lab-env.sh")
 	}
 	if env.controlPlane == "" || env.token == "" {
 		t.Skip("KUBENEST_CONTROL_PLANE and KUBENEST_CLI_TOKEN not set: the install registers the cluster and will not run without a control plane")
@@ -118,13 +119,17 @@ func session(t *testing.T, env gateEnv, journalPath string, bundle *manifest.Man
 
 func gateOptions(env gateEnv) install.Options {
 	return install.Options{
-		Bundle:        env.bundle,
-		Name:          env.cluster,
-		Servers:       []string{env.server},
-		HATier:        "single-server",
-		SSHUser:       env.sshUser,
-		SSHKey:        env.sshKey,
-		StorageDevice: env.storageDevice,
+		Bundle:  env.bundle,
+		Name:    env.cluster,
+		Servers: []string{env.server},
+		HATier:  "single-server",
+		SSHUser: env.sshUser,
+		SSHKey:  env.sshKey,
+		// StorageDevice is deliberately NOT set here. The gate's timed
+		// install uses install.mdx Option 1 — the volume group already
+		// exists and the installer never touches the customer's block
+		// devices. Only the failure-injection run, which starts from a blank
+		// disk, passes --storage-device.
 	}
 }
 
@@ -144,6 +149,20 @@ func fetchBundle(t *testing.T, client *api.Client, version string) *manifest.Man
 // TestPlatformInstallGate is the whole gate, in order, on one host. The
 // subtests share state deliberately: an install that is torn down between
 // assertions is not the thing being tested.
+//
+// The order exercises BOTH documented storage paths on one machine, which is
+// also the only order that works on a single host:
+//
+//  1. failure injection with --storage-device — Option 2, the installer
+//     creates kubenest-vg. It fails at stage 8 by design, leaving k3s behind.
+//  2. uninstall — k3s goes, the volume group stays (the default, data-safe).
+//  3. the timed install with NO --storage-device — Option 1, the default
+//     path, using the volume group left by step 2 exactly as a customer's
+//     pre-created one.
+//  4. reported in, then a second identical run.
+//  5. uninstall --destroy-data — and the volume group STILL survives,
+//     because by step 3 it was the customer's. That is the strongest rule on
+//     the page and it is worth asserting on a real disk.
 func TestPlatformInstallGate(t *testing.T) {
 	env := gateEnvironment(t)
 	journalPath := t.TempDir() + "/journal.json"
@@ -157,7 +176,70 @@ func TestPlatformInstallGate(t *testing.T) {
 
 	var clusterID string
 
+	t.Run("failure injection names the failing component", func(t *testing.T) {
+		if env.storageDevice == "" {
+			t.Skip("KUBENEST_LAB_NODE1_STORAGE_DEVICE not set")
+		}
+		// A bundle whose Velero pin does not exist. Everything else is the
+		// real manifest, so the failure travels the real path: the HelmChart
+		// lands, the helm-install job cannot resolve the version, and the
+		// stage converges to fail.
+		poisoned := fetchBundle(t, bootstrap, env.bundle)
+		poisoned.Core["velero"] = "0.0.0-does-not-exist"
+		// The deadline is what a failing stage waits out. Two minutes proves
+		// the mechanism without spending ten on a chart that will never
+		// resolve. This is the manifest doing its job — the deadline is data.
+		poisoned.Limits.Timeouts["component-ready"] = 2 * time.Minute
+
+		opts := gateOptions(env)
+		opts.StorageDevice = env.storageDevice
+		s, _ := session(t, env, t.TempDir()+"/poisoned.json", poisoned, opts)
+		defer s.Close()
+
+		_, err := install.Execute(ctx, s, install.Plan())
+		if err == nil {
+			t.Fatal("the poisoned bundle must fail")
+		}
+		var stageErr *install.StageError
+		if !errorsAs(err, &stageErr) {
+			t.Fatalf("want a *StageError, got %T: %v", err, err)
+		}
+		t.Logf("failure reported: stage=%s component=%s reason=%s",
+			stageErr.Stage, stageErr.Component, stageErr.ReasonCode)
+
+		if stageErr.Stage != install.StageBackup {
+			t.Errorf("failed at stage %q, want platform-backup", stageErr.Stage)
+		}
+		if stageErr.Component != "velero" {
+			t.Errorf("the failure names component %q, want velero — naming the component is the difference between this installer and one that prints \"error\"", stageErr.Component)
+		}
+		if !strings.Contains(err.Error(), "uninstall --confirm") {
+			t.Errorf("the failure must print both supported exits:\n%v", err)
+		}
+		if health, err := bootstrap.ClusterHealth(ctx, s.Journal.Cluster.ClusterID); err == nil {
+			t.Logf("control plane records the cluster as %q", health.Status)
+			if health.Status != "install_failed" {
+				t.Errorf("a failed install must mark the cluster install_failed, got %q — telemetry has to see it, so a support call about it is never a surprise", health.Status)
+			}
+		}
+	})
+
+	t.Run("uninstall after a failed install leaves the data", func(t *testing.T) {
+		nodes := connectNodes(t, env)
+		if err := uninstall.Run(ctx, uninstall.Options{Nodes: nodes, Out: testWriter{t}}); err != nil {
+			t.Fatal(err)
+		}
+		assertHost(t, ctx, nodes[0], map[string]string{
+			"k3s binary is gone":        "absent",
+			"platform state is gone":    "absent",
+			"the volume group survives": "present",
+		})
+	})
+
 	t.Run("install completes under the fifteen-minute budget", func(t *testing.T) {
+		// No --storage-device: kubenest-vg already exists, which is exactly
+		// install.mdx Option 1 — the customer created it and the installer
+		// never touches their block devices.
 		s, _ := session(t, env, journalPath, bundle, gateOptions(env))
 		defer s.Close()
 
@@ -223,83 +305,46 @@ func TestPlatformInstallGate(t *testing.T) {
 		}
 	})
 
-	t.Run("failure injection names the failing component", func(t *testing.T) {
-		if clusterID == "" {
-			t.Skip("install did not complete")
-		}
-		// A bundle whose Velero pin does not exist. Everything else is the
-		// real manifest, so the failure travels the real path: the HelmChart
-		// lands, the helm-install job cannot resolve the version, and the
-		// stage converges to fail.
-		poisoned := fetchBundle(t, bootstrap, env.bundle)
-		poisoned.Core["velero"] = "0.0.0-does-not-exist"
-		// The deadline is what a failing stage waits out. Two minutes proves
-		// the mechanism without spending ten on a chart that will never
-		// resolve. This is the manifest doing its job — the deadline is data.
-		poisoned.Limits.Timeouts["component-ready"] = 2 * time.Minute
-
-		// A fresh journal: this run must reach stage 8, not skip to it.
-		opts := gateOptions(env)
-		s, _ := session(t, env, t.TempDir()+"/poisoned.json", poisoned, opts)
-		defer s.Close()
-
-		_, err := install.Execute(ctx, s, install.Plan())
-		if err == nil {
-			t.Fatal("the poisoned bundle must fail")
-		}
-		var stageErr *install.StageError
-		if !errorsAs(err, &stageErr) {
-			t.Fatalf("want a *StageError, got %T: %v", err, err)
-		}
-		t.Logf("failure reported: stage=%s component=%s reason=%s",
-			stageErr.Stage, stageErr.Component, stageErr.ReasonCode)
-
-		if stageErr.Stage != install.StageBackup {
-			t.Errorf("failed at stage %q, want platform-backup", stageErr.Stage)
-		}
-		if stageErr.Component != "velero" {
-			t.Errorf("the failure names component %q, want velero — naming the component is the difference between this installer and one that prints \"error\"", stageErr.Component)
-		}
-		if !strings.Contains(err.Error(), "uninstall --confirm") {
-			t.Errorf("the failure must print both supported exits:\n%v", err)
-		}
-	})
-
 	t.Run("uninstall leaves a known-clean machine", func(t *testing.T) {
-		s, _ := session(t, env, journalPath, bundle, gateOptions(env))
-		defer s.Close()
 		nodes := connectNodes(t, env)
-
+		// --destroy-data, and the volume group STILL survives: this install
+		// used a volume group the machine already had, and one the installer
+		// did not create is never removed, on either path.
 		if err := uninstall.Run(ctx, uninstall.Options{
-			Nodes: nodes,
-			Out:   testWriter{t},
+			Nodes:       nodes,
+			DestroyData: true,
+			Ownership:   storage.CustomerCreated,
+			Out:         testWriter{t},
 		}); err != nil {
 			t.Fatal(err)
 		}
-
-		// Known-clean: no k3s binary, no k3s service, no platform state under
-		// /var/lib/rancher — and the volume group still there, because
-		// uninstall never destroys data by default.
-		checks := []struct {
-			name    string
-			command string
-			want    string
-		}{
-			{"k3s binary is gone", "command -v k3s >/dev/null 2>&1 && echo present || echo absent", "absent"},
-			{"k3s service is gone", "systemctl list-units --all --no-legend k3s.service | grep -q k3s && echo present || echo absent", "absent"},
-			{"platform state is gone", "test -d /var/lib/rancher/k3s && echo present || echo absent", "absent"},
-			{"the volume group survives", "sudo -n vgs kubenest-vg >/dev/null 2>&1 && echo present || echo absent", "present"},
-		}
-		for _, c := range checks {
-			res, err := nodes[0].Runner.Run(ctx, c.command)
-			if err != nil {
-				t.Fatalf("%s: %v", c.name, err)
-			}
-			if got := strings.TrimSpace(res.Stdout); got != c.want {
-				t.Errorf("%s: got %q, want %q", c.name, got, c.want)
-			}
-		}
+		assertHost(t, ctx, nodes[0], map[string]string{
+			"k3s binary is gone":        "absent",
+			"k3s service is gone":       "absent",
+			"platform state is gone":    "absent",
+			"the volume group survives": "present",
+		})
 	})
+}
+
+// assertHost runs the named host checks and compares their one-word answers.
+func assertHost(t *testing.T, ctx context.Context, node uninstall.Node, want map[string]string) {
+	t.Helper()
+	commands := map[string]string{
+		"k3s binary is gone":        "command -v k3s >/dev/null 2>&1 && echo present || echo absent",
+		"k3s service is gone":       "systemctl list-units --all --no-legend k3s.service | grep -q k3s && echo present || echo absent",
+		"platform state is gone":    "test -d /var/lib/rancher/k3s && echo present || echo absent",
+		"the volume group survives": "sudo -n vgs kubenest-vg >/dev/null 2>&1 && echo present || echo absent",
+	}
+	for name, expected := range want {
+		res, err := node.Runner.Run(ctx, commands[name])
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := strings.TrimSpace(res.Stdout); got != expected {
+			t.Errorf("%s: got %q, want %q", name, got, expected)
+		}
+	}
 }
 
 // connectNodes opens SSH connections for the checks that run outside the
