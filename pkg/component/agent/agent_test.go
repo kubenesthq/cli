@@ -168,3 +168,33 @@ func TestMissingIdentityIsRefused(t *testing.T) {
 		t.Fatal("want a refusal with no credentials at all")
 	}
 }
+
+// The bundle pin decides the version; the mint's ref decides only where the
+// chart lives. A control plane that tags the ref with a different bundle's
+// version must not be able to break an install — it did, with
+// "chart reference and version mismatch: 2.2.0 is not 2.3.4", on a real
+// cluster installing an older bundle.
+func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
+	cases := map[string]string{
+		"oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.2.0": "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2",
+		"oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.3.4": "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2",
+		"oci://ghcr.io/kubenesthq/charts/kubenest-operator-2":       "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2",
+		// A registry port is not a tag.
+		"oci://registry.internal:5000/kubenest/operator":       "oci://registry.internal:5000/kubenest/operator",
+		"oci://registry.internal:5000/kubenest/operator:9.9.9": "oci://registry.internal:5000/kubenest/operator",
+	}
+	for ref, want := range cases {
+		c := creds(false)
+		c.Operator.ChartRef = ref
+		chart, err := agent.Chart(bundle(t), c)
+		if err != nil {
+			t.Fatalf("%s: %v", ref, err)
+		}
+		if chart.Chart != want {
+			t.Errorf("Chart ref %q became %q, want %q", ref, chart.Chart, want)
+		}
+		if chart.Version != "2.2.0" {
+			t.Errorf("%s: version is %q, want the bundle pin", ref, chart.Version)
+		}
+	}
+}

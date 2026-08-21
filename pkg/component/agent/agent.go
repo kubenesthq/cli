@@ -127,10 +127,9 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 		return k3s.HelmChart{}, err
 	}
 
-	// The mint's chart_ref may already carry the version (oci://…:2.2.0).
-	// The bundle pin is authoritative for the version, so strip a trailing
-	// tag rather than letting two sources disagree silently.
-	ref := stripTag(creds.Operator.ChartRef, version)
+	// The bundle pin is authoritative for the version; the ref says only
+	// where the chart lives.
+	ref := chartRepository(creds.Operator.ChartRef)
 
 	return k3s.HelmChart{
 		// The HelmChart resource name IS the Helm release name, which is why
@@ -143,15 +142,35 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 	}, nil
 }
 
-// stripTag removes a trailing :<version> from an OCI reference so the chart
-// and its version are expressed once each.
-func stripTag(ref, version string) string {
-	if suffix := ":" + version; strings.HasSuffix(ref, suffix) {
-		return strings.TrimSuffix(ref, suffix)
+// chartRepository strips any tag from an OCI reference, leaving only where
+// the chart lives.
+//
+// ONE PIN, ONE PLACE. The bundle manifest's core section decides the version;
+// the mint's chart_ref decides the registry and repository. The control plane
+// composes that ref with a tag for its own convenience, and that tag reflects
+// whichever bundle the control plane last looked at — not necessarily the one
+// being installed. Installing bundle 0.9 with a ref the control plane tagged
+// 2.3.4 produced:
+//
+//	Error: INSTALLATION FAILED: chart reference and version mismatch:
+//	2.2.0 is not 2.3.4
+//
+// An earlier version of this function stripped the tag only when it already
+// matched the bundle pin, on the reasoning that an unexpected tag should be
+// reported rather than silently rewritten. It was reported, loudly and
+// legibly — and it also made installing any bundle other than the newest
+// impossible. The version was never the ref's to carry.
+//
+// A registry port is not a tag: only a colon in the segment after the last
+// slash is one.
+func chartRepository(ref string) string {
+	slash := strings.LastIndex(ref, "/")
+	tail := ref[slash+1:]
+	colon := strings.LastIndex(tail, ":")
+	if colon < 0 {
+		return ref
 	}
-	// A tag we did not expect is left alone and reported by the version
-	// mismatch it will cause, rather than silently rewritten.
-	return ref
+	return ref[:slash+1+colon]
 }
 
 // Install places the agent and waits for it to be Ready.

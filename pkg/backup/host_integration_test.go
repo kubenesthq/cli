@@ -311,12 +311,15 @@ kind: ConfigMap
 metadata: {name: kn-f9lm-datastore-sentinel, namespace: default}
 data: {value: before-restore}
 `)
-	res, err := client.Run(ctx, "sudo -n k3s etcd-snapshot save --name kn-f9lm-runbook --s3")
+	// set-target already persists etcd-s3: true. Passing --s3 again makes k3s
+	// reject the command as two forms of the same flag, so exercise the exact
+	// operator runbook form against the configured target.
+	res, err := client.Run(ctx, "sudo -n k3s etcd-snapshot save --name kn-f9lm-runbook")
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("save runbook datastore snapshot: err=%v exit=%d stderr=%s", err, res.ExitCode, res.Stderr)
 	}
 	snapshot := remoteOut(t, ctx, client,
-		"sudo -n k3s etcd-snapshot list --s3 | awk '$1 ~ /^kn-f9lm-runbook-/ {print $1}' | tail -1")
+		"sudo -n k3s etcd-snapshot list | awk '$1 ~ /^kn-f9lm-runbook-/ && $2 ~ /^s3:/ {print $1}' | tail -1")
 	if snapshot == "" {
 		t.Fatal("runbook snapshot was not listed from S3")
 	}
