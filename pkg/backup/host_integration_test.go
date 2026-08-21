@@ -137,6 +137,11 @@ func TestBackupOnRealHost(t *testing.T) {
 	if err := backup.Install(ctx, client, m, reporter); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
+	// Keep retries honest after an interrupted gate: remove only the target
+	// managed by this test so the unconfigured assertion below is exercised
+	// again. Configure recreates this exact resource later.
+	kubectlOrFatal(t, ctx, client, "delete backupstoragelocation "+backup.StorageLocationName+
+		" -n "+backup.Namespace+" --ignore-not-found")
 	// The page's claim: no target is a visible state, never a failure.
 	unconfigured, err := backup.Unconfigured(ctx, client)
 	if err != nil {
@@ -149,10 +154,16 @@ func TestBackupOnRealHost(t *testing.T) {
 	// --- Scaffolding: MinIO as the customer-supplied S3-compatible bucket,
 	// plus a workload whose PVC data must reach it. ---
 	apply(t, ctx, s3Client, minioManifests())
+	// A prior interrupted gate can leave terminal Job pods behind. The
+	// namespace-wide readiness probe is intentionally strict, so remove only
+	// this gate's exact Job names before asking whether MinIO itself is ready.
+	kubectlOrFatal(t, ctx, s3Client,
+		"delete job make-bucket check-datastore-proof check-bucket corrupt-backup -n "+minioNamespace+" --ignore-not-found")
 	waitFor(t, ctx, s3Client, "minio-ready", componentReady, podsReadyIn(s3Client, minioNamespace))
 	runJob(t, ctx, s3Client, "make-bucket", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc mb -p --ignore-existing t/%s", minioNamespace, minioUser, minioPassword, bucket))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc mb -p t/%s", minioNamespace, minioUser, minioPassword, bucket))
 
+	kubectlOrFatal(t, ctx, client, "delete namespace "+proofNamespace+" --ignore-not-found --wait=true")
 	proof := fmt.Sprintf("kn-mzn-proof-%d", time.Now().Unix())
 	apply(t, ctx, client, proofManifests(proof))
 	// The writer must be RUNNING at backup time — file-system backup only
@@ -195,7 +206,7 @@ func TestBackupOnRealHost(t *testing.T) {
 		t.Fatalf("datastore schedule is not hourly/24-kept:\n%s", datastoreConfig)
 	}
 	runJob(t, ctx, s3Client, "check-datastore-proof", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && test -n \"$(mc find t/%s/datastore --type f --print '{{.Key}}')\"", minioNamespace, minioUser, minioPassword, bucket))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && test -n \"$(mc find t/%s/datastore --print '{{.Key}}')\"", minioNamespace, minioUser, minioPassword, bucket))
 
 	// Install the exact bundle-pinned operator. Its WebSocket target is
 	// deliberately unreachable in this slice; reconnection must not stop the
@@ -252,7 +263,7 @@ func TestBackupOnRealHost(t *testing.T) {
 	// backup exists in object storage. mc stat exits non-zero on a missing
 	// object, failing the job.
 	runJob(t, ctx, s3Client, "check-bucket", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc stat t/%s/backups/%s/velero-backup.json", minioNamespace, minioUser, minioPassword, bucket, name))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && mc stat t/%s/workload/backups/%s/velero-backup.json", minioNamespace, minioUser, minioPassword, bucket, name))
 
 	// --- Weekly path, invoked now: restore objects AND bytes, persist proof,
 	// then tear scratch down. This is the same path the scheduler invokes. ---
@@ -274,7 +285,7 @@ func TestBackupOnRealHost(t *testing.T) {
 	// Backup CR remains Completed, forcing the drill to prove it can read the
 	// bytes rather than trusting status metadata.
 	runJob(t, ctx, s3Client, "corrupt-backup", minioNamespace, componentReady,
-		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && printf '{corrupt' >/tmp/bad && mc cp /tmp/bad t/%s/backups/%s/velero-backup.json && test \"$(mc cat t/%s/backups/%s/velero-backup.json)\" = '{corrupt'", minioNamespace, minioUser, minioPassword, bucket, name, bucket, name))
+		fmt.Sprintf("mc alias set t http://minio.%s.svc:9000 %s %s && printf '{corrupt' >/tmp/bad && mc cp /tmp/bad t/%s/workload/backups/%s/velero-backup.json && test \"$(mc cat t/%s/workload/backups/%s/velero-backup.json)\" = '{corrupt'", minioNamespace, minioUser, minioPassword, bucket, name, bucket, name))
 	failedResult, drillErr := backup.RequestDrill(ctx, client, m, reporter)
 	if drillErr == nil {
 		t.Fatal("corrupted backup passed the verified restore drill")

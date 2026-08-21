@@ -24,6 +24,7 @@ package e2e
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -444,32 +445,54 @@ func upgradeSession(t *testing.T, env upgradeEnv, client *api.Client, from, to s
 
 // waitForNodeDwell waits until every node has been Ready for the bundle's
 // node-ready window, which is what the readiness gate requires.
+//
+// It reads JSON and parses it here rather than asking kubectl for a jsonpath:
+// a jsonpath containing spaces, quotes, brackets and a * has to survive a
+// shell, and one that does not survive it fails as "no output" — which is
+// indistinguishable from "no nodes are ready yet" and waits out the whole
+// window before saying so.
 func waitForNodeDwell(t *testing.T, ctx context.Context, r k3s.Runner, bundle *manifest.Manifest) {
 	t.Helper()
 	dwell, err := bundle.Limits.Timeouts.For("node-ready")
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := `get nodes -o jsonpath={range.items[*]}{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}`
+	type nodeList struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Conditions []struct {
+					Type               string    `json:"type"`
+					Status             string    `json:"status"`
+					LastTransitionTime time.Time `json:"lastTransitionTime"`
+				} `json:"conditions"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+
 	deadline := time.Now().Add(dwell + 5*time.Minute)
 	for time.Now().Before(deadline) {
-		out, err := k3s.Kubectl(ctx, r, query)
+		out, err := k3s.Kubectl(ctx, r, "get nodes -o json")
 		if err == nil {
-			steady, seen := true, 0
-			for _, line := range strings.Split(strings.Trim(out, "'"), "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
+			var nodes nodeList
+			if err := json.Unmarshal([]byte(out), &nodes); err == nil && len(nodes.Items) > 0 {
+				steady := true
+				for _, n := range nodes.Items {
+					for _, c := range n.Status.Conditions {
+						if c.Type != "Ready" {
+							continue
+						}
+						if c.Status != "True" || time.Since(c.LastTransitionTime) < dwell {
+							steady = false
+						}
+					}
 				}
-				seen++
-				since, parseErr := time.Parse(time.RFC3339, line)
-				if parseErr != nil || time.Since(since) < dwell {
-					steady = false
+				if steady {
+					t.Logf("every node has been Ready for at least %s", dwell)
+					return
 				}
-			}
-			if steady && seen > 0 {
-				t.Logf("every node has been Ready for at least %s", dwell)
-				return
 			}
 		}
 		time.Sleep(20 * time.Second)
