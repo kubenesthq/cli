@@ -69,7 +69,8 @@ type HelmChart struct {
 	// helm-install-<name>.
 	Name string
 	Repo string
-	// Chart is the chart name within the repo.
+	// Chart is the chart name within the repo, or a full oci:// reference,
+	// in which case Repo is left empty.
 	Chart   string
 	Version string
 	// TargetNamespace is where the release lands; it is created if missing.
@@ -81,18 +82,24 @@ type HelmChart struct {
 
 // Manifest renders the HelmChart custom resource.
 func (h HelmChart) Manifest() ([]byte, error) {
-	if h.Name == "" || h.Repo == "" || h.Chart == "" || h.TargetNamespace == "" {
-		return nil, fmt.Errorf("HelmChart needs Name, Repo, Chart and TargetNamespace")
+	oci := strings.HasPrefix(h.Chart, "oci://")
+	if h.Name == "" || h.Chart == "" || h.TargetNamespace == "" || (h.Repo == "" && !oci) {
+		return nil, fmt.Errorf("HelmChart needs Name, Repo, Chart and TargetNamespace (an oci:// chart carries its own registry and needs no Repo)")
 	}
 	if h.Version == "" {
 		return nil, fmt.Errorf("HelmChart %s has no version: pins come from the bundle manifest's core section", h.Name)
 	}
 	spec := map[string]any{
-		"repo":            h.Repo,
 		"chart":           h.Chart,
 		"version":         h.Version,
 		"targetNamespace": h.TargetNamespace,
 		"createNamespace": true,
+	}
+	// An oci:// reference carries its own registry; helm-controller rejects a
+	// HelmChart that sets both. The kubenest-agent chart is distributed that
+	// way (oci://ghcr.io/kubenesthq/charts/kubenest-operator-2, kn-z6e4).
+	if !oci {
+		spec["repo"] = h.Repo
 	}
 	if h.ValuesYAML != "" {
 		spec["valuesContent"] = h.ValuesYAML

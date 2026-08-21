@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"kubenest.io/cli/pkg/storage"
 )
 
 // Status is a stage's terminal or opening state. These three strings are the
@@ -101,14 +103,13 @@ type ClusterRecord struct {
 // Ownership records who created the kubenest-vg volume group. It gates what
 // uninstall may remove: a volume group the customer created is never removed,
 // on either path.
-type Ownership string
-
-const (
-	// OwnershipCustomer: the volume group existed before the install.
-	OwnershipCustomer Ownership = "customer"
-	// OwnershipInstaller: --storage-device was given and the installer made it.
-	OwnershipInstaller Ownership = "installer"
-)
+//
+// It is storage.Ownership rather than a type of its own, and storage's values
+// are the backend's VolumeGroupOwnership enum. One vocabulary from the
+// preflight check that decides it, through the journal that remembers it, to
+// the record the control plane stores — a second spelling here is exactly how
+// uninstall would end up reading a value it did not recognise and guessing.
+type Ownership = storage.Ownership
 
 // StorageRecord is stage 7's decision, and the only input uninstall trusts
 // about block devices.

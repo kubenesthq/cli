@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -81,6 +82,10 @@ type Session struct {
 	Reporter converge.Reporter
 	// Out receives human-facing narrative that is not a stage transition.
 	Out io.Writer
+	// API is the control plane. Stages 2, 12 and 13 need it; nothing else
+	// does, and no stage may hold a credential in it beyond the CLI token
+	// it was built with.
+	API *api.Client
 
 	// Nodes is filled by stage 1 (preflight), which is why preflight always
 	// runs: every later stage needs these connections.
@@ -91,6 +96,17 @@ type Session struct {
 
 	// Started is when the run began, for the elapsed-time report.
 	Started time.Time
+
+	// closers are the SSH connections stage 1 opened.
+	closers []io.Closer
+}
+
+// Close releases every connection the session opened. Safe to call twice.
+func (s *Session) Close() {
+	for _, c := range s.closers {
+		_ = c.Close()
+	}
+	s.closers = nil
 }
 
 // Server returns the primary control-plane node — the one that runs kubectl
