@@ -297,6 +297,10 @@ func TestBackupOnRealHost(t *testing.T) {
 	if failedResult.Status != "failed" || failedResult.Failure == nil || failedResult.Failure.Stage == "" || failedResult.Failure.ReasonCode == "" {
 		t.Fatalf("corrupted backup failure was not actionable: result=%#v err=%v", failedResult, drillErr)
 	}
+	if failedResult.Failure.Stage != "backup-unreadable" ||
+		failedResult.Failure.ReasonCode != "BACKUP_CONTENT_UNREADABLE" {
+		t.Fatalf("corrupted backup was not named as unreadable: result=%#v err=%v", failedResult, drillErr)
+	}
 	t.Logf("corruption failed loudly: stage=%s reason=%s", failedResult.Failure.Stage, failedResult.Failure.ReasonCode)
 	assertNoScratch(t, ctx, client)
 
