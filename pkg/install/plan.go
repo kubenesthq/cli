@@ -2,9 +2,10 @@ package install
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
-	"sync"
 	"time"
 
 	"kubenest.io/cli/pkg/api"
@@ -14,11 +15,190 @@ import (
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/component/gatewayapi"
 	"kubenest.io/cli/pkg/component/traefik"
+	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/preflight"
 	"kubenest.io/cli/pkg/register"
+	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/storage"
 )
+
+// Options is the install request — `kubenest platform install`'s flag surface
+// resolved into the engine's terms.
+type Options struct {
+	Bundle        string
+	Name          string
+	Org           string
+	Servers       []string
+	Agents        []string
+	HATier        string
+	Profiles      []string
+	SSHUser       string
+	SSHKey        string
+	StorageDevice string
+	BackupTarget  string
+}
+
+// Identity is the part of the request a resume must match exactly.
+func (o Options) Identity() Identity {
+	return Identity{
+		Kind:    Kind,
+		Cluster: o.Name,
+		Fields: map[string]string{
+			"bundle":           o.Bundle,
+			"HA tier":          o.HATier,
+			"--storage-device": o.StorageDevice,
+			"servers":          stages.List(o.Servers),
+			"agents":           stages.List(o.Agents),
+			"profiles":         stages.List(o.Profiles),
+		},
+	}
+}
+
+// NodeRole is what a node is for.
+type NodeRole string
+
+const (
+	RoleServer NodeRole = "server"
+	RoleAgent  NodeRole = "agent"
+)
+
+// Node is one target host with an open connection to it.
+type Node struct {
+	Address string
+	Role    NodeRole
+	Runner  k3s.Runner
+}
+
+// Credentials is stage 2's output, opaque to the engine.
+//
+// The engine can hold it and hand it to stage 10 and to nothing else. It
+// cannot inspect it, print it or write it, and the journal has no field that
+// could accept it. Keeping it `any` here is the type system carrying the rule
+// that key material never leaves this process except onto the target hosts.
+type Credentials any
+
+// Record is what this install must remember across a resume, beyond the
+// entries themselves. It is journalled; nothing in it is a secret, and there
+// is deliberately no field a credential would fit into.
+type Record struct {
+	TokenVersion int               `json:"token_version,omitempty"`
+	RepoURL      string            `json:"repo_url,omitempty"`
+	Adopted      bool              `json:"adopted,omitempty"`
+	Device       string            `json:"storage_device,omitempty"`
+	Ownership    storage.Ownership `json:"volume_group_ownership,omitempty"`
+}
+
+// Session is one install run's state.
+type Session struct {
+	// ID identifies this process across its stages.
+	ID   string
+	Opts Options
+	// Bundle is the manifest fetched from the control plane. Every version
+	// and every deadline comes from here.
+	Bundle   *manifest.Manifest
+	Jnl      *Journal
+	Emit     Emitter
+	Reporter converge.Reporter
+	Out      io.Writer
+	// API is the control plane. Stages 2, 12 and 13 need it; nothing else
+	// does, and no stage may hold a credential in it beyond the CLI token
+	// it was built with.
+	API *api.Client
+
+	// Nodes is filled by stage 1 (preflight), which is why preflight always
+	// runs: every later stage needs these connections.
+	Nodes []Node
+	// Creds is filled by stage 2 (register) and consumed by stage 10. In
+	// memory only, for the life of this process.
+	Creds Credentials
+	// Record is the journalled non-secret record.
+	Record Record
+
+	closers []io.Closer
+}
+
+// The engine's Controller, implemented by this session.
+func (s *Session) RunID() string         { return s.ID }
+func (s *Session) Journal() *Journal     { return s.Jnl }
+func (s *Session) Emitter() Emitter      { return s.Emit }
+func (s *Session) BundleVersion() string { return s.Bundle.Bundle }
+
+// TotalDeadline bounds the whole install. It is NOT the fifteen-minute
+// budget: the budget is a target the release tests assert and an overrun is a
+// defect to fix, while this is when an install that is going nowhere gives up
+// and says which stage was still running.
+func (s *Session) TotalDeadline() (time.Duration, error) {
+	return s.Bundle.Limits.Timeouts.For("install-total")
+}
+
+// Exits are the two supported ways on from a failed install (install.mdx,
+// "When it fails").
+func (s *Session) Exits() []string { return exits }
+
+// Logf writes narrative to the session's output.
+func (s *Session) Logf(format string, args ...any) {
+	if s.Out == nil {
+		return
+	}
+	fmt.Fprintf(s.Out, format+"\n", args...)
+}
+
+// Close releases every connection stage 1 opened. Safe to call twice.
+func (s *Session) Close() {
+	for _, c := range s.closers {
+		_ = c.Close()
+	}
+	s.closers = nil
+}
+
+// saveRecord persists the non-secret record to the journal.
+func (s *Session) saveRecord() error { return s.Jnl.SetState(s.Record) }
+
+// Recorded reads an install's non-secret record back out of its journal.
+// Uninstall uses it: the volume-group ownership recorded here is what decides
+// whether a volume group may ever be removed.
+func Recorded(j *Journal) (Record, error) {
+	var r Record
+	if j == nil {
+		return r, nil
+	}
+	err := j.DecodeState(&r)
+	return r, err
+}
+
+// NodesFromJournal reads the node lists an install recorded, for uninstall to
+// clean without being told them again.
+func NodesFromJournal(j *Journal) (servers, agents []string) {
+	if j == nil {
+		return nil, nil
+	}
+	return strings.Fields(j.Identity.Fields["servers"]), strings.Fields(j.Identity.Fields["agents"])
+}
+
+// Server returns the primary control-plane node — the one that runs kubectl
+// and holds the k3s auto-deploy directory.
+func (s *Session) Server() (k3s.Runner, error) {
+	for _, n := range s.Nodes {
+		if n.Role == RoleServer {
+			return n.Runner, nil
+		}
+	}
+	return nil, errors.New("no server node connection: stage 1 (preflight) opens these, so this is an engine bug, not a host problem")
+}
+
+// NodesWithRole returns every node of one role, in the order given on the
+// command line.
+func (s *Session) NodesWithRole(role NodeRole) []Node {
+	var out []Node
+	for _, n := range s.Nodes {
+		if n.Role == role {
+			out = append(out, n)
+		}
+	}
+	return out
+}
 
 // Plan is the thirteen stages wired to what actually does the work.
 //
@@ -26,21 +206,24 @@ import (
 // file owns which function each stage calls. They are separate so the
 // sequencing is readable without the plumbing, and so a test can exercise
 // resume against a table of fakes.
-func Plan() []Stage {
+func Plan(s *Session) []Stage {
+	bind := func(f func(context.Context, *Session) error) stages.StageFunc {
+		return func(ctx context.Context) error { return f(ctx, s) }
+	}
 	return []Stage{
-		{Name: StagePreflight, AlwaysRun: true, Run: stagePreflight},
-		{Name: StageRegister, AlwaysRun: true, Run: stageRegister},
-		{Name: StageK3sServer, Component: "k3s", Run: stageK3sServer},
-		{Name: StageK3sAgents, Component: "k3s", Run: stageK3sAgents},
-		{Name: StageNetworking, Component: "traefik", Run: stageNetworking},
-		{Name: StageCerts, Component: "cert-manager", Run: stageCerts},
-		{Name: StageStorage, Component: "openebs-lvm-localpv", Run: stageStorage},
-		{Name: StageBackup, Component: "velero", Run: stageBackup},
-		{Name: StageDay2, Component: "system-upgrade-controller", Run: stageDay2},
-		{Name: StageAgent, Component: "kubenest-agent", Run: stageAgent},
-		{Name: StageProfiles, Run: stageProfiles},
-		{Name: StageRecord, Run: stageRecord},
-		{Name: StageVerify, AlwaysRun: true, Run: Verify},
+		{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
+		{Name: StageRegister, AlwaysRun: true, Run: bind(stageRegister)},
+		{Name: StageK3sServer, Component: "k3s", Run: bind(stageK3sServer)},
+		{Name: StageK3sAgents, Component: "k3s", Run: bind(stageK3sAgents)},
+		{Name: StageNetworking, Component: "traefik", Run: bind(stageNetworking)},
+		{Name: StageCerts, Component: "cert-manager", Run: bind(stageCerts)},
+		{Name: StageStorage, Component: "openebs-lvm-localpv", Run: bind(stageStorage)},
+		{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
+		{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
+		{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
+		{Name: StageProfiles, Run: bind(stageProfiles)},
+		{Name: StageRecord, Run: bind(stageRecord)},
+		{Name: StageVerify, AlwaysRun: true, Run: bind(Verify)},
 	}
 }
 
@@ -53,16 +236,16 @@ func stagePreflight(ctx context.Context, s *Session) error {
 	// A resumed install re-runs preflight after earlier stages already
 	// installed k3s and possibly created the volume group. Two checks would
 	// otherwise refuse the installer's own work.
-	_, serversDone := s.Journal.Completed(StageK3sServer)
-	_, agentsDone := s.Journal.Completed(StageK3sAgents)
-	_, storageDone := s.Journal.Completed(StageStorage)
+	_, serversDone := s.Jnl.Completed(StageK3sServer)
+	_, agentsDone := s.Jnl.Completed(StageK3sAgents)
+	_, storageDone := s.Jnl.Completed(StageStorage)
 	for i := range nodes {
 		if nodes[i].Role == string(RoleServer) {
 			nodes[i].ExistingK3sIsOurs = serversDone
 		} else {
 			nodes[i].ExistingK3sIsOurs = agentsDone
 		}
-		nodes[i].StorageIsOurs = storageDone && s.Journal.Storage.Ownership == storage.InstallerCreated
+		nodes[i].StorageIsOurs = storageDone && s.Record.Ownership == storage.InstallerCreated
 	}
 
 	report, err := preflight.Run(ctx, preflight.Options{
@@ -165,11 +348,12 @@ func stageRegister(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	s.Journal.Cluster = ClusterRecord{ClusterID: cluster.ID, Adopted: adopted}
+	s.Jnl.ClusterID = cluster.ID
+	s.Record.Adopted = adopted
 
-	if _, agentInstalled := s.Journal.Completed(StageAgent); agentInstalled {
+	if _, agentInstalled := s.Jnl.Completed(StageAgent); agentInstalled {
 		s.Logf("  the agent is already installed and holding credentials from an earlier run; not re-minting")
-		return s.Journal.Save()
+		return s.saveRecord()
 	}
 
 	creds, err := register.MintCredentials(ctx, s.API, cluster.ID)
@@ -179,11 +363,11 @@ func stageRegister(ctx context.Context, s *Session) error {
 	// In memory, for this process only. Nothing here can reach the journal:
 	// api.Secret refuses to marshal and ClusterRecord has no field for it.
 	s.Creds = creds
-	s.Journal.Cluster.TokenVersion = creds.AgentJWT.TokenVersion
+	s.Record.TokenVersion = creds.AgentJWT.TokenVersion
 	if creds.RepoCredential != nil {
-		s.Journal.Cluster.RepoURL = creds.RepoCredential.RepoURL
+		s.Record.RepoURL = creds.RepoCredential.RepoURL
 	}
-	return s.Journal.Save()
+	return s.saveRecord()
 }
 
 // stageK3sServer installs k3s on the control-plane node, or all three for the
@@ -194,7 +378,7 @@ func stageK3sServer(ctx context.Context, s *Session) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no server node")
 	}
-	if err := failing("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{}, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{}, s.Reporter)); err != nil {
 		return err
 	}
 	if len(servers) == 1 {
@@ -256,10 +440,10 @@ func stageNetworking(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := failing("gateway-api", gatewayapi.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("gateway-api", gatewayapi.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
 		return err
 	}
-	return failing("traefik", traefik.Install(ctx, server, s.Bundle, s.Reporter))
+	return stages.NewComponentError("traefik", traefik.Install(ctx, server, s.Bundle, s.Reporter))
 }
 
 // stageCerts installs cert-manager, then the platform's Gateway defaults —
@@ -271,13 +455,13 @@ func stageCerts(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := failing("cert-manager", certmanager.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("cert-manager", certmanager.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
 		return err
 	}
 	// The Gateway defaults need cert-manager to have issued the platform CA,
 	// so a failure here is cert-manager's story far more often than
 	// Traefik's — and the object the convergence state names says which.
-	return failing("cert-manager", traefik.InstallGatewayDefaults(ctx, server, s.Bundle, s.Reporter))
+	return stages.NewComponentError("cert-manager", traefik.InstallGatewayDefaults(ctx, server, s.Bundle, s.Reporter))
 }
 
 // stageStorage verifies or creates the volume group on every node that can
@@ -298,15 +482,16 @@ func stageStorage(ctx context.Context, s *Session) error {
 	}
 	// Recorded before the install proceeds, because it is what uninstall
 	// reads to decide whether it may ever remove a volume group.
-	s.Journal.Storage = StorageRecord{Device: s.Opts.StorageDevice, Ownership: ownership}
-	if err := s.Journal.Save(); err != nil {
+	s.Record.Device = s.Opts.StorageDevice
+	s.Record.Ownership = ownership
+	if err := s.saveRecord(); err != nil {
 		return err
 	}
 
-	if err := failing(storage.ComponentKey, storage.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	if err := stages.NewComponentError(storage.ComponentKey, storage.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
 		return err
 	}
-	return failing(storage.ComponentKey, storage.Verify(ctx, server, s.Bundle, s.Reporter))
+	return stages.NewComponentError(storage.ComponentKey, storage.Verify(ctx, server, s.Bundle, s.Reporter))
 }
 
 // stageBackup installs Velero, configured if a target was supplied.
@@ -320,7 +505,7 @@ func stageBackup(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := failing("velero", backup.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("velero", backup.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
 		return err
 	}
 	if s.Opts.BackupTarget == "" {
@@ -331,10 +516,10 @@ func stageBackup(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := failing("velero", backup.Configure(ctx, server, s.Bundle, target, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("velero", backup.Configure(ctx, server, s.Bundle, target, s.Reporter)); err != nil {
 		return err
 	}
-	return failing("velero", backup.EnsureSchedule(ctx, server, s.Bundle, s.Reporter))
+	return stages.NewComponentError("velero", backup.EnsureSchedule(ctx, server, s.Bundle, s.Reporter))
 }
 
 // stageDay2 places system-upgrade-controller and kured.
@@ -343,10 +528,10 @@ func stageDay2(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := failing("system-upgrade-controller", day2.InstallUpgradeController(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("system-upgrade-controller", day2.InstallUpgradeController(ctx, server, s.Bundle, s.Reporter)); err != nil {
 		return err
 	}
-	return failing("kured", day2.InstallKured(ctx, server, s.Bundle, s.Reporter))
+	return stages.NewComponentError("kured", day2.InstallKured(ctx, server, s.Bundle, s.Reporter))
 }
 
 // stageAgent installs the KubeNest agent — which IS the operator (decision G)
@@ -361,7 +546,7 @@ func stageAgent(ctx context.Context, s *Session) error {
 	if !ok || creds == nil {
 		return fmt.Errorf("no credentials from stage 2: the mint returns them once per run, so this stage cannot be reached with credentials from an earlier process")
 	}
-	return failing("kubenest-agent", agent.Install(ctx, server, s.Bundle, creds, s.Reporter))
+	return stages.NewComponentError("kubenest-agent", agent.Install(ctx, server, s.Bundle, creds, s.Reporter))
 }
 
 // stageProfiles installs each selected profile, in the order given.
@@ -398,10 +583,10 @@ func stageProfiles(ctx context.Context, s *Session) error {
 // decide whether it may remove a volume group, which is the difference
 // between a clean teardown and destroying a customer's data.
 func stageRecord(ctx context.Context, s *Session) error {
-	if s.API == nil || s.Journal.Cluster.ClusterID == "" {
+	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to record against")
 	}
-	ownership := s.Journal.Storage.Ownership
+	ownership := s.Record.Ownership
 	if ownership == "" {
 		ownership = storage.CustomerCreated
 	}
@@ -409,12 +594,12 @@ func stageRecord(ctx context.Context, s *Session) error {
 	if profiles == nil {
 		profiles = []string{}
 	}
-	return s.API.PutBundleRecord(ctx, s.Journal.Cluster.ClusterID, api.BundleRecord{
+	return s.API.PutBundleRecord(ctx, s.Jnl.ClusterID, api.BundleRecord{
 		BundleVersion:        s.Opts.Bundle,
 		Profiles:             profiles,
 		HATier:               s.Opts.HATier,
 		VolumeGroupOwnership: string(ownership),
-		InstallJournal:       s.Journal.terminalEntries(),
+		InstallJournal:       terminalEntries(s.Jnl),
 	})
 }
 
@@ -422,7 +607,7 @@ func stageRecord(ctx context.Context, s *Session) error {
 // transitions are persisted server-side; `started` exists to make a killed
 // run legible locally and to drive live progress, not to fill a permanent
 // record with noise.
-func (j *Journal) terminalEntries() []api.InstallJournalEntry {
+func terminalEntries(j *Journal) []api.InstallJournalEntry {
 	var out []api.InstallJournalEntry
 	for _, e := range j.Entries {
 		if e.Status == StatusStarted {
@@ -442,113 +627,4 @@ func (j *Journal) terminalEntries() []api.InstallJournalEntry {
 		out = append(out, entry)
 	}
 	return out
-}
-
-// ControlPlaneEmitter publishes stage transitions to the control plane, where
-// they become live SSE progress and the server-side install journal.
-//
-// THE QUEUE IS THE POINT. An event needs a cluster to belong to, and the
-// cluster id does not exist until stage 2 registers it — so preflight's two
-// transitions and register's `started` happen before there is anywhere to
-// send them. Dropping them would cost more than a thin trace:
-//
-//   - the console's progress would begin at stage 2 completed, so the two
-//     stages that run before any machine is touched would be invisible
-//     exactly while an operator is deciding whether to walk away;
-//   - and `started` is the ONLY signal that clears install_failed
-//     (kubenest-backend 9c19e5e, deliberately sticky). A stage that never
-//     emits `started` is a stage whose failure can never be cleared, so a
-//     cluster that failed at preflight or register would stay install_failed
-//     through every subsequent successful run.
-//
-// So they are queued, with the timestamp of when they actually happened, and
-// flushed IN ORDER the moment registration produces the id. If registration
-// never produces one — a preflight refusal — the queue is discarded, which is
-// correct: nothing was written to any machine and no cluster record exists.
-// Locking discipline: the mutex guards the queue slice ONLY, and is never
-// held across a network call. Every critical section here is lock, swap or
-// append the slice, unlock — deliberately without `defer`, because deferring
-// to the end of send would hold the lock through every HTTP POST and make one
-// slow control plane stall the install's next transition.
-type ControlPlaneEmitter struct {
-	Client  *api.Client
-	Session *Session
-
-	mu      sync.Mutex
-	pending []api.InstallJournalEntry
-}
-
-// NewControlPlaneEmitter builds the emitter. It is a pointer because it holds
-// the queue.
-func NewControlPlaneEmitter(client *api.Client, session *Session) *ControlPlaneEmitter {
-	return &ControlPlaneEmitter{Client: client, Session: session}
-}
-
-// Emit posts one transition, queueing it if the cluster is not registered yet.
-func (e *ControlPlaneEmitter) Emit(ctx context.Context, ev Event) error {
-	if e == nil || e.Client == nil || e.Session == nil {
-		return nil
-	}
-	// Stamped when it HAPPENED, not when it is sent: a queued transition
-	// flushed after registration must not claim to have occurred then.
-	now := time.Now().UTC()
-	entry := api.InstallJournalEntry{
-		Stage:      ev.Stage,
-		Component:  ev.Component,
-		Status:     api.InstallStageStatus(ev.Status),
-		At:         &now,
-		ReasonCode: ev.ReasonCode,
-		Detail:     Sanitize(ev.Message),
-	}
-
-	clusterID := e.Session.Journal.Cluster.ClusterID
-	if clusterID == "" {
-		e.mu.Lock()
-		e.pending = append(e.pending, entry)
-		e.mu.Unlock()
-		return nil
-	}
-	return e.send(ctx, clusterID, entry)
-}
-
-// send flushes anything queued, in order, then the new entry. A flush that
-// fails partway leaves the remainder queued so the next transition retries
-// it — and returns the error, which the engine prints without failing the
-// install.
-func (e *ControlPlaneEmitter) send(ctx context.Context, clusterID string, entry api.InstallJournalEntry) error {
-	e.mu.Lock()
-	queued := e.pending
-	e.pending = nil
-	e.mu.Unlock()
-
-	requeue := func(from int, err error) error {
-		e.mu.Lock()
-		// Order is preserved exactly: the unsent remainder, then the entry
-		// that triggered this flush — which has not been sent either — then
-		// anything a concurrent Emit queued behind us.
-		remainder := append([]api.InstallJournalEntry{}, queued[from:]...)
-		remainder = append(remainder, entry)
-		e.pending = append(remainder, e.pending...)
-		held := len(e.pending)
-		e.mu.Unlock()
-		return fmt.Errorf("holding %d stage transition(s) for the next attempt: %w", held, err)
-	}
-
-	for i, q := range queued {
-		if err := e.Client.ReportInstallStage(ctx, clusterID, q); err != nil {
-			return requeue(i, err)
-		}
-	}
-	if err := e.Client.ReportInstallStage(ctx, clusterID, entry); err != nil {
-		return requeue(len(queued), err)
-	}
-	return nil
-}
-
-// Pending reports how many transitions are still waiting for a cluster id.
-// Used by tests and by the engine's end-of-run check.
-func (e *ControlPlaneEmitter) Pending() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return len(e.pending)
 }

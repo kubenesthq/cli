@@ -1,4 +1,4 @@
-package install_test
+package stages_test
 
 import (
 	"context"
@@ -8,45 +8,17 @@ import (
 	"strings"
 	"testing"
 
-	"kubenest.io/cli/pkg/install"
-	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/stages"
 )
-
-func testBundle(t *testing.T) *manifest.Manifest {
-	t.Helper()
-	m, err := manifest.Parse([]byte(`
-bundle: "1.0"
-core:
-  traefik: 41.2.0
-limits:
-  timeouts:
-    install-total: 30m
-    component-ready: 10m
-    node-ready: 5m
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
-func testOpts() install.Options {
-	return install.Options{
-		Bundle:  "1.0",
-		Name:    "prod-1",
-		Servers: []string{"10.0.1.10"},
-		HATier:  "single-server",
-	}
-}
 
 // recorder captures the wire events, which is what the console and the
 // failure-injection gate actually read.
 type recorder struct {
-	events []install.Event
+	events []stages.Event
 	err    error
 }
 
-func (r *recorder) Emit(_ context.Context, e install.Event) error {
+func (r *recorder) Emit(_ context.Context, e stages.Event) error {
 	r.events = append(r.events, e)
 	return r.err
 }
@@ -59,39 +31,23 @@ func (r *recorder) statuses() []string {
 	return out
 }
 
-func newSession(t *testing.T, rec *recorder) *install.Session {
+func newSession(t *testing.T, rec *recorder) *testController {
 	t.Helper()
-	opts := testOpts()
-	path := filepath.Join(t.TempDir(), "journal.json")
-	j, err := install.OpenJournal(path, opts.Identity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &install.Session{
-		RunID:   "run-1",
-		Opts:    opts,
-		Bundle:  testBundle(t),
-		Journal: j,
-		Emitter: rec,
-		Out:     io_Discard{},
-	}
+	return newController(t, rec, filepath.Join(t.TempDir(), "journal.json"),
+		identity("prod-1", map[string]string{"bundle": "1.0"}))
 }
-
-type io_Discard struct{}
-
-func (io_Discard) Write(p []byte) (int, error) { return len(p), nil }
 
 // stages builds a table of no-op stages with the real names, so sequencing
 // can be exercised without a host.
-func stages(t *testing.T, ran *[]string, fail map[string]error) []install.Stage {
+func sequence(t *testing.T, ran *[]string, fail map[string]error) []stages.Stage {
 	t.Helper()
-	var out []install.Stage
-	for _, name := range install.StageNames {
+	var out []stages.Stage
+	for _, name := range stageNames {
 		name := name
-		out = append(out, install.Stage{
+		out = append(out, stages.Stage{
 			Name:      name,
-			AlwaysRun: name == install.StagePreflight || name == install.StageRegister || name == install.StageVerify,
-			Run: func(ctx context.Context, s *install.Session) error {
+			AlwaysRun: name == stagePreflight || name == stageRegister || name == stageVerify,
+			Run: func(ctx context.Context) error {
 				*ran = append(*ran, name)
 				return fail[name]
 			},
@@ -105,14 +61,14 @@ func TestExecuteRunsThirteenStagesInOrder(t *testing.T) {
 	s := newSession(t, rec)
 	var ran []string
 
-	res, err := install.Execute(context.Background(), s, stages(t, &ran, nil))
+	res, err := stages.Execute(context.Background(), s, sequence(t, &ran, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ran) != 13 {
 		t.Fatalf("ran %d stages, want 13: %v", len(ran), ran)
 	}
-	for i, name := range install.StageNames {
+	for i, name := range stageNames {
 		if ran[i] != name {
 			t.Fatalf("stage %d is %q, want %q — the order is not arbitrary, every stage depends on the ones above it", i+1, ran[i], name)
 		}
@@ -145,12 +101,12 @@ func TestPreflightFailureSaysNothingWasWritten(t *testing.T) {
 	s := newSession(t, rec)
 	var ran []string
 
-	_, err := install.Execute(context.Background(), s,
-		stages(t, &ran, map[string]error{install.StagePreflight: errors.New("node 10.0.1.11: sudo -n true failed")}))
+	_, err := stages.Execute(context.Background(), s,
+		sequence(t, &ran, map[string]error{stagePreflight: errors.New("node 10.0.1.11: sudo -n true failed")}))
 	if err == nil {
 		t.Fatal("want an error")
 	}
-	var se *install.StageError
+	var se *stages.StageError
 	if !errors.As(err, &se) {
 		t.Fatalf("want a *StageError, got %T", err)
 	}
@@ -174,14 +130,14 @@ func TestStageFailureNamesTheComponentAndBothExits(t *testing.T) {
 	rec := &recorder{}
 	s := newSession(t, rec)
 	var ran []string
-	table := stages(t, &ran, map[string]error{install.StageStorage: errors.New("pod openebs-lvm-node-x in openebs is CrashLoopBackOff — volume group kubenest-vg not found")})
+	table := sequence(t, &ran, map[string]error{stageStorage: errors.New("pod openebs-lvm-node-x in openebs is CrashLoopBackOff — volume group kubenest-vg not found")})
 	for i := range table {
-		if table[i].Name == install.StageStorage {
+		if table[i].Name == stageStorage {
 			table[i].Component = "openebs-lvm-localpv"
 		}
 	}
 
-	_, err := install.Execute(context.Background(), s, table)
+	_, err := stages.Execute(context.Background(), s, table)
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -200,7 +156,7 @@ func TestStageFailureNamesTheComponentAndBothExits(t *testing.T) {
 
 	// The wire event carries the same three things.
 	last := rec.events[len(rec.events)-1]
-	if last.Status != install.StatusFailed {
+	if last.Status != stages.StatusFailed {
 		t.Fatalf("last event is %s, want failed", last.Status)
 	}
 	if last.Component != "openebs-lvm-localpv" {
@@ -217,19 +173,15 @@ func TestStageFailureNamesTheComponentAndBothExits(t *testing.T) {
 // Resume: completed stages are skipped, the three always-run stages are not,
 // and the install picks up where it stopped.
 func TestResumeSkipsCompletedStagesButNeverPreflightRegisterOrVerify(t *testing.T) {
-	opts := testOpts()
+	id := identity("prod-1", map[string]string{"bundle": "1.0"})
 	path := filepath.Join(t.TempDir(), "journal.json")
 
 	// First run fails at storage (stage 7).
 	first := &recorder{}
-	j1, err := install.OpenJournal(path, opts.Identity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s1 := &install.Session{RunID: "run-1", Opts: opts, Bundle: testBundle(t), Journal: j1, Emitter: first, Out: io_Discard{}}
+	s1 := newController(t, first, path, id)
 	var ran1 []string
-	if _, err := install.Execute(context.Background(), s1,
-		stages(t, &ran1, map[string]error{install.StageStorage: errors.New("boom")})); err == nil {
+	if _, err := stages.Execute(context.Background(), s1,
+		sequence(t, &ran1, map[string]error{stageStorage: errors.New("boom")})); err == nil {
 		t.Fatal("want the first run to fail")
 	}
 	if len(ran1) != 7 {
@@ -238,29 +190,26 @@ func TestResumeSkipsCompletedStagesButNeverPreflightRegisterOrVerify(t *testing.
 
 	// Second run: same command, same journal file.
 	second := &recorder{}
-	j2, err := install.OpenJournal(path, opts.Identity())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s2 := &install.Session{RunID: "run-2", Opts: opts, Bundle: testBundle(t), Journal: j2, Emitter: second, Out: io_Discard{}}
+	s2 := newController(t, second, path, id)
+	s2.id = "run-2"
 	var ran2 []string
-	res, err := install.Execute(context.Background(), s2, stages(t, &ran2, nil))
+	res, err := stages.Execute(context.Background(), s2, sequence(t, &ran2, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	want := []string{
-		install.StagePreflight, // always: writes nothing, hosts may have drifted
-		install.StageRegister,  // always: the mint is once-only
-		install.StageStorage,   // where it failed
-		install.StageBackup, install.StageDay2, install.StageAgent,
-		install.StageProfiles, install.StageRecord,
-		install.StageVerify, // always: a skipped verify is not an install
+		stagePreflight, // always: writes nothing, hosts may have drifted
+		stageRegister,  // always: the mint is once-only
+		stageStorage,   // where it failed
+		stageBackup, stageDay2, stageAgent,
+		stageProfiles, stageRecord,
+		stageVerify, // always: a skipped verify is not an install
 	}
 	if strings.Join(ran2, ",") != strings.Join(want, ",") {
 		t.Errorf("resume ran\n  %v\nwant\n  %v", ran2, want)
 	}
-	wantSkipped := []string{install.StageK3sServer, install.StageK3sAgents, install.StageNetworking, install.StageCerts}
+	wantSkipped := []string{stageK3sServer, stageK3sAgents, stageNetworking, stageCerts}
 	if strings.Join(res.Skipped, ",") != strings.Join(wantSkipped, ",") {
 		t.Errorf("resume skipped %v, want %v", res.Skipped, wantSkipped)
 	}
@@ -271,7 +220,7 @@ func TestResumeSkipsCompletedStagesButNeverPreflightRegisterOrVerify(t *testing.
 		t.Errorf("a resumed run emitted %d events, want 26 — the console must still see all thirteen stages", got)
 	}
 	for _, e := range second.events {
-		if e.Stage == install.StageK3sServer && !strings.Contains(e.Message, "skipped") {
+		if e.Stage == stageK3sServer && !strings.Contains(e.Message, "skipped") {
 			t.Errorf("a skipped stage must say so: %+v", e)
 		}
 	}
@@ -283,7 +232,7 @@ func TestEmitterFailureDoesNotFailTheInstall(t *testing.T) {
 	rec := &recorder{err: errors.New("control plane unreachable")}
 	s := newSession(t, rec)
 	var ran []string
-	if _, err := install.Execute(context.Background(), s, stages(t, &ran, nil)); err != nil {
+	if _, err := stages.Execute(context.Background(), s, sequence(t, &ran, nil)); err != nil {
 		t.Fatalf("telemetry must not be able to fail the thing it observes: %v", err)
 	}
 	if len(ran) != 13 {
@@ -295,7 +244,7 @@ func TestEmitterFailureDoesNotFailTheInstall(t *testing.T) {
 func TestUnwiredStageIsRefused(t *testing.T) {
 	rec := &recorder{}
 	s := newSession(t, rec)
-	_, err := install.Execute(context.Background(), s, []install.Stage{{Name: install.StagePreflight}})
+	_, err := stages.Execute(context.Background(), s, []stages.Stage{{Name: stagePreflight}})
 	if err == nil || !strings.Contains(err.Error(), "not implemented") {
 		t.Fatalf("want a refusal for an unwired stage, got %v", err)
 	}
@@ -306,10 +255,10 @@ func TestJournalRecordsEveryTransition(t *testing.T) {
 	rec := &recorder{}
 	s := newSession(t, rec)
 	var ran []string
-	_, _ = install.Execute(context.Background(), s,
-		stages(t, &ran, map[string]error{install.StageCerts: errors.New("cert-manager webhook never became Ready")}))
+	_, _ = stages.Execute(context.Background(), s,
+		sequence(t, &ran, map[string]error{stageCerts: errors.New("cert-manager webhook never became Ready")}))
 
-	data, err := os.ReadFile(s.Journal.Path())
+	data, err := os.ReadFile(s.journal.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +268,7 @@ func TestJournalRecordsEveryTransition(t *testing.T) {
 			t.Errorf("journal is missing %q:\n%s", want, body)
 		}
 	}
-	if entry, ok := s.Journal.LastFailure(); !ok || entry.Stage != install.StageCerts {
+	if entry, ok := s.journal.LastFailure(); !ok || entry.Stage != stageCerts {
 		t.Errorf("LastFailure = %+v, want platform-certs", entry)
 	}
 }

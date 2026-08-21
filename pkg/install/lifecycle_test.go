@@ -3,6 +3,7 @@ package install_test
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,32 @@ import (
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
 )
+
+// recorder captures the wire events, which is what the console and the
+// failure-injection gate actually read.
+type recorder struct {
+	events []install.Event
+	err    error
+}
+
+func (r *recorder) Emit(_ context.Context, e install.Event) error {
+	r.events = append(r.events, e)
+	return r.err
+}
+
+func newSession(t *testing.T, rec *recorder) *install.Session {
+	t.Helper()
+	m, err := manifest.Parse([]byte("bundle: \"1.0\"\nlimits:\n  timeouts:\n    install-total: 30m\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := install.Options{Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server"}
+	j, err := install.OpenJournal(filepath.Join(t.TempDir(), "journal.json"), opts.Identity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &install.Session{ID: "run-1", Opts: opts, Bundle: m, Jnl: j, Emit: rec, Out: io.Discard}
+}
 
 // The failed event and the failed journal entry must name the component that
 // actually broke, not the one its stage lists first. platform-networking
@@ -34,7 +61,7 @@ func TestFailedStageNamesTheActualComponent(t *testing.T) {
 			table := []install.Stage{{
 				Name:      c.stage,
 				Component: c.declared,
-				Run: func(ctx context.Context, s *install.Session) error {
+				Run: func(ctx context.Context) error {
 					return install.NewComponentError(c.tagged, errors.New("helm-install job never completed"))
 				},
 			}}
@@ -59,7 +86,7 @@ func TestFailedStageNamesTheActualComponent(t *testing.T) {
 				t.Errorf("failed event names component %q, want %q — the record is what a failure-injection run matches against", last.Component, c.wantJSON)
 			}
 
-			body, readErr := os.ReadFile(s.Journal.Path())
+			body, readErr := os.ReadFile(s.Jnl.Path())
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
@@ -77,7 +104,7 @@ func TestUntaggedFailureFallsBackToTheStageComponent(t *testing.T) {
 	table := []install.Stage{{
 		Name:      install.StageStorage,
 		Component: "openebs-lvm-localpv",
-		Run: func(ctx context.Context, s *install.Session) error {
+		Run: func(ctx context.Context) error {
 			return errors.New("volume group kubenest-vg not found")
 		},
 	}}
@@ -103,7 +130,7 @@ func TestEveryPlanComponentIsAManifestKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, stage := range install.Plan() {
+	for _, stage := range install.Plan(newSession(t, &recorder{})) {
 		if stage.Component == "" {
 			continue
 		}
@@ -123,7 +150,7 @@ func TestEveryPlanComponentIsAManifestKey(t *testing.T) {
 
 // The plan is the contract's stage list, in order, fully wired.
 func TestPlanMatchesTheStageContract(t *testing.T) {
-	plan := install.Plan()
+	plan := install.Plan(newSession(t, &recorder{}))
 	if len(plan) != len(install.StageNames) {
 		t.Fatalf("plan has %d stages, want %d", len(plan), len(install.StageNames))
 	}

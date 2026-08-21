@@ -1,4 +1,4 @@
-package install
+package stages
 
 import (
 	"errors"
@@ -71,25 +71,4 @@ func ComponentOf(err error) string {
 // shape the stage implementations use.
 func NewComponentError(component string, err error) error {
 	return failing(component, err)
-}
-
-// taggedComponents is every manifest key the plan can attach to a failure.
-// Kept beside the call sites it mirrors so a test can assert each one is a
-// key the shipped bundle actually pins — a typo here would be a wrong record
-// discovered on a customer's cluster rather than a failing test.
-var taggedComponents = []string{
-	"k3s",
-	"gateway-api",
-	"traefik",
-	"cert-manager",
-	"openebs-lvm-localpv",
-	"velero",
-	"system-upgrade-controller",
-	"kured",
-	"kubenest-agent",
-}
-
-// TaggedComponents returns the component keys the plan can report.
-func TaggedComponents() []string {
-	return append([]string(nil), taggedComponents...)
 }

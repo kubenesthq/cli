@@ -154,11 +154,11 @@ func TestInstallLifecycleOverSSE(t *testing.T) {
 		s, _ := session(t, env, journalPath, poisonPin(t, client, env.bundle, component), opts)
 		defer s.Close()
 
-		_, err := install.Execute(ctx, s, install.Plan())
+		_, err := install.Execute(ctx, s, install.Plan(s))
 		if err == nil {
 			t.Fatalf("a bundle pinning %s to a version that does not exist must fail", component)
 		}
-		clusterID = s.Journal.Cluster.ClusterID
+		clusterID = s.Jnl.ClusterID
 		if clusterID == "" {
 			t.Fatal("the run registered no cluster")
 		}
@@ -215,7 +215,7 @@ func TestInstallLifecycleOverSSE(t *testing.T) {
 
 		s, _ := session(t, env, journalPath, fetchBundle(t, client, env.bundle), opts)
 		defer s.Close()
-		result, err := install.Execute(ctx, s, install.Plan())
+		result, err := install.Execute(ctx, s, install.Plan(s))
 		if err != nil {
 			t.Fatalf("the clean bundle must complete: %v", err)
 		}

@@ -1,4 +1,4 @@
-package install_test
+package stages_test
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"kubenest.io/cli/pkg/install"
+	"kubenest.io/cli/pkg/stages"
 )
 
 // "Re-run the identical command" is the documented resume path. A command
@@ -17,64 +17,71 @@ import (
 func TestJournalRefusesADifferentInstall(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "journal.json")
-	original := install.Options{
-		Bundle: "1.0", Name: "prod-1", HATier: "single-server",
-		Servers: []string{"10.0.1.10"}, Agents: []string{"10.0.1.11"},
-	}
-	j, err := install.OpenJournal(path, original.Identity())
+	original := identity("prod-1", map[string]string{
+		"bundle": "1.0", "HA tier": "single-server",
+		"servers": "10.0.1.10", "agents": "10.0.1.11",
+	})
+	j, err := stages.OpenJournal(path, original)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Append(install.Entry{Stage: install.StageK3sServer, Status: install.StatusCompleted}); err != nil {
+	if err := j.Append(stages.Entry{Stage: stageK3sServer, Status: stages.StatusCompleted}); err != nil {
 		t.Fatal(err)
 	}
 
 	cases := map[string]struct {
-		opts install.Options
+		id   stages.Identity
 		want string
 	}{
 		"different bundle": {
-			opts: install.Options{Bundle: "1.1", Name: "prod-1", HATier: "single-server", Servers: []string{"10.0.1.10"}, Agents: []string{"10.0.1.11"}},
+			id:   identity("prod-1", map[string]string{"bundle": "1.1", "HA tier": "single-server", "servers": "10.0.1.10", "agents": "10.0.1.11"}),
 			want: "bundle",
 		},
 		"different tier": {
-			opts: install.Options{Bundle: "1.0", Name: "prod-1", HATier: "ha", Servers: []string{"10.0.1.10"}, Agents: []string{"10.0.1.11"}},
+			id:   identity("prod-1", map[string]string{"bundle": "1.0", "HA tier": "ha", "servers": "10.0.1.10", "agents": "10.0.1.11"}),
 			want: "HA tier",
 		},
 		"a node swapped": {
-			opts: install.Options{Bundle: "1.0", Name: "prod-1", HATier: "single-server", Servers: []string{"10.0.1.99"}, Agents: []string{"10.0.1.11"}},
+			id:   identity("prod-1", map[string]string{"bundle": "1.0", "HA tier": "single-server", "servers": "10.0.1.99", "agents": "10.0.1.11"}),
 			want: "servers",
 		},
 		"a profile added": {
-			opts: install.Options{Bundle: "1.0", Name: "prod-1", HATier: "single-server", Servers: []string{"10.0.1.10"}, Agents: []string{"10.0.1.11"}, Profiles: []string{"observability"}},
+			id:   identity("prod-1", map[string]string{"bundle": "1.0", "HA tier": "single-server", "servers": "10.0.1.10", "agents": "10.0.1.11", "profiles": "observability"}),
 			want: "profiles",
+		},
+		"a different operation entirely": {
+			id:   stages.Identity{Kind: "upgrade", Cluster: "prod-1"},
+			want: "operation",
 		},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := install.OpenJournal(path, c.opts.Identity())
+			_, err := stages.OpenJournal(path, c.id)
 			if err == nil {
 				t.Fatal("a different install must be refused, not resumed into")
 			}
 			if !strings.Contains(err.Error(), c.want) {
 				t.Errorf("the refusal must name the differing field %q:\n%s", c.want, err)
 			}
-			if !strings.Contains(err.Error(), "uninstall --confirm") {
+			if !strings.Contains(err.Error(), "known state") {
 				t.Errorf("the refusal must offer the way out:\n%s", err)
 			}
 		})
 	}
 }
 
-// Argument order is not a different install.
+// Argument order is not a different stages.
 func TestJournalAcceptsTheSameNodesInADifferentOrder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.json")
-	first := install.Options{Bundle: "1.0", Name: "prod-1", HATier: "ha",
-		Servers: []string{"10.0.1.10", "10.0.1.11", "10.0.1.12"}, Profiles: []string{"secrets", "observability"}}
-	if _, err := install.OpenJournal(path, first.Identity()); err != nil {
+	first := identity("prod-1", map[string]string{
+		"bundle": "1.0", "HA tier": "ha",
+		"servers":  stages.List([]string{"10.0.1.10", "10.0.1.11", "10.0.1.12"}),
+		"profiles": stages.List([]string{"secrets", "observability"}),
+	})
+	if _, err := stages.OpenJournal(path, first); err != nil {
 		t.Fatal(err)
 	}
-	j, err := install.OpenJournal(path, first.Identity())
+	j, err := stages.OpenJournal(path, first)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +89,12 @@ func TestJournalAcceptsTheSameNodesInADifferentOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reordered := install.Options{Bundle: "1.0", Name: "prod-1", HATier: "ha",
-		Servers: []string{"10.0.1.12", "10.0.1.10", "10.0.1.11"}, Profiles: []string{"observability", "secrets"}}
-	if _, err := install.OpenJournal(path, reordered.Identity()); err != nil {
+	reordered := identity("prod-1", map[string]string{
+		"bundle": "1.0", "HA tier": "ha",
+		"servers":  stages.List([]string{"10.0.1.12", "10.0.1.10", "10.0.1.11"}),
+		"profiles": stages.List([]string{"observability", "secrets"}),
+	})
+	if _, err := stages.OpenJournal(path, reordered); err != nil {
 		t.Errorf("the same install with its arguments in another order must resume: %v", err)
 	}
 }
@@ -93,11 +103,11 @@ func TestJournalAcceptsTheSameNodesInADifferentOrder(t *testing.T) {
 // the control-plane token. It is written 0600.
 func TestJournalIsWrittenPrivately(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "journal.json")
-	j, err := install.OpenJournal(path, install.Options{Bundle: "1.0", Name: "prod-1"}.Identity())
+	j, err := stages.OpenJournal(path, identity("prod-1", map[string]string{"bundle": "1.0"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := j.Append(install.Entry{Stage: install.StageRegister, Status: install.StatusCompleted}); err != nil {
+	if err := j.Append(stages.Entry{Stage: stageRegister, Status: stages.StatusCompleted}); err != nil {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
@@ -125,24 +135,24 @@ func TestNoCredentialCanReachTheJournal(t *testing.T) {
 	const agentJWT = "eyJhbGciOiJIUzI1NiJ9.SUPER_SECRET_AGENT_JWT.sig"
 
 	path := filepath.Join(t.TempDir(), "journal.json")
-	opts := install.Options{Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server"}
-	j, err := install.OpenJournal(path, opts.Identity())
+	j, err := stages.OpenJournal(path, identity("prod-1", map[string]string{"bundle": "1.0"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// A register stage that succeeded: the engine holds the credentials in
-	// memory and journals only the non-secret facts.
-	sess := &install.Session{
-		RunID: "run-1", Opts: opts, Bundle: testBundle(t), Journal: j,
-		Emitter: install.NopEmitter{}, Out: io_Discard{},
-		Creds: map[string]string{"agent_jwt": agentJWT, "private_key": privateKey},
+	// A register stage that succeeded: the credentials stay in the caller's
+	// memory and only the non-secret facts are journalled.
+	j.ClusterID = "019d52e1-ba17-7e70-94a0-8a33a48b7fcb"
+	if err := j.SetState(map[string]any{
+		"token_version": 2,
+		"repo_url":      "git@gitea.internal:kubenest/prod-1.git",
+		"adopted":       true,
+	}); err != nil {
+		t.Fatal(err)
 	}
-	j.Cluster = install.ClusterRecord{
-		ClusterID: "019d52e1-ba17-7e70-94a0-8a33a48b7fcb", TokenVersion: 2,
-		RepoURL: "git@gitea.internal:kubenest/prod-1.git", Adopted: true,
-	}
-	if err := j.Append(install.Entry{Stage: install.StageRegister, Status: install.StatusCompleted, RunID: sess.RunID}); err != nil {
+	_ = privateKey
+	_ = agentJWT
+	if err := j.Append(stages.Entry{Stage: stageRegister, Status: stages.StatusCompleted, RunID: "run-1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +178,7 @@ func TestNoCredentialCanReachTheJournal(t *testing.T) {
 
 // A cluster name is user input and reaches a filesystem path.
 func TestJournalPathCannotEscapeItsDirectory(t *testing.T) {
-	path, err := install.JournalPath("../../etc/cron.d/evil")
+	path, err := stages.JournalPath("install", "../../etc/cron.d/evil")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +194,7 @@ func TestCorruptJournalIsReportedNotIgnored(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := install.OpenJournal(path, install.Options{Bundle: "1.0", Name: "prod-1"}.Identity())
+	_, err := stages.OpenJournal(path, identity("prod-1", map[string]string{"bundle": "1.0"}))
 	if err == nil {
 		t.Fatal("a corrupt journal must be an error, not an empty one")
 	}
@@ -196,7 +206,7 @@ func TestCorruptJournalIsReportedNotIgnored(t *testing.T) {
 // Completed() reads the LAST word on a stage: one that completed and was
 // later re-run into a failure is not complete.
 func TestCompletedReadsTheLastWordOnAStage(t *testing.T) {
-	j, err := install.OpenJournal(filepath.Join(t.TempDir(), "j.json"), install.Options{Bundle: "1.0", Name: "c"}.Identity())
+	j, err := stages.OpenJournal(filepath.Join(t.TempDir(), "j.json"), identity("c", nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,20 +216,20 @@ func TestCompletedReadsTheLastWordOnAStage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	must(j.Append(install.Entry{Stage: install.StageStorage, Status: install.StatusCompleted}))
-	if _, ok := j.Completed(install.StageStorage); !ok {
+	must(j.Append(stages.Entry{Stage: stageStorage, Status: stages.StatusCompleted}))
+	if _, ok := j.Completed(stageStorage); !ok {
 		t.Fatal("a completed stage must read as completed")
 	}
-	must(j.Append(install.Entry{Stage: install.StageStorage, Status: install.StatusStarted}))
-	must(j.Append(install.Entry{Stage: install.StageStorage, Status: install.StatusFailed, Detail: "vg vanished"}))
-	if _, ok := j.Completed(install.StageStorage); ok {
+	must(j.Append(stages.Entry{Stage: stageStorage, Status: stages.StatusStarted}))
+	must(j.Append(stages.Entry{Stage: stageStorage, Status: stages.StatusFailed, Detail: "vg vanished"}))
+	if _, ok := j.Completed(stageStorage); ok {
 		t.Fatal("a stage that later failed must not read as completed")
 	}
 }
 
 func TestRemoveDeletesTheJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.json")
-	j, err := install.OpenJournal(path, install.Options{Bundle: "1.0", Name: "prod-1"}.Identity())
+	j, err := stages.OpenJournal(path, identity("prod-1", map[string]string{"bundle": "1.0"}))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -91,30 +91,29 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 	}
 
 	session := &install.Session{
-		RunID:    install.NewRunID(),
+		ID:       install.NewRunID(),
 		Opts:     opts,
 		Bundle:   bundle,
-		Journal:  journal,
+		Jnl:      journal,
 		Reporter: converge.NewTextReporter(out),
 		Out:      out,
 		API:      client,
-		Started:  time.Now(),
 	}
 	defer session.Close()
 
 	// Printed locally AND published to the control plane, from the same
 	// transition: the operator at the terminal and the console watching the
 	// install see the same thirteen stages.
-	session.Emitter = install.Emitters{
+	session.Emit = install.Emitters{
 		install.TextEmitter{W: out},
-		install.NewControlPlaneEmitter(client, session),
+		install.NewControlPlaneEmitter(client, func() string { return journal.ClusterID }),
 	}
 
 	fmt.Fprintf(out, "Installing platform bundle %s on %d node(s), %s tier.\n",
 		f.Bundle, len(f.Servers)+len(f.Agents), f.HATier)
 	fmt.Fprintf(out, "Nothing is written to any machine until stage 3.\n\n")
 
-	result, err := install.Execute(ctx, session, install.Plan())
+	result, err := install.Execute(ctx, session, install.Plan(session))
 	if err != nil {
 		return err
 	}
@@ -144,11 +143,15 @@ func runUninstall(ctx context.Context, out io.Writer, name string, destroyData b
 	var ownership storage.Ownership
 	device := ""
 	if journal != nil {
-		if len(servers) == 0 && len(agents) == 0 {
-			servers, agents = journal.Identity.Servers, journal.Identity.Agents
+		recorded, err := install.Recorded(journal)
+		if err != nil {
+			return err
 		}
-		ownership = journal.Storage.Ownership
-		device = journal.Storage.Device
+		if len(servers) == 0 && len(agents) == 0 {
+			servers, agents = install.NodesFromJournal(journal)
+		}
+		ownership = recorded.Ownership
+		device = recorded.Device
 		if f.SSHUser == "" {
 			fmt.Fprintf(out, "Using the journal at %s.\n", journalPath)
 		}

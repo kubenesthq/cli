@@ -1,4 +1,4 @@
-package install
+package stages
 
 import (
 	"encoding/json"
@@ -8,8 +8,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"kubenest.io/cli/pkg/storage"
 )
 
 // Status is a stage's terminal or opening state. These three strings are the
@@ -37,97 +35,97 @@ type Entry struct {
 	RunID string `json:"run_id,omitempty"`
 }
 
-// Identity is what makes a resume a resume rather than a different install
+// Identity is what makes a resume a resume rather than a different operation
 // wearing the same journal. install.mdx's recovery path is "re-run the
 // identical command"; this is "identical", made checkable.
+//
+// Kind separates an install journal from an upgrade one so neither can ever
+// resume into the other, and Fields carries whatever each operation considers
+// part of its identity — the node set and profile list for an install, the
+// version transition for an upgrade.
 type Identity struct {
-	Cluster       string   `json:"cluster"`
-	Bundle        string   `json:"bundle"`
-	HATier        string   `json:"ha_tier"`
-	Servers       []string `json:"servers"`
-	Agents        []string `json:"agents,omitempty"`
-	Profiles      []string `json:"profiles,omitempty"`
-	StorageDevice string   `json:"storage_device,omitempty"`
-}
-
-// Normalized returns the identity with node and profile lists sorted, so
-// argument ORDER is not mistaken for a different install.
-func (i Identity) Normalized() Identity {
-	i.Servers = sortedCopy(i.Servers)
-	i.Agents = sortedCopy(i.Agents)
-	i.Profiles = sortedCopy(i.Profiles)
-	return i
+	// Kind is the operation, e.g. "install" or "upgrade".
+	Kind string `json:"kind"`
+	// Cluster is the cluster name the operation targets.
+	Cluster string `json:"cluster"`
+	// Fields are the operation's remaining identity, in the operator's own
+	// terms: the map keys are what a mismatch message will name.
+	Fields map[string]string `json:"fields,omitempty"`
 }
 
 // Differences names every field on which two identities disagree, in the
 // user's terms. Empty means identical.
 func (i Identity) Differences(other Identity) []string {
-	a, b := i.Normalized(), other.Normalized()
 	var diffs []string
-	scalar := func(field, was, now string) {
+	compare := func(field, was, now string) {
 		if was != now {
 			diffs = append(diffs, fmt.Sprintf("%s: the journal has %q, you passed %q", field, was, now))
 		}
 	}
-	list := func(field string, was, now []string) {
-		if !slices.Equal(was, now) {
-			diffs = append(diffs, fmt.Sprintf("%s: the journal has [%s], you passed [%s]",
-				field, strings.Join(was, " "), strings.Join(now, " ")))
-		}
+	compare("operation", i.Kind, other.Kind)
+	compare("cluster name", i.Cluster, other.Cluster)
+
+	keys := map[string]bool{}
+	for k := range i.Fields {
+		keys[k] = true
 	}
-	scalar("cluster name", a.Cluster, b.Cluster)
-	scalar("bundle", a.Bundle, b.Bundle)
-	scalar("HA tier", a.HATier, b.HATier)
-	scalar("--storage-device", a.StorageDevice, b.StorageDevice)
-	list("servers", a.Servers, b.Servers)
-	list("agents", a.Agents, b.Agents)
-	list("profiles", a.Profiles, b.Profiles)
+	for k := range other.Fields {
+		keys[k] = true
+	}
+	names := make([]string, 0, len(keys))
+	for k := range keys {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		compare(name, i.Fields[name], other.Fields[name])
+	}
 	return diffs
 }
 
-// ClusterRecord is what stage 2 (register) leaves behind: the NON-SECRET
-// facts only.
-//
-// The agent JWT and the repository deploy key are minted once per process by
-// design and live in memory until they terminate on the target hosts. Nothing
-// here can hold them — that is why this struct has four scalar fields and no
-// credential type, and why resume re-runs register instead of trying to
-// recover secrets it deliberately never wrote down.
-type ClusterRecord struct {
-	ClusterID    string `json:"cluster_id,omitempty"`
-	TokenVersion int    `json:"token_version,omitempty"`
-	RepoURL      string `json:"repo_url,omitempty"`
-	Adopted      bool   `json:"adopted,omitempty"`
+// List renders a list field for an Identity, sorted, so argument ORDER is
+// never mistaken for a different operation.
+func List(values []string) string {
+	sorted := slices.Clone(values)
+	slices.Sort(sorted)
+	return strings.Join(sorted, " ")
 }
 
-// Ownership records who created the kubenest-vg volume group. It gates what
-// uninstall may remove: a volume group the customer created is never removed,
-// on either path.
-//
-// It is storage.Ownership rather than a type of its own, and storage's values
-// are the backend's VolumeGroupOwnership enum. One vocabulary from the
-// preflight check that decides it, through the journal that remembers it, to
-// the record the control plane stores — a second spelling here is exactly how
-// uninstall would end up reading a value it did not recognise and guessing.
-type Ownership = storage.Ownership
-
-// StorageRecord is stage 7's decision, and the only input uninstall trusts
-// about block devices.
-type StorageRecord struct {
-	Device    string    `json:"device,omitempty"`
-	Ownership Ownership `json:"ownership,omitempty"`
-}
-
-// Journal is the durable record of one install, and the reason resume is
-// deterministic rather than a hope that every component happens to be
-// idempotent (install.mdx, "When it fails").
+// Journal is the durable record of one operation, and the reason resume is
+// deterministic rather than a hope that every step happens to be idempotent
+// (install.mdx, "When it fails").
 type Journal struct {
-	Identity Identity      `json:"identity"`
-	Cluster  ClusterRecord `json:"cluster"`
-	Storage  StorageRecord `json:"storage"`
-	Entries  []Entry       `json:"entries"`
+	Identity Identity `json:"identity"`
+	// ClusterID is the control-plane id, once the operation knows it. Both
+	// operations need it and it is not a secret.
+	ClusterID string  `json:"cluster_id,omitempty"`
+	Entries   []Entry `json:"entries"`
+	// State is whatever else the operation must remember across a resume,
+	// encoded by the caller. It exists so the engine can stay ignorant of
+	// what an install or an upgrade considers worth remembering — and so
+	// that nothing here has a field a credential could fit into.
+	State json.RawMessage `json:"state,omitempty"`
 
 	path string
+}
+
+// SetState stores the caller's record and persists the journal.
+func (j *Journal) SetState(v any) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	j.State = raw
+	return j.Save()
+}
+
+// DecodeState reads the caller's record back. A journal with no state leaves
+// v untouched and returns nil, so a first run needs no special case.
+func (j *Journal) DecodeState(v any) error {
+	if len(j.State) == 0 {
+		return nil
+	}
+	return json.Unmarshal(j.State, v)
 }
 
 const (
@@ -136,14 +134,21 @@ const (
 	fileMode       = 0o600
 )
 
-// JournalPath is where one cluster's journal lives. It sits beside the CLI
-// config, under the same 0700 directory.
-func JournalPath(cluster string) (string, error) {
+// JournalPath is where one operation's journal for one cluster lives. It sits
+// beside the CLI config, under the same 0700 directory. The kind is part of
+// the name so an upgrade journal can never be opened as an install one.
+func JournalPath(kind, cluster string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".kubenest", journalDirName, safeFileName(cluster)+".json"), nil
+	name := safeFileName(cluster)
+	if kind != "" && kind != "install" {
+		// install keeps the historical <cluster>.json name so journals
+		// written before upgrades existed still resume.
+		name += "-" + safeFileName(kind)
+	}
+	return filepath.Join(home, ".kubenest", journalDirName, name+".json"), nil
 }
 
 // safeFileName keeps a cluster name from escaping the journal directory. A
@@ -164,14 +169,13 @@ func safeFileName(name string) string {
 	return b.String()
 }
 
-// OpenJournal loads the journal for this install, or starts one.
+// OpenJournal loads the journal for this operation, or starts one.
 //
-// A journal for a DIFFERENT install is refused rather than overwritten or
-// silently reused: resuming into a half-installed cluster with changed flags
-// is how an install ends up not matching its own record, and the record is
-// what every day-2 operation trusts.
+// A journal for a DIFFERENT operation is refused rather than overwritten or
+// silently reused: resuming into a half-finished cluster with changed
+// arguments is how a cluster ends up not matching its own record, and the
+// record is what every day-2 operation trusts.
 func OpenJournal(path string, want Identity) (*Journal, error) {
-	want = want.Normalized()
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return &Journal{Identity: want, path: path}, nil
@@ -186,8 +190,8 @@ func OpenJournal(path string, want Identity) (*Journal, error) {
 	j.path = path
 	if diffs := j.Identity.Differences(want); len(diffs) > 0 {
 		return nil, fmt.Errorf(
-			"this journal records a different install:\n  %s\n\nresume re-runs the IDENTICAL command (%s). Fix the flag, or run `kubenest platform uninstall --confirm` on those hosts and install fresh",
-			strings.Join(diffs, "\n  "), path)
+			"this journal records a different %s:\n  %s\n\nresume re-runs the IDENTICAL command (%s). Fix the argument, or start from a known state",
+			j.Identity.Kind, strings.Join(diffs, "\n  "), path)
 	}
 	// Keep the loaded identity; it and want are equal by the check above.
 	return &j, nil
@@ -277,7 +281,7 @@ func (j *Journal) Path() string { return j.path }
 
 // Remove deletes the journal. Uninstall calls it last, once the hosts are
 // actually clean — a journal outliving its cluster would make the next
-// install refuse for a cluster that no longer exists.
+// operation refuse for a cluster that no longer exists.
 func (j *Journal) Remove() error {
 	if j.path == "" {
 		return nil
@@ -286,15 +290,6 @@ func (j *Journal) Remove() error {
 		return err
 	}
 	return nil
-}
-
-func sortedCopy(in []string) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := slices.Clone(in)
-	slices.Sort(out)
-	return out
 }
 
 // JournalDir is where every cluster's journal lives.

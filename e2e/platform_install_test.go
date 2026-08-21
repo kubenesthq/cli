@@ -101,18 +101,17 @@ func session(t *testing.T, env gateEnv, journalPath string, bundle *manifest.Man
 		t.Fatal(err)
 	}
 	s := &install.Session{
-		RunID:    install.NewRunID(),
+		ID:       install.NewRunID(),
 		Opts:     opts,
 		Bundle:   bundle,
-		Journal:  journal,
+		Jnl:      journal,
 		Reporter: reporterTo(t),
 		Out:      testWriter{t},
 		API:      client,
-		Started:  time.Now(),
 	}
-	s.Emitter = install.Emitters{
+	s.Emit = install.Emitters{
 		install.TextEmitter{W: testWriter{t}},
-		install.NewControlPlaneEmitter(client, s),
+		install.NewControlPlaneEmitter(client, func() string { return journal.ClusterID }),
 	}
 	return s, client
 }
@@ -196,7 +195,7 @@ func TestPlatformInstallGate(t *testing.T) {
 		s, _ := session(t, env, t.TempDir()+"/poisoned.json", poisoned, opts)
 		defer s.Close()
 
-		_, err := install.Execute(ctx, s, install.Plan())
+		_, err := install.Execute(ctx, s, install.Plan(s))
 		if err == nil {
 			t.Fatal("the poisoned bundle must fail")
 		}
@@ -222,7 +221,7 @@ func TestPlatformInstallGate(t *testing.T) {
 		// emitted, the backend persisted, and the record names the stage and
 		// the component. An API error here is FATAL: a check that passes
 		// when the thing it checks is unreachable is worse than no check.
-		clusterID := s.Journal.Cluster.ClusterID
+		clusterID := s.Jnl.ClusterID
 		if clusterID == "" {
 			t.Fatal("the failed run registered no cluster, so there is no server-side record to assert against")
 		}
@@ -279,12 +278,12 @@ func TestPlatformInstallGate(t *testing.T) {
 		defer s.Close()
 
 		start := time.Now()
-		result, err := install.Execute(ctx, s, install.Plan())
+		result, err := install.Execute(ctx, s, install.Plan(s))
 		elapsed := time.Since(start)
 		if err != nil {
 			t.Fatalf("install failed after %s:\n%v", elapsed.Round(time.Second), err)
 		}
-		clusterID = s.Journal.Cluster.ClusterID
+		clusterID = s.Jnl.ClusterID
 
 		t.Logf("install completed in %s (budget %s)", elapsed.Round(time.Second), Budget)
 		if len(result.Ran) != 13 {
@@ -321,7 +320,7 @@ func TestPlatformInstallGate(t *testing.T) {
 		defer s.Close()
 
 		start := time.Now()
-		result, err := install.Execute(ctx, s, install.Plan())
+		result, err := install.Execute(ctx, s, install.Plan(s))
 		if err != nil {
 			t.Fatalf("a second identical run must converge, not fail:\n%v", err)
 		}

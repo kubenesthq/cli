@@ -1,4 +1,4 @@
-package install_test
+package stages_test
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"kubenest.io/cli/pkg/api"
-	"kubenest.io/cli/pkg/install"
+	"kubenest.io/cli/pkg/stages"
 )
 
 // received is one install-event POST as the control plane saw it.
@@ -63,19 +63,19 @@ func TestPreRegistrationTransitionsAreQueuedAndFlushedInOrder(t *testing.T) {
 	client, got := controlPlane(t, nil)
 	rec := &recorder{}
 	s := newSession(t, rec)
-	emitter := install.NewControlPlaneEmitter(client, s)
+	emitter := stages.NewControlPlaneEmitter(client, func() string { return s.journal.ClusterID })
 	ctx := context.Background()
 
-	emit := func(stage string, status install.Status) {
-		if err := emitter.Emit(ctx, install.Event{Stage: stage, Status: status}); err != nil {
+	emit := func(stage string, status stages.Status) {
+		if err := emitter.Emit(ctx, stages.Event{Stage: stage, Status: status}); err != nil {
 			t.Fatalf("%s %s: %v", stage, status, err)
 		}
 	}
 
 	// Stage 1 writes nothing anywhere and there is no cluster yet.
-	emit(install.StagePreflight, install.StatusStarted)
-	emit(install.StagePreflight, install.StatusCompleted)
-	emit(install.StageRegister, install.StatusStarted)
+	emit(stagePreflight, stages.StatusStarted)
+	emit(stagePreflight, stages.StatusCompleted)
+	emit(stageRegister, stages.StatusStarted)
 	if len(*got) != 0 {
 		t.Fatalf("nothing can be sent before a cluster exists, sent %d", len(*got))
 	}
@@ -84,8 +84,8 @@ func TestPreRegistrationTransitionsAreQueuedAndFlushedInOrder(t *testing.T) {
 	}
 
 	// Registration returns the id mid-stage.
-	s.Journal.Cluster.ClusterID = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c17"
-	emit(install.StageRegister, install.StatusCompleted)
+	s.journal.ClusterID = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c17"
+	emit(stageRegister, stages.StatusCompleted)
 
 	var order []string
 	for _, r := range *got {
@@ -112,14 +112,14 @@ func TestQueuedTransitionsKeepTheirOwnTimestamps(t *testing.T) {
 	client, got := controlPlane(t, nil)
 	rec := &recorder{}
 	s := newSession(t, rec)
-	emitter := install.NewControlPlaneEmitter(client, s)
+	emitter := stages.NewControlPlaneEmitter(client, func() string { return s.journal.ClusterID })
 	ctx := context.Background()
 
-	if err := emitter.Emit(ctx, install.Event{Stage: install.StagePreflight, Status: install.StatusStarted}); err != nil {
+	if err := emitter.Emit(ctx, stages.Event{Stage: stagePreflight, Status: stages.StatusStarted}); err != nil {
 		t.Fatal(err)
 	}
-	s.Journal.Cluster.ClusterID = "cluster-1"
-	if err := emitter.Emit(ctx, install.Event{Stage: install.StageRegister, Status: install.StatusCompleted}); err != nil {
+	s.journal.ClusterID = "cluster-1"
+	if err := emitter.Emit(ctx, stages.Event{Stage: stageRegister, Status: stages.StatusCompleted}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -142,16 +142,16 @@ func TestEveryStartedSurvivesTheQueue(t *testing.T) {
 	client, got := controlPlane(t, nil)
 	rec := &recorder{}
 	s := newSession(t, rec)
-	emitter := install.NewControlPlaneEmitter(client, s)
+	emitter := stages.NewControlPlaneEmitter(client, func() string { return s.journal.ClusterID })
 	ctx := context.Background()
 
-	for _, stage := range install.StageNames {
-		if stage == install.StageK3sServer {
+	for _, stage := range stageNames {
+		if stage == stageK3sServer {
 			// The id appears during register, before the first machine is touched.
-			s.Journal.Cluster.ClusterID = "cluster-1"
+			s.journal.ClusterID = "cluster-1"
 		}
-		for _, status := range []install.Status{install.StatusStarted, install.StatusCompleted} {
-			if err := emitter.Emit(ctx, install.Event{Stage: stage, Status: status}); err != nil {
+		for _, status := range []stages.Status{stages.StatusStarted, stages.StatusCompleted} {
+			if err := emitter.Emit(ctx, stages.Event{Stage: stage, Status: status}); err != nil {
 				t.Fatalf("%s %s: %v", stage, status, err)
 			}
 		}
@@ -163,13 +163,13 @@ func TestEveryStartedSurvivesTheQueue(t *testing.T) {
 			starts[r.entry.Stage] = true
 		}
 	}
-	for _, stage := range install.StageNames {
+	for _, stage := range stageNames {
 		if !starts[stage] {
 			t.Errorf("stage %s never reported `started`: its failure could never be cleared", stage)
 		}
 	}
-	if len(*got) != 2*len(install.StageNames) {
-		t.Errorf("sent %d events, want %d (started+terminal for all thirteen)", len(*got), 2*len(install.StageNames))
+	if len(*got) != 2*len(stageNames) {
+		t.Errorf("sent %d events, want %d (started+terminal for all thirteen)", len(*got), 2*len(stageNames))
 	}
 }
 
@@ -180,21 +180,21 @@ func TestAFailedFlushKeepsTheRemainderQueued(t *testing.T) {
 	client, got := controlPlane(t, func(n int) bool { return n == 1 })
 	rec := &recorder{}
 	s := newSession(t, rec)
-	emitter := install.NewControlPlaneEmitter(client, s)
+	emitter := stages.NewControlPlaneEmitter(client, func() string { return s.journal.ClusterID })
 	ctx := context.Background()
 
-	_ = emitter.Emit(ctx, install.Event{Stage: install.StagePreflight, Status: install.StatusStarted})
-	_ = emitter.Emit(ctx, install.Event{Stage: install.StagePreflight, Status: install.StatusCompleted})
-	s.Journal.Cluster.ClusterID = "cluster-1"
+	_ = emitter.Emit(ctx, stages.Event{Stage: stagePreflight, Status: stages.StatusStarted})
+	_ = emitter.Emit(ctx, stages.Event{Stage: stagePreflight, Status: stages.StatusCompleted})
+	s.journal.ClusterID = "cluster-1"
 
-	if err := emitter.Emit(ctx, install.Event{Stage: install.StageRegister, Status: install.StatusStarted}); err == nil {
+	if err := emitter.Emit(ctx, stages.Event{Stage: stageRegister, Status: stages.StatusStarted}); err == nil {
 		t.Fatal("a failed flush must be reported to the caller")
 	}
 	if emitter.Pending() == 0 {
 		t.Fatal("the unsent transitions were dropped")
 	}
 
-	if err := emitter.Emit(ctx, install.Event{Stage: install.StageRegister, Status: install.StatusCompleted}); err != nil {
+	if err := emitter.Emit(ctx, stages.Event{Stage: stageRegister, Status: stages.StatusCompleted}); err != nil {
 		t.Fatalf("the retry must succeed: %v", err)
 	}
 	var order []string
@@ -214,11 +214,11 @@ func TestAPreflightRefusalDiscardsTheQueue(t *testing.T) {
 	client, got := controlPlane(t, nil)
 	rec := &recorder{}
 	s := newSession(t, rec)
-	emitter := install.NewControlPlaneEmitter(client, s)
+	emitter := stages.NewControlPlaneEmitter(client, func() string { return s.journal.ClusterID })
 	ctx := context.Background()
 
-	_ = emitter.Emit(ctx, install.Event{Stage: install.StagePreflight, Status: install.StatusStarted})
-	_ = emitter.Emit(ctx, install.Event{Stage: install.StagePreflight, Status: install.StatusFailed,
+	_ = emitter.Emit(ctx, stages.Event{Stage: stagePreflight, Status: stages.StatusStarted})
+	_ = emitter.Emit(ctx, stages.Event{Stage: stagePreflight, Status: stages.StatusFailed,
 		ReasonCode: "PREFLIGHT_FAILED", Message: "sudo -n true failed"})
 
 	if len(*got) != 0 {

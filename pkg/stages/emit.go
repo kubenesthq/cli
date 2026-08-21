@@ -1,4 +1,4 @@
-package install
+package stages
 
 import (
 	"context"

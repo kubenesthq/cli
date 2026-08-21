@@ -254,14 +254,14 @@ func cleanupVerifyNamespace(ctx context.Context, r k3s.Runner) {
 // but MANAGED: the control plane shows it connected, which only happens once
 // the agent has dialled the hub and the first heartbeat has arrived.
 func verifyClusterReportsIn(ctx context.Context, s *Session) error {
-	if s.API == nil || s.Journal.Cluster.ClusterID == "" {
+	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to check: stage 2 must run before stage 13")
 	}
 	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
-	clusterID := s.Journal.Cluster.ClusterID
+	clusterID := s.Jnl.ClusterID
 
 	probe := func(ctx context.Context) (bool, converge.State, error) {
 		health, err := s.API.ClusterHealth(ctx, clusterID)
