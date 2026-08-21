@@ -323,6 +323,18 @@ data: {value: before-restore}
 	if snapshot == "" {
 		t.Fatal("runbook snapshot was not listed from S3")
 	}
+	// A normal save also leaves a local copy. Remove it before reset and prove
+	// the inventory contains only the S3 object, or this gate could pass while
+	// never exercising the disaster-download path the runbook promises.
+	localSnapshot := "/var/lib/rancher/k3s/server/db/snapshots/" + snapshot
+	res, err = client.Run(ctx, "sudo -n rm -f "+localSnapshot)
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("remove local runbook snapshot: err=%v exit=%d stderr=%s", err, res.ExitCode, res.Stderr)
+	}
+	if local := remoteOut(t, ctx, client,
+		"sudo -n k3s etcd-snapshot list | awk '$1 == \""+snapshot+"\" && $2 ~ /^file:/ {print $2}'"); local != "" {
+		t.Fatalf("runbook snapshot still had a local copy: %s", local)
+	}
 	kubectlOrFatal(t, ctx, client,
 		`patch configmap kn-f9lm-datastore-sentinel -n default --type merge -p '{"data":{"value":"after-snapshot"}}'`)
 	startedRestore := time.Now()
