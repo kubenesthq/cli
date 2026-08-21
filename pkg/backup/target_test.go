@@ -199,6 +199,7 @@ func scripted(answers map[string]string) func(string) (sshx.Result, error) {
 func TestConfigureAppliesThenProvesTheTarget(t *testing.T) {
 	r := &fakeRunner{Respond: scripted(map[string]string{
 		"get backupstoragelocation": `{"status":{"phase":"Available"}}`,
+		"get backuprepositories":    `{"items":[]}`,
 		"get schedule":              "Enabled",
 	})}
 	if err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
@@ -235,6 +236,7 @@ func TestConfigureAppliesThenProvesTheTarget(t *testing.T) {
 func TestConfigureWritesTheManifestSchedule(t *testing.T) {
 	r := &fakeRunner{Respond: scripted(map[string]string{
 		"get backupstoragelocation": `{"status":{"phase":"Available"}}`,
+		"get backuprepositories":    `{"items":[]}`,
 		"get schedule":              "Enabled",
 	})}
 	if err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {

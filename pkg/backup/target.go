@@ -239,11 +239,54 @@ func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t T
 	if err := res.Err(); err != nil {
 		return err
 	}
+	if err := reestablishMovedRepositories(ctx, r); err != nil {
+		return err
+	}
 
 	if err := EnsureSchedule(ctx, r, bundle, rep); err != nil {
 		return err
 	}
 	return EnsureDrillConfiguration(ctx, r, bundle)
+}
+
+// reestablishMovedRepositories handles Velero's explicit state after a
+// BackupStorageLocation changes its object root. Kopia repositories are
+// per-volume-namespace and retain the old BSL identity; Velero marks them
+// NotReady with an instruction to create or delete. Leaving them in place
+// makes the next backup PartiallyFailed with no PVC data. Delete only that
+// exact terminal state for KubeNest's managed location; the next filesystem
+// backup recreates each repository against the new root.
+func reestablishMovedRepositories(ctx context.Context, r k3s.Runner) error {
+	out, err := k3s.Kubectl(ctx, r, "get backuprepositories.velero.io -n "+Namespace+
+		" -l velero.io/storage-location="+StorageLocationName+" -o json")
+	if err != nil {
+		return fmt.Errorf("list backup repositories after target validation: %w", err)
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Phase   string `json:"phase"`
+				Message string `json:"message"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return fmt.Errorf("parse backup repositories after target validation: %w", err)
+	}
+	for _, repo := range list.Items {
+		if repo.Status.Phase != "NotReady" ||
+			!strings.Contains(repo.Status.Message, "re-establish on BSL change") {
+			continue
+		}
+		if _, err := k3s.Kubectl(ctx, r, "delete backuprepository.velero.io "+repo.Metadata.Name+
+			" -n "+Namespace+" --ignore-not-found"); err != nil {
+			return fmt.Errorf("re-establish backup repository %s after target change: %w", repo.Metadata.Name, err)
+		}
+	}
+	return nil
 }
 
 // EnsureSchedule applies the default workload Schedule — cadence and
