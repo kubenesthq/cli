@@ -207,8 +207,74 @@ func stageComponents(ctx context.Context, s *Session) error {
 		if err := stages.NewComponentError(c.key, c.install(ctx, server, s.To, s.Reporter)); err != nil {
 			return err
 		}
+		// AND PROVE IT MOVED. The installers converge on the component being
+		// healthy, which the PREVIOUS version also is: a chart version that
+		// cannot resolve leaves the old release running and every pod Ready,
+		// so a stage that only waited for health would report success for an
+		// upgrade that changed nothing. Observed on a real cluster with a
+		// deliberately poisoned pin, which sailed through this stage.
+		if err := stages.NewComponentError(c.key, confirmVersion(ctx, server, c.key, to, s)); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// confirmVersion checks that the component's HelmChart resource reports the
+// version the bundle pins AND that its release actually deployed at that
+// version. Release-manifest components have no chart to check and are proven
+// by their own readiness.
+func confirmVersion(ctx context.Context, r k3s.Runner, key, want string, s *Session) error {
+	resource := chartResource(key)
+	if resource == "" {
+		return nil
+	}
+	deadline, err := s.To.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return err
+	}
+	probe := func(ctx context.Context) (bool, converge.State, error) {
+		out, err := k3s.Kubectl(ctx, r, fmt.Sprintf(
+			"get helmchart %s -n kube-system -o jsonpath='{.spec.version} {.status.jobName}'", resource))
+		object := "helmchart " + resource
+		if err != nil {
+			return false, converge.State{Object: object, Status: "unobservable"}, err
+		}
+		fields := strings.Fields(strings.Trim(out, "'"))
+		if len(fields) == 0 || fields[0] != want {
+			current := "nothing"
+			if len(fields) > 0 {
+				current = fields[0]
+			}
+			return false, converge.State{Object: object, Status: "still at " + current}, nil
+		}
+		// The resource says the new version; now the job that applies it
+		// must have SUCCEEDED. A failed helm-install job leaves the previous
+		// release serving, which is exactly the state that looks healthy.
+		if len(fields) < 2 {
+			return false, converge.State{Object: object, Status: "no apply job yet"}, nil
+		}
+		status, err := k3s.Kubectl(ctx, r, fmt.Sprintf(
+			"get job %s -n kube-system -o jsonpath='{.status.succeeded}'", fields[1]))
+		if err != nil {
+			return false, converge.State{Object: "job " + fields[1], Status: "unobservable"}, err
+		}
+		if strings.Trim(strings.TrimSpace(status), "'") != "1" {
+			return false, converge.State{
+				Object: "job " + fields[1],
+				Status: "has not succeeded yet",
+				Detail: "the previous release keeps serving until it does, so a healthy component here does not mean an upgraded one",
+			}, nil
+		}
+		return true, converge.State{Object: object, Status: "deployed at " + want}, nil
+	}
+	res, err := converge.Wait(ctx, probe, converge.Options{
+		Name: key + "-at-" + want, Deadline: deadline, Reporter: s.Reporter,
+	})
+	if err != nil {
+		return err
+	}
+	return res.Err()
 }
 
 // coreComponents is the upgrade order, and it is dependency order rather than

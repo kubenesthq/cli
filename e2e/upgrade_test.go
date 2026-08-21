@@ -329,14 +329,19 @@ data:
 		if !upgraded {
 			t.Skip("the first upgrade did not complete")
 		}
-		// Go back to 0.9 with a poisoned component pin, so the upgrade fails
-		// in the platform-components stage — before the point of no return,
-		// which is where the rollback is a component revert.
-		poisoned := fetchBundle(t, client, from)
+		// The cluster is on 1.0 now, so the failure lane cannot be another
+		// 0.9 -> 1.0. It is 1.0 -> 1.0-with-a-poisoned-pin: the same forward
+		// shape, failing in platform-components, which is BEFORE the point
+		// of no return and therefore the lane where rollback is a component
+		// revert. Asking for an older bundle would be a downgrade, which the
+		// bundle-path gate now refuses outright — Kubernetes does not go
+		// backwards and pretending otherwise in a test would prove nothing.
+		poisoned := fetchBundle(t, client, to)
+		poisoned.Bundle = to
 		poisoned.Core["traefik"] = "0.0.0-does-not-exist"
 		poisoned.Limits.Timeouts["component-ready"] = 2 * time.Minute
 
-		s := upgradeSession(t, env, client, to, from, poisoned)
+		s := upgradeSession(t, env, client, to, to, poisoned)
 		defer s.Close()
 
 		_, err := stages.Execute(ctx, s, upgrade.Plan(s))
@@ -349,13 +354,13 @@ data:
 		}
 		t.Logf("failed as designed: stage=%s component=%s", stageErr.Stage, stageErr.Component)
 		if stageErr.Stage != upgrade.StageComponents {
-			t.Errorf("failed at %q, want %s", stageErr.Stage, upgrade.StageComponents)
+			t.Errorf("failed at %q, want %s — a chart version that cannot resolve must fail the stage rather than pass it because the old release is still healthy",
+				stageErr.Stage, upgrade.StageComponents)
 		}
 		if stageErr.Component != "traefik" {
 			t.Errorf("the failure names %q, want traefik", stageErr.Component)
 		}
 
-		// The rollback: before the point of no return, so a component revert.
 		plan := s.RollbackPlan()
 		t.Logf("rollback plan:\n%s", plan)
 		if plan.Mechanism != upgrade.MechanismComponents {
@@ -365,8 +370,8 @@ data:
 			t.Fatalf("rolling back: %v", err)
 		}
 
-		// And the cluster is back where it was: the workload still serving,
-		// and the record saying so.
+		// The workload survived it, and the record still names the version
+		// the cluster is actually on.
 		out, err := k3s.Kubectl(ctx, server.Runner,
 			"get deployment always-up -n gate-availability -o jsonpath='{.status.readyReplicas}'")
 		if err != nil {

@@ -140,3 +140,54 @@ profiles: {ha: {}}
 		}
 	})
 }
+
+// Kubernetes does not downgrade, so a bundle whose Kubernetes pin is older
+// than the running one cannot be reached by upgrading. Refusing it here is
+// the difference between a clear message and system-upgrade-controller being
+// asked to do something impossible after the point of no return — which is
+// what happened on a real cluster before this gate existed.
+func TestABackwardTransitionIsRefused(t *testing.T) {
+	newer := parseManifest(t, "bundle: \"1.0\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+	older := parseManifest(t, "bundle: \"0.9\"\ncore: {k3s: v1.35.6+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+
+	got := checkBundlePath(newer, older, nil, "single-server")
+	if got.Passed {
+		t.Fatal("moving to an older Kubernetes version must be refused")
+	}
+	for _, want := range []string{"older", "does not support downgrading", "rollback"} {
+		if !strings.Contains(got.Detail+" "+got.Fix, want) {
+			t.Errorf("the refusal is missing %q: %s / %s", want, got.Detail, got.Fix)
+		}
+	}
+
+	// Forward is fine, and equal Kubernetes with a newer bundle is fine —
+	// a bundle may move only its charts.
+	if got := checkBundlePath(older, newer, nil, "single-server"); !got.Passed {
+		t.Errorf("a forward transition must pass: %s", got.Detail)
+	}
+	sameK8s := parseManifest(t, "bundle: \"1.1\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+	if got := checkBundlePath(newer, sameK8s, nil, "single-server"); !got.Passed {
+		t.Errorf("a chart-only bundle move must pass: %s", got.Detail)
+	}
+}
+
+// Versions are compared numerically: v1.35.10 is newer than v1.35.9, which a
+// string comparison gets backwards.
+func TestVersionsCompareNumerically(t *testing.T) {
+	older := parseManifest(t, "bundle: \"a\"\ncore: {k3s: v1.35.9+k3s1}\nlimits: {timeouts: {node-ready: 5m}}\n")
+	newer := parseManifest(t, "bundle: \"b\"\ncore: {k3s: v1.35.10+k3s1}\nlimits: {timeouts: {node-ready: 5m}}\n")
+	back, err := movesBackwards(older, newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back {
+		t.Error("v1.35.9 → v1.35.10 is forward")
+	}
+	back, err = movesBackwards(newer, older)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back {
+		t.Error("v1.35.10 → v1.35.9 is backward")
+	}
+}

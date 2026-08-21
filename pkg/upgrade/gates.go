@@ -209,6 +209,22 @@ func checkWindow(s *Session) GateResult {
 // checkBundlePath refuses a transition the target bundle does not offer for
 // this cluster's shape. Untested transitions are not offered.
 func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier string) GateResult {
+	// A BACKWARD transition is refused here, before anything is touched,
+	// rather than discovered at the point of no return. Kubernetes does not
+	// downgrade and neither does k3s: a bundle whose Kubernetes pin is older
+	// than the running one cannot be reached by upgrading, only by restoring
+	// a snapshot taken before the move. Without this gate the sequence
+	// happily reaches the kubernetes stage and asks
+	// system-upgrade-controller to do something it cannot do — observed on a
+	// real cluster.
+	if older, err := movesBackwards(from, to); err == nil && older {
+		return GateResult{
+			Gate: GateBundlePath, Passed: false,
+			Detail: fmt.Sprintf("bundle %s pins Kubernetes %s, older than the %s this cluster runs",
+				to.Bundle, to.Core["k3s"], from.Core["k3s"]),
+			Fix: "Kubernetes does not support downgrading, so an older bundle cannot be reached by upgrading. To go back to a previous bundle, restore the datastore snapshot taken before the upgrade — `kubenest platform rollback`",
+		}
+	}
 	if from.Bundle == to.Bundle {
 		return GateResult{
 			Gate: GateBundlePath, Passed: false,
@@ -236,6 +252,47 @@ func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier stri
 		Gate: GateBundlePath, Passed: true,
 		Detail: fmt.Sprintf("%s → %s is offered for the %s tier and this cluster's profile set", from.Bundle, to.Bundle, haTier),
 	}
+}
+
+// movesBackwards reports whether the target's Kubernetes pin is older than
+// the running one. Versions are compared numerically, not as strings:
+// "v1.35.10" is newer than "v1.35.9" and a lexical comparison says otherwise.
+func movesBackwards(from, to *manifest.Manifest) (bool, error) {
+	current, err := semverParts(from.Core["k3s"])
+	if err != nil {
+		return false, err
+	}
+	target, err := semverParts(to.Core["k3s"])
+	if err != nil {
+		return false, err
+	}
+	for i := range current {
+		if target[i] != current[i] {
+			return target[i] < current[i], nil
+		}
+	}
+	return false, nil
+}
+
+// semverParts turns "v1.35.7+k3s1" into {1, 35, 7}.
+func semverParts(version string) ([3]int, error) {
+	var out [3]int
+	v := strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if i := strings.IndexAny(v, "+-"); i >= 0 {
+		v = v[:i]
+	}
+	fields := strings.Split(v, ".")
+	if len(fields) != 3 {
+		return out, fmt.Errorf("%q is not a version", version)
+	}
+	for i, f := range fields {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return out, fmt.Errorf("%q is not a version", version)
+		}
+		out[i] = n
+	}
+	return out, nil
 }
 
 // nodeStatus is what the readiness and disruption gates read.
