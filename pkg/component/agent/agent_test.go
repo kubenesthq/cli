@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
@@ -92,6 +94,30 @@ func TestBootstrapCertManagerIsDisabled(t *testing.T) {
 	}
 	if !strings.Contains(values, "certManager") || !strings.Contains(values, "enabled: false") {
 		t.Errorf("the chart's bootstrap cert-manager must be disabled — stage 6 already installed the platform's:\n%s", values)
+	}
+}
+
+// The credential API calls this field hub_url because it points at the hub.
+// The established chart key is kubenest.backendURL, which becomes the
+// KUBENEST_BACKEND_URL environment variable. The removed backend-generated
+// Helm command once copied the API name into a nonexistent kubenest.hubURL
+// key; Helm ignored it and the operator silently dialled the chart default.
+func TestHubURLMapsToTheChartBackendURLKey(t *testing.T) {
+	values, err := agent.Values(creds(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Kubenest map[string]any `yaml:"kubenest"`
+	}
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	if got := document.Kubenest["backendURL"]; got != "wss://hub.example.test/ws/operator" {
+		t.Errorf("kubenest.backendURL = %v, want the minted agent_jwt.hub_url", got)
+	}
+	if _, exists := document.Kubenest["hubURL"]; exists {
+		t.Error("kubenest.hubURL does not exist in the operator chart; use backendURL")
 	}
 }
 
