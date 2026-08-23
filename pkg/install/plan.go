@@ -569,7 +569,7 @@ func stageAgent(ctx context.Context, s *Session) error {
 //
 // Every requested profile has already been checked against the bundle by
 // preflight, so anything reaching here is offered by the bundle — but the
-// component profiles are not built yet (kn-sev5, kn-ynaq, kn-54ni, wave 4).
+// component profiles are not built yet (kn-sev5, kn-ynaq, wave 4).
 // Saying so and failing is the only honest option: silently installing core
 // when someone asked for observability produces a cluster that does not match
 // its own record.
@@ -588,7 +588,7 @@ func stageProfiles(ctx context.Context, s *Session) error {
 		s.Logf("  core only, no component profiles requested")
 		return nil
 	}
-	return fmt.Errorf("bundle %s offers %s, but this build of the CLI cannot install %s yet — the component profiles land after core (kn-sev5 observability, kn-ynaq secrets, kn-54ni replicated-storage). Install core now and add the profile when it ships",
+	return fmt.Errorf("bundle %s offers %s, but this build of the CLI cannot install %s yet — the component profiles land after core (kn-sev5 observability, kn-ynaq secrets). Install core now and add the profile when it ships",
 		s.Bundle.Bundle, strings.Join(s.Bundle.Profiles.Names(), ", "), strings.Join(unbuilt, ", "))
 }
 

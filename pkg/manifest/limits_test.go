@@ -165,7 +165,7 @@ func TestShippedManifestCarriesPreflightThresholds(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	for _, p := range []string{"observability", "secrets", "replicated-storage", "ha"} {
+	for _, p := range []string{"observability", "secrets", "ha"} {
 		if _, err := m.Profiles.Get(p); err != nil {
 			t.Error(err)
 		}
