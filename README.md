@@ -15,7 +15,7 @@ kubenest login --control-plane https://api.your-domain.com
 
 # Install the platform bundle onto your hosts, over SSH
 kubenest platform install \
-  --bundle 1.4 \
+  --bundle 1.0 \
   --name prod-1 \
   --server 10.0.1.10 \
   --agent  10.0.1.11 \

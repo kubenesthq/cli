@@ -17,7 +17,7 @@ func newPlatformDiffCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "diff",
 		Short:   "Show what changes between two platform bundles",
-		Example: `  kubenest platform diff --from 1.0 --to 1.1`,
+		Example: `  kubenest platform diff --from 0.9 --to 1.0`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if from == "" || to == "" {
 				return fmt.Errorf("--from and --to are both required")
