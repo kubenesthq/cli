@@ -61,13 +61,25 @@ func ReleaseName() string { return releaseName }
 //	              cert-manager; the chart's bootstrap copy is a different
 //	              version, and two cert-managers fight over the same CRDs.
 //	gitea         DISABLED when the control plane minted a repository
-//	              credential — the GitOps repo is the per-cluster one the
-//	              broker issued, and an in-cluster Git server would be a
-//	              second source of truth. Left at the chart default when no
-//	              repo credential was issued, which is the chart's
-//	              zero-external-dependency fallback.
+//	              credential — an in-cluster Git server would be a second
+//	              source of truth beside the per-cluster repo the broker
+//	              issued. Left at the chart default when no repo credential
+//	              was issued, which is the chart's zero-external-dependency
+//	              fallback.
 //	argo-cd       left at the chart default: it is the operator's own
 //	              deploy engine, not a platform component.
+//
+// The fourth decision is what the disabled Gitea is replaced WITH: when the
+// mint carries a repo_credential, this renders the per-cluster GitOps
+// credential into kubenest.bootstrapController — gitRepoURL, gitRepoBranch,
+// and gitSSHPrivateKey, the write deploy key on that cluster's own repo
+// (kn-rnyl phases B/C). Disabling Gitea WITHOUT rendering this is the
+// kn-rnyl.2 defect: the installed operator ends up with neither a Git server
+// nor the external repo. The private key rides the same protected path as
+// the agent JWT: chart values, written to a 0600 file, never a command
+// argument, never the journal. The chart's gitSSHKnownHosts stays at its
+// default — the contract does not carry a host key yet (kn-rnyl.1), so
+// host-key pinning cannot honestly be rendered from here.
 func Values(creds *api.AgentCredentials) (string, error) {
 	if creds == nil {
 		return "", fmt.Errorf("the agent needs the credentials minted in stage 2")
@@ -80,6 +92,19 @@ func Values(creds *api.AgentCredentials) (string, error) {
 	}
 	if creds.AgentJWT.HubURL == "" {
 		return "", fmt.Errorf("the minted credentials carry no hub URL: the agent would dial the chart's default, which is not this control plane")
+	}
+	if creds.RepoCredential != nil {
+		// A half-rendered repo credential installs an operator that can
+		// neither push nor sync; refuse at render time instead.
+		if creds.RepoCredential.RepoURL == "" {
+			return "", fmt.Errorf("the minted repo credential carries no repo_url: the operator would push to nothing — re-mint with POST /clusters/{id}/agent-credentials")
+		}
+		if creds.RepoCredential.PrivateKey.IsZero() {
+			return "", fmt.Errorf("the minted repo credential carries no private_key: a gitSSHPrivateKey of '' is a startup error for the operator — re-mint with POST /clusters/{id}/agent-credentials")
+		}
+		if creds.RepoCredential.Branch == "" {
+			return "", fmt.Errorf("the minted repo credential carries no branch: the operator would clone the empty default and never find the cluster's desired state — re-mint with POST /clusters/{id}/agent-credentials")
+		}
 	}
 
 	values := map[string]any{
@@ -97,6 +122,20 @@ func Values(creds *api.AgentCredentials) (string, error) {
 	}
 	if creds.RepoCredential != nil {
 		values["bootstrap"].(map[string]any)["gitea"] = map[string]any{"enabled": false}
+		// The per-cluster GitOps repo the broker issued (kn-rnyl). The key is
+		// revealed at the point of use and only here, like the JWT: it lands
+		// in the 0600 values file the in-cluster helm controller reads, and
+		// the chart mounts it as a file — never the operator's environment.
+		// gitToken, the legacy backend-wide writer, is deliberately left at
+		// its empty default: the deploy key wins when both are present, and
+		// rendering the token is how the kn-rnyl leak happened in the first
+		// place. gitSSHKnownHosts stays empty until the contract carries a
+		// host key (kn-rnyl.1).
+		values["kubenest"].(map[string]any)["bootstrapController"] = map[string]any{
+			"gitRepoURL":       creds.RepoCredential.RepoURL,
+			"gitRepoBranch":    creds.RepoCredential.Branch,
+			"gitSSHPrivateKey": creds.RepoCredential.PrivateKey.Reveal(),
+		}
 	}
 
 	out, err := yaml.Marshal(values)

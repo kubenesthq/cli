@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -15,6 +16,12 @@ import (
 )
 
 const agentJWT = "eyJhbGciOiJIUzI1NiJ9.AGENT_TOKEN_VALUE.signature"
+
+// repoKey is the per-cluster write deploy key the mint returns. It is
+// multiline on purpose: a PEM reaches the chart values as a block and must
+// survive the YAML round trip byte-for-byte, or the operator mounts a broken
+// key and every push fails at ssh.
+const repoKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----"
 
 func bundle(t *testing.T) *manifest.Manifest {
 	t.Helper()
@@ -40,7 +47,7 @@ func creds(withRepo bool) *api.AgentCredentials {
 	}
 	if withRepo {
 		c.RepoCredential = &api.RepoCredential{
-			PrivateKey: api.NewSecret("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----"),
+			PrivateKey: api.NewSecret(repoKey),
 			RepoURL:    "git@gitea.example.test:kubenest/prod-1.git",
 			Branch:     "main",
 		}
@@ -222,5 +229,126 @@ func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
 		if chart.Version != "2.2.0" {
 			t.Errorf("%s: version is %q, want the bundle pin", ref, chart.Version)
 		}
+	}
+}
+
+// kn-rnyl.2: when the mint carries a repo_credential, the agent must hand the
+// operator the per-cluster repo it just disabled Gitea in favour of — URL,
+// branch and write deploy key — through the chart's bootstrapController keys.
+// Disabling Gitea without this leaves the operator with NEITHER a Git server
+// nor the external repo.
+func TestRepoCredentialRendersIntoTheBootstrapControllerKeys(t *testing.T) {
+	values, err := agent.Values(creds(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Kubenest struct {
+			BootstrapController map[string]any `yaml:"bootstrapController"`
+		} `yaml:"kubenest"`
+		Bootstrap struct {
+			Gitea map[string]any `yaml:"gitea"`
+		} `yaml:"bootstrap"`
+	}
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	bc := document.Kubenest.BootstrapController
+	if bc == nil {
+		t.Fatalf("kubenest.bootstrapController is absent — the minted repo credential was dropped:\n%s", values)
+	}
+	if got := bc["gitRepoURL"]; got != "git@gitea.example.test:kubenest/prod-1.git" {
+		t.Errorf("gitRepoURL = %v, want the minted repo_url", got)
+	}
+	if got := bc["gitRepoBranch"]; got != "main" {
+		t.Errorf("gitRepoBranch = %v, want the minted branch", got)
+	}
+	if got := bc["gitSSHPrivateKey"]; got != repoKey {
+		t.Errorf("gitSSHPrivateKey did not survive the YAML round trip byte-for-byte;\n got %q\nwant %q", got, repoKey)
+	}
+	if _, leaked := bc["gitToken"]; leaked {
+		t.Error("gitToken is the legacy backend-wide writer and must stay at its empty default")
+	}
+	if document.Bootstrap.Gitea == nil || document.Bootstrap.Gitea["enabled"] != false {
+		t.Errorf("a minted repo credential must disable the in-cluster Gitea:\n%s", values)
+	}
+}
+
+// No repo credential means the control plane has no GitOps configured: the
+// chart's own Gitea fallback stands, and no external credential values may
+// render — a gitRepoURL of "" with Gitea disabled reproduces kn-rnyl.2.
+func TestNoRepoCredentialRendersNoBootstrapController(t *testing.T) {
+	values, err := agent.Values(creds(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Kubenest struct {
+			BootstrapController map[string]any `yaml:"bootstrapController"`
+		} `yaml:"kubenest"`
+	}
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Kubenest.BootstrapController != nil {
+		t.Errorf("with no repo credential, bootstrapController must stay at the chart defaults:\n%s", values)
+	}
+	if strings.Contains(values, "gitSSHPrivateKey") || strings.Contains(values, "gitRepoURL") {
+		t.Errorf("external credential keys rendered without a repo credential:\n%s", values)
+	}
+}
+
+// THE rule for this package, extended to the deploy key: it reaches the
+// cluster as chart values and by no other route. Never a command argument —
+// command lines are visible in the target host's process list — and never the
+// journal: api.Secret refuses to marshal, and the install Record keeps only
+// the non-secret repo_url (pkg/install/plan.go).
+func TestTheRepoKeyNeverReachesACommandLineNorAJournal(t *testing.T) {
+	fake := &componenttest.FakeRunner{Respond: func(cmd string) (sshx.Result, error) {
+		if strings.Contains(cmd, "get deployment") || strings.Contains(cmd, "kubectl get") {
+			return sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Available","status":"True"}]}}`}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	if err := agent.Install(context.Background(), fake, bundle(t), creds(true), nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range fake.Commands() {
+		if strings.Contains(cmd, repoKey) || strings.Contains(cmd, "OPENSSH PRIVATE KEY") {
+			t.Fatalf("the repo private key appeared in a command:\n%s", cmd)
+		}
+	}
+
+	// The journal path: anything a journal could marshal must refuse to carry
+	// the key. AgentCredentials contains RepoCredential.PrivateKey (api.Secret),
+	// so encoding it is an error, not a leak.
+	if _, err := json.Marshal(creds(true)); err == nil {
+		t.Fatal("marshaling the minted credentials succeeded — the private key could reach a journal")
+	}
+	var leaked strings.Builder
+	enc := json.NewEncoder(&leaked)
+	_ = enc.Encode(creds(true)) // error by design; check nothing escaped anyway
+	if strings.Contains(leaked.String(), "OPENSSH PRIVATE KEY") {
+		t.Fatalf("the private key leaked into encoded output:\n%s", leaked.String())
+	}
+}
+
+// A half-rendered repo credential installs an operator that can neither push
+// nor sync; the mint is the only producer, so refuse at render time and name
+// the fix.
+func TestAMalformedRepoCredentialIsRefused(t *testing.T) {
+	cases := map[string]func(*api.AgentCredentials){
+		"no repo_url":    func(c *api.AgentCredentials) { c.RepoCredential.RepoURL = "" },
+		"no private_key": func(c *api.AgentCredentials) { c.RepoCredential.PrivateKey = api.Secret{} },
+		"no branch":      func(c *api.AgentCredentials) { c.RepoCredential.Branch = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := creds(true)
+			mutate(c)
+			if _, err := agent.Values(c); err == nil {
+				t.Fatal("want a refusal for a repo credential missing its " + name)
+			}
+		})
 	}
 }
