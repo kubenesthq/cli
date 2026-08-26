@@ -145,14 +145,22 @@ fetch() {
   fi
 }
 
-# Print the SHA-256 of a file, hex only.
+# Print the SHA-256 of a file, hex only. No pipelines: POSIX sh has no
+# pipefail, so a failing hash tool behind a pipe could be masked. Each tool's
+# output is captured whole and the hash is extracted by parameter expansion.
 sha256_of() {
+  _h_out=""
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    _h_out="$(sha256sum "$1")" || die "sha256sum failed on $1"
+    printf '%s\n' "${_h_out%% *}"
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
+    _h_out="$(shasum -a 256 "$1")" || die "shasum failed on $1"
+    printf '%s\n' "${_h_out%% *}"
   elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$1" | awk '{print $NF}'
+    # "SHA2-256(file)= <hash>" (newer) or "SHA256(file)= <hash>" (older)
+    _h_out="$(openssl dgst -sha256 "$1")" || die "openssl failed on $1"
+    _h_out="${_h_out##*= }"
+    printf '%s\n' "${_h_out}"
   else
     die "need sha256sum, shasum or openssl to verify the download" \
         "install one of them and re-run"
@@ -164,12 +172,18 @@ sha256_of() {
 # names: kubenest-<tag>-<os>-<arch>[.exe]. See .github/workflows/build.yml.
 # ---------------------------------------------------------------------------
 detect_platform() {
-  _os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  _machine="$(uname -m)"
+  # No pipeline (no `uname | tr`): POSIX sh lacks pipefail, so detection must
+  # not be able to mask a failure. case matches the spellings uname emits.
+  _os="$(uname -s)" || die "uname failed; cannot detect the operating system"
+  _machine="$(uname -m)" || die "uname failed; cannot detect the architecture"
 
   case "$_os" in
-    linux)  OS="linux" ;;
-    darwin) OS="darwin" ;;
+    Linux|linux)   OS="linux" ;;
+    Darwin|darwin) OS="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT)
+      die "Windows is not supported by this installer" \
+          "download the .exe from https://github.com/${REPO}/releases and verify it per the release notes"
+      ;;
     *)
       die "unsupported operating system: $_os" \
           "the CLI ships for Linux and macOS; build from source for other systems"
@@ -204,8 +218,10 @@ resolve_version() {
     || die "could not reach the release API at ${RELEASE_API}/releases/latest" \
            "check your network, or pin a version with --version"
 
-  # Extract "tag_name": "..." without assuming jq is present.
-  VERSION="$(sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' "$_latest_json" | head -n 1)"
+  # Extract "tag_name": "..." without assuming jq is present. Single awk, no
+  # pipeline (POSIX sh has no pipefail; a masked failure must be impossible).
+  VERSION="$(awk -F'"' '/"tag_name"[[:space:]]*:/ { print $4; exit }' "$_latest_json")" \
+    || die "could not read the latest-release response"
   [ -n "$VERSION" ] || die "could not determine the latest release tag" \
                            "pin a version with --version"
   info "latest release is ${VERSION}"

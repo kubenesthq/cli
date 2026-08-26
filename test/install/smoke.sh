@@ -145,31 +145,50 @@ run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c '
 ' || fail "happy path did not install a verified binary"
 pass "verified download installed and runs; re-run is a no-op"
 
-# --- 5. negative: tampered binary must abort before install ----------------
-log "negative path: corrupted binary must abort"
+# Negative-path container body: run the installer, require it to fail, and
+# require that NOTHING was installed. Exits 88 if the installer succeeded,
+# 89 if it aborted but left a binary behind.
+# Double-quoted so INSTALL_CMD expands now; \$? and \$rc stay literal until
+# the container's shell runs them.
+NEG_BODY="rc=0
+${INSTALL_CMD} >/dev/null 2>&1 || rc=\$?
+[ \"\$rc\" -ne 0 ] || { echo 'installer unexpectedly succeeded'; exit 88; }
+test ! -e /usr/local/bin/kubenest || { echo 'binary installed despite abort'; exit 89; }"
+
+# --- 5. negative: tampered binary must abort, leaving nothing behind -------
+log "negative path: corrupted binary must abort and install nothing"
 printf 'X' | dd of="${RELEASE_DIR}/${ASSET}" bs=1 seek=100 conv=notrunc status=none
 set +e
-run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c '
-  '"${INSTALL_CMD}"'
-' >/dev/null 2>&1
+run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
 rc=$?
 set -e
-[ "$rc" -ne 0 ] || fail "installer accepted a tampered binary"
-pass "tampered binary aborted (exit ${rc})"
+[ "$rc" -eq 0 ] || fail "tampered binary not cleanly rejected (container exit ${rc}: 88=installed, 89=installed-despite-abort)"
+pass "tampered binary aborted and installed nothing"
 # restore the good binary for the next test
 ( cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
     -ldflags "-s -w -X kubenest.io/cli/pkg/version.Version=${VERSION}" \
     -o "${RELEASE_DIR}/${ASSET}" ./cmd/kubenest )
 
 # --- 6. negative: wrong public key must abort ------------------------------
-log "negative path: wrong public key must abort"
+log "negative path: wrong public key must abort and install nothing"
 set +e
-run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/wrong.pub -- bash -c '
-  '"${INSTALL_CMD}"'
-' >/dev/null 2>&1
+run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/wrong.pub -- bash -c "${NEG_BODY}"
 rc=$?
 set -e
-[ "$rc" -ne 0 ] || fail "installer accepted a signature from the wrong key"
-pass "wrong-key signature aborted (exit ${rc})"
+[ "$rc" -eq 0 ] || fail "wrong-key signature not cleanly rejected (container exit ${rc})"
+pass "wrong-key signature aborted and installed nothing"
+
+# --- 7. negative: unsigned release (no bundle) must abort ------------------
+# This is the shape of every release published before Sigstore bundle signing
+# (e.g. v1.0.6): checksums exist, no signature. The installer must refuse it.
+log "negative path: release with no Sigstore bundle must abort"
+mv "${RELEASE_DIR}/checksums.txt.sigstore.json" "${WORK}/bundle.aside"
+set +e
+run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
+rc=$?
+set -e
+mv "${WORK}/bundle.aside" "${RELEASE_DIR}/checksums.txt.sigstore.json"
+[ "$rc" -eq 0 ] || fail "unsigned release not cleanly rejected (container exit ${rc})"
+pass "unsigned release (no bundle) aborted and installed nothing"
 
 printf '\n\033[0;32m[smoke] ALL CHECKS PASSED\033[0m\n'
