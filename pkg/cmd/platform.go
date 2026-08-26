@@ -34,6 +34,13 @@ type InstallFlags struct {
 	SSHKey        string
 	StorageDevice string
 	BackupTarget  string
+	// Standalone installs a cluster that registers with nothing: no control
+	// plane, no `kubenest login`, no fleet record anywhere but the cluster
+	// itself (kn-l827). It is an explicit flag and not an inference from a
+	// missing config, because "you were logged out and we quietly installed
+	// an unregistered cluster instead" is a discovery for the customer's
+	// next audit, not for install time.
+	Standalone bool
 }
 
 // Validate applies the checks that need no manifest and no network: flag
@@ -44,7 +51,10 @@ func (f *InstallFlags) Validate() error {
 		return fmt.Errorf("--bundle is required: the bundle version pins every component (see the Bundle contents page)")
 	}
 	if f.Name == "" {
-		return fmt.Errorf("--name is required: the cluster is registered with the control plane under this name")
+		return fmt.Errorf("--name is required: the cluster is recorded under this name")
+	}
+	if f.Standalone && f.Org != "" {
+		return fmt.Errorf("--org names the organization to register under, and --standalone registers with nothing: pass one or the other")
 	}
 	if len(f.Servers) == 0 {
 		return fmt.Errorf("at least one --server is required")
@@ -94,7 +104,12 @@ SSH, as one versioned unit.
 
 Preflight checks everything before the first byte is written to any machine.
 SSH keys come from --ssh-key, ssh-agent or ~/.ssh/config and never leave this
-machine.`,
+machine.
+
+With --standalone the cluster registers with nothing: no control plane, no
+login, and the record of what was installed lives on the cluster itself. Add a
+control plane later for the fleet view; a standalone cluster is a complete
+platform, not a degraded one.`,
 		Example: `  kubenest platform install \
     --bundle 1.0 \
     --name prod-1 \
@@ -117,6 +132,7 @@ machine.`,
 	fs.StringVar(&f.Bundle, "bundle", "", "platform bundle version to install (required)")
 	fs.StringVar(&f.Name, "name", "", "cluster name, recorded against the control plane (required)")
 	fs.StringVar(&f.Org, "org", "", "organization slug or id (only needed when your credential can see more than one)")
+	fs.BoolVar(&f.Standalone, "standalone", false, "install a cluster that registers with nothing: no control plane, no login, the record lives on the cluster")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (repeat three times for --ha ha)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (repeatable)")
 	fs.StringVar(&f.HATier, "ha", "", "HA tier: single-server or ha (required, permanent)")

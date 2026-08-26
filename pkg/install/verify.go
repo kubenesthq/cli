@@ -254,6 +254,24 @@ func cleanupVerifyNamespace(ctx context.Context, r k3s.Runner) {
 // but MANAGED: the control plane shows it connected, which only happens once
 // the agent has dialled the hub and the first heartbeat has arrived.
 func verifyClusterReportsIn(ctx context.Context, s *Session) error {
+	if s.Standalone() {
+		// A standalone cluster has nothing to report to, so this check
+		// cannot be run as written — and it must not therefore PASS. What
+		// replaces it is the equivalent question answered from inside the
+		// cluster: not "does a pod look healthy" but "does the agent
+		// actually reconcile", the same standard verifyStorageProvisions
+		// holds storage to when it refuses to accept that a StorageClass
+		// exists as proof that storage works.
+		//
+		// It is not written yet because it cannot be: the reconcile it would
+		// drive needs an agent that can reach Ready without a hub, which is
+		// kn-sf17. Stage 10 refuses before this is reached, so this is
+		// unreachable today rather than silently skipped — and if that ever
+		// stops being true, this says so instead of passing.
+		return fmt.Errorf("a standalone cluster has no control plane to report in to, and the check that replaces this one " +
+			"— that the agent actually reconciles, proved from inside the cluster — lands with kn-sf17 alongside the agent " +
+			"that can run without a hub. This install is not verified")
+	}
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to check: stage 2 must run before stage 13")
 	}
@@ -375,11 +393,14 @@ func chartComponents(s *Session) map[string]string {
 	kuredChart, err := day2.Chart(s.Bundle)
 	add("kured", kuredChart, err)
 	out[storage.ComponentKey] = storage.ChartResourceName
-
-	if creds, ok := s.Creds.(*api.AgentCredentials); ok && creds != nil {
-		agentChart, err := agent.Chart(s.Bundle, creds)
-		add("kubenest-agent", agentChart, err)
-	}
+	// The agent's row does NOT come from agent.Chart, which needs the minted
+	// credentials to render a chart reference it does not need here: what
+	// this check matches on is the HelmChart RESOURCE name, and that is the
+	// release name, a constant. Deriving it from the credentials meant that
+	// any install without them — every standalone one — silently dropped the
+	// agent from the record check and still reported a pass. A check that
+	// quietly stops checking is worse than one that fails.
+	out["kubenest-agent"] = agent.ReleaseName()
 	return out
 }
 

@@ -88,6 +88,12 @@ type Record struct {
 	Adopted      bool              `json:"adopted,omitempty"`
 	Device       string            `json:"storage_device,omitempty"`
 	Ownership    storage.Ownership `json:"volume_group_ownership,omitempty"`
+	// Standalone records that this install had no control plane, so the
+	// cluster id in the journal was generated locally rather than assigned
+	// (kn-l827). It is what lets a later adoption tell "this cluster minted
+	// its own identity" apart from "this journal belongs to a different
+	// control plane", which are two very different situations to walk into.
+	Standalone bool `json:"standalone,omitempty"`
 }
 
 // Session is one install run's state.
@@ -260,7 +266,8 @@ func stagePreflight(ctx context.Context, s *Session) error {
 		StorageDevice: s.Opts.StorageDevice,
 		Nodes:         nodes,
 		Egress:        EgressTargets(s),
-		Catalog:       bundleCatalog{s.API},
+		Catalog:       s.catalog(),
+		Standalone:    s.Standalone(),
 	})
 	for _, warning := range report.Warnings() {
 		s.Logf("  warning: %s", warning)
@@ -312,6 +319,17 @@ func EgressTargets(s *Session) []preflight.EgressTarget {
 	return targets
 }
 
+// catalog is where stage 1 reads the offered bundles from: the control plane
+// when there is one, the versions built into this binary when there is not.
+// Same check either way — a request for a tier or a profile the bundle does
+// not offer is refused before anything is written to a machine.
+func (s *Session) catalog() preflight.Catalog {
+	if s.Standalone() {
+		return EmbeddedCatalog{}
+	}
+	return bundleCatalog{s.API}
+}
+
 // bundleCatalog adapts the API client to preflight's narrow view of it.
 type bundleCatalog struct{ client *api.Client }
 
@@ -341,8 +359,11 @@ func (b bundleCatalog) ListBundles(ctx context.Context) ([]preflight.BundleEntry
 // Re-minting on a resume whose agent is already installed and heartbeating
 // would rotate a live cluster's identity to no purpose.
 func stageRegister(ctx context.Context, s *Session) error {
-	if s.API == nil {
-		return fmt.Errorf("no control plane configured: run `kubenest login` first")
+	if s.Standalone() {
+		// Nothing to register against, by decision rather than by accident
+		// (kn-l827). The cluster generates its own identity and mints no
+		// credential — see stageRegisterStandalone.
+		return stageRegisterStandalone(s)
 	}
 	org, err := register.ResolveOrg(ctx, s.API, s.Opts.Org)
 	if err != nil {
@@ -554,6 +575,25 @@ func stageDay2(ctx context.Context, s *Session) error {
 // — with the identity minted in stage 2, and only ever with THIS process's
 // credentials.
 func stageAgent(ctx context.Context, s *Session) error {
+	if s.Standalone() {
+		// The CLI half of standalone install has landed; the operator half
+		// has not. The agent's readiness probe is wired to its hub
+		// WebSocket (op3 cmd/manager/main.go, pkg/websocket/manager.go
+		// ReadyzCheck), so with no hub the pod never goes Ready, the
+		// Deployment never goes Available, and this stage's wait would time
+		// out after installing something that could never converge.
+		//
+		// Refusing before anything is applied is the only honest option
+		// (invariant 5: an unimplemented path says so and never pretends
+		// success). It leaves the cluster with stages 1-9 complete and
+		// nothing to undo, and a re-run resumes from exactly this point.
+		return stages.NewComponentError("kubenest-agent", fmt.Errorf(
+			"a standalone cluster cannot run the agent yet: the agent reports Ready only while it is connected to a hub, "+
+				"and a standalone cluster has none, so it would install and never converge. "+
+				"The operator-side fix is kn-sf17 (unmanaged mode: with no hub configured the hub connection is not attempted "+
+				"and readiness reflects the controllers), and it needs a new operator chart and image published before this stage can run. "+
+				"Stages 1-9 are installed and correct; re-run this identical command once kn-sf17 has shipped and it resumes here"))
+	}
 	server, err := s.Server()
 	if err != nil {
 		return err
@@ -599,6 +639,12 @@ func stageProfiles(ctx context.Context, s *Session) error {
 // decide whether it may remove a volume group, which is the difference
 // between a clean teardown and destroying a customer's data.
 func stageRecord(ctx context.Context, s *Session) error {
+	if s.Standalone() {
+		// No control plane to record against, so the record goes where the
+		// cluster is: onto the cluster. See standalone.go — this is the
+		// only copy that exists in this mode, and kn-y3gt is its reader.
+		return stageRecordStandalone(ctx, s)
+	}
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to record against")
 	}

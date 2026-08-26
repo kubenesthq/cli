@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
@@ -21,17 +22,22 @@ import (
 )
 
 // controlPlaneClient builds an authenticated client from the stored config.
-// Install requires a control plane: the cluster is registered before anything
-// is written to a machine, because there is no safe upgrade without a record
-// of what was installed, and fleet telemetry has to start at install rather
-// than at the first support call.
+//
+// A control plane is how a cluster JOINS A FLEET: it is the console, the
+// health view and the multi-cluster day-2 surface. It is NOT a prerequisite
+// for installing a cluster (kn-l827, decision 2026-08-26: nothing is hosted
+// by us), and `--standalone` takes the other path. What has to be true either
+// way is that the cluster records what was installed on it — without that
+// there is no safe upgrade — so standalone writes that record onto the
+// cluster instead of into a control plane.
 func controlPlaneClient() (*api.Client, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
 	}
 	if cfg.ControlPlaneURL == "" {
-		return nil, fmt.Errorf("no control plane configured: run `kubenest login --control-plane https://...` first")
+		return nil, fmt.Errorf("no control plane configured: run `kubenest login --control-plane https://...` first, " +
+			"or install a cluster that registers with nothing: `kubenest platform install --standalone`")
 	}
 	creds, err := config.LoadCredentials()
 	if err != nil {
@@ -39,28 +45,52 @@ func controlPlaneClient() (*api.Client, error) {
 	}
 	token := creds.TokenFor(cfg.ControlPlaneURL)
 	if token == "" {
-		return nil, fmt.Errorf("not logged in to %s: run `kubenest login` first", cfg.ControlPlaneURL)
+		return nil, fmt.Errorf("not logged in to %s: run `kubenest login` first, "+
+			"or install a cluster that registers with nothing: `kubenest platform install --standalone`", cfg.ControlPlaneURL)
 	}
 	return api.New(cfg.ControlPlaneURL, api.WithToken(token))
 }
 
-// runInstall is `kubenest platform install`.
-func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
-	client, err := controlPlaneClient()
-	if err != nil {
-		return err
+// installSources resolves the two things an install needs before it starts:
+// the control plane, if there is one, and the bundle manifest.
+//
+// THE MANIFEST IS THE POINT. Every version pin and every deadline in the
+// installer comes out of it (a missing timeout is an error, never a default),
+// so where it comes from decides whether an install can happen at all. A
+// registered install fetches it from the control plane, because the record
+// written in stage 12 has to be checkable against the same document the
+// control plane validates against. A standalone install reads the copy built
+// into this binary — see pkg/bundles for why the pins travel with the binary
+// that installs them.
+func installSources(ctx context.Context, f InstallFlags) (*api.Client, *manifest.Manifest, error) {
+	if f.Standalone {
+		bundle, err := bundles.Manifest(f.Bundle)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, bundle, nil
 	}
 
-	// The bundle manifest comes from the control plane, not from a file on
-	// this machine: it is a versioned artifact of the release, and the record
-	// written in stage 12 has to be checkable against the same document.
+	client, err := controlPlaneClient()
+	if err != nil {
+		return nil, nil, err
+	}
 	raw, err := client.BundleManifest(ctx, f.Bundle)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	bundle, err := manifest.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("bundle %s from the control plane is not a valid manifest: %w", f.Bundle, err)
+		return nil, nil, fmt.Errorf("bundle %s from the control plane is not a valid manifest: %w", f.Bundle, err)
+	}
+	return client, bundle, nil
+}
+
+// runInstall is `kubenest platform install`.
+func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
+	client, bundle, err := installSources(ctx, f)
+	if err != nil {
+		return err
 	}
 
 	opts := install.Options{
@@ -101,16 +131,22 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 	}
 	defer session.Close()
 
-	// Printed locally AND published to the control plane, from the same
-	// transition: the operator at the terminal and the console watching the
-	// install see the same thirteen stages.
-	session.Emit = install.Emitters{
-		install.TextEmitter{W: out},
-		install.NewControlPlaneEmitter(client, func() string { return journal.ClusterID }),
+	// Printed locally AND, when there is one, published to the control plane
+	// from the same transition: the operator at the terminal and the console
+	// watching the install see the same thirteen stages. A standalone install
+	// has only the terminal, and attaching a nil-client emitter would be a
+	// publisher that silently drops everything.
+	emitters := install.Emitters{install.TextEmitter{W: out}}
+	if client != nil {
+		emitters = append(emitters, install.NewControlPlaneEmitter(client, func() string { return journal.ClusterID }))
 	}
+	session.Emit = emitters
 
 	fmt.Fprintf(out, "Installing platform bundle %s on %d node(s), %s tier.\n",
 		f.Bundle, len(f.Servers)+len(f.Agents), f.HATier)
+	if f.Standalone {
+		fmt.Fprintf(out, "Standalone: this cluster registers with nothing, and its record lives on the cluster.\n")
+	}
 	fmt.Fprintf(out, "Nothing is written to any machine until stage 3.\n\n")
 
 	result, err := install.Execute(ctx, session, install.Plan(session))

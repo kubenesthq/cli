@@ -1,0 +1,216 @@
+# KubeNest Platform 0.9 — the release Platform 1.0 succeeds.
+#
+# WHY THIS FILE EXISTS, stated plainly because a version in the catalog is a
+# product statement: an upgrade cannot be built or tested against a catalog
+# with one entry in it. kn-fuo needs a real N -> N+1 to exercise, and the one
+# transition that matters — the point of no return, where nodes drain and
+# Kubernetes moves — cannot be exercised by a bundle that changes no
+# Kubernetes version.
+#
+# It differs from 1.0 in TWO PINS, and both differences are real history
+# rather than invention:
+#
+#   k3s            v1.35.6+k3s1 rather than v1.35.7+k3s1. Both are real k3s
+#                  releases of the v1.35 line, and both satisfy decision B
+#                  (track stable minus one minor, pinned to that minor's
+#                  current patch) at the time each was cut — 0.9 pinned the
+#                  then-current patch, 1.0 pins the one after it.
+#
+#   kubenest-agent 2.2.0 rather than 2.3.5. 2.3.5 is the corruption-aware
+#                  chart kn-f9lm cut on 2026-08-21, after 0.9. Back-pinning
+#                  0.9 to a chart that did not exist when 0.9 was current
+#                  would be fiction, and the point of this file is that
+#                  nothing in it is invented.
+#
+# The k3s difference is what makes the upgrade worth gating: 0.9 -> 1.0
+# crosses the point of no return, so every node drains and returns and a
+# rollback from beyond it genuinely needs the datastore snapshot rather than
+# a Helm revert. The agent difference rides along and is closer to a real
+# upgrade than a Kubernetes-only transition would have been.
+#
+# test_vendored_09_differs_from_10_only_in_the_k3s_pin asserts this exact set,
+# so a third pin drifting between the two is a test failure and not a silent
+# change to what the upgrade gate is testing.
+#
+# kn-boj owns the bundle catalog. If the real 0.9 should carry different pins,
+# or should not be in the catalog at all, that is that bead's call and this
+# file is cheap to change or delete.
+
+# Inherited verbatim from Platform 1.0 (kn-boj), except the two pins above.
+#
+# Pin rule (see bundle-manifest.schema.json): the version is the version of the
+# artifact the installer installs — Helm chart version for chart-installed
+# components, upstream release tag otherwise. Every pin below was verified
+# against the live upstream release channel on 2026-08-20.
+#
+# k3s policy (decision B, 2026-08-20): track upstream stable minus one minor,
+# pinned to that minor's current patch. Stable was v1.36.3+k3s1 on 2026-08-20,
+# so Platform 1.0 pins the v1.35 channel's latest patch.
+#
+# Chart repo facts recorded for the installer libraries (verified 2026-08-20):
+#   traefik                  https://traefik.github.io/charts
+#   cert-manager             https://charts.jetstack.io
+#   openebs-lvm-localpv      https://openebs.github.io/lvm-localpv
+#   velero                   https://vmware-tanzu.github.io/helm-charts
+#                            (the SOURCE repo moved to velero-io/velero, but the
+#                            chart still lives and releases in vmware-tanzu)
+#   kured                    https://kubereboot.github.io/charts
+#   sealed-secrets           https://bitnami.github.io/sealed-secrets
+#                            (moved from bitnami-labs; the old index is a 404)
+#   external-secrets         https://charts.external-secrets.io
+#   grafana / loki           https://grafana-community.github.io/helm-charts
+#                            (moved from grafana/helm-charts in 2026; the old
+#                            repo is frozen / enterprise-only for these charts)
+#   victoria-metrics-single  https://victoriametrics.github.io/helm-charts
+#   openebs (umbrella)       https://openebs.github.io/openebs
+#   kubenest-agent           oci://ghcr.io/kubenesthq/charts/kubenest-operator-2
+#                            (machine-readable under sources: below — the backend
+#                            composes install-instructions chart_ref from it)
+
+bundle: "0.9"
+
+core:
+  k3s: v1.35.6+k3s1                    # single-node embedded etcd on every tier (decision A)
+  traefik: 41.2.0                      # chart; ships Traefik v3.7.10, Gateway API provider
+  gateway-api: v1.6.1                  # standard-channel CRD bundle of this release
+  cert-manager: v1.21.1                # chart == app version
+  openebs-lvm-localpv: 1.10.0          # chart == app version
+  velero: 12.1.0                       # chart; ships Velero 1.18.1
+  system-upgrade-controller: v0.20.1   # release manifests, not a chart
+  kured: 6.1.0                         # chart; ships kured 1.23.0
+  kubenest-agent: 2.2.0                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.2.0 (kn-z6e4/kn-8ys1/kn-awcb): helm-only installs self-provision
+                                       # identity, no ingress-nginx, gitea without Bitnami; image tag exists.
+                                       # 2.1.0's default image tag was published nowhere - do not pin back.
+
+# Version-less base refs; the version is ALWAYS the core pin above (one pin, one
+# place). kubenest-agent's is load-bearing: the backend renders install-instructions
+# chart_ref as <source>:<pin>, and the previous hardcoded registry.kubenest.io did
+# not exist (kn-z6e4). Anonymous `helm pull` of this ref verified 2026-08-20.
+sources:
+  kubenest-agent: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2
+
+os:
+  # Only releases actually exercised by the compatibility tests belong here.
+  # Ubuntu 26.04 LTS exists; it enters this list when kn-twe tests it.
+  supported: [ubuntu-24.04]
+
+ha-tiers: [single-server, ha]
+
+limits:
+  # Provisional per decision C (2026-08-20): the structure is settled, the
+  # numbers are bundle.mdx's pre-measurement values. kn-ze1 replaces them with
+  # measurements and the flag comes off in that bundle release.
+  provisional: true
+  resources:
+    # Binary units throughout: 1 GiB = 1024^3 bytes, which is what
+    # /proc/meminfo and statfs report. 3.7Gi is a "4 GB" machine as the kernel
+    # actually sees it; a floor written 4Gi would refuse correctly-sized hosts.
+    floor: { cpu: 2, memory: 3.7Gi, disk: 36Gi }
+    recommended: { cpu: 4, memory: 7.4Gi, disk: 92Gi }
+    upgrade-headroom: { disk: 10Gi }
+  timeouts:
+    node-ready: 5m
+    component-ready: 10m
+    node-drain: 15m
+    node-reboot: 20m
+    install-total: 30m
+    upgrade-per-node: 30m
+    backup: 1h
+    restore-drill: 2h
+
+health:
+  # kn-j5s. Provisional per decision C's rule: the structure is settled, the
+  # numbers are judgement until the fleet is real enough to tune them. They
+  # live here rather than in backend code so a release can retune them without
+  # a deploy, and so a missing one is a validation error rather than a default
+  # someone has to go read the source to discover.
+  provisional: true
+  certificates:
+    # 30 days is enough notice to schedule renewal into a maintenance window
+    # rather than page someone; 7 is the point where it stops being planning.
+    warning-days: 30
+    critical-days: 7
+  reporting:
+    # Three, not one: a single missed report is a dropped packet or a restart,
+    # and an alerting system that cries wolf on those gets muted, which is the
+    # same end state as having no alerting.
+    missed-reports-before-alert: 3
+    clock-skew-tolerance: 5m
+  nodes:
+    # Absorbs a kured reboot (node-reboot is 20m above) without hiding a node
+    # that is actually gone.
+    not-ready-grace: 25m
+  backup:
+    # Decision E: workload backup daily, restore drill weekly. These are the
+    # ages at which their ABSENCE alerts, so each is its interval plus one
+    # cycle of slack — a single failed run is not yet a support incident.
+    max-backup-age: 48h
+    max-restore-drill-age: 336h   # 14d; the shared duration type is s|m|h
+    unconfigured-target-grace: 168h  # 7d
+  datastore:
+    # Decision E sets hourly datastore snapshots; alert at three missed.
+    max-snapshot-age: 3h
+
+upgrade:
+  # Decision D (2026-08-20): adopt pluto, pin its deprecation dataset so the
+  # scan cannot silently go stale. The dataset is the data embedded in the
+  # pinned pluto release.
+  deprecation-scanner:
+    tool: pluto
+    version: v5.24.3
+    dataset: v5.24.3
+
+backup:
+  # The object-store plugin rides inside the velero deployment as an init
+  # container and serves every S3-compatible target, not only AWS. Its
+  # major.minor pairs with the Velero APP version (1.18.x <-> plugin v1.14.x,
+  # upstream compatibility matrix) — check this pin whenever core.velero moves.
+  # Image verified on Docker Hub (velero/velero-plugin-for-aws) 2026-08-20.
+  # Source repo moved to velero-io/velero-plugin-for-aws; the image org did not.
+  object-store-plugin:
+    provider: aws
+    version: v1.14.2
+  # Decision E (2026-08-20). On single-server, the gap between datastore
+  # snapshots is exactly how much cluster state a disk failure costs.
+  defaults:
+    datastore-snapshot: { interval: 1h, keep: 24 }
+    workload-backup: { interval: 24h, keep: 14 }
+    restore-drill: { interval: 7d }
+
+profiles:
+  # ONE COMPONENT SET PER SLOT (decision M, 2026-08-23). A profile name resolves
+  # to exactly one set of pins, or the compatibility matrix cannot enumerate what
+  # "the secrets profile" means and kn-twe's six configurations are not six.
+  #
+  # Profile pins are chosen and verified against upstream, but no profile has
+  # been tested against core as a unit yet — that is wave-4 work (kn-sev5,
+  # kn-ynaq) gated by kn-twe's matrix. Hence provisional: true on both component
+  # profiles until the matrix runs.
+  observability:
+    provisional: true
+    components:
+      victoria-metrics-single: 0.45.0   # chart; ships VictoriaMetrics v1.150.0
+      grafana: 12.11.1                  # grafana-community chart; ships Grafana 13.2.0
+      loki: 18.10.1                     # grafana-community chart; ships Loki 3.7.6
+  secrets:
+    # sealed-secrets, and only sealed-secrets. external-secrets was the second
+    # component in this slot until decision M; it returns as its own profile,
+    # `secrets-external`, when a client with an existing Vault or cloud secret
+    # manager needs it — not before. Pinning a component nobody has run is what
+    # makes "tested together as one thing" untrue.
+    provisional: true
+    components:
+      sealed-secrets: 2.19.3            # chart; ships controller 0.39.1
+  ha:
+    # Topology change, not components: two more servers join the embedded-etcd
+    # cluster that single-server already runs (decision A).
+    components: {}
+
+# NOT IN 1.x: replicated-storage (decision N, 2026-08-23). The engine choice —
+# OpenEBS Replicated PV Mayastor via the openebs umbrella chart, 4.5.1, was the
+# provisional pin — is deferred until a client needs replicated volumes. It was
+# the lowest-priority profile (kn-54ni, P3), no engine had been tested against
+# core, and carrying a provisional pin for software nobody has run is the thing
+# that makes the bundle's central claim false. Local PV LVM in core plus
+# restore-tested backups is the storage story until it returns.

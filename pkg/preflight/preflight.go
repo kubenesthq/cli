@@ -172,7 +172,17 @@ type Options struct {
 	StorageDevice string
 	Nodes         []Node
 	Egress        []EgressTarget
-	Catalog       Catalog
+	// Catalog is where the offered bundles are read from: the control plane
+	// in a registered install, the versions built into this binary in a
+	// standalone one. Preflight does not care which — the request is checked
+	// against the offer either way.
+	Catalog Catalog
+	// Standalone is an install with no control plane at all (kn-l827,
+	// decision 2026-08-26: nothing is hosted by us). It changes what the
+	// control-plane check REPORTS, not whether the bundle is checked: an
+	// unregistered cluster still may not be handed a tier or a profile its
+	// bundle does not offer.
+	Standalone bool
 }
 
 // Run executes every check against every node and returns the full report.
@@ -194,34 +204,20 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	return rep, rep.Err()
 }
 
-// checkControlPlaneAndBundle covers two of the eleven: the control plane is
-// reachable and this CLI is logged in, and the requested bundle exists and
-// offers the requested tier and profiles.
+// checkControlPlaneAndBundle covers two of the eleven: where this cluster will
+// register — a reachable, logged-in control plane, or nothing at all under
+// --standalone — and whether the requested bundle exists and offers the
+// requested tier and profiles.
+//
+// The second check is the same in both modes. Only the first differs, and it
+// differs in what it reports rather than in whether it runs: a check that
+// silently disappeared in one mode would make the difference between the two
+// invisible in the report an operator reads.
 func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) {
-	if opts.Catalog == nil {
-		rep.add(Result{
-			Check: CheckControlPlane, Outcome: Fail,
-			Detail: "no control plane configured",
-			Fix:    "run `kubenest login` first — install registers the cluster and will not run without a control plane",
-		})
+	bundles, ok := offeredBundles(ctx, opts, rep)
+	if !ok {
 		return
 	}
-	bundles, err := opts.Catalog.ListBundles(ctx)
-	if err != nil {
-		rep.add(Result{
-			Check: CheckControlPlane, Outcome: Fail,
-			Detail: "the control plane could not be reached, or this CLI is not logged in: " + err.Error(),
-			Fix:    "check the control-plane URL and run `kubenest login`",
-		})
-		// Without the catalog there is nothing to check the bundle against.
-		rep.add(Result{
-			Check: CheckBundle, Outcome: Fail,
-			Detail: "not checked: the control plane is unreachable",
-			Fix:    "fix the control plane, then re-run",
-		})
-		return
-	}
-	rep.add(Result{Check: CheckControlPlane, Outcome: Pass, Detail: fmt.Sprintf("reachable, %d bundle(s) offered", len(bundles))})
 
 	var found *BundleEntry
 	var offered []string
@@ -232,11 +228,13 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 		}
 	}
 	if found == nil {
-		rep.add(Result{
-			Check: CheckBundle, Outcome: Fail,
-			Detail: fmt.Sprintf("this control plane does not offer bundle %q", opts.BundleVersion),
-			Fix:    "it offers " + orNone(offered),
-		})
+		detail := fmt.Sprintf("this control plane does not offer bundle %q", opts.BundleVersion)
+		fix := "it offers " + orNone(offered)
+		if opts.Standalone {
+			detail = fmt.Sprintf("this CLI does not carry bundle %q", opts.BundleVersion)
+			fix = "it carries " + orNone(offered) + "; upgrade the CLI to a release that ships the bundle you want"
+		}
+		rep.add(Result{Check: CheckBundle, Outcome: Fail, Detail: detail, Fix: fix})
 		return
 	}
 	if !contains(found.HATiers, opts.HATier) {
@@ -261,6 +259,69 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 		Check: CheckBundle, Outcome: Pass,
 		Detail: fmt.Sprintf("bundle %s offers the %s tier and every requested profile", found.Version, opts.HATier),
 	})
+}
+
+// offeredBundles resolves the catalog the request is checked against, and
+// reports the control-plane check while it is there.
+//
+// The two modes differ in what "Control plane" MEANS, not in whether the
+// bundle is checked. Registered: it must be reachable and this CLI logged in.
+// Standalone: there is nothing to reach, and saying "pass" would be a check
+// reporting on something that does not exist — so it reports what is actually
+// true, which is that this cluster will register with nothing.
+func offeredBundles(ctx context.Context, opts Options, rep *Report) ([]BundleEntry, bool) {
+	if opts.Catalog == nil {
+		if opts.Standalone {
+			// Not a login problem: the binary is supposed to carry its own
+			// catalog, so this is a build that shipped without one.
+			rep.add(Result{
+				Check: CheckBundle, Outcome: Fail,
+				Detail: "this CLI carries no bundle catalog, so the requested bundle cannot be checked",
+				Fix:    "reinstall the CLI from a published release",
+			})
+			return nil, false
+		}
+		rep.add(Result{
+			Check: CheckControlPlane, Outcome: Fail,
+			Detail: "no control plane configured",
+			Fix:    "run `kubenest login` first, or install without one: `kubenest platform install --standalone`",
+		})
+		return nil, false
+	}
+
+	bundles, err := opts.Catalog.ListBundles(ctx)
+	if err != nil {
+		if opts.Standalone {
+			rep.add(Result{
+				Check: CheckBundle, Outcome: Fail,
+				Detail: "the bundle catalog built into this CLI could not be read: " + err.Error(),
+				Fix:    "reinstall the CLI from a published release",
+			})
+			return nil, false
+		}
+		rep.add(Result{
+			Check: CheckControlPlane, Outcome: Fail,
+			Detail: "the control plane could not be reached, or this CLI is not logged in: " + err.Error(),
+			Fix:    "check the control-plane URL and run `kubenest login`",
+		})
+		// Without the catalog there is nothing to check the bundle against.
+		rep.add(Result{
+			Check: CheckBundle, Outcome: Fail,
+			Detail: "not checked: the control plane is unreachable",
+			Fix:    "fix the control plane, then re-run",
+		})
+		return nil, false
+	}
+
+	if opts.Standalone {
+		rep.add(Result{
+			Check: CheckControlPlane, Outcome: Pass,
+			Detail: fmt.Sprintf("not applicable: installing standalone, so this cluster registers with nothing and %d bundle(s) come from this CLI", len(bundles)),
+		})
+		return bundles, true
+	}
+	rep.add(Result{Check: CheckControlPlane, Outcome: Pass, Detail: fmt.Sprintf("reachable, %d bundle(s) offered", len(bundles))})
+	return bundles, true
 }
 
 // checkNodeCount is the arithmetic the tier requires. It is checked here as

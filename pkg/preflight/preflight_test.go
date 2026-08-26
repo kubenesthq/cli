@@ -252,7 +252,7 @@ func TestUnreachableControlPlaneIsRefusedBeforeAnythingElse(t *testing.T) {
 	opts.Catalog = fakeCatalog{err: errors.New("dial tcp: connection refused")}
 	rep, err := preflight.Run(context.Background(), opts)
 	if err == nil {
-		t.Fatal("install requires a control plane and must refuse without one")
+		t.Fatal("an install that registers with a control plane must refuse when it cannot reach one")
 	}
 	res, _ := outcomeOf(rep, preflight.CheckControlPlane)
 	if !strings.Contains(res.Fix, "kubenest login") {
