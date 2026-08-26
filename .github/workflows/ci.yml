@@ -37,6 +37,20 @@ jobs:
       - name: go test
         run: go test -race ./...
 
+  # install.sh installs software onto production hosts as root via `curl | sh`,
+  # so it is linted as strictly as the Go. It must stay POSIX sh (it runs under
+  # dash on Ubuntu), hence --shell=sh. The container smoke test
+  # (test/install/smoke.sh) is the behavioural gate and is run manually / on
+  # release because it needs Docker; shellcheck is the cheap always-on gate.
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: shellcheck install.sh (POSIX sh)
+        run: shellcheck --shell=sh --severity=style install.sh
+
   # The CLI is a customer-facing binary for workstations and bastions: it must
   # build on every platform we release for, on every change, not only at tag
   # time.
