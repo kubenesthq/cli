@@ -22,7 +22,28 @@
 #   crypto is real. It is a fixture only in that it is not hosted on GitHub
 #   under a live tag. See the bead before trusting a "green" here.
 #
-# Requirements: docker, go, cosign (v2 or v3), python3.
+#   THE FIXTURE'S SHAPE IS NOT THIS SCRIPT'S TO INVENT, and it was, once. The
+#   installer downloaded checksums.txt.sigstore.json while build.yml signed
+#   into a detached .sig/.pem pair, so install.sh could not install any release
+#   this repository cut — and this test passed throughout, because it built the
+#   bundle itself. contract_test.sh now compares install.sh against build.yml
+#   directly and runs FIRST, below, so the fixture cannot drift from the
+#   workflow again without something going red.
+#
+# WHAT THIS TEST DOES NOT COVER, stated rather than left silent:
+#   REAL KEYLESS VERIFICATION. Keyless needs a Fulcio certificate chained to
+#   the Sigstore public-good root and a Rekor entry, which cannot be minted
+#   without a GitHub Actions OIDC token — so the happy path here uses a pinned
+#   public key (install.sh's KUBENEST_COSIGN_PUBKEY mode) and NOT the keyless
+#   branch every real user takes. Case 8 drives install.sh with no pinned key
+#   so the keyless branch is at least entered and its cosign flags are proven
+#   to parse, but it cannot prove a genuine Fulcio identity matches
+#   KEYLESS_IDENTITY_REGEXP. That gap closes only against a real signed
+#   release. Until then the identity regexp is covered statically by
+#   contract_test.sh, which asserts it is identical to build.yml's, anchored,
+#   and restricted to release tags.
+#
+# Requirements: docker, go, cosign, python3.
 # Run:  bash test/install/smoke.sh
 
 set -euo pipefail
@@ -40,8 +61,34 @@ fail() { printf '\033[0;31m[smoke] FAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 for tool in docker go python3 curl; do
   command -v "$tool" >/dev/null 2>&1 || fail "missing required tool: $tool"
 done
-COSIGN_BIN="$(command -v cosign || true)"
-[ -n "$COSIGN_BIN" ] || fail "missing cosign (needed to sign the fixture release)"
+COSIGN_BIN="${SMOKE_COSIGN:-$(command -v cosign || true)}"
+[ -n "$COSIGN_BIN" ] || fail "missing cosign (needed to sign the fixture release); set SMOKE_COSIGN to a binary"
+
+# --- the fixture must match the workflow, checked before anything is built ---
+log "checking the install.sh <-> build.yml release contract"
+sh "${REPO_ROOT}/test/install/contract_test.sh" \
+  || fail "install.sh and build.yml do not describe the same release; fix that before trusting anything below"
+
+# The fixture must be signed in the format PRODUCTION emits, or this test
+# exercises an artifact shape that will never exist. build.yml pins cosign to
+# install.sh's COSIGN_VERSION and signs with plain --bundle, which on v3 means
+# the new Sigstore bundle; cosign v2's --bundle defaults to the legacy format
+# and needs --new-bundle-format to match. (v3's verify-blob reads both, so a
+# v2-signed fixture was never a false green — but it was not production's
+# artifact either.)
+PINNED_COSIGN="$(sed -n 's/^COSIGN_VERSION="\(.*\)"$/\1/p' "${REPO_ROOT}/install.sh")"
+COSIGN_VER="$("$COSIGN_BIN" version 2>/dev/null | sed -n 's/^ *GitVersion: *//p')"
+BUNDLE_FLAGS=""
+case "$COSIGN_VER" in
+  v3.*) : ;;
+  v2.*) BUNDLE_FLAGS="--new-bundle-format" ;;
+  *)    fail "cannot read cosign's version from ${COSIGN_BIN} (got '${COSIGN_VER}')" ;;
+esac
+if [ "$COSIGN_VER" != "$PINNED_COSIGN" ]; then
+  log "NOTE: fixture signed with cosign ${COSIGN_VER}; install.sh pins ${PINNED_COSIGN}."
+  log "      Forcing the new bundle format so the artifact matches what build.yml emits."
+  log "      Set SMOKE_COSIGN to a ${PINNED_COSIGN} binary to test the exact production signer."
+fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/kubenest-smoke.XXXXXX")"
 SERVER_PID=""
@@ -82,10 +129,18 @@ log "generating checksums.txt and signing it with cosign"
   cd "$RELEASE_DIR"
   sha256sum "$ASSET" > checksums.txt
   COSIGN_PASSWORD=smoketest "$COSIGN_BIN" generate-key-pair >/dev/null 2>&1
-  COSIGN_PASSWORD=smoketest "$COSIGN_BIN" sign-blob --yes \
+  # shellcheck disable=SC2086 # BUNDLE_FLAGS is deliberately word-split: empty, or one flag
+  COSIGN_PASSWORD=smoketest "$COSIGN_BIN" sign-blob --yes $BUNDLE_FLAGS \
     --key cosign.key --bundle checksums.txt.sigstore.json checksums.txt >/dev/null 2>&1
 )
 [ -s "${RELEASE_DIR}/checksums.txt.sigstore.json" ] || fail "bundle was not produced"
+
+# The exact bytes checksums.txt was computed over. The tamper case restores
+# from this rather than re-running `go build`: the rebuild is not byte-identical
+# here, so every later case was failing its CHECKSUM instead of the thing it
+# claimed to test — the wrong-key case in particular never reached the
+# signature check at all.
+cp "${RELEASE_DIR}/${ASSET}" "${WORK}/asset.pristine"
 
 # A wrong key, for the negative test.
 ( cd "$WORK" && COSIGN_PASSWORD=other "$COSIGN_BIN" generate-key-pair >/dev/null 2>&1 )
@@ -145,50 +200,121 @@ run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c '
 ' || fail "happy path did not install a verified binary"
 pass "verified download installed and runs; re-run is a no-op"
 
-# Negative-path container body: run the installer, require it to fail, and
-# require that NOTHING was installed. Exits 88 if the installer succeeded,
-# 89 if it aborted but left a binary behind.
+# Negative-path container body: run the installer, require it to fail, require
+# that NOTHING was installed, and require that it failed for the REASON this
+# case is about. That last assertion is not decoration — without it a case can
+# pass on an unrelated earlier failure and still read green, which is exactly
+# what the wrong-key case did once the tamper case stopped restoring the signed
+# bytes. $EXPECT is supplied per case via docker -e.
+# Exits: 88 installer succeeded, 89 aborted but installed anyway, 92 failed for
+# a different reason than $EXPECT.
 # Double-quoted so INSTALL_CMD expands now; \$? and \$rc stay literal until
 # the container's shell runs them.
-NEG_BODY="rc=0
-${INSTALL_CMD} >/dev/null 2>&1 || rc=\$?
+NEG_BODY="out=\$( ${INSTALL_CMD} 2>&1 ); rc=\$?
+printf '%s\\n' \"\$out\"
 [ \"\$rc\" -ne 0 ] || { echo 'installer unexpectedly succeeded'; exit 88; }
-test ! -e /usr/local/bin/kubenest || { echo 'binary installed despite abort'; exit 89; }"
+test ! -e /usr/local/bin/kubenest || { echo 'binary installed despite abort'; exit 89; }
+case \"\$out\" in
+  *\"\$EXPECT\"*) : ;;
+  *) echo \"aborted, but not because of: \$EXPECT\"; exit 92 ;;
+esac"
+
+# neg_fail turns a container exit code into a sentence.
+neg_fail() {
+  case "$2" in
+    88) fail "$1: the installer SUCCEEDED when it had to refuse" ;;
+    89) fail "$1: aborted but installed a binary anyway" ;;
+    92) fail "$1: aborted for the wrong reason — see the output above" ;;
+    *)  fail "$1: container exited $2" ;;
+  esac
+}
 
 # --- 5. negative: tampered binary must abort, leaving nothing behind -------
 log "negative path: corrupted binary must abort and install nothing"
 printf 'X' | dd of="${RELEASE_DIR}/${ASSET}" bs=1 seek=100 conv=notrunc status=none
 set +e
-run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
+run_container -e EXPECT="SHA-256 mismatch" -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
 rc=$?
 set -e
-[ "$rc" -eq 0 ] || fail "tampered binary not cleanly rejected (container exit ${rc}: 88=installed, 89=installed-despite-abort)"
-pass "tampered binary aborted and installed nothing"
-# restore the good binary for the next test
-( cd "$REPO_ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-    -ldflags "-s -w -X kubenest.io/cli/pkg/version.Version=${VERSION}" \
-    -o "${RELEASE_DIR}/${ASSET}" ./cmd/kubenest )
+[ "$rc" -eq 0 ] || neg_fail "tampered binary" "$rc"
+pass "tampered binary aborted at the checksum and installed nothing"
+# Restore the exact signed bytes. NOT a rebuild — see asset.pristine above.
+cp "${WORK}/asset.pristine" "${RELEASE_DIR}/${ASSET}"
 
 # --- 6. negative: wrong public key must abort ------------------------------
 log "negative path: wrong public key must abort and install nothing"
 set +e
-run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/wrong.pub -- bash -c "${NEG_BODY}"
+run_container -e EXPECT="signature verification FAILED" -e KUBENEST_COSIGN_PUBKEY=/fixture/wrong.pub -- bash -c "${NEG_BODY}"
 rc=$?
 set -e
-[ "$rc" -eq 0 ] || fail "wrong-key signature not cleanly rejected (container exit ${rc})"
-pass "wrong-key signature aborted and installed nothing"
+[ "$rc" -eq 0 ] || neg_fail "wrong public key" "$rc"
+pass "wrong-key signature aborted at the signature check and installed nothing"
 
-# --- 7. negative: unsigned release (no bundle) must abort ------------------
-# This is the shape of every release published before Sigstore bundle signing
-# (e.g. v1.0.6): checksums exist, no signature. The installer must refuse it.
-log "negative path: release with no Sigstore bundle must abort"
-mv "${RELEASE_DIR}/checksums.txt.sigstore.json" "${WORK}/bundle.aside"
+# --- 7. negative: a release in the shape build.yml produced BEFORE kn-s9ck ---
+# checksums.txt plus a DETACHED signature and certificate, and no Sigstore
+# bundle. That is what this repository's release workflow emitted while
+# install.sh was downloading checksums.txt.sigstore.json — the installer could
+# not install any release this repo cut, and this test passed anyway because it
+# built the bundle itself. Served as its own release directory rather than by
+# mutating the good one, so the happy-path fixture stays untouched.
+log "negative path: pre-kn-s9ck release layout (detached .sig/.pem, no bundle) must abort"
+OLD_VERSION="v9.9.8-prefix"
+OLD_DIR="${WORK}/serve/download/${OLD_VERSION}"
+mkdir -p "$OLD_DIR"
+cp "${RELEASE_DIR}/${ASSET}" "${OLD_DIR}/kubenest-${OLD_VERSION}-linux-amd64"
+(
+  cd "$OLD_DIR"
+  sha256sum "kubenest-${OLD_VERSION}-linux-amd64" > checksums.txt
+  printf 'MEUCIQD-not-a-real-detached-signature\n' > checksums.txt.sig
+  printf -- '-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----\n' > checksums.txt.pem
+)
+[ -e "${OLD_DIR}/checksums.txt.sigstore.json" ] && fail "the pre-fix fixture must NOT contain a bundle"
 set +e
-run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
+run_container -e EXPECT="could not download the Sigstore bundle" \
+  -e KUBENEST_VERSION="${OLD_VERSION}" -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c "${NEG_BODY}"
 rc=$?
 set -e
-mv "${WORK}/bundle.aside" "${RELEASE_DIR}/checksums.txt.sigstore.json"
-[ "$rc" -eq 0 ] || fail "unsigned release not cleanly rejected (container exit ${rc})"
-pass "unsigned release (no bundle) aborted and installed nothing"
+[ "$rc" -eq 0 ] || neg_fail "pre-kn-s9ck release layout" "$rc"
+pass "a release with a detached signature and no bundle aborted and installed nothing"
+
+# --- 8. the KEYLESS branch is entered and its flags parse -------------------
+# Every case above pins a public key, so install.sh takes the
+# KUBENEST_COSIGN_PUBKEY branch and the keyless branch — the DEFAULT for every
+# real user, and the one carrying the identity pinning — never runs. Drop the
+# pinned key and it does.
+#
+# What this proves: the keyless branch is reached, and cosign accepts
+# --certificate-identity-regexp / --certificate-oidc-issuer as written (a typo,
+# or a flag renamed by a cosign upgrade, would surface as a usage error rather
+# than a verification failure). What it CANNOT prove: that a genuine Fulcio
+# identity matches KEYLESS_IDENTITY_REGEXP — the fixture is key-signed, because
+# minting a Fulcio certificate needs a GitHub Actions OIDC token. Verification
+# MUST fail here; the assertion is on HOW it fails. See the header.
+log "keyless path: entered, flags parse, and it fails on verification rather than usage"
+KEYLESS_BODY="out=\$( ${INSTALL_CMD} 2>&1 ); rc=\$?
+printf '%s\\n' \"\$out\"
+[ \"\$rc\" -ne 0 ] || { echo 'keyless verification unexpectedly succeeded'; exit 88; }
+test ! -e /usr/local/bin/kubenest || { echo 'binary installed despite abort'; exit 89; }
+case \"\$out\" in
+  *'unknown flag'*|*'unknown shorthand'*|*'unknown command'*|*'Error: accepts'*)
+    echo 'cosign rejected the keyless FLAGS, not the signature'; exit 90 ;;
+esac
+case \"\$out\" in
+  *'signature verification FAILED'*) : ;;
+  *) echo 'the failure did not come from the signature check'; exit 91 ;;
+esac"
+set +e
+run_container -- bash -c "${KEYLESS_BODY}"
+rc=$?
+set -e
+case "$rc" in
+  0)  pass "keyless branch entered; cosign accepted the identity flags and failed on the signature" ;;
+  88) fail "keyless verification SUCCEEDED against a key-signed fixture — install.sh is not verifying identity" ;;
+  89) fail "keyless verification aborted but a binary was installed anyway" ;;
+  90) fail "cosign rejected install.sh's keyless FLAGS — --certificate-identity-regexp / --certificate-oidc-issuer do not match this cosign" ;;
+  91) fail "the keyless run failed somewhere other than the signature check; read the output above" ;;
+  *)  fail "keyless case exited ${rc}" ;;
+esac
 
 printf '\n\033[0;32m[smoke] ALL CHECKS PASSED\033[0m\n'
+printf '\033[1;33m[smoke] NOT COVERED: real keyless verification against a Fulcio identity — see the header.\033[0m\n'

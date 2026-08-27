@@ -62,7 +62,17 @@ COSIGN_SHA_DARWIN_ARM64="5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7d
 # Keyless identity of the release workflow. Must match the OIDC subject GitHub
 # Actions issues for .github/workflows/build.yml in this repo, and the issuer
 # GitHub uses for Actions tokens.
-KEYLESS_IDENTITY_REGEXP='https://github.com/kubenesthq/cli/\.github/workflows/build\.yml@.*'
+#
+# ANCHORED, AND TAG-ONLY, both deliberately. cosign matches this with Go's
+# regexp, which is a substring match unless anchored. And `@.*` would accept a
+# signature from build.yml running on ANY ref — that workflow is tag-triggered
+# today, so the guarantee would live in its trigger config rather than in this
+# check; add a workflow_dispatch some day and a branch build would verify as a
+# release. `@refs/tags/v.*` makes the verification itself carry the rule.
+#
+# This string must stay identical to the one in the release notes of
+# .github/workflows/build.yml. test/install/contract_test.sh asserts that.
+KEYLESS_IDENTITY_REGEXP='^https://github\.com/kubenesthq/cli/\.github/workflows/build\.yml@refs/tags/v.*$'
 KEYLESS_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
 VERSION="${KUBENEST_VERSION:-}"

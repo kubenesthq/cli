@@ -49,7 +49,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: shellcheck install.sh (POSIX sh)
-        run: shellcheck --shell=sh --severity=style install.sh
+        run: shellcheck --shell=sh --severity=style install.sh test/install/contract_test.sh
+
+      # The release contract: install.sh and build.yml must describe the SAME
+      # release. This needs no Docker and no network, so unlike the container
+      # smoke test it runs on every push. It exists because they once did not
+      # — the installer downloaded a Sigstore bundle the workflow never
+      # produced, and every test passed because the smoke test built the bundle
+      # itself.
+      - name: install.sh <-> build.yml release contract
+        run: sh test/install/contract_test.sh
 
   # The CLI is a customer-facing binary for workstations and bastions: it must
   # build on every platform we release for, on every change, not only at tag
