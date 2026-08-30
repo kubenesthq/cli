@@ -67,6 +67,11 @@ check_produced checksums.txt.sigstore.json   "--bundle dist/checksums.txt.sigsto
 
 # The per-platform binary: install.sh composes kubenest-<tag>-<os>-<arch>, the
 # workflow writes dist/kubenest-${TAG}-${os}-${arch}${ext}. Compare the shape.
+#
+# The single quotes are the point: these are grep patterns matching the LITERAL
+# text "${BIN_NAME}" etc. in the two files, not expansions. Expanding them here
+# would compare this script's empty variables and pass on anything.
+# shellcheck disable=SC2016
 if grep -q 'ASSET="\${BIN_NAME}-\${VERSION}-\${OS}-\${ARCH}"' "$INSTALL_SH" \
    && in_workflow -- 'dist/kubenest-\${TAG}-\${os}-\${arch}\${ext}'; then
   ok "the binary asset name is composed the same way on both sides"
