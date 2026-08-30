@@ -2,7 +2,7 @@ package storage
 
 import (
 	"context"
-	"encoding/base64"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
@@ -27,19 +27,11 @@ type prefixReply struct {
 	res    sshx.Result
 }
 
-var writeRe = regexp.MustCompile(`printf '%s' ([A-Za-z0-9+/=]+) \| base64 -d \| sudo -n tee ` + k3s.ManifestDir + `/([a-z0-9-]+)\.yaml`)
+var writeRe = regexp.MustCompile(`^sudo -n tee ` + k3s.ManifestDir + `/([a-z0-9-]+)\.yaml >/dev/null$`)
 
 func (p *prefixRunner) Run(_ context.Context, command string) (sshx.Result, error) {
-	if m := writeRe.FindStringSubmatch(command); m != nil {
-		decoded, err := base64.StdEncoding.DecodeString(m[1])
-		if err != nil {
-			p.t.Fatalf("bad payload in %q: %v", command, err)
-		}
-		if p.writes == nil {
-			p.writes = map[string]string{}
-		}
-		p.writes[m[2]] = string(decoded)
-		return sshx.Result{}, nil
+	if writeRe.MatchString(command) {
+		p.t.Fatalf("manifest write arrived as a plain command with no stdin: %q", command)
 	}
 	for _, r := range p.replies {
 		if strings.HasPrefix(command, r.prefix) {
@@ -47,6 +39,24 @@ func (p *prefixRunner) Run(_ context.Context, command string) (sshx.Result, erro
 		}
 	}
 	p.t.Fatalf("unscripted command: %q", command)
+	return sshx.Result{}, nil
+}
+
+// Manifest content arrives over stdin, never in the command (kn-40rd).
+func (p *prefixRunner) RunInput(_ context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	m := writeRe.FindStringSubmatch(command)
+	if m == nil {
+		p.t.Fatalf("unscripted streamed command: %q", command)
+		return sshx.Result{}, nil
+	}
+	content, err := io.ReadAll(stdin)
+	if err != nil {
+		p.t.Fatalf("reading stdin for %q: %v", command, err)
+	}
+	if p.writes == nil {
+		p.writes = map[string]string{}
+	}
+	p.writes[m[1]] = string(content)
 	return sshx.Result{}, nil
 }
 

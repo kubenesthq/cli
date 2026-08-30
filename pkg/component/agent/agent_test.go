@@ -2,7 +2,9 @@ package agent_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -148,10 +150,95 @@ func TestGiteaFollowsTheMintedRepoCredential(t *testing.T) {
 	}
 }
 
-// THE rule for this package: the JWT reaches the cluster as chart values and
-// by no other route. Never a command argument — command lines are visible in
-// the target host's process list — and the file it lands in is 0600, because
-// the k3s auto-deploy directory is world-readable by default.
+// recoverableFrom reports whether needle can be recovered from a command
+// string: verbatim, base64-encoded whole, or one decode away inside any
+// base64-looking run the command contains.
+//
+// WHY IT IS NOT A strings.Contains. Both tests below used to scan for the
+// plaintext alone, and both passed for months while the property they are
+// named for was false. k3s.WriteManifest base64-encoded the whole values
+// document into the command string, so the plaintext could never appear
+// there and the check could never fail — while the agent JWT and the GitOps
+// deploy key really were in `ps auxww` on the target host, one `base64 -d`
+// from anyone with a shell (kn-40rd). A test that cannot observe the failure
+// it is named for is worse than no test at all, because it gets cited as
+// evidence the failure cannot happen.
+//
+// So this decodes before it looks. Any future write path that encodes,
+// wraps, or chunks a secret onto a command line trips it.
+func recoverableFrom(command, needle string) bool {
+	if carries(command, needle) {
+		return true
+	}
+	if strings.Contains(command, base64.StdEncoding.EncodeToString([]byte(needle))) {
+		return true
+	}
+	for _, run := range base64Runs.FindAllString(command, -1) {
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if decoded, err := enc.DecodeString(run); err == nil && carries(string(decoded), needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// carries reports whether every line of needle appears in text.
+//
+// A multiline secret is matched line by line rather than as one string,
+// because YAML renders a PEM as an indented block scalar: the deploy key is
+// present in the values document byte for byte, and yet `strings.Contains`
+// for the key never matches, because every line but the first gained two
+// spaces. Requiring the contiguous form would hand these tests back the
+// blindness they are here to remove — a leaked key that happens to be
+// indented is still a leaked key.
+func carries(text, needle string) bool {
+	for _, line := range strings.Split(needle, "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.Contains(text, line) {
+			return false
+		}
+	}
+	return true
+}
+
+// Runs long enough to be a payload rather than a path segment or a flag.
+var base64Runs = regexp.MustCompile(`[A-Za-z0-9+/_-]{20,}={0,2}`)
+
+// The scanner above is the only thing standing between these tests and the
+// vacuity they had before, so it is itself tested — against the exact command
+// shape that shipped the defect. Without this, a scanner that silently
+// matched nothing would make every assertion below pass forever, which is the
+// failure mode being corrected, reintroduced one level up.
+func TestTheLeakScannerCatchesTheShapeThatShippedTheDefect(t *testing.T) {
+	values, err := agent.Values(creds(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// k3s.WriteManifest as it stood before kn-40rd.
+	defective := "printf '%s' " + base64.StdEncoding.EncodeToString([]byte(values)) +
+		" | base64 -d | sudo -n tee /var/lib/rancher/k3s/server/manifests/kubenest-agent.yaml >/dev/null"
+
+	if strings.Contains(defective, agentJWT) {
+		t.Fatal("the fixture is not the defect: the JWT is plaintext in it, which the old check would have caught")
+	}
+	for name, needle := range map[string]string{"agent JWT": agentJWT, "repo deploy key": repoKey} {
+		if !recoverableFrom(defective, needle) {
+			t.Errorf("the scanner does not catch the %s in the command shape that shipped the defect — every leak assertion below is vacuous", name)
+		}
+	}
+	if recoverableFrom("sudo -n chmod 600 /var/lib/rancher/k3s/server/manifests/kubenest-agent.yaml >/dev/null", agentJWT) {
+		t.Error("the scanner matches a command carrying no payload — it would fail on any install")
+	}
+}
+
+// THE rule for this package: the JWT reaches the cluster as chart values over
+// stdin and by no other route. Never a command argument, in any encoding —
+// command lines are visible in the target host's process list — and the file
+// it lands in is 0600, because the k3s auto-deploy directory is
+// world-readable by default.
 func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 	fake := &componenttest.FakeRunner{Respond: func(cmd string) (sshx.Result, error) {
 		if strings.Contains(cmd, "get deployment") || strings.Contains(cmd, "kubectl get") {
@@ -165,11 +252,8 @@ func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 
 	var chmodded bool
 	for _, cmd := range fake.Commands() {
-		if strings.Contains(cmd, agentJWT) {
-			t.Fatalf("the agent JWT appeared verbatim in a command:\n%s", cmd)
-		}
-		if strings.Contains(cmd, "AGENT_TOKEN_VALUE") {
-			t.Fatalf("the agent JWT leaked into a command:\n%s", cmd)
+		if recoverableFrom(cmd, agentJWT) || recoverableFrom(cmd, "AGENT_TOKEN_VALUE") {
+			t.Fatalf("the agent JWT is recoverable from a command line:\n%s", cmd)
 		}
 		if strings.Contains(cmd, "chmod 600") && strings.Contains(cmd, "kubenest-agent.yaml") {
 			chmodded = true
@@ -177,6 +261,19 @@ func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 	}
 	if !chmodded {
 		t.Error("the values file carries the agent JWT and must be chmod 600 on the server node")
+	}
+
+	// Positive control for THIS run: the JWT must actually have been written,
+	// over stdin. Without it the loop above would also pass on an install
+	// that rendered no credential at all — a green earned by doing nothing.
+	var delivered bool
+	for _, in := range fake.Inputs() {
+		if carries(string(in), agentJWT) {
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Error("the agent JWT reached the cluster by no route at all — it must travel to the auto-deploy dir over stdin")
 	}
 }
 
@@ -314,9 +411,21 @@ func TestTheRepoKeyNeverReachesACommandLineNorAJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, cmd := range fake.Commands() {
-		if strings.Contains(cmd, repoKey) || strings.Contains(cmd, "OPENSSH PRIVATE KEY") {
-			t.Fatalf("the repo private key appeared in a command:\n%s", cmd)
+		if recoverableFrom(cmd, repoKey) || recoverableFrom(cmd, "OPENSSH PRIVATE KEY") {
+			t.Fatalf("the repo private key is recoverable from a command line:\n%s", cmd)
 		}
+	}
+
+	// Positive control: the key must have reached the cluster over stdin, or
+	// the scan above proves nothing about a document that was never rendered.
+	var delivered bool
+	for _, in := range fake.Inputs() {
+		if carries(string(in), repoKey) {
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Error("the repo deploy key reached the cluster by no route at all — it must travel to the auto-deploy dir over stdin")
 	}
 
 	// The journal path: anything a journal could marshal must refuse to carry

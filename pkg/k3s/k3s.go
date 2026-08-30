@@ -17,10 +17,11 @@
 package k3s
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 
@@ -30,10 +31,20 @@ import (
 	"kubenest.io/cli/pkg/sshx"
 )
 
-// Runner runs one command on the k3s server node. *sshx.Client implements
-// it; tests substitute a fake.
+// Runner talks to the k3s server node. *sshx.Client implements it; tests
+// substitute a fake.
+//
+// RunInput is part of the interface rather than an optional capability
+// detected by a type assertion, because the optional form carried a fallback
+// and the fallback WAS the defect (kn-40rd): a runner that could not stream
+// got the manifest inlined into the command string instead, which is how the
+// agent JWT and the per-cluster GitOps deploy key ended up in the target
+// host's process list. A capability that must never be absent does not
+// belong behind an interface assertion — absent, it has to fail to compile,
+// not fail quietly on a live host.
 type Runner interface {
 	Run(ctx context.Context, command string) (sshx.Result, error)
+	RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error)
 }
 
 // ManifestDir is k3s's auto-deploy directory on a server node. Files placed
@@ -43,15 +54,27 @@ const ManifestDir = "/var/lib/rancher/k3s/server/manifests"
 var manifestName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // WriteManifest writes one YAML document set to the auto-deploy directory as
-// <name>.yaml. Content travels base64-encoded so nothing needs shell quoting.
+// <name>.yaml.
+//
+// The content travels over stdin and NEVER in the command string. Manifests
+// carry secrets — the agent's values document holds the agent JWT and, since
+// kn-rnyl.2, the per-cluster GitOps write deploy key — and a command string
+// is the argv of the shell sshd spawns on the target host: readable in
+// `ps auxww` by every local user for the length of the write, and recorded
+// by whatever that host audits. The previous form base64-encoded the content
+// into that argv, which is an encoding and not a concealment: one `base64 -d`
+// from plaintext (kn-40rd).
+//
+// Streaming also removes the SSH packet cap on large manifests — the command
+// string travels in a single exec request, stdin in as many packets as it
+// needs — which is why pkg/component/gatewayapi had to work around this for
+// the ~700KB CRD bundle before the write path itself was fixed.
 func WriteManifest(ctx context.Context, r Runner, name string, content []byte) error {
 	if !manifestName.MatchString(name) {
 		return fmt.Errorf("manifest name %q must be lowercase alphanumerics and hyphens", name)
 	}
 	path := ManifestDir + "/" + name + ".yaml"
-	encoded := base64.StdEncoding.EncodeToString(content)
-	cmd := fmt.Sprintf("printf '%%s' %s | base64 -d | sudo -n tee %s >/dev/null", encoded, path)
-	res, err := r.Run(ctx, cmd)
+	res, err := r.RunInput(ctx, "sudo -n tee "+path+" >/dev/null", bytes.NewReader(content))
 	if err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}

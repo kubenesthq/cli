@@ -23,7 +23,6 @@
 package day2
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -35,7 +34,6 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
-	"kubenest.io/cli/pkg/sshx"
 )
 
 // Namespace is where system-upgrade-controller runs; it is the namespace its
@@ -96,7 +94,7 @@ func InstallUpgradeController(ctx context.Context, r k3s.Runner, bundle *manifes
 		if err != nil {
 			return fmt.Errorf("download system-upgrade-controller %s (%s): %w", version, part.asset, err)
 		}
-		if err := writeStreamed(ctx, r, part.name, data); err != nil {
+		if err := k3s.WriteManifest(ctx, r, part.name, data); err != nil {
 			return err
 		}
 	}
@@ -197,29 +195,6 @@ func kuredReadyProbe(r k3s.Runner) converge.Probe {
 		}
 		return false, state, nil
 	}
-}
-
-// InputRunner is a Runner that can stream stdin. The controller manifests are
-// large enough to be worth streaming rather than inlining.
-type InputRunner interface {
-	k3s.Runner
-	RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error)
-}
-
-func writeStreamed(ctx context.Context, r k3s.Runner, name string, content []byte) error {
-	ir, ok := r.(InputRunner)
-	if !ok {
-		return k3s.WriteManifest(ctx, r, name, content)
-	}
-	path := k3s.ManifestDir + "/" + name + ".yaml"
-	res, err := ir.RunInput(ctx, "sudo -n tee "+path+" >/dev/null", bytes.NewReader(content))
-	if err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("write %s: exit %d: %s", path, res.ExitCode, strings.TrimSpace(res.Stderr))
-	}
-	return nil
 }
 
 func fetch(ctx context.Context, url string) ([]byte, error) {

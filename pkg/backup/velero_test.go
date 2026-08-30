@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -19,13 +20,37 @@ import (
 type fakeRunner struct {
 	mu       sync.Mutex
 	commands []string
+	inputs   [][]byte
 	// Respond maps a command to its result; nil means success, empty output.
 	Respond func(command string) (sshx.Result, error)
 }
 
 func (f *fakeRunner) Run(ctx context.Context, command string) (sshx.Result, error) {
+	return f.record(command, nil)
+}
+
+// RunInput records the streamed manifest alongside its command. Velero's
+// values document carries the backup target's object-store credentials, so
+// the same rule as the agent applies here: content over stdin, never in the
+// command string (kn-40rd).
+func (f *fakeRunner) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	var payload []byte
+	if stdin != nil {
+		var err error
+		payload, err = io.ReadAll(stdin)
+		if err != nil {
+			return sshx.Result{}, err
+		}
+	}
+	return f.record(command, payload)
+}
+
+func (f *fakeRunner) record(command string, stdin []byte) (sshx.Result, error) {
 	f.mu.Lock()
 	f.commands = append(f.commands, command)
+	if stdin != nil {
+		f.inputs = append(f.inputs, stdin)
+	}
 	f.mu.Unlock()
 	if f.Respond == nil {
 		return sshx.Result{}, nil

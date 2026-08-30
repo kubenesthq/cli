@@ -2,8 +2,7 @@ package k3s
 
 import (
 	"context"
-	"encoding/base64"
-	"regexp"
+	"io"
 	"strings"
 	"testing"
 
@@ -29,7 +28,26 @@ func (f *fakeRunner) Run(_ context.Context, command string) (sshx.Result, error)
 	return res, nil
 }
 
-func TestWriteManifestRoundTripsContentThroughBase64(t *testing.T) {
+// This fake scripts kubectl calls, which never stream. A streamed call here
+// means the code under test changed shape and the script no longer describes
+// it, so say so rather than answering an empty success.
+func (f *fakeRunner) RunInput(_ context.Context, command string, _ io.Reader) (sshx.Result, error) {
+	f.t.Fatalf("unexpected streamed command: %q", command)
+	return sshx.Result{}, nil
+}
+
+// The manifest content reaches the host over stdin and appears nowhere in
+// the command string. This is the property kn-40rd is about: manifests carry
+// secrets (the agent's values document holds the agent JWT and the GitOps
+// deploy key), and a command string is the argv of the shell sshd spawns —
+// world-readable in `ps auxww` on the target host.
+//
+// The command is asserted to contain NO base64 run of any length, rather
+// than merely not containing the plaintext. The defect this replaces was
+// invisible to a plaintext scan precisely because it base64-encoded first,
+// so "the content is not in the command" is not a strong enough assertion to
+// state here — "the command carries no payload at all" is.
+func TestWriteManifestSendsContentOverStdinAndNeverOnTheCommandLine(t *testing.T) {
 	content := []byte("kind: StorageClass\nmetadata:\n  name: x\n")
 	var captured string
 	r := &capturingRunner{onRun: func(cmd string) sshx.Result {
@@ -40,30 +58,39 @@ func TestWriteManifestRoundTripsContentThroughBase64(t *testing.T) {
 	if err := WriteManifest(context.Background(), r, "kubenest-storageclass", content); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(captured, ManifestDir+"/kubenest-storageclass.yaml") {
-		t.Errorf("command %q does not target the auto-deploy dir", captured)
+	// Exact equality, not a substring check. The command is fully determined
+	// by the manifest path, so stating it exactly is the assertion that no
+	// payload in ANY encoding can be hiding in it — a scan for the plaintext,
+	// or even for base64-looking runs, is the kind of check the old form
+	// slipped past.
+	want := "sudo -n tee " + ManifestDir + "/kubenest-storageclass.yaml >/dev/null"
+	if captured != want {
+		t.Errorf("command =\n  %q\nwant\n  %q", captured, want)
 	}
-	if !strings.Contains(captured, "sudo -n tee") {
-		t.Errorf("command %q does not write via sudo tee", captured)
-	}
-	m := regexp.MustCompile(`printf '%s' ([A-Za-z0-9+/=]+) \|`).FindStringSubmatch(captured)
-	if m == nil {
-		t.Fatalf("no base64 payload in %q", captured)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(m[1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(decoded) != string(content) {
-		t.Errorf("payload round-trip = %q, want %q", decoded, content)
+	if string(r.stdin) != string(content) {
+		t.Errorf("stdin payload = %q, want %q", r.stdin, content)
 	}
 }
 
 type capturingRunner struct {
 	onRun func(cmd string) sshx.Result
+	// stdin holds what the last streamed call sent, so a test can assert on
+	// the payload separately from the command that carried it.
+	stdin []byte
 }
 
 func (c *capturingRunner) Run(_ context.Context, cmd string) (sshx.Result, error) {
+	return c.onRun(cmd), nil
+}
+
+func (c *capturingRunner) RunInput(_ context.Context, cmd string, stdin io.Reader) (sshx.Result, error) {
+	if stdin != nil {
+		b, err := io.ReadAll(stdin)
+		if err != nil {
+			return sshx.Result{}, err
+		}
+		c.stdin = b
+	}
 	return c.onRun(cmd), nil
 }
 

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -23,6 +24,12 @@ func (f *fakeRunner) Run(_ context.Context, command string) (sshx.Result, error)
 		f.t.Fatalf("unscripted command: %q", command)
 	}
 	return res, nil
+}
+
+// This fake scripts lvm/vgs calls, which never stream.
+func (f *fakeRunner) RunInput(_ context.Context, command string, _ io.Reader) (sshx.Result, error) {
+	f.t.Fatalf("unexpected streamed command: %q", command)
+	return sshx.Result{}, nil
 }
 
 const (

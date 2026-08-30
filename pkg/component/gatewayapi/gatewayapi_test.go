@@ -2,7 +2,6 @@ package gatewayapi
 
 import (
 	"context"
-	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,20 +65,21 @@ func TestInstallFetchesPinAndConverges(t *testing.T) {
 		t.Errorf("fetched %q — the pin from the manifest must pick the release", served)
 	}
 
-	// The write command carries the manifest base64-encoded into the
-	// auto-deploy dir; decode and compare byte-for-byte.
+	// The CRD bundle reaches the auto-deploy dir over stdin, and the command
+	// that carries it names only the path. Before kn-40rd this fake had no
+	// RunInput, so the streamed path silently fell back to inlining the
+	// payload into the command — and this test asserted on that fallback,
+	// checking a code path no real install ever took.
 	var wrote bool
-	for _, cmd := range r.Commands() {
-		if !strings.Contains(cmd, "/var/lib/rancher/k3s/server/manifests/kubenest-gateway-api.yaml") {
+	for _, e := range r.Executions() {
+		if !strings.Contains(e.Command, "/var/lib/rancher/k3s/server/manifests/kubenest-gateway-api.yaml") {
 			continue
 		}
 		wrote = true
-		fields := strings.Fields(cmd)
-		decoded, err := base64.StdEncoding.DecodeString(fields[2])
-		if err != nil {
-			t.Fatalf("write command payload is not base64: %v", err)
+		if e.Stdin == nil {
+			t.Fatalf("the manifest was written without streaming: %q", e.Command)
 		}
-		if string(decoded) != crdYAML {
+		if string(e.Stdin) != crdYAML {
 			t.Errorf("auto-deploy content differs from the release manifest")
 		}
 	}

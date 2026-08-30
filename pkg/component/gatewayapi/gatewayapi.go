@@ -6,19 +6,16 @@
 package gatewayapi
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"kubenest.io/cli/pkg/component"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
-	"kubenest.io/cli/pkg/sshx"
 )
 
 // ReleaseBaseURL is where the pinned release manifest is fetched from. A
@@ -58,7 +55,7 @@ func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep c
 	if err != nil {
 		return fmt.Errorf("download Gateway API %s release manifest: %w", version, err)
 	}
-	if err := writeStreamed(ctx, r, "kubenest-gateway-api", data); err != nil {
+	if err := k3s.WriteManifest(ctx, r, "kubenest-gateway-api", data); err != nil {
 		return err
 	}
 
@@ -71,32 +68,6 @@ func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, rep c
 		return err
 	}
 	return res.Err()
-}
-
-// InputRunner is a Runner that can stream stdin — *sshx.Client implements
-// it. The CRD bundle is ~700KB: inlined into a single exec command it blows
-// the SSH packet cap (observed as an EOF on a real host), so it must stream.
-type InputRunner interface {
-	k3s.Runner
-	RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error)
-}
-
-// writeStreamed places content in the k3s auto-deploy directory via stdin.
-func writeStreamed(ctx context.Context, r k3s.Runner, name string, content []byte) error {
-	ir, ok := r.(InputRunner)
-	if !ok {
-		// Small-content fallback keeps scripted test runners working.
-		return k3s.WriteManifest(ctx, r, name, content)
-	}
-	path := k3s.ManifestDir + "/" + name + ".yaml"
-	res, err := ir.RunInput(ctx, "sudo -n tee "+path+" >/dev/null", bytes.NewReader(content))
-	if err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("write %s: exit %d: %s", path, res.ExitCode, strings.TrimSpace(res.Stderr))
-	}
-	return nil
 }
 
 func fetch(ctx context.Context, url string) ([]byte, error) {

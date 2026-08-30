@@ -4,12 +4,21 @@
 // the identity minted in stage 2.
 //
 // CREDENTIAL HANDLING, which is the whole reason this package is small:
-// the agent JWT reaches the cluster as chart values and nothing else. It is
-// never an argument to a command (command lines are visible in the target
-// host's process list), never a log line, and never journalled. The values
-// file it lands in is chmod 600 on the server node, because the k3s
-// auto-deploy directory is world-readable by default and a JWT sitting at
-// 0644 on a customer's box is a finding.
+// the agent JWT and the per-cluster GitOps deploy key reach the cluster as
+// chart values and by no other route. The values document travels to the
+// server node over stdin (k3s.WriteManifest), never as an argument to a
+// command — a command line is the argv of the shell sshd spawns, readable in
+// `ps auxww` by any local user on the target host — never a log line, and
+// never journalled. The values file it lands in is chmod 600 on the server
+// node, because the k3s auto-deploy directory is world-readable by default
+// and a JWT sitting at 0644 on a customer's box is a finding.
+//
+// "Never an argument to a command" was stated here, and tested for, while it
+// was false: the write path base64-encoded the whole document into the
+// command string, so a test scanning for the plaintext could not see it
+// (kn-40rd). The tests now decode before they look, and one of them checks
+// the scanner itself against the defective command shape — a leak assertion
+// that cannot fail is the thing that let this stand.
 //
 // The chart's identity Secret is rendered from clusterID + jwtSecret
 // (kn-z6e4): a helm-only install is self-sufficient and nothing has to reach
