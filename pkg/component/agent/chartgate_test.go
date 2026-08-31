@@ -14,19 +14,36 @@ import (
 // Neither the bundled Git server nor the external repo, discovered later by
 // whoever wondered why nothing deployed.
 //
-// Verified against the published artifacts, not inferred: chart 2.2.0 pulled
-// from ghcr has zero occurrences of gitSSHPrivateKey in values.yaml and no
-// GIT_SSH_* in its templates; 2.3.5 has both.
+// Verified against the published artifacts, not inferred: every tag from 2.2.0
+// to 2.4.0 was pulled from ghcr. 2.2.0-2.3.4 have zero gitSSHPrivateKey and no
+// GIT_SSH_*; 2.3.5 has both but pins appVersion dcc8d25, an operator build that
+// cannot read the variable; 2.4.0 pins 8411f91, which can. No chart in the line
+// ships a values.schema.json, which is why helm accepts and discards.
 func TestARepoCredentialIsRefusedAgainstAChartThatCannotCarryIt(t *testing.T) {
-	_, err := agent.Chart(bundleWithAgent(t, "2.2.0"), creds(true))
-	if err == nil {
-		t.Fatal("a repo credential was rendered into a chart with no gitSSHPrivateKey value")
-	}
-	// The message has to name both versions, or the reader cannot act on it.
-	for _, want := range []string{"2.2.0", "2.3.5", "gitSSHPrivateKey"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal must name %q: %v", want, err)
+	for _, version := range []string{"2.2.0", "2.3.0", "2.3.4", "2.3.5"} {
+		_, err := agent.Chart(bundleWithAgent(t, version), creds(true))
+		if err == nil {
+			t.Fatalf("chart %s cannot deliver a working deploy key and must be refused", version)
 		}
+		// The message has to name the pin and the fix, or the reader cannot act.
+		for _, want := range []string{version, "2.4.0", "gitSSHPrivateKey"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("the refusal for %s must name %q: %v", version, want, err)
+			}
+		}
+	}
+}
+
+// 2.3.5 is the trap. It carries gitSSHPrivateKey and wires
+// GIT_SSH_PRIVATE_KEY_FILE, so a check on the values surface alone passes it -
+// but its appVersion dcc8d25 predates kn-gjew and reads GIT_TOKEN only. The
+// key is accepted, mounted, and ignored: the same silent no-credential end
+// state as 2.2.0, reached one layer down. Kept as its own test because a
+// future reader lowering the constant back to 2.3.5 would still see the test
+// above pass on 2.2.0 and think the gate was intact.
+func TestTheChartThatCarriesTheValueButCannotReadItIsAlsoRefused(t *testing.T) {
+	if _, err := agent.Chart(bundleWithAgent(t, "2.3.5"), creds(true)); err == nil {
+		t.Fatal("2.3.5 accepts gitSSHPrivateKey but its operator cannot read it; it must be refused")
 	}
 }
 
@@ -34,9 +51,9 @@ func TestARepoCredentialIsRefusedAgainstAChartThatCannotCarryIt(t *testing.T) {
 // if Chart refused every repo credential, which would break every install
 // rather than the ones that cannot work.
 func TestARepoCredentialIsAcceptedAtTheFirstChartThatCarriesIt(t *testing.T) {
-	for _, version := range []string{"2.3.5", "2.4.0", "2.10.0", "3.0.0"} {
+	for _, version := range []string{"2.4.0", "2.4.1", "2.10.0", "3.0.0"} {
 		if _, err := agent.Chart(bundleWithAgent(t, version), creds(true)); err != nil {
-			t.Errorf("chart %s carries gitSSHPrivateKey and must be accepted: %v", version, err)
+			t.Errorf("chart %s delivers a working deploy key and must be accepted: %v", version, err)
 		}
 	}
 }

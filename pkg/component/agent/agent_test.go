@@ -33,11 +33,12 @@ func bundle(t *testing.T) *manifest.Manifest {
 	return bundleWithAgent(t, "2.2.0")
 }
 
-// repoCapableBundle pins the first chart that actually carries the GitOps
-// deploy key values.
+// repoCapableBundle pins the first chart on which the GitOps deploy key
+// actually works end to end. Not 2.3.5: that one carries the value and pins an
+// operator build that cannot read it (see chartgate_test.go).
 func repoCapableBundle(t *testing.T) *manifest.Manifest {
 	t.Helper()
-	return bundleWithAgent(t, "2.3.5")
+	return bundleWithAgent(t, "2.4.0")
 }
 
 func bundleWithAgent(t *testing.T, version string) *manifest.Manifest {

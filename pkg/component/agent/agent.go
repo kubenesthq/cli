@@ -154,21 +154,29 @@ func Values(creds *api.AgentCredentials) (string, error) {
 	return string(out), nil
 }
 
-// minChartWithRepoCredential is the first published kubenest-operator-2 chart
-// whose values carry gitSSHPrivateKey and whose deployment renders the
-// GIT_SSH_* environment. Chart 2.2.0, which platform-0.9 pins, has neither.
+// minChartWithRepoCredential is the first chart on which a per-cluster GitOps
+// deploy key actually WORKS end to end — not merely the first whose values
+// surface accepts one.
 //
-// Helm does not reject unknown values — this chart ships no values.schema.json
-// — so rendering gitSSHPrivateKey against 2.2.0 does not fail. It is accepted
-// and discarded. The install then completes green with bootstrap.gitea
-// disabled and no Git credential anywhere: neither the bundled Git server nor
-// the external repo, which is precisely the state kn-rnyl.2 exists to prevent,
-// reached silently.
+// 2.3.5 was the tempting answer and it is wrong. Charts 2.2.0 through 2.3.4
+// have no gitSSHPrivateKey value at all, and no chart in this line ships a
+// values.schema.json, so helm ACCEPTS the value and discards it: the install
+// goes green with bootstrap.gitea disabled and no Git credential of any kind.
+// 2.3.5 was the first to carry the value and wire GIT_SSH_PRIVATE_KEY_FILE in
+// its deployment — but it pins appVersion dcc8d25, a build from before kn-gjew
+// (19a611e) taught the operator to READ that variable. That binary reads
+// GIT_TOKEN only, which this package deliberately leaves empty, so it logs
+// "Warning: GIT_TOKEN not set - only public repositories will be accessible"
+// and carries on against a private repo.
 //
-// 0.9's pin is deliberate history and must not move (see the header of
-// platform-0.9.yaml: back-pinning it to a chart that did not exist when 0.9
-// was current "would be fiction"). So the refusal belongs here.
-const minChartWithRepoCredential = "2.3.5"
+// So 2.3.5 reaches the same silent no-credential end state as 2.2.0, one layer
+// down. A constant of 2.3.5 refused 2.2.0 while telling the reader "2.3.5 or
+// later carries it" — an assurance that a 2.3.5 install works. It does not.
+// 2.4.0 pins appVersion 8411f91, which does read the key.
+//
+// Verified against the published artifacts, not inferred: every tag from 2.2.0
+// to 2.4.0 pulled from ghcr and inspected.
+const minChartWithRepoCredential = "2.4.0"
 
 // Chart renders the agent's HelmChart resource at the bundle's pin. The chart
 // reference comes from the MINT (operator.chart_ref), not from a constant:
@@ -196,7 +204,7 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 		}
 		if cmp < 0 {
 			return k3s.HelmChart{}, fmt.Errorf(
-				"bundle pins kubenest-agent %s, which has no gitSSHPrivateKey value: the per-cluster GitOps deploy key would be accepted by helm and silently discarded, leaving the cluster with no Git credential at all. %s or later carries it. Install this cluster from a bundle that pins %s or later, or register it without a GitOps repository",
+				"bundle pins kubenest-agent %s, on which the per-cluster GitOps deploy key does not work: it is accepted and then silently dropped, leaving the cluster with no Git credential at all. Charts before 2.3.5 have no gitSSHPrivateKey value and helm discards it; 2.3.5 carries the value but pins an operator build that cannot read it. %s is the first that works end to end. Install this cluster from a bundle that pins %s or later, or register it without a GitOps repository",
 				version, minChartWithRepoCredential, minChartWithRepoCredential)
 		}
 	}
