@@ -40,28 +40,30 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.3.5                # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.3.5 proves PVC bytes and names unreadable backup archives.
+  kubenest-agent: 2.4.0                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.4.0 is the first chart whose appVersion can actually READ the
+                                       # per-cluster GitOps deploy key. 2.3.5 carried gitSSHPrivateKey and
+                                       # mounted it, but pinned appVersion dcc8d25 - a build from before
+                                       # kn-gjew (19a611e) taught the operator to read
+                                       # GIT_SSH_PRIVATE_KEY_FILE. That binary reads GIT_TOKEN only, which
+                                       # the CLI deliberately leaves empty, so it logged "Warning: GIT_TOKEN
+                                       # not set - only public repositories will be accessible" and carried
+                                       # on against a private repo. GitOps did not work on this bundle and
+                                       # nothing said so. Verified by pulling chart 2.3.5 from ghcr and
+                                       # reading dcc8d25's cmd/manager/main.go, not inferred.
+                                       #
+                                       # 2.4.0 also makes kubenest.backendURL REQUIRED (kn-vv3f): the chart
+                                       # refuses to render without it rather than defaulting to a live host
+                                       # serving another customer. Safe here - agent.Values always sets it
+                                       # from the mint, and refuses an empty hub URL before that.
+                                       #
+                                       # 2.3.5 proved PVC bytes and named unreadable backup archives.
                                        # 2.2.0 made Helm-only installs self-provision identity and dropped ingress-nginx.
                                        # 2.1.0's default image tag was published nowhere - do not pin back.
                                        #
-                                       # MOVE THIS TO 2.4.0 ONCE 2.4.0 IS PUBLISHED. GitOps does not work on
-                                       # 2.3.5 and the failure is silent. The chart carries gitSSHPrivateKey
-                                       # and mounts it, but its appVersion is dcc8d25 - a build from before
-                                       # kn-gjew (19a611e) taught the operator to read GIT_SSH_PRIVATE_KEY_FILE.
-                                       # That binary reads GIT_TOKEN only, which this CLI deliberately leaves
-                                       # empty, so it logs "Warning: GIT_TOKEN not set - only public
-                                       # repositories will be accessible" and carries on against a private
-                                       # repo. Verified by pulling chart 2.3.5 from ghcr and reading
-                                       # dcc8d25's cmd/manager/main.go, not inferred.
-                                       #
-                                       # op3 charts/kubenest-operator is now at 2.4.0 with appVersion
-                                       # 8411f91, which does read the key. The pin cannot move until that
-                                       # chart is pushed to ghcr - pinning an unpublished version breaks
-                                       # every install immediately, which is worse than the silent failure.
-                                       #
-                                       # Note 2.3.5 on ghcr is NOT the 2.3.5 that a273b3d cut: 19a611e and
+                                       # Note the 2.3.5 on ghcr is NOT the 2.3.5 a273b3d cut: 19a611e and
                                        # 8411f91 both changed chart contents without bumping the version.
+                                       # Every content change from 2.4.0 on bumps it.
 
 # Version-less base refs; the version is ALWAYS the core pin above (one pin, one
 # place). kubenest-agent's is load-bearing: the backend renders install-instructions
