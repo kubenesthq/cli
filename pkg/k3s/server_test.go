@@ -7,6 +7,7 @@ import (
 
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/leakscan"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
 )
@@ -127,13 +128,31 @@ func TestJoinTokenNeverAppearsOnACommandLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// RecoverableFrom, not strings.Contains. The verbatim check this replaces
+	// passed for months while writeTokenFile base64-encoded the token onto the
+	// command line under a comment asserting the value "never appears as a
+	// command argument" — the plaintext genuinely was absent, and the token was
+	// one `base64 -d` away for anyone with a shell on the host (kn-40rd).
 	for _, c := range fake.Commands() {
-		if strings.Contains(c, token) {
-			t.Fatalf("the cluster token appeared verbatim in a command: %s", c)
+		if leakscan.RecoverableFrom(c, token) {
+			t.Fatalf("the cluster token is recoverable from a command line: %s", c)
 		}
 		if strings.Contains(c, "get.k3s.io") && !strings.Contains(c, "--token-file") {
 			t.Errorf("a joining server must use --token-file: %s", c)
 		}
+	}
+
+	// Positive control: the token must actually have been delivered, over
+	// stdin. Without this the check above passes just as well if the token is
+	// never sent at all, which is a green earned by doing nothing.
+	var streamed bool
+	for _, in := range fake.Inputs() {
+		if string(in) == token {
+			streamed = true
+		}
+	}
+	if !streamed {
+		t.Error("the token reached the host in no stdin payload; the leak check above proves nothing")
 	}
 	// And it must NOT be removed. k3s bakes --token-file into the systemd
 	// unit, so the file is read on every start of the service, not only at

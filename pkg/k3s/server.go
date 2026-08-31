@@ -2,7 +2,6 @@ package k3s
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -197,15 +196,19 @@ func NodeToken(ctx context.Context, r Runner) (string, error) {
 	return token, nil
 }
 
-// writeTokenFile stages the cluster token root-only, base64-encoded in
-// transit so nothing needs shell quoting and the value never appears as a
-// command argument.
+// writeTokenFile stages the cluster token root-only. The token travels over
+// STDIN and never in the command string.
+//
+// This comment previously claimed "the value never appears as a command
+// argument" while base64-encoding it into exactly that argument — the same
+// false-guarantee-plus-encoding shape kn-40rd was filed to remove from
+// WriteManifest. The cluster join token is the credential that lets a machine
+// become a server node; it belongs on stdin like every other secret here.
 func writeTokenFile(ctx context.Context, r Runner, token string) error {
-	encoded := base64.StdEncoding.EncodeToString([]byte(token))
 	cmd := fmt.Sprintf(
-		"sudo -n install -d -m 0700 /etc/rancher && printf '%%s' %s | base64 -d | sudo -n install -m 0600 /dev/stdin %s",
-		encoded, tokenFile)
-	res, err := r.Run(ctx, cmd)
+		"sudo -n install -d -m 0700 /etc/rancher && sudo -n install -m 0600 /dev/stdin %s",
+		tokenFile)
+	res, err := r.RunInput(ctx, cmd, strings.NewReader(token))
 	if err != nil {
 		return fmt.Errorf("staging the cluster token: %w", err)
 	}

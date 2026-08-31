@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -13,6 +12,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/leakscan"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
 )
@@ -25,9 +25,24 @@ const agentJWT = "eyJhbGciOiJIUzI1NiJ9.AGENT_TOKEN_VALUE.signature"
 // key and every push fails at ssh.
 const repoKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----"
 
+// bundle pins kubenest-agent 2.2.0 — the pin platform-0.9 carries, and the one
+// that has no gitSSHPrivateKey value. Tests that render a repo credential must
+// use repoCapableBundle instead; agent.Chart refuses this pairing on purpose.
 func bundle(t *testing.T) *manifest.Manifest {
 	t.Helper()
-	m, err := manifest.Parse([]byte("bundle: \"1.0\"\ncore:\n  kubenest-agent: 2.2.0\nlimits:\n  timeouts:\n    component-ready: 2s\n"))
+	return bundleWithAgent(t, "2.2.0")
+}
+
+// repoCapableBundle pins the first chart that actually carries the GitOps
+// deploy key values.
+func repoCapableBundle(t *testing.T) *manifest.Manifest {
+	t.Helper()
+	return bundleWithAgent(t, "2.3.5")
+}
+
+func bundleWithAgent(t *testing.T, version string) *manifest.Manifest {
+	t.Helper()
+	m, err := manifest.Parse([]byte("bundle: \"1.0\"\ncore:\n  kubenest-agent: " + version + "\nlimits:\n  timeouts:\n    component-ready: 2s\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,62 +165,24 @@ func TestGiteaFollowsTheMintedRepoCredential(t *testing.T) {
 	}
 }
 
-// recoverableFrom reports whether needle can be recovered from a command
-// string: verbatim, base64-encoded whole, or one decode away inside any
-// base64-looking run the command contains.
+// recoverableFrom and carries delegate to pkg/leakscan, which owns the
+// scanner and its own tests. They were defined here first, and then pkg/backup
+// and pkg/k3s turned out to need exactly the same check — the object store
+// credentials and the cluster join token were leaking by the same mechanism.
+// Copying a subtle scanner into three packages is how it drifts, and a drifted
+// leak scanner fails open.
 //
-// WHY IT IS NOT A strings.Contains. Both tests below used to scan for the
-// plaintext alone, and both passed for months while the property they are
-// named for was false. k3s.WriteManifest base64-encoded the whole values
-// document into the command string, so the plaintext could never appear
-// there and the check could never fail — while the agent JWT and the GitOps
-// deploy key really were in `ps auxww` on the target host, one `base64 -d`
-// from anyone with a shell (kn-40rd). A test that cannot observe the failure
-// it is named for is worse than no test at all, because it gets cited as
-// evidence the failure cannot happen.
-//
-// So this decodes before it looks. Any future write path that encodes,
-// wraps, or chunks a secret onto a command line trips it.
+// Note what leakscan does NOT catch: base64 wrapped across lines, base64 in
+// shell-concatenated chunks, hex, and anything compressed before encoding.
+// The comment that used to live here claimed "any future write path that
+// encodes, wraps, or chunks a secret onto a command line trips it", which was
+// false — an unfalsifiable claim about a falsification tool. leakscan's own
+// TestKnownBlindSpotsAreStillBlindSpots pins the real limit.
 func recoverableFrom(command, needle string) bool {
-	if carries(command, needle) {
-		return true
-	}
-	if strings.Contains(command, base64.StdEncoding.EncodeToString([]byte(needle))) {
-		return true
-	}
-	for _, run := range base64Runs.FindAllString(command, -1) {
-		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-			if decoded, err := enc.DecodeString(run); err == nil && carries(string(decoded), needle) {
-				return true
-			}
-		}
-	}
-	return false
+	return leakscan.RecoverableFrom(command, needle)
 }
 
-// carries reports whether every line of needle appears in text.
-//
-// A multiline secret is matched line by line rather than as one string,
-// because YAML renders a PEM as an indented block scalar: the deploy key is
-// present in the values document byte for byte, and yet `strings.Contains`
-// for the key never matches, because every line but the first gained two
-// spaces. Requiring the contiguous form would hand these tests back the
-// blindness they are here to remove — a leaked key that happens to be
-// indented is still a leaked key.
-func carries(text, needle string) bool {
-	for _, line := range strings.Split(needle, "\n") {
-		if line == "" {
-			continue
-		}
-		if !strings.Contains(text, line) {
-			return false
-		}
-	}
-	return true
-}
-
-// Runs long enough to be a payload rather than a path segment or a flag.
-var base64Runs = regexp.MustCompile(`[A-Za-z0-9+/_-]{20,}={0,2}`)
+func carries(text, needle string) bool { return leakscan.Carries(text, needle) }
 
 // The scanner above is the only thing standing between these tests and the
 // vacuity they had before, so it is itself tested — against the exact command
@@ -246,7 +223,7 @@ func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, bundle(t), creds(true), nil); err != nil {
+	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -407,7 +384,7 @@ func TestTheRepoKeyNeverReachesACommandLineNorAJournal(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, bundle(t), creds(true), nil); err != nil {
+	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, cmd := range fake.Commands() {

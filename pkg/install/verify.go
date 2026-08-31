@@ -1,8 +1,8 @@
 package install
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -439,15 +439,12 @@ func (s *Session) agentNamespace() string {
 	return creds.Operator.Namespace
 }
 
-// encodeBase64 keeps a multi-document YAML off the command line's quoting
-// rules entirely.
-func encodeBase64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
-
-// kubectlApply applies a document from stdin on the server node.
+// kubectlApply applies a document from stdin on the server node. The document
+// travels over stdin and never in the command string — the probe carries no
+// secret today, but this is the path the next secret-bearing caller inherits,
+// which is why kn-40rd named it explicitly.
 func kubectlApply(ctx context.Context, r k3s.Runner, doc string) error {
-	encoded := encodeBase64(doc)
-	cmd := fmt.Sprintf("printf '%%s' %s | base64 -d | sudo -n k3s kubectl apply -f -", encoded)
-	res, err := r.Run(ctx, cmd)
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader([]byte(doc)))
 	if err != nil {
 		return err
 	}

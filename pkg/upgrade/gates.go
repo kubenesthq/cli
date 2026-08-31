@@ -275,24 +275,13 @@ func movesBackwards(from, to *manifest.Manifest) (bool, error) {
 }
 
 // semverParts turns "v1.35.7+k3s1" into {1, 35, 7}.
+//
+// Moved to pkg/manifest, which is where both callers can reach it:
+// pkg/component/agent needs the same ordering to refuse rendering a credential
+// into a chart too old to carry it. Kept as a wrapper so this package's gates
+// read the same as before.
 func semverParts(version string) ([3]int, error) {
-	var out [3]int
-	v := strings.TrimPrefix(strings.TrimSpace(version), "v")
-	if i := strings.IndexAny(v, "+-"); i >= 0 {
-		v = v[:i]
-	}
-	fields := strings.Split(v, ".")
-	if len(fields) != 3 {
-		return out, fmt.Errorf("%q is not a version", version)
-	}
-	for i, f := range fields {
-		n, err := strconv.Atoi(f)
-		if err != nil {
-			return out, fmt.Errorf("%q is not a version", version)
-		}
-		out[i] = n
-	}
-	return out, nil
+	return manifest.SemverParts(version)
 }
 
 // nodeStatus is what the readiness and disruption gates read.

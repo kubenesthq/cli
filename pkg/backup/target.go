@@ -1,8 +1,8 @@
 package backup
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -163,14 +163,16 @@ func (t Target) storageLocationManifest() ([]byte, error) {
 }
 
 // apply pipes one YAML document set into `kubectl apply -f -`. The content
-// travels base64-encoded so nothing needs shell quoting. Deliberately NOT
-// the k3s auto-deploy directory: a target is per-cluster configuration, not
-// part of the bundle, and its Secret belongs in the datastore, not in a
-// world-readable file under /var/lib/rancher. On failure only kubectl's
-// stderr is reported, never the document or the command.
+// travels over STDIN and never in the command string: these documents carry
+// the object-store access key and secret key, and a command string is the
+// argv of the shell sshd spawns — readable in `ps auxww` by any user on the
+// target host. Base64 in argv was an encoding, not a concealment (kn-40rd).
+// Deliberately NOT the k3s auto-deploy directory: a target is per-cluster
+// configuration, not part of the bundle, and its Secret belongs in the
+// datastore, not in a world-readable file under /var/lib/rancher. On failure
+// only kubectl's stderr is reported, never the document or the command.
 func apply(ctx context.Context, r k3s.Runner, what string, doc []byte) error {
-	encoded := base64.StdEncoding.EncodeToString(doc)
-	res, err := r.Run(ctx, fmt.Sprintf("printf '%%s' %s | base64 -d | sudo -n k3s kubectl apply -f -", encoded))
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(doc))
 	if err != nil {
 		return fmt.Errorf("apply %s: %w", what, err)
 	}

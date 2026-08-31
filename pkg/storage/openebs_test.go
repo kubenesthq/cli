@@ -27,7 +27,22 @@ type prefixReply struct {
 	res    sshx.Result
 }
 
-var writeRe = regexp.MustCompile(`^sudo -n tee ` + k3s.ManifestDir + `/([a-z0-9-]+)\.yaml >/dev/null$`)
+// A manifest write is recognised by its target name; the full command is then
+// asserted to equal manifestWriteCmd exactly, so a write that smuggled a
+// payload into the command string would not merely be recognised, it would
+// fail (kn-40rd).
+var writeRe = regexp.MustCompile(
+	`^sudo -n install -m 0600 /dev/stdin ` + regexp.QuoteMeta(k3s.ManifestDir) + `/([a-z0-9-]+)\.yaml\.tmp `)
+
+// manifestWriteCmd mirrors k3s.WriteManifest: create 0600 under a .tmp name,
+// rename into place, remove the temp file on any failure. The file is never
+// world-readable and k3s never sees a partial document.
+func manifestWriteCmd(name string) string {
+	p := k3s.ManifestDir + "/" + name + ".yaml"
+	return "sudo -n install -m 0600 /dev/stdin " + p + ".tmp" +
+		" && sudo -n mv -f " + p + ".tmp " + p +
+		" || { sudo -n rm -f " + p + ".tmp; false; }"
+}
 
 func (p *prefixRunner) Run(_ context.Context, command string) (sshx.Result, error) {
 	if writeRe.MatchString(command) {
@@ -48,6 +63,9 @@ func (p *prefixRunner) RunInput(_ context.Context, command string, stdin io.Read
 	if m == nil {
 		p.t.Fatalf("unscripted streamed command: %q", command)
 		return sshx.Result{}, nil
+	}
+	if want := manifestWriteCmd(m[1]); command != want {
+		p.t.Fatalf("manifest write command =\n  %q\nwant\n  %q", command, want)
 	}
 	content, err := io.ReadAll(stdin)
 	if err != nil {

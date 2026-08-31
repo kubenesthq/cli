@@ -3,7 +3,6 @@ package backup
 import (
 	"context"
 	"fmt"
-	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -13,7 +12,6 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
-	"kubenest.io/cli/pkg/sshx"
 )
 
 const datastoreRestoreConfigPath = "/etc/rancher/k3s/config.yaml.d/40-kubenest-restore.yaml"
@@ -27,11 +25,6 @@ var snapshotNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$
 type DatastoreServer struct {
 	Name   string
 	Runner k3s.Runner
-}
-
-type inputRunner interface {
-	k3s.Runner
-	RunInput(context.Context, string, io.Reader) (sshx.Result, error)
 }
 
 // RestoreDatastoreSnapshotFromS3 performs the documented whole-cluster
@@ -168,15 +161,22 @@ func (t Target) datastoreRestoreConfig() ([]byte, error) {
 	return yaml.Marshal(values)
 }
 
+// writeDatastoreRestoreConfig stages the restore configuration, which holds
+// etcd-s3-secret-key: the credential that reads every etcd snapshot in the
+// bucket.
+//
+// Created 0600 by `install`, not `tee` followed by a chmod. tee creates at
+// root's umask — 0644 — so the previous form left the S3 secret key
+// world-readable on the host for the width of one more command. That is the
+// same window kn-40rd closed in k3s.WriteManifest; it was open here too.
+//
+// The r.(inputRunner) assertion this replaces was dead: k3s.Runner already
+// requires RunInput, so the refusal branch was unreachable and its error
+// message described a state that cannot occur.
 func writeDatastoreRestoreConfig(ctx context.Context, r k3s.Runner, config []byte) error {
-	secure, ok := r.(inputRunner)
-	if !ok {
-		return fmt.Errorf("datastore restore refuses to put S3 credentials in a command line: the SSH runner must support stdin")
-	}
 	command := "sudo -n install -d -m 0755 /etc/rancher/k3s/config.yaml.d && " +
-		"sudo -n tee " + datastoreRestoreConfigPath + " >/dev/null && " +
-		"sudo -n chmod 0600 " + datastoreRestoreConfigPath
-	res, err := secure.RunInput(ctx, command, strings.NewReader(string(config)))
+		"sudo -n install -m 0600 /dev/stdin " + datastoreRestoreConfigPath
+	res, err := r.RunInput(ctx, command, strings.NewReader(string(config)))
 	if err != nil {
 		return fmt.Errorf("write temporary datastore restore configuration: %w", err)
 	}

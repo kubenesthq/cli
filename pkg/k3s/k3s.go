@@ -74,7 +74,20 @@ func WriteManifest(ctx context.Context, r Runner, name string, content []byte) e
 		return fmt.Errorf("manifest name %q must be lowercase alphanumerics and hyphens", name)
 	}
 	path := ManifestDir + "/" + name + ".yaml"
-	res, err := r.RunInput(ctx, "sudo -n tee "+path+" >/dev/null", bytes.NewReader(content))
+	// Created 0600 and renamed into place, never written in place. `tee` would
+	// create at root's umask — 0644 in a world-readable directory — so a
+	// values document holding the agent JWT and the GitOps deploy key would be
+	// world-readable for the width of a round trip before anything chmods it
+	// (kn-40rd acceptance bullet 3). The rename is also what stops k3s's deploy
+	// controller from applying a half-written manifest if the stream dies:
+	// tmp carries no .yaml suffix, so the controller ignores it until it is
+	// whole and named.
+	tmp := path + ".tmp"
+	res, err := r.RunInput(ctx,
+		"sudo -n install -m 0600 /dev/stdin "+tmp+
+			" && sudo -n mv -f "+tmp+" "+path+
+			" || { sudo -n rm -f "+tmp+"; false; }",
+		bytes.NewReader(content))
 	if err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}

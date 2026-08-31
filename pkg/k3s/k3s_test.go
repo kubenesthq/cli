@@ -63,7 +63,10 @@ func TestWriteManifestSendsContentOverStdinAndNeverOnTheCommandLine(t *testing.T
 	// payload in ANY encoding can be hiding in it — a scan for the plaintext,
 	// or even for base64-looking runs, is the kind of check the old form
 	// slipped past.
-	want := "sudo -n tee " + ManifestDir + "/kubenest-storageclass.yaml >/dev/null"
+	target := ManifestDir + "/kubenest-storageclass.yaml"
+	want := "sudo -n install -m 0600 /dev/stdin " + target + ".tmp" +
+		" && sudo -n mv -f " + target + ".tmp " + target +
+		" || { sudo -n rm -f " + target + ".tmp; false; }"
 	if captured != want {
 		t.Errorf("command =\n  %q\nwant\n  %q", captured, want)
 	}

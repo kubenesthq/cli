@@ -2,8 +2,6 @@ package backup
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -209,18 +207,14 @@ func TestConfigureAppliesThenProvesTheTarget(t *testing.T) {
 	// Order: credentials before the location that references them, location
 	// proven before the schedule that writes to it.
 	var secretAt, locationAt, scheduleAt = -1, -1, -1
-	for i, cmd := range r.Commands() {
-		if !strings.Contains(cmd, "kubectl apply") {
-			continue
-		}
-		doc := decodeApplied(t, cmd)
+	for _, a := range r.Applied() {
 		switch {
-		case strings.Contains(doc, "kind: Secret"):
-			secretAt = i
-		case strings.Contains(doc, "kind: BackupStorageLocation"):
-			locationAt = i
-		case strings.Contains(doc, "kind: Schedule"):
-			scheduleAt = i
+		case strings.Contains(a.Doc, "kind: Secret"):
+			secretAt = a.At
+		case strings.Contains(a.Doc, "kind: BackupStorageLocation"):
+			locationAt = a.At
+		case strings.Contains(a.Doc, "kind: Schedule"):
+			scheduleAt = a.At
 		}
 	}
 	if secretAt == -1 || locationAt == -1 || scheduleAt == -1 {
@@ -242,11 +236,8 @@ func TestConfigureWritesTheManifestSchedule(t *testing.T) {
 	if err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, cmd := range r.Commands() {
-		if !strings.Contains(cmd, "kubectl apply") {
-			continue
-		}
-		doc := decodeApplied(t, cmd)
+	for _, a := range r.Applied() {
+		doc := a.Doc
 		if !strings.Contains(doc, "kind: Schedule") {
 			continue
 		}
@@ -319,18 +310,4 @@ func TestTakeBackupPassesOnCompleted(t *testing.T) {
 	if err := TakeBackup(context.Background(), r, testManifest(), "manual-x", nil); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// decodeApplied extracts the YAML document from an apply command's base64.
-func decodeApplied(t *testing.T, cmd string) string {
-	t.Helper()
-	var encoded string
-	if _, err := fmt.Sscanf(cmd, "printf '%%s' %s ", &encoded); err != nil {
-		t.Fatalf("apply command shape changed: %q", cmd)
-	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatalf("apply payload is not base64: %v", err)
-	}
-	return string(raw)
 }

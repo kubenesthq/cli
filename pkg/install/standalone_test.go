@@ -2,7 +2,6 @@ package install_test
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"path/filepath"
@@ -169,17 +168,10 @@ func TestStandaloneRecordStageWritesTheRecordToTheCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	commands := runner.Commands()
-	if len(commands) == 0 {
+	execs := runner.Executions()
+	if len(execs) == 0 {
 		t.Fatal("stage 12 wrote nothing to the cluster")
 	}
-	applied := strings.Join(commands, "\n")
-	if !strings.Contains(applied, "kubectl apply") {
-		t.Errorf("stage 12 did not apply anything: %s", applied)
-	}
-	// The document goes over the wire base64-encoded to stay clear of
-	// shell quoting, so assert on what would be decoded rather than on the
-	// command text.
 	doc, err := install.ClusterRecordManifest(install.ClusterRecord{
 		ClusterID: s.Jnl.ClusterID, ClusterName: "prod-1", BundleVersion: "1.0",
 		Profiles: []string{}, HATier: "single-server",
@@ -188,8 +180,26 @@ func TestStandaloneRecordStageWritesTheRecordToTheCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(applied, base64.StdEncoding.EncodeToString([]byte(doc))) {
-		t.Errorf("stage 12 applied a document other than this cluster's record.\nwanted the encoding of:\n%s", doc)
+	// The document travels over stdin, so it is asserted on the payload and
+	// not on the command text (kn-40rd). Checking Stdin rather than a joined
+	// haystack is what keeps this test able to fail: were the record put back
+	// on the command line, no payload would arrive and this would go red.
+	var appliedAny bool
+	var sawRecord bool
+	for _, e := range execs {
+		if !strings.Contains(e.Command, "kubectl apply") {
+			continue
+		}
+		appliedAny = true
+		if string(e.Stdin) == doc {
+			sawRecord = true
+		}
+	}
+	if !appliedAny {
+		t.Errorf("stage 12 did not apply anything: %s", strings.Join(runner.Commands(), "\n"))
+	}
+	if !sawRecord {
+		t.Errorf("stage 12 applied a document other than this cluster's record.\nwanted:\n%s", doc)
 	}
 }
 

@@ -1,8 +1,8 @@
 package backup
 
 import (
+	"bytes"
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -162,18 +162,21 @@ func ConfigureDatastoreSnapshots(
 // writeDatastoreConfig atomically installs only the non-secret k3s settings.
 // It reports whether k3s needs a restart; an identical set-target is a no-op.
 func writeDatastoreConfig(ctx context.Context, r k3s.Runner, config []byte) (bool, error) {
-	encoded := base64.StdEncoding.EncodeToString(config)
 	const tmp = "/run/kubenest/etcd-s3-config.yaml"
+	// Over stdin, for the same reason as apply above. This document is the
+	// non-secret half of the datastore settings, but it is written by the same
+	// hand as the Secret and inherits the same rule: nothing this package
+	// sends to a host goes on the command line (kn-40rd).
 	cmd := fmt.Sprintf(
 		"sudo -n install -d -m 0700 /run/kubenest && "+
-			"printf '%%s' %s | base64 -d | sudo -n tee %s >/dev/null && "+
+			"sudo -n install -m 0600 /dev/stdin %s && "+
 			"sudo -n install -d -m 0755 /etc/rancher/k3s/config.yaml.d && "+
 			"if sudo -n test -f %s && sudo -n cmp -s %s %s; then printf unchanged; "+
 			"else sudo -n install -m 0600 %s %s && printf changed; fi; "+
 			"status=$?; sudo -n rm -f %s; exit $status",
-		encoded, tmp, datastoreConfigPath, tmp, datastoreConfigPath, tmp, datastoreConfigPath, tmp,
+		tmp, datastoreConfigPath, tmp, datastoreConfigPath, tmp, datastoreConfigPath, tmp,
 	)
-	res, err := r.Run(ctx, cmd)
+	res, err := r.RunInput(ctx, cmd, bytes.NewReader(config))
 	if err != nil {
 		return false, fmt.Errorf("write datastore snapshot configuration: %w", err)
 	}

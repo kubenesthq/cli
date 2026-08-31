@@ -154,6 +154,22 @@ func Values(creds *api.AgentCredentials) (string, error) {
 	return string(out), nil
 }
 
+// minChartWithRepoCredential is the first published kubenest-operator-2 chart
+// whose values carry gitSSHPrivateKey and whose deployment renders the
+// GIT_SSH_* environment. Chart 2.2.0, which platform-0.9 pins, has neither.
+//
+// Helm does not reject unknown values — this chart ships no values.schema.json
+// — so rendering gitSSHPrivateKey against 2.2.0 does not fail. It is accepted
+// and discarded. The install then completes green with bootstrap.gitea
+// disabled and no Git credential anywhere: neither the bundled Git server nor
+// the external repo, which is precisely the state kn-rnyl.2 exists to prevent,
+// reached silently.
+//
+// 0.9's pin is deliberate history and must not move (see the header of
+// platform-0.9.yaml: back-pinning it to a chart that did not exist when 0.9
+// was current "would be fiction"). So the refusal belongs here.
+const minChartWithRepoCredential = "2.3.5"
+
 // Chart renders the agent's HelmChart resource at the bundle's pin. The chart
 // reference comes from the MINT (operator.chart_ref), not from a constant:
 // the control plane composes it from the manifest's sources section, and a
@@ -169,6 +185,20 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 	namespace := creds.Operator.Namespace
 	if namespace == "" {
 		return k3s.HelmChart{}, fmt.Errorf("the minted credentials carry no operator namespace")
+	}
+	// Refuse rather than render a credential the pinned chart cannot consume.
+	// An error naming both versions is recoverable; a green install with no Git
+	// credential is discovered later, by whoever wonders why nothing deploys.
+	if creds.RepoCredential != nil {
+		cmp, err := manifest.CompareVersions(version, minChartWithRepoCredential)
+		if err != nil {
+			return k3s.HelmChart{}, fmt.Errorf("cannot tell whether kubenest-agent %s carries the GitOps deploy key values: %w", version, err)
+		}
+		if cmp < 0 {
+			return k3s.HelmChart{}, fmt.Errorf(
+				"bundle pins kubenest-agent %s, which has no gitSSHPrivateKey value: the per-cluster GitOps deploy key would be accepted by helm and silently discarded, leaving the cluster with no Git credential at all. %s or later carries it. Install this cluster from a bundle that pins %s or later, or register it without a GitOps repository",
+				version, minChartWithRepoCredential, minChartWithRepoCredential)
+		}
 	}
 	values, err := Values(creds)
 	if err != nil {

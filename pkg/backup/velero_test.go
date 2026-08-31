@@ -48,9 +48,10 @@ func (f *fakeRunner) RunInput(ctx context.Context, command string, stdin io.Read
 func (f *fakeRunner) record(command string, stdin []byte) (sshx.Result, error) {
 	f.mu.Lock()
 	f.commands = append(f.commands, command)
-	if stdin != nil {
-		f.inputs = append(f.inputs, stdin)
-	}
+	// Appended unconditionally, nil included, so inputs stays index-aligned
+	// with commands. A stdin slice that skipped the plain Run calls would
+	// silently pair a payload with the wrong command.
+	f.inputs = append(f.inputs, stdin)
 	f.mu.Unlock()
 	if f.Respond == nil {
 		return sshx.Result{}, nil
@@ -62,6 +63,43 @@ func (f *fakeRunner) Commands() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.commands...)
+}
+
+// Inputs returns every stdin payload streamed so far, in order, skipping the
+// plain Run calls that streamed nothing.
+func (f *fakeRunner) Inputs() [][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out [][]byte
+	for _, in := range f.inputs {
+		if in != nil {
+			out = append(out, append([]byte(nil), in...))
+		}
+	}
+	return out
+}
+
+// appliedDoc is one `kubectl apply` and the document it streamed. At is the
+// index in Commands, so a test can still assert ordering.
+type appliedDoc struct {
+	At  int
+	Doc string
+}
+
+// Applied returns every applied document, read from STDIN rather than from
+// the command. The documents carry the object store's access key and secret
+// key, so they no longer appear in the command at all (kn-40rd) — a test that
+// still parsed the command would find nothing and pass vacuously.
+func (f *fakeRunner) Applied() []appliedDoc {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []appliedDoc
+	for i, c := range f.commands {
+		if strings.Contains(c, "kubectl apply") {
+			out = append(out, appliedDoc{At: i, Doc: string(f.inputs[i])})
+		}
+	}
+	return out
 }
 
 // testManifest builds an in-memory bundle with everything backup consumes.
