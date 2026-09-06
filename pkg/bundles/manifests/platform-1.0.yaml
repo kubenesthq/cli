@@ -33,7 +33,38 @@ bundle: "1.0"
 
 core:
   k3s: v1.35.7+k3s1                    # single-node embedded etcd on every tier (decision A)
-  traefik: 41.2.0                      # chart; ships Traefik v3.7.10, Gateway API provider
+  traefik: 41.4.0                      # chart; ships Traefik v3.7.12, Gateway API provider.
+                                       # SECURITY FLOOR (kn-b49n). v3.7.12 is the lowest version
+                                       # with no open Traefik advisory. 41.2.0 shipped v3.7.10,
+                                       # against which SEVEN were open, verified 2026-09-06 via
+                                       # the traefik/traefik repository advisory list:
+                                       #   GHSA-5w68-77r2-r64c  CRITICAL  digestAuth authenticates
+                                       #     any username with no password        (<= 3.7.10 -> 3.7.11)
+                                       #   GHSA-g55h-rg46-x9c5  high  TLSOption confusion in
+                                       #     multi-host routers bypasses mTLS      (<= 3.7.10 -> 3.7.11)
+                                       #   GHSA-rf44-j88r-hh8c  med   ForwardAuth identity spoofing
+                                       #     via dot-form header alias             (<= 3.7.11 -> 3.7.12)
+                                       #   GHSA-m6wx-622r-48r9  high  Ingress service middleware
+                                       #     bypasses crossProviderNamespaces      (<= 3.7.10 -> 3.7.11)
+                                       #   GHSA-j994-9gqj-9hwq  high  same-host Ingress TLS option
+                                       #     conflict disables client-cert auth    (<= 3.7.10 -> 3.7.11)
+                                       #   GHSA-cjr6-pf59-jq29  high  ingress-nginx from-to-www
+                                       #     sibling router serves auth'd backend  (<= 3.7.11 -> 3.7.12)
+                                       #   GHSA-7ghq-v6jf-g56c  med   respondingTimeouts.readTimeout
+                                       #     not applied to HTTP/3                 (<= 3.7.11 -> 3.7.12)
+                                       # The first three are reachable on a platform cluster: the
+                                       # chart installs middlewares.traefik.io and runs with
+                                       # --providers.kubernetescrd, so any project namespace can
+                                       # create the Middleware or TLSOption that triggers them.
+                                       # The last four need the Ingress or ingress-nginx provider
+                                       # or an HTTP/3 entrypoint, none of which the platform
+                                       # enables — they are fixed here, not exploitable before.
+                                       # Not affected at 41.2.0: GHSA-fgjj-px3w-67xx (Gateway API
+                                       # route-identity collision) — patched in v3.7.10, so the
+                                       # previous pin already carried it.
+                                       # 41.2.0 -> 41.4.0 renders byte-identically under this
+                                       # platform's values apart from the image tag.
+                                       # Floor asserted by test_traefik_pin_is_at_or_above_the_security_floor.
   gateway-api: v1.6.1                  # standard-channel CRD bundle of this release
   cert-manager: v1.21.1                # chart == app version
   openebs-lvm-localpv: 1.10.0          # chart == app version

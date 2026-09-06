@@ -2,6 +2,7 @@ package bundles
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -127,4 +128,51 @@ func TestEmbeddedManifestsMatchContracts(t *testing.T) {
 
 func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
+}
+
+// SECURITY FLOOR (kn-b49n). Traefik chart 41.4.0 ships Traefik v3.7.12, the
+// lowest version with no open Traefik advisory. The pin this replaced, 41.2.0,
+// shipped v3.7.10, against which seven were open — among them
+// GHSA-5w68-77r2-r64c, a CRITICAL complete authentication bypass in the
+// digestAuth middleware. That one is reachable on a platform cluster rather
+// than theoretical: the chart installs middlewares.traefik.io and pkg/component
+// /traefik runs Traefik with --providers.kubernetescrd, so any project
+// namespace can create the Middleware that triggers it.
+//
+// The floor applies to the CURRENT bundle only. Older bundles keep the pins
+// that were current when they were cut — that is what platform-0.9.yaml's
+// header says and why it says do not install 0.9 — so this walks the newest
+// version rather than every version.
+//
+// Deliberately a static floor and not a live advisory query: a unit test that
+// reaches the network fails for the wrong reasons. It catches the regression
+// that matters, someone pinning traefik back to fix an unrelated problem.
+// Noticing NEW advisories above the floor is kn-eewa's advisory feed;
+// asserting the version actually running on a cluster is kn-twe's matrix.
+func TestCurrentBundleTraefikPinIsAtOrAboveTheSecurityFloor(t *testing.T) {
+	versions := Versions()
+	if len(versions) == 0 {
+		t.Fatal("this binary carries no bundle manifests")
+	}
+	current := versions[len(versions)-1]
+	m, err := Manifest(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin, err := m.Core.Version("traefik")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(pin, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		t.Fatalf("bundle %s pins traefik to %q, which is not a chart version: %v", current, pin, err)
+	}
+	const floorMajor, floorMinor, floorPatch = 41, 4, 0
+	below := major < floorMajor ||
+		(major == floorMajor && minor < floorMinor) ||
+		(major == floorMajor && minor == floorMinor && patch < floorPatch)
+	if below {
+		t.Errorf("bundle %s pins traefik chart %s, below the %d.%d.%d security floor "+
+			"(Traefik v3.7.12) — see kn-b49n", current, pin, floorMajor, floorMinor, floorPatch)
+	}
 }

@@ -7,7 +7,7 @@
 # Kubernetes moves — cannot be exercised by a bundle that changes no
 # Kubernetes version.
 #
-# It differs from 1.0 in TWO PINS, and both differences are real history
+# It differs from 1.0 in THREE PINS, and every difference is real history
 # rather than invention:
 #
 #   k3s            v1.35.6+k3s1 rather than v1.35.7+k3s1. Both are real k3s
@@ -16,21 +16,33 @@
 #                  current patch) at the time each was cut — 0.9 pinned the
 #                  then-current patch, 1.0 pins the one after it.
 #
-#   kubenest-agent 2.2.0 rather than 2.3.5. 2.3.5 is the corruption-aware
-#                  chart kn-f9lm cut on 2026-08-21, after 0.9. Back-pinning
-#                  0.9 to a chart that did not exist when 0.9 was current
-#                  would be fiction, and the point of this file is that
-#                  nothing in it is invented.
+#   kubenest-agent 2.2.0 rather than 1.0's pin. 1.0's agent chart postdates
+#                  0.9. Back-pinning 0.9 to a chart that did not exist when
+#                  0.9 was current would be fiction, and the point of this
+#                  file is that nothing in it is invented.
+#
+#   traefik        41.2.0 rather than 41.4.0 (kn-b49n). Chart 41.4.0 ships
+#                  Traefik v3.7.12 and was published 2026-08-26, after 0.9's
+#                  pins were verified on 2026-08-20 — so 0.9 keeps 41.2.0
+#                  for the same reason it keeps the older agent chart. 0.9
+#                  therefore ships Traefik v3.7.10, against which seven
+#                  advisories are open including a CRITICAL digestAuth
+#                  authentication bypass (GHSA-5w68-77r2-r64c). That is not
+#                  a defect in this file: it is what an older release is.
+#                  DO NOT INSTALL 0.9. It exists to be upgraded FROM, and
+#                  the upgrade to 1.0 is what closes those seven.
 #
 # The k3s difference is what makes the upgrade worth gating: 0.9 -> 1.0
 # crosses the point of no return, so every node drains and returns and a
 # rollback from beyond it genuinely needs the datastore snapshot rather than
 # a Helm revert. The agent difference rides along and is closer to a real
-# upgrade than a Kubernetes-only transition would have been.
+# upgrade than a Kubernetes-only transition would have been. The traefik
+# difference makes the gate exercise a plain component chart upgrade too,
+# which every real security release will be.
 #
-# test_vendored_09_differs_from_10_only_in_the_k3s_pin asserts this exact set,
-# so a third pin drifting between the two is a test failure and not a silent
-# change to what the upgrade gate is testing.
+# test_vendored_09_to_10_moves_exactly_k3s_the_agent_and_traefik asserts this
+# exact set, so a FOURTH pin drifting between the two is a test failure and
+# not a silent change to what the upgrade gate is testing.
 #
 # kn-boj owns the bundle catalog. If the real 0.9 should carry different pins,
 # or should not be in the catalog at all, that is that bead's call and this
