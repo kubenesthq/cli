@@ -470,6 +470,9 @@ func TestHostKeyPinRendersOnAChartThatConsumesIt(t *testing.T) {
 	if got := bc["gitSSHKnownHosts"]; got != knownHosts {
 		t.Errorf("gitSSHKnownHosts = %v, want the minted known_hosts verbatim", got)
 	}
+	if got, present := argoSSHExtraHostsOf(t, values); !present || got != knownHosts {
+		t.Errorf("argo-cd.configs.ssh.extraHosts = %q, %v; want the minted known_hosts verbatim and present", got, present)
+	}
 }
 
 // The pin must NOT be sent to an older chart. Those operator builds stop
@@ -489,6 +492,9 @@ func TestHostKeyPinIsWithheldFromChartsThatWouldBreakOnIt(t *testing.T) {
 		bc := bootstrapControllerOf(t, values)
 		if _, present := bc["gitSSHKnownHosts"]; present {
 			t.Errorf("chart %s: gitSSHKnownHosts was rendered; that chart's ArgoCD would refuse the repo:\n%s", version, values)
+		}
+		if _, present := argoSSHExtraHostsOf(t, values); present {
+			t.Errorf("chart %s: argo-cd.configs.ssh.extraHosts was rendered alongside a withheld pin:\n%s", version, values)
 		}
 		// The credential itself still has to render, or withholding the pin
 		// would have cost the cluster its GitOps access entirely.
@@ -511,6 +517,35 @@ func TestNoHostKeyPinRendersNoValue(t *testing.T) {
 	if _, present := bootstrapControllerOf(t, values)["gitSSHKnownHosts"]; present {
 		t.Errorf("an absent pin must leave the chart default alone:\n%s", values)
 	}
+	if _, present := argoSSHExtraHostsOf(t, values); present {
+		t.Errorf("an absent pin must not render argo-cd.configs.ssh.extraHosts:\n%s", values)
+	}
+}
+
+// argoSSHExtraHostsOf returns the same public pin Helm passes to the Argo CD
+// subchart. It must travel with gitSSHKnownHosts: otherwise the operator is an
+// out-of-band writer of a Helm-managed ConfigMap and a later credential
+// rotation makes Helm 4 reject its upgrade with an SSA ownership conflict.
+func argoSSHExtraHostsOf(t *testing.T, values string) (string, bool) {
+	t.Helper()
+	var document map[string]any
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	argo, ok := document["argo-cd"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	configs, ok := argo["configs"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	ssh, ok := configs["ssh"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	extraHosts, ok := ssh["extraHosts"].(string)
+	return extraHosts, ok
 }
 
 func bootstrapControllerOf(t *testing.T, values string) map[string]any {

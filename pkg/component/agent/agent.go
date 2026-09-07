@@ -160,6 +160,16 @@ func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
 		// on the path to Gitea from serving forged desired state (kn-rnyl.1).
 		if chartPinsHostKey(chartVersion) && creds.RepoCredential.KnownHosts != "" {
 			bootstrapController["gitSSHKnownHosts"] = creds.RepoCredential.KnownHosts
+			// The Argo CD subchart owns argocd-ssh-known-hosts-cm. Give Helm
+			// the same public pin it gives the operator, rather than making the
+			// operator an out-of-band writer of that Helm-managed field. Apart
+			// from avoiding an SSA conflict on credential rotation, this means
+			// ArgoCD starts strict on the first reconciliation.
+			values["argo-cd"] = map[string]any{
+				"configs": map[string]any{
+					"ssh": map[string]any{"extraHosts": creds.RepoCredential.KnownHosts},
+				},
+			}
 		}
 		values["kubenest"].(map[string]any)["bootstrapController"] = bootstrapController
 	}
