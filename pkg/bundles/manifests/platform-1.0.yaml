@@ -71,8 +71,22 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.4.0                # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.4.0 is the first chart whose appVersion can actually READ the
+  kubenest-agent: 2.4.1                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.4.1, not 2.4.0 (kn-go83). Both carry the same templates and the
+                                       # same appVersion; 2.4.1 is docs-only over 2.4.0 and was verified so
+                                       # by rendering both published charts with identical values and
+                                       # diffing 41,371 lines of output to nothing. What it fixes is the
+                                       # chart's OWN README values table, which in 2.4.0 still names
+                                       # wss://api.kubenest.io/v2/operator/events as the default for
+                                       # kubenest.backendURL - the live host serving another customer that
+                                       # 2.4.0's templates had just removed (kn-vv3f). Pinning 2.4.0 here
+                                       # would ship a bundle whose `helm show readme` hands the operator
+                                       # exactly the host the bundle exists to keep them away from.
+                                       # This pin said 2.4.0 only because 2.4.1 did not exist yet: contracts
+                                       # moved to 2.4.0 at 2026-08-31 00:46 UTC and 2.4.1 was published at
+                                       # ~06:59 UTC the same day.
+                                       #
+                                       # 2.4.0 was the first chart whose appVersion can actually READ the
                                        # per-cluster GitOps deploy key. 2.3.5 carried gitSSHPrivateKey and
                                        # mounted it, but pinned appVersion dcc8d25 - a build from before
                                        # kn-gjew (19a611e) taught the operator to read
@@ -94,7 +108,10 @@ core:
                                        #
                                        # Note the 2.3.5 on ghcr is NOT the 2.3.5 a273b3d cut: 19a611e and
                                        # 8411f91 both changed chart contents without bumping the version.
-                                       # Every content change from 2.4.0 on bumps it.
+                                       # Every content change from 2.4.0 on bumps it - a convention, with
+                                       # nothing enforcing it until kn-bife lands: the chart workflow
+                                       # republishes whatever version Chart.yaml names, over whatever is
+                                       # already there.
 
 # Version-less base refs; the version is ALWAYS the core pin above (one pin, one
 # place). kubenest-agent's is load-bearing: the backend renders install-instructions
