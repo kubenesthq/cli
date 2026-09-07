@@ -347,10 +347,11 @@ install_binary() {
   _bin="$1"
   _target="${INSTALL_DIR}/${BIN_NAME}"
 
-  # Probe whether the destination is usable as-is: it must exist (or be
-  # creatable) and be writable. A scratch file is the reliable test.
+  # Create a missing destination as the caller first; only a creation or write
+  # failure needs sudo. A scratch file is the reliable writeability test.
+  [ -d "$INSTALL_DIR" ] || mkdir -p "$INSTALL_DIR" 2>/dev/null || true
   _need_sudo=""
-  if [ ! -d "$INSTALL_DIR" ] || ! ( : > "${INSTALL_DIR}/.kubenest-install-probe" ) 2>/dev/null; then
+  if ! ( : > "${INSTALL_DIR}/.kubenest-install-probe" ) 2>/dev/null; then
     _need_sudo="yes"
   else
     rm -f "${INSTALL_DIR}/.kubenest-install-probe"
@@ -359,7 +360,7 @@ install_binary() {
   if [ -n "$_need_sudo" ]; then
     command -v sudo >/dev/null 2>&1 \
       || die "cannot write to ${INSTALL_DIR} and sudo is not available" \
-             "install to a writable directory with --install-dir"
+             "re-run with --install-dir ~/.local/bin"
     info "installing to ${INSTALL_DIR} (requires sudo)"
     sudo mkdir -p "$INSTALL_DIR"
     sudo install -m 0755 "$_bin" "$_target" \

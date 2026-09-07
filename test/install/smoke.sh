@@ -51,7 +51,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL_SH="${REPO_ROOT}/install.sh"
 PORT="${SMOKE_PORT:-8123}"
-BASE_IMAGE="kubenest-install-smoke-base"
+BASE_IMAGE="kubenest-install-smoke-base-nqei"
 
 log()  { printf '\033[0;36m[smoke]\033[0m %s\n' "$*"; }
 pass() { printf '\033[0;32m[smoke] PASS:\033[0m %s\n' "$*"; }
@@ -105,6 +105,7 @@ if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
 FROM ubuntu:24.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates \
+ && useradd --create-home --uid 10001 --shell /bin/sh kubenest \
  && rm -rf /var/lib/apt/lists/*
 EOF
 fi
@@ -184,6 +185,7 @@ run_container() {
 }
 
 INSTALL_CMD='curl -fsSL "http://127.0.0.1:'"$PORT"'/install.sh" | sh'
+INSTALL_LOCAL_CMD='curl -fsSL "http://127.0.0.1:'"$PORT"'/install.sh" | sh -s -- --install-dir ~/.local/bin'
 
 # --- 4. happy path: verified download + install + idempotence --------------
 log "happy path: curl | sh, verified install"
@@ -199,6 +201,55 @@ run_container -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub -- bash -c '
   curl -fsSL "http://127.0.0.1:'"$PORT"'/install.sh" | bash -s -- --force
 ' || fail "happy path did not install a verified binary"
 pass "verified download installed and runs; re-run is a no-op"
+
+# --- 5. printed no-sudo remedy: a missing user directory must work ---------
+# The error recommends --install-dir ~/.local/bin. Exercise that exact remedy
+# on a fresh Ubuntu user without sudo, and require the directory to start
+# absent: otherwise this can regress to the self-referential error again.
+log "non-root no-sudo path: follow the printed --install-dir remedy into a missing directory"
+NONROOT_REMEDY_BODY='set -eu
+  command -v sudo >/dev/null 2>&1 && { echo "sudo must be absent"; exit 93; }
+  test ! -e "$HOME/.local/bin" || { echo "target directory already exists"; exit 94; }
+  set +e
+  out=$( '"${INSTALL_CMD}"' 2>&1 )
+  rc=$?
+  set -e
+  printf "%s\\n" "$out"
+  [ "$rc" -ne 0 ] || { echo "default install unexpectedly succeeded"; exit 95; }
+  case "$out" in
+    *"remedy: re-run with --install-dir ~/.local/bin"*) : ;;
+    *) echo "installer did not print the exact no-sudo remedy"; exit 96 ;;
+  esac
+  test ! -e "$HOME/.local/bin" || { echo "default install created the remedy directory"; exit 97; }
+  '"${INSTALL_LOCAL_CMD}"'
+  test -x "$HOME/.local/bin/kubenest" || { echo "remedy did not install the binary"; exit 98; }
+  "$HOME/.local/bin/kubenest" --version | grep -F '"${VERSION}"' \
+    || { echo "remedy installed the wrong version"; exit 99; }
+'
+set +e
+docker run --rm --network host --user 10001:10001 \
+  -v "${RELEASE_DIR}:/fixture:ro" \
+  -v "${COSIGN_BIN}:/tools/cosign:ro" \
+  -e HOME=/home/kubenest \
+  -e KUBENEST_RELEASE_BASE="http://127.0.0.1:${PORT}" \
+  -e KUBENEST_RELEASE_API="http://127.0.0.1:${PORT}/api" \
+  -e KUBENEST_VERSION="${VERSION}" \
+  -e KUBENEST_COSIGN=/tools/cosign \
+  -e KUBENEST_COSIGN_PUBKEY=/fixture/cosign.pub \
+  "$BASE_IMAGE" bash -c "${NONROOT_REMEDY_BODY}"
+rc=$?
+set -e
+case "$rc" in
+  0) pass "printed non-root remedy created ~/.local/bin and installed without sudo" ;;
+  93) fail "non-root remedy image unexpectedly has sudo" ;;
+  94) fail "non-root remedy target was not a clean missing directory" ;;
+  95) fail "non-root default install unexpectedly succeeded" ;;
+  96) fail "installer remedy text drifted from the executable command" ;;
+  97) fail "non-root default install mutated the remedy directory" ;;
+  98) fail "printed non-root remedy did not install a binary" ;;
+  99) fail "printed non-root remedy installed the wrong version" ;;
+  *) fail "printed non-root remedy container exited $rc" ;;
+esac
 
 # Negative-path container body: run the installer, require it to fail, require
 # that NOTHING was installed, and require that it failed for the REASON this
