@@ -86,10 +86,21 @@ func ReleaseName() string { return releaseName }
 // kn-rnyl.2 defect: the installed operator ends up with neither a Git server
 // nor the external repo. The private key rides the same protected path as
 // the agent JWT: chart values, written to a 0600 file, never a command
-// argument, never the journal. The chart's gitSSHKnownHosts stays at its
-// default — the contract does not carry a host key yet (kn-rnyl.1), so
-// host-key pinning cannot honestly be rendered from here.
-func Values(creds *api.AgentCredentials) (string, error) {
+// argument, never the journal.
+//
+// The fifth is whether to pin the GitOps host's SSH key, which is why this
+// takes a chart version. The mint now carries known_hosts (kn-rnyl.1) and
+// gitSSHKnownHosts has existed since chart 2.3.5 — but on any chart before
+// minChartWithHostKeyPin, rendering it BREAKS the cluster rather than
+// hardening it: those operator builds react to a known_hosts file by dropping
+// insecureIgnoreHostKey from the ArgoCD repository Secret, and nothing puts
+// the host into argocd-ssh-known-hosts-cm, so ArgoCD refuses the repository
+// outright and no desired state syncs at all. The pin is therefore rendered
+// only where the operator also teaches ArgoCD the same host key. Below that
+// version the value is omitted and the install proceeds unpinned — which is
+// what every install did before this field existed, where refusing would take
+// out an install path over hardening it.
+func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
 	if creds == nil {
 		return "", fmt.Errorf("the agent needs the credentials minted in stage 2")
 	}
@@ -138,13 +149,19 @@ func Values(creds *api.AgentCredentials) (string, error) {
 		// gitToken, the legacy backend-wide writer, is deliberately left at
 		// its empty default: the deploy key wins when both are present, and
 		// rendering the token is how the kn-rnyl leak happened in the first
-		// place. gitSSHKnownHosts stays empty until the contract carries a
-		// host key (kn-rnyl.1).
-		values["kubenest"].(map[string]any)["bootstrapController"] = map[string]any{
+		// place.
+		bootstrapController := map[string]any{
 			"gitRepoURL":       creds.RepoCredential.RepoURL,
 			"gitRepoBranch":    creds.RepoCredential.Branch,
 			"gitSSHPrivateKey": creds.RepoCredential.PrivateKey.Reveal(),
 		}
+		// known_hosts is the server's PUBLIC key. It is not revealed from a
+		// Secret because it was never one, and it is what stops an attacker
+		// on the path to Gitea from serving forged desired state (kn-rnyl.1).
+		if chartPinsHostKey(chartVersion) && creds.RepoCredential.KnownHosts != "" {
+			bootstrapController["gitSSHKnownHosts"] = creds.RepoCredential.KnownHosts
+		}
+		values["kubenest"].(map[string]any)["bootstrapController"] = bootstrapController
 	}
 
 	out, err := yaml.Marshal(values)
@@ -177,6 +194,28 @@ func Values(creds *api.AgentCredentials) (string, error) {
 // Verified against the published artifacts, not inferred: every tag from 2.2.0
 // to 2.4.0 pulled from ghcr and inspected.
 const minChartWithRepoCredential = "2.4.0"
+
+// minChartWithHostKeyPin is the first chart whose operator teaches BOTH sides
+// of the GitOps path the same host key: go-git verifies against the mounted
+// known_hosts, and the bootstrap controller writes the same lines into
+// argocd-ssh-known-hosts-cm before it stops setting insecureIgnoreHostKey on
+// the repository Secret.
+//
+// Order matters more than the version does. Charts 2.3.5 through 2.5.x mount
+// known_hosts and their operators already drop insecureIgnoreHostKey when the
+// file is present — but they teach ArgoCD nothing, so ArgoCD then refuses a
+// repository it has no entry for and the cluster syncs nothing. A pin sent to
+// those charts is not weaker hardening, it is an outage.
+const minChartWithHostKeyPin = "2.6.0"
+
+// chartPinsHostKey reports whether this chart consumes gitSSHKnownHosts on
+// both sides. An unreadable version answers no: the cost of not pinning is
+// the unverified host every install had before kn-rnyl.1, and the cost of
+// guessing wrong is a cluster whose ArgoCD refuses its own repository.
+func chartPinsHostKey(version string) bool {
+	cmp, err := manifest.CompareVersions(version, minChartWithHostKeyPin)
+	return err == nil && cmp >= 0
+}
 
 // minChartForUnmanaged is the first chart that can express "this cluster has
 // no hub" (kn-sf17). Below it the value is not merely unsupported, it is
@@ -218,7 +257,7 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 				version, minChartWithRepoCredential, minChartWithRepoCredential)
 		}
 	}
-	values, err := Values(creds)
+	values, err := Values(creds, version)
 	if err != nil {
 		return k3s.HelmChart{}, err
 	}

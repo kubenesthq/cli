@@ -189,7 +189,8 @@ func TestMintDecodesCredentialsButKeepsThemUnprintable(t *testing.T) {
 			              "hub_url": "wss://hub/ws/operator", "token_version": 3},
 			"repo_credential": {"private_key": "-----BEGIN OPENSSH PRIVATE KEY-----",
 			                    "repo_url": "ssh://git@gitea/kubenest/gitops-cluster-1.git",
-			                    "branch": "main"},
+			                    "branch": "main",
+			                    "known_hosts": "gitea ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPin"},
 			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://reg/kubenest-agent:2.2.0"}}`))
 	}))
 
@@ -205,6 +206,12 @@ func TestMintDecodesCredentialsButKeepsThemUnprintable(t *testing.T) {
 	}
 	if creds.Operator.ChartRef == "" || creds.RepoCredential.Branch != "main" {
 		t.Errorf("non-secret fields did not decode: %+v", creds.Operator)
+	}
+	// The host-key pin (kn-rnyl.1) is public key material and decodes like any
+	// other non-secret field — it has to, or the cluster clones its desired
+	// state from a server nothing verifies.
+	if creds.RepoCredential.KnownHosts != "gitea ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPin" {
+		t.Errorf("known_hosts did not decode: %q", creds.RepoCredential.KnownHosts)
 	}
 
 	// The whole response must refuse to be written down.

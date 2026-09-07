@@ -227,6 +227,12 @@ type RepoCredential struct {
 	PrivateKey Secret `json:"private_key"`
 	RepoURL    string `json:"repo_url"`
 	Branch     string `json:"branch"`
+	// KnownHosts pins the GitOps host: OpenSSH known_hosts lines for the host
+	// in RepoURL (kn-rnyl.1). Not a secret — it is the server's PUBLIC key,
+	// and it is useless to an attacker who cannot already answer as that host.
+	// Empty means the control plane could not establish one, and the operator
+	// and ArgoCD then accept whichever key the host presents.
+	KnownHosts string `json:"known_hosts"`
 }
 
 // OperatorInstallInfo is where and what to install — no secrets.
