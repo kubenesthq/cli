@@ -71,7 +71,12 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.5.0                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+  kubenest-agent: 2.6.1                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.1 is the immutable correction for the already-published 2.6.0:
+                                       # it pins operator image c7915c7, which teaches ArgoCD the minted
+                                       # GitOps SSH host key before removing insecureIgnoreHostKey. 2.6.0
+                                       # advertised that capability but still rendered the older 7b84b83
+                                       # image, so it was never safe to put in a bundle (kn-zrex).
                                        # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
                                        # NO hub. Below it, kubenest.unmanaged is accepted and silently
                                        # discarded — no chart in this line ships a values.schema.json — so a
