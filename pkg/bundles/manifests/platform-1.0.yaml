@@ -71,7 +71,17 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.4.1                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+  kubenest-agent: 2.5.0                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
+                                       # NO hub. Below it, kubenest.unmanaged is accepted and silently
+                                       # discarded — no chart in this line ships a values.schema.json — so a
+                                       # standalone install would deploy an agent still expecting a hub.
+                                       # The CLI refuses rather than allowing that (minChartForUnmanaged),
+                                       # so this pin is what makes `kubenest platform install` work with no
+                                       # control plane at all. appVersion moves with it to 7b84b83, the
+                                       # operator build that reads the mode; 2.4.1's binary does not know it.
+                                       # A managed render is unchanged from 2.4.1 apart from two comments.
+                                       #
                                        # 2.4.1, not 2.4.0 (kn-go83). Both carry the same templates and the
                                        # same appVersion; 2.4.1 is docs-only over 2.4.0 and was verified so
                                        # by rendering both published charts with identical values and

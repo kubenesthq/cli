@@ -8,7 +8,9 @@ import (
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
+	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/sshx"
 )
 
 func verifySession(t *testing.T) *Session {
@@ -23,15 +25,69 @@ func verifySession(t *testing.T) *Session {
 // Acceptance check 4 asks whether the cluster is MANAGED, and a standalone
 // cluster has nothing to be managed by. The one thing it must not do is
 // quietly succeed: an install that skipped a check has not passed it.
+//
+// Until kn-sf17 this returned an error saying the replacement did not exist
+// yet. It exists now — verifyAgentReconciles — so the check runs for real, and
+// what this holds is that it still cannot pass by doing nothing.
 func TestStandaloneClusterCheckDoesNotSilentlyPass(t *testing.T) {
-	s := verifySession(t) // no API client, so standalone
+	s := verifySession(t) // no API client, so standalone; and no nodes
 
 	err := verifyClusterReportsIn(context.Background(), s)
 	if err == nil {
 		t.Fatal("acceptance check 4 reported a pass on a cluster with nothing to report to")
 	}
-	if !strings.Contains(err.Error(), "kn-sf17") {
-		t.Errorf("the refusal does not name the bead that lands the replacement: %v", err)
+}
+
+// The probe is the whole check, so it is tested directly rather than through
+// converge.Wait, whose deadline is ten minutes.
+//
+// The case that matters is the middle one. An agent whose pod is Available but
+// whose controllers are not reconciling is exactly what unmanaged mode risks:
+// readiness no longer reflects a hub, so nothing else in the install would
+// notice. A probe that treated "the CR exists" as success would pass on it.
+func TestTheReconcileProbeDistinguishesRunningFromReconciling(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		project string
+		wantOK  bool
+		wantIn  string
+	}{
+		{
+			name:    "reconciled",
+			project: `{"status":{"phase":"Ready"}}`,
+			wantOK:  true,
+		},
+		{
+			name:    "accepted but never looked at",
+			project: `{"status":{}}`,
+			wantOK:  false,
+			wantIn:  "controllers have not reconciled",
+		},
+		{
+			name:    "reconciled and failed",
+			project: `{"status":{"phase":"Failed"}}`,
+			wantOK:  false,
+			wantIn:  "Failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+				if strings.Contains(command, "get project") {
+					return sshx.Result{Stdout: tc.project}, nil
+				}
+				return sshx.Result{Stdout: "Running"}, nil
+			}}
+			ok, state, err := reconciledProjectProbe(r)(context.Background())
+			if err != nil {
+				t.Fatalf("probe errored: %v", err)
+			}
+			if ok != tc.wantOK {
+				t.Fatalf("probe returned %v, want %v (state: %+v)", ok, tc.wantOK, state)
+			}
+			if tc.wantIn != "" && !strings.Contains(state.Status, tc.wantIn) {
+				t.Errorf("the state does not say what went wrong: %+v", state)
+			}
+		})
 	}
 }
 

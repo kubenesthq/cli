@@ -576,23 +576,28 @@ func stageDay2(ctx context.Context, s *Session) error {
 // credentials.
 func stageAgent(ctx context.Context, s *Session) error {
 	if s.Standalone() {
-		// The CLI half of standalone install has landed; the operator half
-		// has not. The agent's readiness probe is wired to its hub
-		// WebSocket (op3 cmd/manager/main.go, pkg/websocket/manager.go
-		// ReadyzCheck), so with no hub the pod never goes Ready, the
-		// Deployment never goes Available, and this stage's wait would time
-		// out after installing something that could never converge.
+		// Unmanaged: the cluster has an identity generated in stage 2 and no
+		// hub, no bearer and no mint (kn-sf17). This stage used to REFUSE
+		// here, because readiness was wired to the hub WebSocket and the
+		// Deployment could never go Available — the pod would sit READY 0/1
+		// forever. Operator 7b84b83 makes "no hub configured" a mode of its
+		// own, distinct from "hub configured and unreachable", and chart
+		// 2.5.0 is the first that can express it.
 		//
-		// Refusing before anything is applied is the only honest option
-		// (invariant 5: an unimplemented path says so and never pretends
-		// success). It leaves the cluster with stages 1-9 complete and
-		// nothing to undo, and a re-run resumes from exactly this point.
-		return stages.NewComponentError("kubenest-agent", fmt.Errorf(
-			"a standalone cluster cannot run the agent yet: the agent reports Ready only while it is connected to a hub, "+
-				"and a standalone cluster has none, so it would install and never converge. "+
-				"The operator-side fix is kn-sf17 (unmanaged mode: with no hub configured the hub connection is not attempted "+
-				"and readiness reflects the controllers), and it needs a new operator chart and image published before this stage can run. "+
-				"Stages 1-9 are installed and correct; re-run this identical command once kn-sf17 has shipped and it resumes here"))
+		// The identity comes from the journal rather than from credentials
+		// because there are none to hold: stageRegisterStandalone generated
+		// it locally and deliberately minted nothing alongside it.
+		if s.Jnl.ClusterID == "" {
+			return stages.NewComponentError("kubenest-agent", fmt.Errorf(
+				"stage 2 recorded no cluster identity in the journal, so the agent has nothing to install as; "+
+					"re-run from the start rather than installing an operator with an empty cluster id (kn-z6e4)"))
+		}
+		server, err := s.Server()
+		if err != nil {
+			return err
+		}
+		return stages.NewComponentError("kubenest-agent",
+			agent.InstallUnmanaged(ctx, server, s.Bundle, s.Jnl.ClusterID, s.Reporter))
 	}
 	server, err := s.Server()
 	if err != nil {

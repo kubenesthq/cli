@@ -41,6 +41,13 @@ type Manifest struct {
 	// Health is the thresholds fleet health is evaluated against (kn-j5s).
 	Health   Health   `yaml:"health"`
 	Profiles Profiles `yaml:"profiles"`
+	// Sources maps a component to the version-less base ref it is pulled
+	// from. The VERSION always comes from Core — one pin, one place. A
+	// registered install gets this ref from the mint instead
+	// (operator.chart_ref, composed by the control plane); a standalone
+	// install has no mint, so the manifest is the only place it can come
+	// from (kn-sf17).
+	Sources Components `yaml:"sources"`
 }
 
 // Components maps component name to pinned version.

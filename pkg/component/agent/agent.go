@@ -178,6 +178,16 @@ func Values(creds *api.AgentCredentials) (string, error) {
 // to 2.4.0 pulled from ghcr and inspected.
 const minChartWithRepoCredential = "2.4.0"
 
+// minChartForUnmanaged is the first chart that can express "this cluster has
+// no hub" (kn-sf17). Below it the value is not merely unsupported, it is
+// SILENTLY DISCARDED: no chart in this line ships a values.schema.json, so
+// helm accepts kubenest.unmanaged and drops it — the same way it dropped
+// gitSSHPrivateKey on charts before 2.3.5. What saves the reader on 2.4.x is
+// an accident rather than a design: the render then fails on the missing
+// backendURL, loudly, but with a message about the wrong thing. Refuse here
+// instead, naming the version that works.
+const minChartForUnmanaged = "2.5.0"
+
 // Chart renders the agent's HelmChart resource at the bundle's pin. The chart
 // reference comes from the MINT (operator.chart_ref), not from a constant:
 // the control plane composes it from the manifest's sources section, and a
@@ -259,12 +269,114 @@ func chartRepository(ref string) string {
 	return ref[:slash+1+colon]
 }
 
+// UnmanagedValues renders the agent values for a cluster with no hub
+// (kn-sf17).
+//
+// AN IDENTITY AND NOTHING ELSE. There is no jwtSecret and no backendURL, and
+// their absence is the whole point rather than an omission to be tidied up
+// later: with no hub there is no second party to authenticate to, so there is
+// no bearer to hold. Generating one locally to satisfy the chart would be a
+// credential trusted by nothing that reads as real six months from now — the
+// same reasoning that made stageRegisterStandalone mint nothing.
+//
+// kubenest.unmanaged is what tells the operator the absence is deliberate. The
+// chart refuses to render if it is set alongside either value, so this cannot
+// drift into a half-registered cluster.
+func UnmanagedValues(clusterID string) (string, error) {
+	if clusterID == "" {
+		return "", fmt.Errorf("a standalone cluster still needs an identity: the agent's Secret cannot be rendered without a cluster id, and an operator with an empty one is the kn-z6e4 defect regardless of whether a hub is watching")
+	}
+	values := map[string]any{
+		"kubenest": map[string]any{
+			"clusterID": clusterID,
+			"unmanaged": true,
+		},
+		"bootstrap": map[string]any{
+			"certManager": map[string]any{"enabled": false},
+			// No hub means no control plane means no GitOps repo to be
+			// handed. Gitea stays off for the same reason it is off on the
+			// registered path: the platform installs cert-manager itself.
+			"gitea": map[string]any{"enabled": false},
+		},
+	}
+	out, err := yaml.Marshal(values)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// UnmanagedChart is Chart for a cluster with no control plane to have minted
+// anything.
+//
+// The chart reference comes from the bundle manifest's sources section rather
+// than from a mint, which is the only difference in where it looks: the
+// VERSION still comes from core, so one pin still lives in one place.
+func UnmanagedChart(bundle *manifest.Manifest, clusterID string) (k3s.HelmChart, error) {
+	version, err := bundle.Core.Version("kubenest-agent")
+	if err != nil {
+		return k3s.HelmChart{}, err
+	}
+	cmp, err := manifest.CompareVersions(version, minChartForUnmanaged)
+	if err != nil {
+		return k3s.HelmChart{}, fmt.Errorf("cannot tell whether kubenest-agent %s supports unmanaged mode: %w", version, err)
+	}
+	if cmp < 0 {
+		return k3s.HelmChart{}, fmt.Errorf(
+			"bundle pins kubenest-agent %s, which cannot express a cluster with no hub: kubenest.unmanaged is accepted and silently discarded (no values.schema.json), so the agent would be installed expecting a hub it will never have. %s is the first chart that carries the mode. Install this cluster from a bundle that pins %s or later",
+			version, minChartForUnmanaged, minChartForUnmanaged)
+	}
+	ref, err := bundle.Sources.Version("kubenest-agent")
+	if err != nil {
+		return k3s.HelmChart{}, fmt.Errorf("a standalone install has no mint to supply the operator chart reference, so the bundle manifest must carry it under sources: %w", err)
+	}
+	values, err := UnmanagedValues(clusterID)
+	if err != nil {
+		return k3s.HelmChart{}, err
+	}
+	return k3s.HelmChart{
+		Name:            releaseName,
+		Chart:           chartRepository(ref),
+		Version:         version,
+		TargetNamespace: UnmanagedNamespace,
+		ValuesYAML:      values,
+	}, nil
+}
+
+// UnmanagedNamespace is where a standalone agent lands. The registered path
+// takes this from the mint (operator.namespace); with no mint the value has to
+// come from somewhere, and this is the namespace every other platform
+// component already uses.
+const UnmanagedNamespace = "kubenest-system"
+
+// InstallUnmanaged places the agent on a cluster with no hub and waits for it
+// to be Ready — which it now can be, because readiness reflects the
+// controllers rather than a hub connection when the operator is unmanaged
+// (kn-sf17, operator 7b84b83 / chart 2.5.0).
+func InstallUnmanaged(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, clusterID string, rep converge.Reporter) error {
+	chart, err := UnmanagedChart(bundle, clusterID)
+	if err != nil {
+		return err
+	}
+	return installChart(ctx, r, bundle, chart, rep)
+}
+
 // Install places the agent and waits for it to be Ready.
 func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, creds *api.AgentCredentials, rep converge.Reporter) error {
 	chart, err := Chart(bundle, creds)
 	if err != nil {
 		return err
 	}
+	return installChart(ctx, r, bundle, chart, rep)
+}
+
+// installChart is the half of Install that does not care how the chart was
+// built. Shared with InstallUnmanaged so the two paths cannot drift in how
+// they write, restrict and wait — the 0600 in particular, which is not
+// conditional on there being a secret in the file today: the manifest
+// directory is world-readable, and a standalone values file still names the
+// cluster's identity.
+func installChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, chart k3s.HelmChart, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err

@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
@@ -27,7 +28,10 @@ import (
 // claims otherwise.
 func standaloneSession(t *testing.T, runner *componenttest.FakeRunner) *install.Session {
 	t.Helper()
-	m, err := manifest.Parse([]byte("bundle: \"1.0\"\nlimits:\n  timeouts:\n    install-total: 30m\n    component-ready: 10m\n"))
+	// core.kubenest-agent and sources.kubenest-agent are both required by the
+	// standalone agent stage: the version comes from core and, with no mint to
+	// supply a chart_ref, the registry comes from sources (kn-sf17).
+	m, err := manifest.Parse([]byte("bundle: \"1.0\"\ncore:\n  kubenest-agent: 2.5.0\nsources:\n  kubenest-agent: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2\nlimits:\n  timeouts:\n    install-total: 30m\n    component-ready: 10m\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,20 +137,52 @@ func TestEveryStandaloneIdentityIsDistinct(t *testing.T) {
 	}
 }
 
-// Stage 10 must refuse rather than install an agent that can never converge,
-// and the refusal must name the fix — which here is a bead, because the fix
-// is not in this repo.
-func TestStandaloneAgentStageRefusesAndNamesTheOperatorBead(t *testing.T) {
+// Stage 10 used to REFUSE on a standalone cluster, because the agent's
+// readiness was wired to a hub connection and the Deployment could never go
+// Available. kn-sf17 landed unmanaged mode, so it installs — and what it
+// installs is the thing worth asserting, because the failure mode this
+// replaces was not a crash but a cluster that installed and never converged.
+func TestStandaloneAgentStageInstallsUnmanaged(t *testing.T) {
 	s := standaloneSession(t, &componenttest.FakeRunner{})
+	if err := stageNamed(t, s, install.StageRegister).Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	chart, err := agent.UnmanagedChart(s.Bundle, s.Jnl.ClusterID)
+	if err != nil {
+		t.Fatalf("the standalone agent chart cannot be built: %v", err)
+	}
+
+	// An identity, and deliberately nothing else. A jwtSecret or a backendURL
+	// here would be a credential trusted by nothing and a hub that does not
+	// exist; the chart refuses both alongside unmanaged, so this would also
+	// fail at render — assert it at the source so the message names the cause.
+	if !strings.Contains(chart.ValuesYAML, "unmanaged: true") {
+		t.Errorf("the standalone values do not declare unmanaged, so the operator would read the missing hub as a misconfiguration and exit:\n%s", chart.ValuesYAML)
+	}
+	if !strings.Contains(chart.ValuesYAML, s.Jnl.ClusterID) {
+		t.Errorf("the standalone values do not carry the identity generated in stage 2:\n%s", chart.ValuesYAML)
+	}
+	for _, forbidden := range []string{"jwtSecret", "backendURL"} {
+		if strings.Contains(chart.ValuesYAML, forbidden) {
+			t.Errorf("the standalone values carry %q; a cluster with no hub has nothing to authenticate to (kn-sf17):\n%s", forbidden, chart.ValuesYAML)
+		}
+	}
+}
+
+// The identity is not optional just because the credential is. An operator
+// with an empty cluster id is the kn-z6e4 defect whether or not a hub is
+// watching, so stage 10 must refuse rather than install one.
+func TestStandaloneAgentStageRefusesWithoutAnIdentity(t *testing.T) {
+	s := standaloneSession(t, &componenttest.FakeRunner{})
+	s.Jnl.ClusterID = "" // stage 2 never ran, or its journal was lost
 
 	err := stageNamed(t, s, install.StageAgent).Run(context.Background())
 	if err == nil {
-		t.Fatal("stage 10 reported success on a cluster whose agent cannot reach Ready")
+		t.Fatal("stage 10 installed an agent with no cluster identity")
 	}
-	for _, want := range []string{"kn-sf17", "hub", "Ready"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("the refusal does not mention %q: %v", want, err)
-		}
+	if !strings.Contains(err.Error(), "kn-z6e4") {
+		t.Errorf("the refusal does not name why an empty identity is a defect: %v", err)
 	}
 	if got := install.ComponentOf(err); got != "kubenest-agent" {
 		t.Errorf("the refusal is tagged %q, so a failure-injection run would not learn which component broke", got)
