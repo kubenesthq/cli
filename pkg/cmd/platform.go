@@ -111,15 +111,14 @@ login, and the record of what was installed lives on the cluster itself. Add a
 control plane later for the fleet view; a standalone cluster is a complete
 platform, not a degraded one.`,
 		Example: `  kubenest platform install \
+    --standalone \
     --bundle 1.0 \
     --name prod-1 \
     --server 10.0.1.10 \
-    --agent  10.0.1.11 \
-    --agent  10.0.1.12 \
     --ha single-server \
-    --profile observability \
     --ssh-user ubuntu \
-    --ssh-key ~/.ssh/id_ed25519`,
+    --ssh-key ~/.ssh/id_ed25519 \
+    --storage-device /dev/nvme1n1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := f.Validate(); err != nil {
 				return err

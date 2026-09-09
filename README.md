@@ -9,22 +9,39 @@ Full documentation: [docs.kubenest.io/platform](https://docs.kubenest.io/platfor
 
 ## What it does
 
-```bash
-# Authenticate to your control plane once
-kubenest login --control-plane https://api.your-domain.com
+### First cluster: standalone
 
-# Install the platform bundle onto your hosts, over SSH
+The first cluster does not need a KubeNest control plane, hub connection, or
+`kubenest login`. Install the core platform directly onto a clean Ubuntu 24.04
+host you supply:
+
+```bash
 kubenest platform install \
+  --standalone \
   --bundle 1.0 \
   --name prod-1 \
   --server 10.0.1.10 \
-  --agent  10.0.1.11 \
-  --agent  10.0.1.12 \
   --ha single-server \
-  --profile observability \
   --ssh-user ubuntu \
-  --ssh-key ~/.ssh/id_ed25519
+  --ssh-key ~/.ssh/id_ed25519 \
+  --storage-device /dev/nvme1n1
 ```
+
+Replace the server address and use a **blank** storage device. The full
+[standalone quickstart](https://docs.kubenest.io/quickstart) records the
+real-host acceptance for this path.
+
+### A customer-operated control plane
+
+If you operate a control plane yourself and deliberately choose its separate
+fleet path, identify that control plane explicitly before using its
+control-plane features:
+
+```bash
+kubenest login --control-plane https://api.your-domain.com
+```
+
+This is not a prerequisite for the standalone install above.
 
 Two properties the design guarantees, enforced by tests rather than promised:
 

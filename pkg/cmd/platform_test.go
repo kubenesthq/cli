@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -49,6 +50,30 @@ func TestInstallFlagsValidate(t *testing.T) {
 	f.Standalone = true
 	if err := f.Validate(); err != nil {
 		t.Errorf("a standalone install needs no control-plane flags and must validate: %v", err)
+	}
+}
+
+// The help example is a first action a reader can copy. It must show the
+// standalone path, rather than quietly requiring an unmentioned control plane
+// or offering a component profile the current CLI cannot install.
+func TestPlatformInstallHelpShowsTheStandaloneFirstPath(t *testing.T) {
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"platform", "install", "--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("platform install help: %v", err)
+	}
+
+	help := output.String()
+	wantExample := "kubenest platform install \\\n    --standalone \\\n    --bundle 1.0"
+	if !strings.Contains(help, wantExample) {
+		t.Errorf("install help does not show the standalone first path:\n%s", help)
+	}
+	if strings.Contains(help, "--profile observability") {
+		t.Errorf("install help advertises an unbuilt profile:\n%s", help)
 	}
 }
 
