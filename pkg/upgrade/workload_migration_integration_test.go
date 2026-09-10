@@ -346,6 +346,105 @@ func TestWorkloadApplicationOwnershipRefusesAnAlreadyOperatorCluster(t *testing.
 	t.Logf("live HTTP 200/operator response was refused; receiver gate stayed closed and the workload stayed Ready")
 }
 
+// TestWorkloadApplicationOwnershipRefusesOpenRecordWithExplicitFalse covers
+// the converse of a closed ConfigMap paired with explicit true. It is a state
+// older migration code could leave behind: the ConfigMap was patched open,
+// while the HelmChart still tells a restarted operator to close. The CLI must
+// not treat that open record as a completed hand-off or change either record.
+func TestWorkloadApplicationOwnershipRefusesOpenRecordWithExplicitFalse(t *testing.T) {
+	container := integrationEnv(t, "KUBENEST_E2E_K3D_SERVER")
+	namespace := integrationEnv(t, "KUBENEST_E2E_WORKLOAD_NAMESPACE")
+	bundlePath := integrationEnv(t, "KUBENEST_E2E_BUNDLE_PATH")
+
+	bundle, err := manifest.Load(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := dockerExecRunner{container: container}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	state, err := workloadApplicationsGateState(ctx, runner)
+	if err != nil {
+		t.Fatalf("read receiver-recorded precondition: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("receiver gate before inconsistency = %q, want closed", state)
+	}
+	if _, err := k3s.Kubectl(ctx, runner,
+		"patch configmap kubenest-workload-applications-gate -n kubenest-system --type merge -p '{\"data\":{\"state\":\"open\",\"reason\":\"e2e-inconsistent-record\"}}'"); err != nil {
+		t.Fatalf("create real false-plus-open inconsistent record: %v", err)
+	}
+	state, err = workloadApplicationsGateState(ctx, runner)
+	if err != nil {
+		t.Fatalf("read inconsistent receiver record: %v", err)
+	}
+	if state != "open" {
+		t.Fatalf("receiver gate after setup = %q, want open", state)
+	}
+	values, err := k3s.Kubectl(ctx, runner, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.valuesContent}'")
+	if err != nil {
+		t.Fatalf("read HelmChart false precondition: %v", err)
+	}
+	if !strings.Contains(values, "workloadApplications:") || !strings.Contains(values, "enabled: false") {
+		t.Fatalf("the live HelmChart does not carry the explicit false precondition:\n%s", values)
+	}
+	valuesBefore := values
+	ready, podState, err := k3s.CheckPodsReady(ctx, runner, namespace)
+	if err != nil {
+		t.Fatalf("read pre-refusal workload pods: %v", err)
+	}
+	if !ready {
+		t.Fatalf("pre-refusal workload is not running and Ready: %s", podState)
+	}
+	uidBefore, err := readyWorkloadPodUID(ctx, runner, namespace)
+	if err != nil {
+		t.Fatalf("read pre-refusal workload pod UID: %v", err)
+	}
+
+	err = stageAgent(ctx, &Session{
+		Opts:     Options{MigrateWorkloadApplications: true},
+		From:     bundle,
+		To:       bundle,
+		Jnl:      &stages.Journal{ClusterID: "inconsistent-record"},
+		Reporter: converge.NewTextReporter(os.Stdout),
+		Nodes:    []Node{{Address: container, Server: true, Runner: runner}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "explicitly sets kubenest.workloadApplications.enabled=false") {
+		t.Fatalf("false-plus-open migration error = %v, want named inconsistent-record refusal", err)
+	}
+
+	state, err = workloadApplicationsGateState(ctx, runner)
+	if err != nil {
+		t.Fatalf("read receiver state after refusal: %v", err)
+	}
+	if state != "open" {
+		t.Fatalf("refused migration changed the inconsistent receiver record: state=%q, want open", state)
+	}
+	valuesAfter, err := k3s.Kubectl(ctx, runner, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.valuesContent}'")
+	if err != nil {
+		t.Fatalf("read HelmChart after refusal: %v", err)
+	}
+	if valuesAfter != valuesBefore {
+		t.Fatal("refused migration changed the HelmChart valuesContent")
+	}
+	ready, podState, err = k3s.CheckPodsReady(ctx, runner, namespace)
+	if err != nil {
+		t.Fatalf("read post-refusal workload pods: %v", err)
+	}
+	if !ready {
+		t.Fatalf("refused migration disrupted the existing workload: %s", podState)
+	}
+	uidAfter, err := readyWorkloadPodUID(ctx, runner, namespace)
+	if err != nil {
+		t.Fatalf("read post-refusal workload pod UID: %v", err)
+	}
+	if uidAfter != uidBefore {
+		t.Fatalf("refused migration recreated the workload pod: before=%s after=%s", uidBefore, uidAfter)
+	}
+	t.Logf("explicit false plus open record was refused without mutating either record or the running workload")
+}
+
 func readyWorkloadPodUID(ctx context.Context, runner k3s.Runner, namespace string) (string, error) {
 	out, err := k3s.Kubectl(ctx, runner, "get pods -n "+namespace+" -o json")
 	if err != nil {

@@ -315,6 +315,15 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 		return fmt.Errorf("reading the operator's workload-application gate before migration: %w", err)
 	}
 	if state != "closed" {
+		if state == "open" {
+			explicitlyDisabled, err := workloadApplicationsExplicitlyDisabled(ctx, r)
+			if err != nil {
+				return fmt.Errorf("reading the HelmChart workload-application value before migration: %w", err)
+			}
+			if explicitlyDisabled {
+				return fmt.Errorf("cannot migrate workload-application ownership: the operator gate records state=open while the HelmChart explicitly sets kubenest.workloadApplications.enabled=false; do not edit the operator-managed ConfigMap, reconcile the HelmChart so a restarted operator records closed, then re-run the migration")
+			}
+		}
 		return fmt.Errorf("cannot migrate workload-application ownership: the operator gate records state=%q, want closed; inspect kubenest-workload-applications-gate before retrying", state)
 	}
 	sourceChart, liveChart, err := migratedGateCharts(ctx, r)
@@ -451,6 +460,63 @@ func migratedGateCharts(ctx context.Context, r k3s.Runner) (source, live []byte,
 		return nil, nil, fmt.Errorf("rendering the persisted migrated agent HelmChart: %w", err)
 	}
 	return source, live, nil
+}
+
+// workloadApplicationsExplicitlyDisabled reports whether the agent HelmChart
+// has an explicit false. It deliberately reads the source of truth rather than
+// inferring it from the gate ConfigMap: an older CLI could have patched that
+// ConfigMap open while the chart still rendered false, and treating the open
+// record as a completed hand-off would create two Application owners.
+func workloadApplicationsExplicitlyDisabled(ctx context.Context, r k3s.Runner) (bool, error) {
+	var chart struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec map[string]json.RawMessage `json:"spec"`
+	}
+	raw, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o json")
+	if err != nil {
+		return false, err
+	}
+	if err := json.Unmarshal([]byte(raw), &chart); err != nil {
+		return false, fmt.Errorf("decoding the existing agent HelmChart: %w", err)
+	}
+	if chart.APIVersion != "helm.cattle.io/v1" || chart.Kind != "HelmChart" ||
+		chart.Metadata.Name != agent.ReleaseName() || chart.Metadata.Namespace != "kube-system" {
+		return false, fmt.Errorf("the existing agent HelmChart is not the expected kube-system/%s helm.cattle.io/v1 object", agent.ReleaseName())
+	}
+	valuesRaw, ok := chart.Spec["valuesContent"]
+	if !ok {
+		return false, fmt.Errorf("the existing agent HelmChart has no valuesContent")
+	}
+	var valuesContent string
+	if err := json.Unmarshal(valuesRaw, &valuesContent); err != nil {
+		return false, fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
+	values := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
+		return false, fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
+	kubenestValues, ok := values["kubenest"].(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("the existing agent valuesContent has no kubenest identity")
+	}
+	workloadValues, ok := kubenestValues["workloadApplications"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	enabledRaw, ok := workloadValues["enabled"]
+	if !ok {
+		return false, nil
+	}
+	enabled, ok := enabledRaw.(bool)
+	if !ok {
+		return false, fmt.Errorf("the existing agent valuesContent has kubenest.workloadApplications.enabled as %T, not a boolean", enabledRaw)
+	}
+	return !enabled, nil
 }
 
 func detachState(r *api.WorkloadApplicationsDetachResponse) string {
