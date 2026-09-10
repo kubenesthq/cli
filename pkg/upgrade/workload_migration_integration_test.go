@@ -72,6 +72,83 @@ func integrationEnv(t *testing.T, key string) string {
 	return value
 }
 
+// TestFreshRegisteredAgentStartsClosed establishes the population this
+// migration must move. It deliberately does not reuse ephemeral-env's direct
+// Helm release: it creates a fresh backend record, mints once, and invokes the
+// same agent.Install renderer that the registered CLI install stage uses.
+//
+// The setup is destructive only to the disposable local-profile cluster named
+// by the supplied kubeconfig. It removes the profile's bootstrap Helm release
+// so the k3s HelmChart produced by agent.Install is the sole owner.
+func TestFreshRegisteredAgentStartsClosed(t *testing.T) {
+	apiURL := integrationEnv(t, "KUBENEST_E2E_API_URL")
+	token := integrationEnv(t, "KUBENEST_E2E_TOKEN")
+	container := integrationEnv(t, "KUBENEST_E2E_K3D_SERVER")
+	kubeconfig := integrationEnv(t, "KUBENEST_E2E_KUBECONFIG")
+	kubeContext := integrationEnv(t, "KUBENEST_E2E_KUBE_CONTEXT")
+	bundlePath := integrationEnv(t, "KUBENEST_E2E_BUNDLE_PATH")
+
+	bundle, err := manifest.Load(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := api.New(apiURL, api.WithToken(token))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	orgs, err := client.ListOrgs(ctx)
+	if err != nil {
+		t.Fatalf("list organizations for fresh registration: %v", err)
+	}
+	if len(orgs) != 1 {
+		t.Fatalf("fresh registration needs one unambiguous organization, got %d", len(orgs))
+	}
+	cluster, err := client.CreateCluster(ctx, orgs[0].ID, fmt.Sprintf("zod2-fresh-%d", time.Now().UnixNano()), "kn-zod2 fresh registration acceptance")
+	if err != nil {
+		t.Fatalf("create fresh backend cluster record: %v", err)
+	}
+	creds, err := client.MintAgentCredentials(ctx, cluster.ID)
+	if err != nil {
+		t.Fatalf("mint fresh cluster credentials: %v", err)
+	}
+	if !creds.Operator.CreatesWorkloadApplications {
+		t.Fatal("fresh backend registration did not declare backend workload-Application ownership")
+	}
+
+	remove := exec.CommandContext(ctx, "helm", "uninstall", agent.ReleaseName(),
+		"--kubeconfig", kubeconfig, "--kube-context", kubeContext,
+		"--namespace", creds.Operator.Namespace, "--wait")
+	if output, err := remove.CombinedOutput(); err != nil {
+		t.Fatalf("remove disposable profile operator release before real CLI install: %v: %s", err, firstLine(string(output)))
+	}
+
+	runner := dockerExecRunner{container: container}
+	if err := agent.Install(ctx, runner, bundle, creds, converge.NewTextReporter(os.Stdout)); err != nil {
+		t.Fatalf("install fresh agent through the CLI renderer: %v", err)
+	}
+	state, err := workloadApplicationsGateState(ctx, runner)
+	if err != nil {
+		t.Fatalf("read fresh receiver gate: %v", err)
+	}
+	if state != "closed" {
+		t.Fatalf("fresh receiver gate = %q, want closed", state)
+	}
+	values, err := k3s.Kubectl(ctx, runner, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.valuesContent}'")
+	if err != nil {
+		t.Fatalf("read fresh agent HelmChart values: %v", err)
+	}
+	enabled, err := explicitWorkloadApplicationsValue(values)
+	if err != nil {
+		t.Fatalf("decode fresh agent HelmChart values: %v", err)
+	}
+	if enabled {
+		t.Fatal("fresh agent HelmChart enabled workload Applications despite backend ownership")
+	}
+	t.Logf("fresh registered cluster ready for migration: id=%s; minted backend ownership rendered explicit false and the receiver recorded closed", cluster.ID)
+}
+
 // TestWorkloadApplicationOwnershipMigrationOnRealCluster is intentionally
 // opt-in. It verifies the supported same-bundle carrier against a real
 // backend, hub, k3s server, operator and running workload. It begins only
@@ -83,6 +160,7 @@ func TestWorkloadApplicationOwnershipMigrationOnRealCluster(t *testing.T) {
 	clusterID := integrationEnv(t, "KUBENEST_E2E_CLUSTER_ID")
 	container := integrationEnv(t, "KUBENEST_E2E_K3D_SERVER")
 	namespace := integrationEnv(t, "KUBENEST_E2E_WORKLOAD_NAMESPACE")
+	workloadName := integrationEnv(t, "KUBENEST_E2E_WORKLOAD_NAME")
 	bundlePath := integrationEnv(t, "KUBENEST_E2E_BUNDLE_PATH")
 
 	bundle, err := manifest.Load(bundlePath)
@@ -104,12 +182,15 @@ func TestWorkloadApplicationOwnershipMigrationOnRealCluster(t *testing.T) {
 	if state != "closed" {
 		t.Fatalf("receiver gate before migration = %q, want closed", state)
 	}
-	applications, err := argoApplicationCount(ctx, runner)
+	owners, err := workloadApplicationOwners(ctx, runner, clusterID, namespace, workloadName)
 	if err != nil {
-		t.Fatalf("inspect Applications before migration: %v", err)
+		t.Fatalf("inspect the workload Application before migration: %v", err)
 	}
-	if applications == 0 {
-		t.Fatal("pre-migration Application count is zero: this is an upstream application-creation observation, not evidence that workload ownership migration failed (kn-cqtb)")
+	if owners.backend == 0 && owners.operator == 0 && len(owners.unclassified) == 0 {
+		t.Fatalf("the workload Application %q is absent across all namespaces: this is an upstream application-creation observation, not evidence that workload ownership migration failed (kn-cqtb)", workloadName)
+	}
+	if owners.backend != 1 || owners.operator != 0 || len(owners.unclassified) != 0 {
+		t.Fatalf("pre-migration workload Application owners = backend:%d operator:%d unclassified:%v, want exactly one backend owner", owners.backend, owners.operator, owners.unclassified)
 	}
 	ready, podState, err := k3s.CheckPodsReady(ctx, runner, namespace)
 	if err != nil {
@@ -143,6 +224,13 @@ func TestWorkloadApplicationOwnershipMigrationOnRealCluster(t *testing.T) {
 	if state != "open" {
 		t.Fatalf("receiver gate after migration = %q, want open", state)
 	}
+	owners, err = workloadApplicationOwners(ctx, runner, clusterID, namespace, workloadName)
+	if err != nil {
+		t.Fatalf("inspect the workload Application after migration: %v", err)
+	}
+	if owners.backend != 0 || owners.operator != 1 || len(owners.unclassified) != 0 {
+		t.Fatalf("post-migration workload Application owners = backend:%d operator:%d unclassified:%v, want exactly one operator owner", owners.backend, owners.operator, owners.unclassified)
+	}
 	ready, podState, err = k3s.CheckPodsReady(ctx, runner, namespace)
 	if err != nil {
 		t.Fatalf("read post-migration workload pods: %v", err)
@@ -162,8 +250,12 @@ func TestWorkloadApplicationOwnershipMigrationOnRealCluster(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migrated HelmChart values: %v", err)
 	}
-	if !strings.Contains(values, "workloadApplications:") || !strings.Contains(values, "enabled: true") {
-		t.Fatalf("the live HelmChart did not receive the explicit true that restarts the operator:\n%s", values)
+	enabled, err := explicitWorkloadApplicationsValue(values)
+	if err != nil {
+		t.Fatalf("decode migrated HelmChart values: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("the live HelmChart has kubenest.workloadApplications.enabled=%t, want true", enabled)
 	}
 
 	t.Logf("receiver gate migrated closed→open and pods in %s remained Ready", namespace)
@@ -477,22 +569,72 @@ func explicitWorkloadApplicationsValue(valuesContent string) (bool, error) {
 	return enabled, nil
 }
 
-// argoApplicationCount deliberately queries every namespace. A namespaced
-// lookup could turn an Application placed outside the assumed namespace into a
-// false absence, which would incorrectly attribute an upstream creation
-// failure to the ownership migration.
-func argoApplicationCount(ctx context.Context, runner k3s.Runner) (int, error) {
+type workloadApplicationOwnerCounts struct {
+	backend      int
+	operator     int
+	unclassified []string
+}
+
+// workloadApplicationOwners queries every namespace because the hand-off is
+// specifically about who owns this workload's Application. A cluster-wide
+// count can be nonzero while this workload has no Application at all, which is
+// the upstream creation observation tracked in kn-cqtb, not a migration
+// failure. Backend and operator Applications deliberately share a name but
+// live under distinct ArgoCD controllers/namespaces, so count both by the
+// workload's stable name and destination namespace.
+func workloadApplicationOwners(ctx context.Context, runner k3s.Runner, clusterID, workloadNamespace, workloadName string) (workloadApplicationOwnerCounts, error) {
 	out, err := k3s.Kubectl(ctx, runner, "get applications.argoproj.io -A -o json")
 	if err != nil {
-		return 0, err
+		return workloadApplicationOwnerCounts{}, err
 	}
 	var applications struct {
-		Items []json.RawMessage `json:"items"`
+		Items []struct {
+			Metadata struct {
+				Name      string            `json:"name"`
+				Namespace string            `json:"namespace"`
+				Labels    map[string]string `json:"labels"`
+			} `json:"metadata"`
+			Spec struct {
+				Destination struct {
+					Namespace string `json:"namespace"`
+				} `json:"destination"`
+			} `json:"spec"`
+		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(out), &applications); err != nil {
-		return 0, err
+		return workloadApplicationOwnerCounts{}, err
 	}
-	return len(applications.Items), nil
+
+	expectedName := workloadApplicationName(clusterID, workloadName)
+	counts := workloadApplicationOwnerCounts{}
+	for _, application := range applications.Items {
+		if application.Spec.Destination.Namespace != workloadNamespace {
+			continue
+		}
+		labels := application.Metadata.Labels
+		// ubs:ignore — clusterID is a public Kubernetes label used to classify test artifacts, not a credential or secret.
+		isBackendWorkload := labels["kubenest.io/cluster-id"] == clusterID && labels["kubenest.io/workload"] == workloadName
+		if application.Metadata.Name != expectedName && !isBackendWorkload {
+			continue
+		}
+		switch {
+		case labels["app.kubernetes.io/managed-by"] == "kubenest-operator":
+			counts.operator++
+		case isBackendWorkload:
+			counts.backend++
+		default:
+			counts.unclassified = append(counts.unclassified, application.Metadata.Namespace+"/"+application.Metadata.Name)
+		}
+	}
+	return counts, nil
+}
+
+func workloadApplicationName(clusterID, workloadName string) string {
+	shortClusterID := clusterID
+	if len(shortClusterID) > 8 {
+		shortClusterID = shortClusterID[:8]
+	}
+	return workloadName + "-" + shortClusterID
 }
 
 func readyWorkloadPodUID(ctx context.Context, runner k3s.Runner, namespace string) (string, error) {
