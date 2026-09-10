@@ -104,6 +104,13 @@ func TestWorkloadApplicationOwnershipMigrationOnRealCluster(t *testing.T) {
 	if state != "closed" {
 		t.Fatalf("receiver gate before migration = %q, want closed", state)
 	}
+	applications, err := argoApplicationCount(ctx, runner)
+	if err != nil {
+		t.Fatalf("inspect Applications before migration: %v", err)
+	}
+	if applications == 0 {
+		t.Fatal("pre-migration Application count is zero: this is an upstream application-creation observation, not evidence that workload ownership migration failed (kn-cqtb)")
+	}
 	ready, podState, err := k3s.CheckPodsReady(ctx, runner, namespace)
 	if err != nil {
 		t.Fatalf("read pre-migration workload pods: %v", err)
@@ -468,6 +475,24 @@ func explicitWorkloadApplicationsValue(valuesContent string) (bool, error) {
 		return false, fmt.Errorf("missing boolean kubenest.workloadApplications.enabled")
 	}
 	return enabled, nil
+}
+
+// argoApplicationCount deliberately queries every namespace. A namespaced
+// lookup could turn an Application placed outside the assumed namespace into a
+// false absence, which would incorrectly attribute an upstream creation
+// failure to the ownership migration.
+func argoApplicationCount(ctx context.Context, runner k3s.Runner) (int, error) {
+	out, err := k3s.Kubectl(ctx, runner, "get applications.argoproj.io -A -o json")
+	if err != nil {
+		return 0, err
+	}
+	var applications struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &applications); err != nil {
+		return 0, err
+	}
+	return len(applications.Items), nil
 }
 
 func readyWorkloadPodUID(ctx context.Context, runner k3s.Runner, namespace string) (string, error) {
