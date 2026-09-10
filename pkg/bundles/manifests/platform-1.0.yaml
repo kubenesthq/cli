@@ -71,8 +71,14 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.13               # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.13 pins image 45eb0e7. It completes the safety boundary for
+  kubenest-agent: 2.6.14               # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.14 pins image 3c1e510. It establishes the configured GitOps
+                                       # branch before the initial commit in a pre-existing empty repository,
+                                       # verifies the remote ref after a push, and rejects a no-write signal
+                                       # that previously looked like success. A real empty Gitea bootstrap
+                                       # created main, then reached a Synced/Healthy Application and Ready Pod
+                                       # without a hand-created repository commit. 3c1e510 is a descendant of
+                                       # 45eb0e7, so it also retains 2.6.13's safety boundary for
                                        # 2.6.12's P0 cache repair; do not attach the old chart-only rationale
                                        # to this release. 2.6.12 made ArgoCD's namespaced cache work by
                                        # granting every API type within a namespace. ArgoCD enumerates every
@@ -99,7 +105,7 @@ core:
                                        # listing Traefik and resource.k8s.io types.
                                        # THIS PIN CARRIES ONLY THE CHART/OPERATOR HALF. The backend half is
                                        # 024bff6, which writes ArgoCD Secret scope keys at the top level and
-                                       # has no chart version gate. A repaired cluster needs BOTH 2.6.13 and
+                                       # has no chart version gate. A repaired cluster needs BOTH 2.6.14 and
                                        # a control plane at or after 024bff6.
                                        # Everything 2.6.11 carried rides along: the stack-intent ownership
                                        # fixes, the capability advertisement that keeps a current hub
