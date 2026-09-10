@@ -103,10 +103,37 @@ core:
                                        # The 2.6.12 functional evidence remains separate: on a real cluster
                                        # ArgoCD Synced/Healthy and a workload pod reached 1/1 Running while
                                        # listing Traefik and resource.k8s.io types.
-                                       # THIS PIN CARRIES ONLY THE CHART/OPERATOR HALF. The backend half is
-                                       # 024bff6, which writes ArgoCD Secret scope keys at the top level and
-                                       # has no chart version gate. A repaired cluster needs BOTH 2.6.14 and
-                                       # a control plane at or after 024bff6.
+                                       # THIS PIN CARRIES ONLY THE CHART/OPERATOR HALF. TWO SEPARATE P0s
+                                       # were repaired half here and half in a control plane this pin cannot
+                                       # gate, so state both rather than letting a reader assume the pin is
+                                       # the whole repair:
+                                       #
+                                       #   WHAT YOU GET FROM THIS PIN  the 2.6.12 namespaced-cache grant,
+                                       #     2.6.13's namespace-ownership boundary, and 2.6.14's GitOps
+                                       #     bootstrap repair. Operator-side only.
+                                       #
+                                       #   WHAT NEEDS A CONTROL PLANE TOO, and how to check it. Both halves
+                                       #     are in the backend and neither is pinnable from here:
+                                       #       contract >= 1  the ArgoCD Secret's scope keys are written at
+                                       #                      the TOP LEVEL, where ArgoCD reads them, rather
+                                       #                      than inside the config blob where they were
+                                       #                      silently ignored (2mmz, backend 024bff6).
+                                       #       contract >= 2  a cluster is NEVER registered unrestricted. The
+                                       #                      scope keys were omitted entirely for a cluster
+                                       #                      with no projects yet -- which is every cluster
+                                       #                      at first registration -- and ArgoCD reads an
+                                       #                      absent `namespaces` key as EVERY namespace, so
+                                       #                      the cache enumerated the whole cluster and one
+                                       #                      denial failed it (kn-k9ko, backend 79d77b5).
+                                       #
+                                       #     CHECK IT, do not take it on trust, and do not compare SHAs --
+                                       #     two SHAs cannot be ordered without the repository, which no
+                                       #     operator has:
+                                       #       curl -fsS -H "Authorization: Bearer $TOKEN" \
+                                       #         "$API/api/v1/version" | jq -r .contract
+                                       #     A 404 there means the control plane predates the endpoint, so
+                                       #     the check is UNAVAILABLE -- not that the fix is absent.
+                                       #     (kn-control-plane-version-identity-frev.)
                                        # Everything 2.6.11 carried rides along: the stack-intent ownership
                                        # fixes, the capability advertisement that keeps a current hub
                                        # routing to this agent, the StackDeploy lifecycle handlers, kn-
