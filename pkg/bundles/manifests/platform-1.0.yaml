@@ -71,8 +71,9 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.7                # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.7 pins image 88dbb71, including the hub-routed Component Secret
+  kubenest-agent: 2.6.8                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.8 pins image efb876f, including the correlated, fail-closed
+                                       # addon_configure intent path (kn-m0mr), the hub-routed Component Secret
                                        # handler (kn-37n5), the strict-host-pin refusal, and the aligned workload
                                        # Application renderer. Operator-owned workload Applications default OFF
                                        # pending chart-mode equivalence (kn-agent-chart-predates-renderer-fixes-
