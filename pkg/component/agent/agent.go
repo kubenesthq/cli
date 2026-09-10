@@ -140,6 +140,11 @@ func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
 			"certManager": map[string]any{"enabled": false},
 		},
 	}
+	// A legacy backend omits this field; api.OperatorInstallInfo defaults that
+	// case to true. The explicit false path keeps the operator gate closed.
+	values["kubenest"].(map[string]any)["workloadApplications"] = map[string]any{
+		"enabled": !creds.Operator.CreatesWorkloadApplications,
+	}
 	if creds.RepoCredential != nil {
 		values["bootstrap"].(map[string]any)["gitea"] = map[string]any{"enabled": false}
 		// The per-cluster GitOps repo the broker issued (kn-rnyl). The key is

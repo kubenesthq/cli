@@ -336,7 +336,7 @@ func stageAgent(ctx context.Context, s *Session) error {
 		return nil
 	}
 	s.Logf("  kubenest-agent %s → %s", from, to)
-	return stages.NewComponentError("kubenest-agent", upgradeAgentChart(ctx, server, s.To, to, s.Reporter))
+	return stages.NewComponentError("kubenest-agent", upgradeAgentChart(ctx, server, s.API, s.Jnl.ClusterID, s.To, to, s.Reporter))
 }
 
 // stageRecord updates the cluster's recorded bundle version.

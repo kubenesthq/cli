@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
@@ -279,12 +280,56 @@ func planProbe(r k3s.Runner, plan, target string, want int) converge.Probe {
 // again, and an upgrade has no business re-minting a live cluster's identity
 // — so only the version field is patched, in place, and the existing values
 // are left exactly as they are.
-func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, version string, rep converge.Reporter) error {
+func upgradeAgentChart(ctx context.Context, r k3s.Runner, apiClient *api.Client, clusterID string, bundle *manifest.Manifest, version string, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
-	patch := fmt.Sprintf(`{"spec":{"version":%q}}`, version)
+	// Existing clusters may still have the backend-owned gate explicitly
+	// closed. The backend must detach its Applications before we open the
+	// operator gate; otherwise two reconcilers can own the same workload.
+	if apiClient == nil || clusterID == "" {
+		return fmt.Errorf("cannot migrate workload-application ownership: this upgrade has no registered control-plane cluster")
+	}
+	if _, err := apiClient.DetachWorkloadApplications(ctx, clusterID); err != nil {
+		return fmt.Errorf("detaching host workload Applications before opening the operator gate: %w", err)
+	}
+	var chart struct {
+		Spec struct {
+			ValuesContent string `json:"valuesContent"`
+		} `json:"spec"`
+	}
+	raw, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o json")
+	if err != nil {
+		return fmt.Errorf("reading the existing agent values: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &chart); err != nil {
+		return fmt.Errorf("decoding the existing agent values: %w", err)
+	}
+	values := map[string]any{}
+	if err := yaml.Unmarshal([]byte(chart.Spec.ValuesContent), &values); err != nil {
+		return fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
+	kubenestValues, ok := values["kubenest"].(map[string]any)
+	if !ok {
+		kubenestValues = map[string]any{}
+		values["kubenest"] = kubenestValues
+	}
+	workloadValues, ok := kubenestValues["workloadApplications"].(map[string]any)
+	if !ok {
+		workloadValues = map[string]any{}
+		kubenestValues["workloadApplications"] = workloadValues
+	}
+	workloadValues["enabled"] = true
+	updatedValues, err := yaml.Marshal(values)
+	if err != nil {
+		return fmt.Errorf("encoding migrated agent values: %w", err)
+	}
+	patchDoc, err := json.Marshal(map[string]any{"spec": map[string]any{"version": version, "valuesContent": string(updatedValues)}})
+	if err != nil {
+		return err
+	}
+	patch := string(patchDoc)
 	if _, err := k3s.Kubectl(ctx, r,
 		fmt.Sprintf("patch helmchart %s -n kube-system --type merge -p %s", agent.ReleaseName(), shellQuote(patch))); err != nil {
 		return fmt.Errorf("moving the agent chart to %s: %w", version, err)

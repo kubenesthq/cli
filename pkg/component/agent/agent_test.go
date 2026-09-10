@@ -136,6 +136,24 @@ func TestBootstrapCertManagerIsDisabled(t *testing.T) {
 	}
 }
 
+func TestOperatorGateFollowsReceiverOwnership(t *testing.T) {
+	c := creds(false)
+	c.Operator.CreatesWorkloadApplications = false
+	values, err := agent.Values(c, repoCapableChart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(values), &doc); err != nil {
+		t.Fatal(err)
+	}
+	k := doc["kubenest"].(map[string]any)
+	w := k["workloadApplications"].(map[string]any)
+	if w["enabled"] != true {
+		t.Fatalf("operator gate = %v, want true when backend no longer owns workloads", w["enabled"])
+	}
+}
+
 // The credential API calls this field hub_url because it points at the hub.
 // The established chart key is kubenest.backendURL, which becomes the
 // KUBENEST_BACKEND_URL environment variable. The removed backend-generated
