@@ -276,28 +276,33 @@ func planProbe(r k3s.Runner, plan, target string, want int) converge.Probe {
 // re-minting its identity.
 //
 // The agent's HelmChart resource already carries its cluster id and JWT in
-// valuesContent. Rewriting the whole resource would need those credentials
-// again, and an upgrade has no business re-minting a live cluster's identity
-// — so only the version field is patched, in place, and the existing values
-// are left exactly as they are.
+// valuesContent. An upgrade never re-mints that identity. The ownership
+// migration is the deliberately narrow exception to preserving values: after
+// the backend has detached its host Applications, it adds exactly
+// kubenest.workloadApplications.enabled=true while retaining every existing
+// identity, Git credential, and customer value.
+//
+// The rewritten HelmChart travels through k3s.WriteManifest over stdin. It
+// MUST NOT be sent through kubectl patch: valuesContent holds the agent JWT
+// and may hold the Git deploy key, and a patch body is shell argv on the
+// server node.
 func upgradeAgentChart(ctx context.Context, r k3s.Runner, apiClient *api.Client, clusterID string, bundle *manifest.Manifest, version string, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
-	// Existing clusters may still have the backend-owned gate explicitly
-	// closed. The backend must detach its Applications before we open the
-	// operator gate; otherwise two reconcilers can own the same workload.
-	if apiClient == nil || clusterID == "" {
-		return fmt.Errorf("cannot migrate workload-application ownership: this upgrade has no registered control-plane cluster")
-	}
-	if _, err := apiClient.DetachWorkloadApplications(ctx, clusterID); err != nil {
-		return fmt.Errorf("detaching host workload Applications before opening the operator gate: %w", err)
-	}
+	// Read and validate everything required to change the local HelmChart
+	// before changing backend ownership. A malformed local chart must not
+	// strand the backend in `migrating` when no host Application has been
+	// detached yet.
 	var chart struct {
-		Spec struct {
-			ValuesContent string `json:"valuesContent"`
-		} `json:"spec"`
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec map[string]json.RawMessage `json:"spec"`
 	}
 	raw, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o json")
 	if err != nil {
@@ -306,14 +311,25 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, apiClient *api.Client,
 	if err := json.Unmarshal([]byte(raw), &chart); err != nil {
 		return fmt.Errorf("decoding the existing agent values: %w", err)
 	}
+	if chart.APIVersion != "helm.cattle.io/v1" || chart.Kind != "HelmChart" ||
+		chart.Metadata.Name != agent.ReleaseName() || chart.Metadata.Namespace != "kube-system" {
+		return fmt.Errorf("the existing agent HelmChart is not the expected kube-system/%s helm.cattle.io/v1 object", agent.ReleaseName())
+	}
+	valuesRaw, ok := chart.Spec["valuesContent"]
+	if !ok {
+		return fmt.Errorf("the existing agent HelmChart has no valuesContent; refusing to rewrite its identity")
+	}
+	var valuesContent string
+	if err := json.Unmarshal(valuesRaw, &valuesContent); err != nil {
+		return fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
 	values := map[string]any{}
-	if err := yaml.Unmarshal([]byte(chart.Spec.ValuesContent), &values); err != nil {
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
 		return fmt.Errorf("decoding the existing agent valuesContent: %w", err)
 	}
 	kubenestValues, ok := values["kubenest"].(map[string]any)
 	if !ok {
-		kubenestValues = map[string]any{}
-		values["kubenest"] = kubenestValues
+		return fmt.Errorf("the existing agent valuesContent has no kubenest identity; refusing to rewrite it")
 	}
 	workloadValues, ok := kubenestValues["workloadApplications"].(map[string]any)
 	if !ok {
@@ -325,13 +341,33 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, apiClient *api.Client,
 	if err != nil {
 		return fmt.Errorf("encoding migrated agent values: %w", err)
 	}
-	patchDoc, err := json.Marshal(map[string]any{"spec": map[string]any{"version": version, "valuesContent": string(updatedValues)}})
+	versionRaw, err := json.Marshal(version)
 	if err != nil {
 		return err
 	}
-	patch := string(patchDoc)
-	if _, err := k3s.Kubectl(ctx, r,
-		fmt.Sprintf("patch helmchart %s -n kube-system --type merge -p %s", agent.ReleaseName(), shellQuote(patch))); err != nil {
+	updatedValuesRaw, err := json.Marshal(string(updatedValues))
+	if err != nil {
+		return err
+	}
+	chart.Spec["version"] = versionRaw
+	chart.Spec["valuesContent"] = updatedValuesRaw
+	doc, err := json.Marshal(chart)
+	if err != nil {
+		return fmt.Errorf("rendering migrated agent HelmChart: %w", err)
+	}
+
+	// Existing clusters may still have the backend-owned gate explicitly
+	// closed. Only after the replacement manifest is ready may the backend
+	// detach its Applications: from this point a write failure leaves the
+	// backend safely in `migrating`, never with two reconcilers owning one
+	// workload.
+	if apiClient == nil || clusterID == "" {
+		return fmt.Errorf("cannot migrate workload-application ownership: this upgrade has no registered control-plane cluster")
+	}
+	if _, err := apiClient.DetachWorkloadApplications(ctx, clusterID); err != nil {
+		return fmt.Errorf("detaching host workload Applications before opening the operator gate: %w", err)
+	}
+	if err := k3s.WriteManifest(ctx, r, "kubenest-agent", doc); err != nil {
 		return fmt.Errorf("moving the agent chart to %s: %w", version, err)
 	}
 
@@ -341,7 +377,33 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, apiClient *api.Client,
 	if err != nil {
 		return err
 	}
-	return res.Err()
+	if err := res.Err(); err != nil {
+		return err
+	}
+	gate, err := converge.Wait(ctx, workloadApplicationsGateProbe(r), converge.Options{
+		Name: "workload-applications-gate-open", Deadline: deadline, Reporter: rep,
+	})
+	if err != nil {
+		return err
+	}
+	return gate.Err()
+}
+
+// workloadApplicationsGateProbe reads the operator's own recorded decision,
+// not the Helm value the CLI intended to set. That receiver-side assertion is
+// what catches an ignored/misnested value before the upgrade is recorded.
+func workloadApplicationsGateProbe(r k3s.Runner) converge.Probe {
+	return func(ctx context.Context) (bool, converge.State, error) {
+		out, err := k3s.Kubectl(ctx, r,
+			"get configmap kubenest-workload-applications-gate -n kubenest-system -o jsonpath='{.data.state}'")
+		if err != nil {
+			return false, converge.State{Object: "the workload-application gate", Status: "unobservable"}, err
+		}
+		if state := strings.Trim(strings.TrimSpace(out), "'"); state != "open" {
+			return false, converge.State{Object: "the workload-application gate", Status: "state=" + state}, nil
+		}
+		return true, converge.State{Object: "the workload-application gate", Status: "open"}, nil
+	}
 }
 
 // agentUpgradedProbe waits for the chart resource to report the new version
