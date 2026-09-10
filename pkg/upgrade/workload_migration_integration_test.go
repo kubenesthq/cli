@@ -579,9 +579,11 @@ type workloadApplicationOwnerCounts struct {
 // specifically about who owns this workload's Application. A cluster-wide
 // count can be nonzero while this workload has no Application at all, which is
 // the upstream creation observation tracked in kn-cqtb, not a migration
-// failure. Backend and operator Applications deliberately share a name but
-// live under distinct ArgoCD controllers/namespaces, so count both by the
-// workload's stable name and destination namespace.
+// failure. It deliberately does not reconstruct an Application name: that
+// format is an implementation detail that can change independently of this
+// acceptance. Backend and operator Applications instead carry distinct stable
+// identity-label sets. Any other Application targeting this namespace is
+// unclassified rather than evidence that this workload has no Application.
 func workloadApplicationOwners(ctx context.Context, runner k3s.Runner, clusterID, workloadNamespace, workloadName string) (workloadApplicationOwnerCounts, error) {
 	out, err := k3s.Kubectl(ctx, runner, "get applications.argoproj.io -A -o json")
 	if err != nil {
@@ -605,7 +607,6 @@ func workloadApplicationOwners(ctx context.Context, runner k3s.Runner, clusterID
 		return workloadApplicationOwnerCounts{}, err
 	}
 
-	expectedName := workloadApplicationName(clusterID, workloadName)
 	counts := workloadApplicationOwnerCounts{}
 	for _, application := range applications.Items {
 		if application.Spec.Destination.Namespace != workloadNamespace {
@@ -614,11 +615,12 @@ func workloadApplicationOwners(ctx context.Context, runner k3s.Runner, clusterID
 		labels := application.Metadata.Labels
 		// ubs:ignore — clusterID is a public Kubernetes label used to classify test artifacts, not a credential or secret.
 		isBackendWorkload := labels["kubenest.io/cluster-id"] == clusterID && labels["kubenest.io/workload"] == workloadName
-		if application.Metadata.Name != expectedName && !isBackendWorkload {
-			continue
-		}
+		isOperatorWorkload := labels["app.kubernetes.io/managed-by"] == "kubenest-operator" &&
+			labels["kubenest.io/cluster-id"] == clusterID &&
+			labels["kubenest.io/workload-name"] == workloadName &&
+			labels["kubenest.io/workload-namespace"] == workloadNamespace
 		switch {
-		case labels["app.kubernetes.io/managed-by"] == "kubenest-operator":
+		case isOperatorWorkload:
 			counts.operator++
 		case isBackendWorkload:
 			counts.backend++
@@ -627,14 +629,6 @@ func workloadApplicationOwners(ctx context.Context, runner k3s.Runner, clusterID
 		}
 	}
 	return counts, nil
-}
-
-func workloadApplicationName(clusterID, workloadName string) string {
-	shortClusterID := clusterID
-	if len(shortClusterID) > 8 {
-		shortClusterID = shortClusterID[:8]
-	}
-	return workloadName + "-" + shortClusterID
 }
 
 func readyWorkloadPodUID(ctx context.Context, runner k3s.Runner, namespace string) (string, error) {
