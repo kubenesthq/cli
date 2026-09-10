@@ -321,8 +321,17 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 	if apiClient == nil || clusterID == "" {
 		return fmt.Errorf("cannot migrate workload-application ownership: this upgrade has no registered control-plane cluster")
 	}
-	if _, err := apiClient.DetachWorkloadApplications(ctx, clusterID); err != nil {
+	detach, err := apiClient.DetachWorkloadApplications(ctx, clusterID)
+	if err != nil {
 		return fmt.Errorf("detaching host workload Applications before opening the operator gate: %w", err)
+	}
+	if detach == nil || detach.State != "migrating" {
+		return fmt.Errorf("detaching host workload Applications returned unsafe state %q (%s); refusing to open the operator gate", detachState(detach), detachMessage(detach))
+	}
+	for _, result := range detach.Results {
+		if result.Result != "detached" && result.Result != "already_absent" {
+			return fmt.Errorf("workload application %s was not detached (%s); refusing to open the operator gate", result.Application, result.Result)
+		}
 	}
 	patch := `{"data":{"state":"open","reason":"cli-migration"}}`
 	if _, err := k3s.Kubectl(ctx, r, "patch configmap kubenest-workload-applications-gate -n kubenest-system --type merge -p "+shellQuote(patch)); err != nil {
@@ -335,6 +344,20 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 		return err
 	}
 	return gate.Err()
+}
+
+func detachState(r *api.WorkloadApplicationsDetachResponse) string {
+	if r == nil {
+		return "<nil>"
+	}
+	return r.State
+}
+
+func detachMessage(r *api.WorkloadApplicationsDetachResponse) string {
+	if r == nil || r.Message == "" {
+		return "no backend message"
+	}
+	return r.Message
 }
 
 func workloadApplicationsGateState(ctx context.Context, r k3s.Runner) (string, error) {
