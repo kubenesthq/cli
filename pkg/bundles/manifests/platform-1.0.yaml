@@ -71,13 +71,12 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.6                # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.6 pins image 8338c06: it retains the strict-host-pin refusal
-                                       # from 2.6.5 and aligns operator-owned workload Applications with the
-                                       # backend. In particular, a registry-with-port image is split into its
-                                       # repository and tag correctly. Operator-owned workload Applications
-                                       # default OFF pending chart-mode equivalence (kn-agent-chart-predates-
-                                       # renderer-fixes-0gxj); existing 2.6.5 Applications are not repaired.
+  kubenest-agent: 2.6.7                # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.7 pins image 88dbb71, including the hub-routed Component Secret
+                                       # handler (kn-37n5), the strict-host-pin refusal, and the aligned workload
+                                       # Application renderer. Operator-owned workload Applications default OFF
+                                       # pending chart-mode equivalence (kn-agent-chart-predates-renderer-fixes-
+                                       # 0gxj); existing 2.6.5 Applications are not repaired.
                                        # 2.6.1 through 2.6.4 are immutable rejected recovery experiments;
                                        # never republish or repin them.
                                        # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
