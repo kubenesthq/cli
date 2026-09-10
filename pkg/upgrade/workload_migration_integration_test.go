@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/converge"
@@ -386,7 +387,11 @@ func TestWorkloadApplicationOwnershipRefusesOpenRecordWithExplicitFalse(t *testi
 	if err != nil {
 		t.Fatalf("read HelmChart false precondition: %v", err)
 	}
-	if !strings.Contains(values, "workloadApplications:") || !strings.Contains(values, "enabled: false") {
+	enabled, err := explicitWorkloadApplicationsValue(values)
+	if err != nil {
+		t.Fatalf("decode HelmChart false precondition: %v", err)
+	}
+	if enabled {
 		t.Fatalf("the live HelmChart does not carry the explicit false precondition:\n%s", values)
 	}
 	valuesBefore := values
@@ -443,6 +448,26 @@ func TestWorkloadApplicationOwnershipRefusesOpenRecordWithExplicitFalse(t *testi
 		t.Fatalf("refused migration recreated the workload pod: before=%s after=%s", uidBefore, uidAfter)
 	}
 	t.Logf("explicit false plus open record was refused without mutating either record or the running workload")
+}
+
+func explicitWorkloadApplicationsValue(valuesContent string) (bool, error) {
+	values := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
+		return false, err
+	}
+	kubenestValues, ok := values["kubenest"].(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("missing kubenest values")
+	}
+	workloadValues, ok := kubenestValues["workloadApplications"].(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("missing explicit kubenest.workloadApplications values")
+	}
+	enabled, ok := workloadValues["enabled"].(bool)
+	if !ok {
+		return false, fmt.Errorf("missing boolean kubenest.workloadApplications.enabled")
+	}
+	return enabled, nil
 }
 
 func readyWorkloadPodUID(ctx context.Context, runner k3s.Runner, namespace string) (string, error) {
