@@ -71,51 +71,51 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.11               # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.11 pins image fc6294d. THIS IS A SECURITY BUMP, and what it
-                                       # fixes shipped in 2.6.10, which this line used to point at. The
-                                       # operator's StackDeploy intent handlers had three ownership holes:
-                                       # delete never called authorizeStackIntent (create and update did),
-                                       # so the one DESTRUCTIVE intent was the only one that never checked
-                                       # its target namespace belongs to a backend-managed project; both
-                                       # ownership comparisons failed OPEN on a missing field, because
-                                       # string equality against "" passes; and the AlreadyExists branch of
-                                       # create reported success without checking what it had collided
-                                       # with.
-                                       # Found by review after 2.6.10 was published and pinned. An end-to-
-                                       # end run cannot reach any of it -- it only ever deletes what it
-                                       # just created, in a namespace it owns, with every field populated
-                                       # -- which is why the 10/10 acceptance on 2.6.10 said nothing about
-                                       # it.
-                                       # NOT A PURE IMAGE MOVE, unlike 2.6.9 and 2.6.10, and the difference
-                                       # was measured rather than described. This chart also carries kn-
-                                       # lx5t.1, whose templates CI refused to publish because that commit
-                                       # changed chart files without bumping the chart version. Rendered
-                                       # against published 2.6.10 with the same values: with a COMPLETE
-                                       # clusterID + jwtSecret pair, 845 lines each, differing only in the
-                                       # chart label, the version label and the two image references -- a
-                                       # correctly configured install renders identically. With a PARTIAL
-                                       # pair, 2.6.10 renders and emits two Secrets, one carrying an EMPTY
-                                       # bearer; 2.6.11 refuses. So the delta is confined to the partial-
-                                       # pair case, where the old behaviour was a credential trusted by
-                                       # nothing. An install relying on that silence fails at upgrade.
-                                       # Everything 2.6.10 carried rides along, and one part of it must:
-                                       # the capability advertisement from op3 63d5b4b is an ancestor of
-                                       # fc6294d. Without it a current hub refuses every intent to this
-                                       # agent while the cluster still reports connected (kn-hub-
-                                       # capability-gate-agent-skew-pyz3). Do not pin below 2.6.10 for that
-                                       # reason and do not pin 2.6.10 itself for the reason above.
+  kubenest-agent: 2.6.12               # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.12 pins image fc6294d, unchanged from 2.6.11: this is a CHART-
+                                       # ONLY fix and no operator code moved. What it fixes is a P0 -- on
+                                       # 2.6.11 and every chart before it carrying kn-p61d's narrowed
+                                       # bearer, NO WORKLOAD COULD SYNC.
+                                       # The per-namespace grant for the ArgoCD bearer enumerated API
+                                       # groups. ArgoCD's cache lists EVERY API resource type present in a
+                                       # watched namespace, not only the ones KubeNest manages, and ONE
+                                       # denial fails the whole cluster cache -- so a single CRD outside
+                                       # the list stopped every Application on the cluster. Traefik is in
+                                       # this very bundle, so traefik.io was on every install from the day
+                                       # the list was written. And in chart mode the CUSTOMER's chart
+                                       # renders the manifests and can create any type, so the list was not
+                                       # incomplete, it was unclosable. The grant is now all types WITHIN
+                                       # the namespace (kn-argocd-bearer-narrowing-breaks-sync-2mmz).
+                                       # THE NARROWING THAT MATTERS IS UNTOUCHED, measured by rendering
+                                       # published 2.6.11 and 2.6.12 side by side: the cluster-scoped read
+                                       # role is IDENTICAL -- namespaces, customresourcedefinitions,
+                                       # apiservices, and nothing else. The bearer still cannot read kube-
+                                       # system, cannot reach k3s bootstrap material and cannot touch
+                                       # another tenant's namespace. What changed is a type list that was
+                                       # never a boundary; it only decided which charts happened to work.
+                                       # THIS PIN IS HALF THE FIX. The other half is backend-side and has
+                                       # NO PIN: the cluster Secret's namespaces and clusterResources were
+                                       # written inside the config blob, where ArgoCD does not read them,
+                                       # so the scoping was inert while the RBAC that depended on it was
+                                       # real. A working cluster needs BOTH this chart AND a control plane
+                                       # at or after kubenest-backend 024bff6. Do not read this pin as the
+                                       # whole repair.
+                                       # Proven before publishing: installed from this chart on a real
+                                       # cluster, the bearer can list traefik.io and resource.k8s.io types
+                                       # in a project namespace, the Application went Synced/Healthy with
+                                       # no conditions, and a pod reached 1/1 Running. Before the fix the
+                                       # identical path returned 201 from the API and produced no pod at
+                                       # all.
+                                       # Everything 2.6.11 carried rides along: the stack-intent ownership
+                                       # fixes, the capability advertisement that keeps a current hub
+                                       # routing to this agent, the StackDeploy lifecycle handlers, kn-
+                                       # bibk's reachability condition, fail-closed addon configuration and
+                                       # the hub-routed Component Secret handler. Do not pin below 2.6.10
+                                       # (the hub refuses an agent that does not advertise) and do not pin
+                                       # 2.6.10 or 2.6.11 (ownership holes, then this one).
                                        # WHICH INSTALLS THIS REACHES: standalone, and any managed install
-                                       # that consumes this pin. It reaches a provisioned cluster NOT AT
-                                       # ALL -- the provisioner installs chart 2.1.0 (kn-5mba, P0).
-                                       # "Delivered in 2.6.11" is a claim about those modes and no other.
-                                       # Earlier pins, for the record: 2.6.9/50cdc69 and 2.6.8/efb876f
-                                       # carried fail-closed addon configuration (kn-m0mr), the hub-routed
-                                       # Component Secret handler (kn-37n5), the strict-host-pin refusal
-                                       # and the aligned workload Application renderer. Operator-owned
-                                       # workload Applications remain default OFF pending chart-mode
-                                       # equivalence (kn-agent-chart-predates-renderer-fixes-0gxj);
-                                       # existing 2.6.5 Applications are still not repaired.
+                                       # consuming this pin. It reaches a provisioned cluster NOT AT ALL --
+                                       # the provisioner installs chart 2.1.0 (kn-5mba, P0).
                                        # 2.6.1 through 2.6.4 are immutable rejected recovery experiments;
                                        # never republish or repin them.
                                        # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
