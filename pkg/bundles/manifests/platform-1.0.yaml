@@ -71,42 +71,48 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.10               # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.10 pins image 63d5b4b. THE PIN BELOW 2.6.10 IS NOT MERELY
-                                       # OLDER, IT IS REFUSED. kubenest-hub main (kn-miss) fails backend-
-                                       # to-operator routing closed: a connected operator that has not
-                                       # advertised a handler for an event type has that intent REFUSED.
-                                       # Advertisement arrived in op3 63d5b4b, so every chart below this
-                                       # one -- 2.6.9 and 2.6.8 included -- runs an agent that advertises
-                                       # nothing and is therefore sent nothing. Not just stack intents:
-                                       # project_create too.
-                                       # The failure is quiet, which is why it is called out here. The
-                                       # heartbeat runs operator-to-backend and is unaffected, so the
-                                       # cluster still reports "connected" while executing none of what it
-                                       # is told. Observed on a real cluster, then fixed on that same
-                                       # cluster by moving only the image: the hub logged "Registered
-                                       # operator intent capabilities" with 13 event types and the
-                                       # previously refused project_create was applied. See kn-hub-
-                                       # capability-gate-agent-skew-pyz3, which argues the durable fix is a
-                                       # compatibility window (kn-opj8), not a pin move per hub release.
-                                       # Over 2.6.9 this is an image move: both published charts render 826
-                                       # lines from identical values and differ only in the chart-version
-                                       # and app-version labels and the two image references. Verified by
-                                       # rendering, 2026-09-10.
-                                       # What 63d5b4b carries, beyond the advertisement: the StackDeploy
-                                       # lifecycle intent handlers (kn-2fz2 phase 2, b7c3b26) applying
-                                       # stack_create / stack_update / stack_delete on the operator's own
-                                       # cluster, and kn-bibk (50cdc69) reporting an unreachable in-cluster
-                                       # API endpoint on the heartbeat rather than as a later opaque 504.
-                                       # Both are ancestors.
+  kubenest-agent: 2.6.11               # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.11 pins image fc6294d. THIS IS A SECURITY BUMP, and what it
+                                       # fixes shipped in 2.6.10, which this line used to point at. The
+                                       # operator's StackDeploy intent handlers had three ownership holes:
+                                       # delete never called authorizeStackIntent (create and update did),
+                                       # so the one DESTRUCTIVE intent was the only one that never checked
+                                       # its target namespace belongs to a backend-managed project; both
+                                       # ownership comparisons failed OPEN on a missing field, because
+                                       # string equality against "" passes; and the AlreadyExists branch of
+                                       # create reported success without checking what it had collided
+                                       # with.
+                                       # Found by review after 2.6.10 was published and pinned. An end-to-
+                                       # end run cannot reach any of it -- it only ever deletes what it
+                                       # just created, in a namespace it owns, with every field populated
+                                       # -- which is why the 10/10 acceptance on 2.6.10 said nothing about
+                                       # it.
+                                       # NOT A PURE IMAGE MOVE, unlike 2.6.9 and 2.6.10, and the difference
+                                       # was measured rather than described. This chart also carries kn-
+                                       # lx5t.1, whose templates CI refused to publish because that commit
+                                       # changed chart files without bumping the chart version. Rendered
+                                       # against published 2.6.10 with the same values: with a COMPLETE
+                                       # clusterID + jwtSecret pair, 845 lines each, differing only in the
+                                       # chart label, the version label and the two image references -- a
+                                       # correctly configured install renders identically. With a PARTIAL
+                                       # pair, 2.6.10 renders and emits two Secrets, one carrying an EMPTY
+                                       # bearer; 2.6.11 refuses. So the delta is confined to the partial-
+                                       # pair case, where the old behaviour was a credential trusted by
+                                       # nothing. An install relying on that silence fails at upgrade.
+                                       # Everything 2.6.10 carried rides along, and one part of it must:
+                                       # the capability advertisement from op3 63d5b4b is an ancestor of
+                                       # fc6294d. Without it a current hub refuses every intent to this
+                                       # agent while the cluster still reports connected (kn-hub-
+                                       # capability-gate-agent-skew-pyz3). Do not pin below 2.6.10 for that
+                                       # reason and do not pin 2.6.10 itself for the reason above.
                                        # WHICH INSTALLS THIS REACHES: standalone, and any managed install
                                        # that consumes this pin. It reaches a provisioned cluster NOT AT
                                        # ALL -- the provisioner installs chart 2.1.0 (kn-5mba, P0).
-                                       # "Delivered in 2.6.10" is a claim about those modes and no other.
-                                       # 2.6.9 pinned 50cdc69 and 2.6.8 pinned efb876f: fail-closed addon
-                                       # configuration (kn-m0mr), the hub-routed Component Secret handler
-                                       # (kn-37n5), the strict-host-pin refusal, and the aligned workload
-                                       # Application renderer. All of it rides along. Operator-owned
+                                       # "Delivered in 2.6.11" is a claim about those modes and no other.
+                                       # Earlier pins, for the record: 2.6.9/50cdc69 and 2.6.8/efb876f
+                                       # carried fail-closed addon configuration (kn-m0mr), the hub-routed
+                                       # Component Secret handler (kn-37n5), the strict-host-pin refusal
+                                       # and the aligned workload Application renderer. Operator-owned
                                        # workload Applications remain default OFF pending chart-mode
                                        # equivalence (kn-agent-chart-predates-renderer-fixes-0gxj);
                                        # existing 2.6.5 Applications are still not repaired.
