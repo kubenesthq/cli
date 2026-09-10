@@ -71,39 +71,45 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.9                # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.9 pins image 50cdc69. Over 2.6.8 this is an image move and
-                                       # nothing else: rendering both published charts with identical
-                                       # values gives 826 lines each, differing only in the chart-version
+  kubenest-agent: 2.6.10               # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.10 pins image 63d5b4b. THE PIN BELOW 2.6.10 IS NOT MERELY
+                                       # OLDER, IT IS REFUSED. kubenest-hub main (kn-miss) fails backend-
+                                       # to-operator routing closed: a connected operator that has not
+                                       # advertised a handler for an event type has that intent REFUSED.
+                                       # Advertisement arrived in op3 63d5b4b, so every chart below this
+                                       # one -- 2.6.9 and 2.6.8 included -- runs an agent that advertises
+                                       # nothing and is therefore sent nothing. Not just stack intents:
+                                       # project_create too.
+                                       # The failure is quiet, which is why it is called out here. The
+                                       # heartbeat runs operator-to-backend and is unaffected, so the
+                                       # cluster still reports "connected" while executing none of what it
+                                       # is told. Observed on a real cluster, then fixed on that same
+                                       # cluster by moving only the image: the hub logged "Registered
+                                       # operator intent capabilities" with 13 event types and the
+                                       # previously refused project_create was applied. See kn-hub-
+                                       # capability-gate-agent-skew-pyz3, which argues the durable fix is a
+                                       # compatibility window (kn-opj8), not a pin move per hub release.
+                                       # Over 2.6.9 this is an image move: both published charts render 826
+                                       # lines from identical values and differ only in the chart-version
                                        # and app-version labels and the two image references. Verified by
-                                       # rendering on 2026-09-10, not read off the file stat.
-                                       # What the new image adds over efb876f:
-                                       # - kn-2fz2 phase 2 (b7c3b26): StackDeploy lifecycle intent
-                                       #   handlers. stack_create / stack_update / stack_delete are applied
-                                       #   on the operator's own cluster. Phase 0 (18ffa47) is already in
-                                       #   2.6.8 and makes an unhandled intent an ERROR, so against an
-                                       #   agent below this pin the backend's stack intents fail loudly
-                                       #   rather than being dropped. That is the intended failure, not a
-                                       #   working path: the backend half needs this pin to do anything at
-                                       #   all.
-                                       # - kn-bibk (50cdc69): an in-cluster Kubernetes API endpoint the
-                                       #   operator cannot reach is reported as a condition on the
-                                       #   heartbeat, instead of surfacing later as an opaque 504.
-                                       # WHICH INSTALLS THIS REACHES: standalone only. The provisioner
-                                       # installs chart 2.1.0 (kn-5mba, P0), so nothing in this wave --
-                                       # this pin included -- reaches a provisioned cluster. "Delivered in
-                                       # 2.6.9" is a claim about standalone installs and about no other
-                                       # install mode.
-                                       # NOT in this pin: 63d5b4b (kn-miss), which advertises which intents
-                                       # the operator handles, is a descendant of 50cdc69 and needs its own
-                                       # cut.
-                                       # 2.6.8 pinned image efb876f: the correlated, fail-closed
-                                       # addon_configure intent path (kn-m0mr), the hub-routed Component
-                                       # Secret handler (kn-37n5), the strict-host-pin refusal, and the
-                                       # aligned workload Application renderer. All of that rides along in
-                                       # 2.6.9. Operator-owned workload Applications remain default OFF
-                                       # pending chart-mode equivalence (kn-agent-chart-predates-renderer-
-                                       # fixes-0gxj); existing 2.6.5 Applications are still not repaired.
+                                       # rendering, 2026-09-10.
+                                       # What 63d5b4b carries, beyond the advertisement: the StackDeploy
+                                       # lifecycle intent handlers (kn-2fz2 phase 2, b7c3b26) applying
+                                       # stack_create / stack_update / stack_delete on the operator's own
+                                       # cluster, and kn-bibk (50cdc69) reporting an unreachable in-cluster
+                                       # API endpoint on the heartbeat rather than as a later opaque 504.
+                                       # Both are ancestors.
+                                       # WHICH INSTALLS THIS REACHES: standalone, and any managed install
+                                       # that consumes this pin. It reaches a provisioned cluster NOT AT
+                                       # ALL -- the provisioner installs chart 2.1.0 (kn-5mba, P0).
+                                       # "Delivered in 2.6.10" is a claim about those modes and no other.
+                                       # 2.6.9 pinned 50cdc69 and 2.6.8 pinned efb876f: fail-closed addon
+                                       # configuration (kn-m0mr), the hub-routed Component Secret handler
+                                       # (kn-37n5), the strict-host-pin refusal, and the aligned workload
+                                       # Application renderer. All of it rides along. Operator-owned
+                                       # workload Applications remain default OFF pending chart-mode
+                                       # equivalence (kn-agent-chart-predates-renderer-fixes-0gxj);
+                                       # existing 2.6.5 Applications are still not repaired.
                                        # 2.6.1 through 2.6.4 are immutable rejected recovery experiments;
                                        # never republish or repin them.
                                        # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
