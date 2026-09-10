@@ -100,6 +100,10 @@ type Options struct {
 	// Acknowledge accepts individual deprecation findings by
 	// namespace/Kind/name. There is deliberately no blanket override.
 	Acknowledge []string
+	// MigrateWorkloadApplications is an explicit ownership hand-off, not an
+	// ordinary chart upgrade. It remains false unless the caller asks to detach
+	// the backend-owned Applications and open the in-cluster operator gate.
+	MigrateWorkloadApplications bool
 	// Now overrides the clock, for tests.
 	Now func() time.Time
 }
@@ -112,10 +116,11 @@ func (o Options) Identity(from string) stages.Identity {
 		Kind:    Kind,
 		Cluster: o.Cluster,
 		Fields: map[string]string{
-			"from bundle": from,
-			"to bundle":   o.To,
-			"servers":     stages.List(o.Servers),
-			"agents":      stages.List(o.Agents),
+			"from bundle":                   from,
+			"to bundle":                     o.To,
+			"servers":                       stages.List(o.Servers),
+			"agents":                        stages.List(o.Agents),
+			"migrate workload applications": fmt.Sprintf("%t", o.MigrateWorkloadApplications),
 		},
 	}
 }

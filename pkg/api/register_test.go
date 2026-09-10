@@ -191,7 +191,7 @@ func TestMintDecodesCredentialsButKeepsThemUnprintable(t *testing.T) {
 			                    "repo_url": "ssh://git@gitea/kubenest/gitops-cluster-1.git",
 			                    "branch": "main",
 			                    "known_hosts": "gitea ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPin"},
-			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://reg/kubenest-agent:2.2.0"}}`))
+			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://reg/kubenest-agent:2.2.0", "creates_workload_applications": true}}`))
 	}))
 
 	creds, err := c.MintAgentCredentials(context.Background(), "cluster-1")
@@ -206,6 +206,9 @@ func TestMintDecodesCredentialsButKeepsThemUnprintable(t *testing.T) {
 	}
 	if creds.Operator.ChartRef == "" || creds.RepoCredential.Branch != "main" {
 		t.Errorf("non-secret fields did not decode: %+v", creds.Operator)
+	}
+	if !creds.Operator.WorkloadApplicationsOwnershipDeclared {
+		t.Fatal("an explicit ownership field must be marked declared")
 	}
 	// The host-key pin (kn-rnyl.1) is public key material and decodes like any
 	// other non-secret field — it has to, or the cluster clones its desired
@@ -242,7 +245,7 @@ func TestMintWithoutGitOpsHasNoRepoCredential(t *testing.T) {
 		_, _ = w.Write([]byte(`{"cluster_id": "c1",
 			"agent_jwt": {"token": "t", "token_version": 1},
 			"repo_credential": null,
-			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://x:1"}}`))
+			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://x:1", "creates_workload_applications": true}}`))
 	}))
 	creds, err := c.MintAgentCredentials(context.Background(), "c1")
 	if err != nil {
@@ -250,6 +253,23 @@ func TestMintWithoutGitOpsHasNoRepoCredential(t *testing.T) {
 	}
 	if creds.RepoCredential != nil {
 		t.Error("expected no repo credential")
+	}
+}
+
+func TestMintWithoutOwnershipDeclarationKeepsTheOperatorClosed(t *testing.T) {
+	c, _ := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"cluster_id":"c1","agent_jwt":{"token":"t"},"operator":{"namespace":"kubenest-system","chart_ref":"oci://x:1"}}`))
+	}))
+	creds, err := c.MintAgentCredentials(context.Background(), "c1")
+	if err != nil {
+		t.Fatalf("legacy mint: %v", err)
+	}
+	if !creds.Operator.CreatesWorkloadApplications {
+		t.Fatal("an undeclared legacy owner must keep the operator gate closed")
+	}
+	if creds.Operator.WorkloadApplicationsOwnershipDeclared {
+		t.Fatal("an omitted ownership field must remain detectable to callers")
 	}
 }
 

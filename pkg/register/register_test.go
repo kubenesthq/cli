@@ -88,7 +88,7 @@ func (f *fakeAPI) MintAgentCredentials(_ context.Context, clusterID string) (*ap
 			RepoURL:    "ssh://git@gitea/kubenest/gitops-" + clusterID + ".git",
 			Branch:     "main",
 		},
-		Operator: api.OperatorInstallInfo{Namespace: "kubenest-system", ChartRef: "oci://reg/kubenest-agent:2.2.0"},
+		Operator: api.OperatorInstallInfo{Namespace: "kubenest-system", ChartRef: "oci://reg/kubenest-agent:2.2.0", CreatesWorkloadApplications: true},
 	}, nil
 }
 

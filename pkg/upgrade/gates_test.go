@@ -112,7 +112,7 @@ limits: {timeouts: {node-ready: 5m}}
 profiles: {ha: {}}
 `)
 	t.Run("a tier the target does not offer", func(t *testing.T) {
-		got := checkBundlePath(from, to, nil, "single-server")
+		got := checkBundlePath(from, to, nil, "single-server", false)
 		if got.Passed {
 			t.Fatal("a bundle that drops this cluster's permanent tier cannot be a target")
 		}
@@ -121,7 +121,7 @@ profiles: {ha: {}}
 		}
 	})
 	t.Run("a profile the target drops", func(t *testing.T) {
-		got := checkBundlePath(from, to, []string{"observability"}, "ha")
+		got := checkBundlePath(from, to, []string{"observability"}, "ha", false)
 		if got.Passed {
 			t.Fatal("a bundle that drops an installed profile cannot be a target")
 		}
@@ -130,12 +130,21 @@ profiles: {ha: {}}
 		}
 	})
 	t.Run("already there", func(t *testing.T) {
-		if got := checkBundlePath(from, from, nil, "ha"); got.Passed {
+		if got := checkBundlePath(from, from, nil, "ha", false); got.Passed {
 			t.Error("upgrading a cluster to the version it already runs is not an upgrade")
 		}
 	})
+	t.Run("same bundle only for the explicit ownership migration", func(t *testing.T) {
+		got := checkBundlePath(from, from, nil, "ha", true)
+		if !got.Passed {
+			t.Fatalf("the explicit ownership migration must have a supported same-bundle carrier: %s", got)
+		}
+		if !strings.Contains(got.Detail, "explicit") {
+			t.Errorf("the exception must name why it is safe: %s", got.Detail)
+		}
+	})
 	t.Run("a supported transition", func(t *testing.T) {
-		if got := checkBundlePath(from, to, nil, "ha"); !got.Passed {
+		if got := checkBundlePath(from, to, nil, "ha", false); !got.Passed {
 			t.Errorf("want a pass: %s", got.Detail)
 		}
 	})
@@ -150,7 +159,7 @@ func TestABackwardTransitionIsRefused(t *testing.T) {
 	newer := parseManifest(t, "bundle: \"1.0\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
 	older := parseManifest(t, "bundle: \"0.9\"\ncore: {k3s: v1.35.6+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
 
-	got := checkBundlePath(newer, older, nil, "single-server")
+	got := checkBundlePath(newer, older, nil, "single-server", false)
 	if got.Passed {
 		t.Fatal("moving to an older Kubernetes version must be refused")
 	}
@@ -162,11 +171,11 @@ func TestABackwardTransitionIsRefused(t *testing.T) {
 
 	// Forward is fine, and equal Kubernetes with a newer bundle is fine —
 	// a bundle may move only its charts.
-	if got := checkBundlePath(older, newer, nil, "single-server"); !got.Passed {
+	if got := checkBundlePath(older, newer, nil, "single-server", false); !got.Passed {
 		t.Errorf("a forward transition must pass: %s", got.Detail)
 	}
 	sameK8s := parseManifest(t, "bundle: \"1.1\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
-	if got := checkBundlePath(newer, sameK8s, nil, "single-server"); !got.Passed {
+	if got := checkBundlePath(newer, sameK8s, nil, "single-server", false); !got.Passed {
 		t.Errorf("a chart-only bundle move must pass: %s", got.Detail)
 	}
 }

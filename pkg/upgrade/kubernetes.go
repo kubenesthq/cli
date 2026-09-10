@@ -299,9 +299,12 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manif
 // migrateWorkloadApplicationOwnership is the explicit, one-way hand-off from
 // backend-owned workload Applications to the in-cluster operator. This is not
 // implicit in a chart version: a caller must opt in because an explicit false
-// could be a deliberate user choice. It changes only the gate field and
-// preserves every other existing Helm value, including the cluster identity
-// and deploy key.
+// could be a deliberate user choice. The ConfigMap is only a startup record:
+// changing it under an already-running operator does not change the resolved
+// in-memory gate. This one deliberate hand-off therefore renders an explicit
+// true into the existing HelmChart and waits for the restarted operator to
+// record open itself. It preserves the cluster identity, deploy key, and every
+// other Helm value.
 func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiClient *api.Client, clusterID string, bundle *manifest.Manifest, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
@@ -314,10 +317,14 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 	if state != "closed" {
 		return fmt.Errorf("cannot migrate workload-application ownership: the operator gate records state=%q, want closed; inspect kubenest-workload-applications-gate before retrying", state)
 	}
+	sourceChart, liveChart, err := migratedGateCharts(ctx, r)
+	if err != nil {
+		return err
+	}
 
-	// Detach first; then update the operator's recorded receiver state. The
-	// HelmChart values are intentionally untouched: the operator resolves an
-	// unset value from this ConfigMap and re-probing would reopen the race.
+	// Prepare the local update before changing backend ownership. A malformed
+	// HelmChart must not strand the backend in migrating before it has a way to
+	// open the operator side of the hand-off.
 	if apiClient == nil || clusterID == "" {
 		return fmt.Errorf("cannot migrate workload-application ownership: this upgrade has no registered control-plane cluster")
 	}
@@ -333,9 +340,17 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 			return fmt.Errorf("workload application %s was not detached (%s); refusing to open the operator gate", result.Application, result.Result)
 		}
 	}
-	patch := `{"data":{"state":"open","reason":"cli-migration"}}`
-	if _, err := k3s.Kubectl(ctx, r, "patch configmap kubenest-workload-applications-gate -n kubenest-system --type merge -p "+shellQuote(patch)); err != nil {
-		return fmt.Errorf("recording the migrated workload-application gate: %w", err)
+	// valuesContent can hold the agent JWT and Git deploy key. Stream the
+	// complete typed HelmChart through stdin rather than placing either in a
+	// kubectl patch command line. The new explicit value makes Helm roll the
+	// controller; that startup is what resolves (and records) the new gate.
+	// Never patch the ConfigMap ourselves: it is a report of the receiver's
+	// resolved state, not a dynamic control plane for an already-running pod.
+	if err := k3s.WriteManifest(ctx, r, "kubenest-agent", sourceChart); err != nil {
+		return fmt.Errorf("recording the explicit workload-application hand-off: %w", err)
+	}
+	if err := k3s.ReplaceManifest(ctx, r, liveChart); err != nil {
+		return fmt.Errorf("applying the explicit workload-application hand-off: %w", err)
 	}
 	gate, err := converge.Wait(ctx, workloadApplicationsGateProbe(r), converge.Options{
 		Name: "workload-applications-gate-open", Deadline: deadline, Reporter: rep,
@@ -344,6 +359,98 @@ func migrateWorkloadApplicationOwnership(ctx context.Context, r k3s.Runner, apiC
 		return err
 	}
 	return gate.Err()
+}
+
+// migratedGateCharts returns two forms of the same changed HelmChart. source
+// persists without a resourceVersion for k3s's next boot; live carries the
+// observed version for an optimistic replace now. Both differ from the
+// existing resource only at kubenest.workloadApplications.enabled=true. An
+// unset value is deliberately made explicit: the receiver ConfigMap records a
+// startup decision, so merely changing that record cannot reopen the running
+// operator.
+func migratedGateCharts(ctx context.Context, r k3s.Runner) (source, live []byte, err error) {
+	var chart struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name            string            `json:"name"`
+			Namespace       string            `json:"namespace"`
+			ResourceVersion string            `json:"resourceVersion,omitempty"`
+			Labels          map[string]string `json:"labels,omitempty"`
+			Annotations     map[string]string `json:"annotations,omitempty"`
+			Finalizers      []string          `json:"finalizers,omitempty"`
+		} `json:"metadata"`
+		Spec map[string]json.RawMessage `json:"spec"`
+	}
+	raw, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o json")
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading the existing agent values: %w", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &chart); err != nil {
+		return nil, nil, fmt.Errorf("decoding the existing agent values: %w", err)
+	}
+	if chart.APIVersion != "helm.cattle.io/v1" || chart.Kind != "HelmChart" ||
+		chart.Metadata.Name != agent.ReleaseName() || chart.Metadata.Namespace != "kube-system" {
+		return nil, nil, fmt.Errorf("the existing agent HelmChart is not the expected kube-system/%s helm.cattle.io/v1 object", agent.ReleaseName())
+	}
+	if chart.Metadata.ResourceVersion == "" {
+		return nil, nil, fmt.Errorf("the existing agent HelmChart has no resourceVersion; refusing a blind ownership update")
+	}
+	valuesRaw, ok := chart.Spec["valuesContent"]
+	if !ok {
+		return nil, nil, fmt.Errorf("the existing agent HelmChart has no valuesContent; refusing to change workload ownership")
+	}
+	var valuesContent string
+	if err := json.Unmarshal(valuesRaw, &valuesContent); err != nil {
+		return nil, nil, fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
+	values := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesContent), &values); err != nil {
+		return nil, nil, fmt.Errorf("decoding the existing agent valuesContent: %w", err)
+	}
+	kubenestValues, ok := values["kubenest"].(map[string]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("the existing agent valuesContent has no kubenest identity; refusing to change workload ownership")
+	}
+	workloadRaw, hasWorkload := kubenestValues["workloadApplications"]
+	if !hasWorkload {
+		workloadRaw = map[string]any{}
+		kubenestValues["workloadApplications"] = workloadRaw
+	}
+	workloadValues, ok := workloadRaw.(map[string]any)
+	if !ok {
+		return nil, nil, fmt.Errorf("the existing agent valuesContent has kubenest.workloadApplications as %T, not a mapping; refusing to replace a user value", workloadRaw)
+	}
+	enabledRaw, hasEnabled := workloadValues["enabled"]
+	if hasEnabled {
+		enabled, ok := enabledRaw.(bool)
+		if !ok {
+			return nil, nil, fmt.Errorf("the existing agent valuesContent has kubenest.workloadApplications.enabled as %T, not a boolean; refusing to replace a user value", enabledRaw)
+		}
+		if enabled {
+			return nil, nil, fmt.Errorf("the operator gate is recorded closed while the HelmChart explicitly enables workload Applications; resolve that inconsistent state before migrating")
+		}
+	}
+	workloadValues["enabled"] = true
+	updatedValues, err := yaml.Marshal(values)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encoding migrated agent values: %w", err)
+	}
+	updatedValuesRaw, err := json.Marshal(string(updatedValues))
+	if err != nil {
+		return nil, nil, err
+	}
+	chart.Spec["valuesContent"] = updatedValuesRaw
+	live, err = json.Marshal(chart)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rendering the live migrated agent HelmChart: %w", err)
+	}
+	chart.Metadata.ResourceVersion = ""
+	source, err = json.Marshal(chart)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rendering the persisted migrated agent HelmChart: %w", err)
+	}
+	return source, live, nil
 }
 
 func detachState(r *api.WorkloadApplicationsDetachResponse) string {

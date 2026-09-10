@@ -25,6 +25,10 @@ type UpgradeFlags struct {
 	// Acknowledge accepts individual deprecation findings by
 	// namespace/Kind/name. There is deliberately no blanket --force.
 	Acknowledge []string
+	// MigrateWorkloadApplications explicitly hands workload Application
+	// ownership from the backend to the in-cluster operator during this bundle
+	// upgrade. It is never inferred from a chart version.
+	MigrateWorkloadApplications bool
 	// Servers and Agents override the node list when there is no local
 	// install journal — an upgrade run from a different machine than the
 	// install.
@@ -80,7 +84,8 @@ func buildUpgradeSession(ctx context.Context, out io.Writer, f UpgradeFlags) (*u
 		Cluster: f.Cluster, To: f.To,
 		Servers: servers, Agents: agents,
 		SSHUser: f.SSHUser, SSHKey: f.SSHKey,
-		Acknowledge: f.Acknowledge,
+		Acknowledge:                 f.Acknowledge,
+		MigrateWorkloadApplications: f.MigrateWorkloadApplications,
 	}
 
 	journalPath, err := upgrade.JournalPath(f.Cluster)

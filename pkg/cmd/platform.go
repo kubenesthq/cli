@@ -221,6 +221,7 @@ actively harmed you.`,
 	fs.StringVar(&f.Cluster, "cluster", "", "cluster to upgrade (required)")
 	fs.StringVar(&f.To, "to", "", "bundle version to upgrade to (required)")
 	fs.StringArrayVar(&f.Acknowledge, "acknowledge", nil, "accept one deprecated-API finding by namespace/Kind/name (repeatable; there is deliberately no blanket override)")
+	fs.BoolVar(&f.MigrateWorkloadApplications, "migrate-workload-applications", false, "explicitly hand workload Application ownership from the backend to the in-cluster operator during this bundle upgrade")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without a local install journal)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")

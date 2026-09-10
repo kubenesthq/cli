@@ -134,6 +134,6 @@ func TestTheRecordCheckNamesTheSameAgentObjectInBothModes(t *testing.T) {
 func agentCredentialsForTest() *api.AgentCredentials {
 	return &api.AgentCredentials{
 		ClusterID: "cluster-1",
-		Operator:  api.OperatorInstallInfo{Namespace: "kubenest-system", ChartRef: "oci://example.invalid/chart:1"},
+		Operator:  api.OperatorInstallInfo{Namespace: "kubenest-system", ChartRef: "oci://example.invalid/chart:1", CreatesWorkloadApplications: true},
 	}
 }

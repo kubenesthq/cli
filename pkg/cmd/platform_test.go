@@ -77,6 +77,21 @@ func TestPlatformInstallHelpShowsTheStandaloneFirstPath(t *testing.T) {
 	}
 }
 
+func TestPlatformUpgradeHelpNamesTheExplicitOwnershipMigration(t *testing.T) {
+	root := NewRootCommand()
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"platform", "upgrade", "--help"})
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("platform upgrade help: %v", err)
+	}
+	if got := output.String(); !strings.Contains(got, "--migrate-workload-applications") {
+		t.Errorf("upgrade help omits the explicit workload ownership migration:\n%s", got)
+	}
+}
+
 // Every platform command is implemented now. What is asserted here is that
 // each still refuses loudly rather than pretending: a command that cannot do
 // its job must exit non-zero and say why.

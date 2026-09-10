@@ -61,7 +61,7 @@ func stagePreflight(ctx context.Context, s *Session) error {
 	}
 	var report GateReport
 
-	report.add(checkBundlePath(s.From, s.To, s.installedProfiles(), s.haTier()))
+	report.add(checkBundlePath(s.From, s.To, s.installedProfiles(), s.haTier(), s.Opts.MigrateWorkloadApplications))
 	report.add(checkWindow(s))
 
 	dwell, err := s.To.Limits.Timeouts.For("node-ready")
@@ -331,12 +331,21 @@ func stageAgent(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if from == to {
+	if from == to && !s.Opts.MigrateWorkloadApplications {
 		s.Logf("  kubenest-agent unchanged at %s", to)
 		return nil
 	}
-	s.Logf("  kubenest-agent %s → %s", from, to)
-	return stages.NewComponentError("kubenest-agent", upgradeAgentChart(ctx, server, s.API, s.Jnl.ClusterID, s.To, to, s.Reporter))
+	if from != to {
+		s.Logf("  kubenest-agent %s → %s", from, to)
+		if err := upgradeAgentChart(ctx, server, s.To, to, s.Reporter); err != nil {
+			return stages.NewComponentError("kubenest-agent", err)
+		}
+	}
+	if !s.Opts.MigrateWorkloadApplications {
+		return nil
+	}
+	s.Logf("  migrating workload Application ownership to the in-cluster operator")
+	return stages.NewComponentError("kubenest-agent", migrateWorkloadApplicationOwnership(ctx, server, s.API, s.Jnl.ClusterID, s.To, s.Reporter))
 }
 
 // stageRecord updates the cluster's recorded bundle version.

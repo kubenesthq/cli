@@ -97,6 +97,26 @@ func WriteManifest(ctx context.Context, r Runner, name string, content []byte) e
 	return nil
 }
 
+// ReplaceManifest replaces a complete Kubernetes document through stdin.
+//
+// WriteManifest persists the k3s auto-deploy source for the next server
+// restart. It does not, however, update an object that the deploy controller
+// has already registered from that source. Callers changing a live resource
+// therefore pair the durable write with this direct replace. The document
+// carries its observed resourceVersion, so a concurrent writer is refused
+// rather than overwritten. As with WriteManifest, content can contain values
+// secrets and must never enter a command string.
+func ReplaceManifest(ctx context.Context, r Runner, content []byte) error {
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl replace -f -", bytes.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("replace manifest: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("replace manifest: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
+	}
+	return nil
+}
+
 // HelmChart describes one chart install expressed as a k3s HelmChart custom
 // resource. Version is REQUIRED and comes from the bundle manifest's core
 // pins — there is no "latest" here.

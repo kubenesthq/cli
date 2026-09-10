@@ -140,8 +140,9 @@ func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
 			"certManager": map[string]any{"enabled": false},
 		},
 	}
-	// A legacy backend omits this field; api.OperatorInstallInfo defaults that
-	// case to true. The explicit false path keeps the operator gate closed.
+	// The control plane declares which side owns workload Applications. A legacy
+	// response with no declaration is deliberately rendered closed: guessing
+	// open would permit two reconcilers to own one workload.
 	values["kubenest"].(map[string]any)["workloadApplications"] = map[string]any{
 		"enabled": !creds.Operator.CreatesWorkloadApplications,
 	}

@@ -208,7 +208,7 @@ func checkWindow(s *Session) GateResult {
 
 // checkBundlePath refuses a transition the target bundle does not offer for
 // this cluster's shape. Untested transitions are not offered.
-func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier string) GateResult {
+func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier string, migrateWorkloadApplications bool) GateResult {
 	// A BACKWARD transition is refused here, before anything is touched,
 	// rather than discovered at the point of no return. Kubernetes does not
 	// downgrade and neither does k3s: a bundle whose Kubernetes pin is older
@@ -226,6 +226,13 @@ func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier stri
 		}
 	}
 	if from.Bundle == to.Bundle {
+		if migrateWorkloadApplications {
+			return GateResult{
+				Gate:   GateBundlePath,
+				Passed: true,
+				Detail: fmt.Sprintf("bundle %s is unchanged; the explicit workload-Application ownership migration is the requested operation", to.Bundle),
+			}
+		}
 		return GateResult{
 			Gate: GateBundlePath, Passed: false,
 			Detail: fmt.Sprintf("this cluster is already on bundle %s", to.Bundle),

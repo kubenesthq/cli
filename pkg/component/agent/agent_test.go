@@ -73,8 +73,9 @@ func creds(withRepo bool) *api.AgentCredentials {
 			TokenVersion: 2,
 		},
 		Operator: api.OperatorInstallInfo{
-			Namespace: "kubenest-system",
-			ChartRef:  "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.2.0",
+			Namespace:                   "kubenest-system",
+			ChartRef:                    "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.2.0",
+			CreatesWorkloadApplications: true,
 		},
 	}
 	if withRepo {

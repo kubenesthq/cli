@@ -237,9 +237,10 @@ type RepoCredential struct {
 
 // OperatorInstallInfo is where and what to install — no secrets.
 type OperatorInstallInfo struct {
-	Namespace                   string `json:"namespace"`
-	ChartRef                    string `json:"chart_ref"`
-	CreatesWorkloadApplications bool   `json:"creates_workload_applications"`
+	Namespace                             string `json:"namespace"`
+	ChartRef                              string `json:"chart_ref"`
+	CreatesWorkloadApplications           bool   `json:"creates_workload_applications"`
+	WorkloadApplicationsOwnershipDeclared bool   `json:"-"`
 }
 
 func (o *OperatorInstallInfo) UnmarshalJSON(data []byte) error {
@@ -252,6 +253,11 @@ func (o *OperatorInstallInfo) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	o.Namespace, o.ChartRef = v.Namespace, v.ChartRef
+	o.WorkloadApplicationsOwnershipDeclared = v.Creates != nil
+	// Older control planes do not declare ownership. Keep the operator closed
+	// in that case: an explicit false is safer than guessing that a second
+	// reconciler is absent. The field remains modelled, so a caller can tell
+	// whether a newer control plane actually made the declaration.
 	o.CreatesWorkloadApplications = true
 	if v.Creates != nil {
 		o.CreatesWorkloadApplications = *v.Creates
