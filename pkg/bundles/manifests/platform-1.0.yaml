@@ -71,8 +71,66 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.6.14               # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 2.6.14 pins image 3c1e510. It establishes the configured GitOps
+  kubenest-agent: 2.6.16               # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 2.6.16 pins image 2b26e23, and it moves for ONE reason: 36551fd,
+                                       # where the operator STOPS ADVERTISING kubenest_sa_token once it owns
+                                       # its workload Applications. Until this pin moved, that fix existed as
+                                       # a published image that no install could take.
+                                       #
+                                       # WHAT A STANDALONE INSTALL ACTUALLY RECEIVES BY MOVING 2.6.14 ->
+                                       # 2.6.16. Read by extracting BOTH published archives and diffing them,
+                                       # not from the branch. Ignoring comments, README and the Chart.lock
+                                       # timestamp, the whole functional delta is three things:
+                                       #
+                                       #   image.tag             3c1e510 -> 2b26e23   the operator binary
+                                       #   image.digest          (new, empty) + deployment.yaml renders
+                                       #                         through the kubenest-operator.image helper
+                                       #                         instead of repository:tag  (eb245af)
+                                       #   workloadApplications.enabled   false -> null
+                                       #
+                                       # THE THIRD LINE IS THE BEHAVIOUR CHANGE AND IT IS NOT THE BEARER FIX.
+                                       # 2.6.14 shipped the migration gate as an explicit false, so a
+                                       # standalone install kept the legacy host-ArgoCD owner. 2.6.16 ships it
+                                       # UNSET, which hands the decision to the operator's one-time probe: a
+                                       # FRESH cluster opens the gate and owns its workload Applications
+                                       # locally. That is kn-k9ko (93f612e), not kn-bz3k, and anyone reading
+                                       # this pin as "the bearer fix" alone will be surprised by it.
+                                       #
+                                       # The upgrade direction is guarded and the guard is in the operator,
+                                       # not here: the resolved gate is recorded in the ConfigMap
+                                       # kubenest-workload-applications-gate, and an unset chart value READS
+                                       # THAT RECORD rather than re-probing. So an existing cluster whose host
+                                       # Applications have not been detached cannot be flipped open by this
+                                       # pin. Verified in source (workload_gate.go ResolveWorkloadApplications-
+                                       # Gate), not on an upgrade run.
+                                       #
+                                       # The binary also gains 8c555d8 (kn-k9ko: the operator REFUSES to
+                                       # overwrite a workload Application it does not own, instead of adopting
+                                       # a name collision into an overwrite with prune and selfHeal) and
+                                       # 2b26e23 (kn-pvxx: the StackDeploy CRD kind maps to the hub's "stack"
+                                       # resource vocabulary, so operator status reaches the backend mirror).
+                                       #
+                                       # PROVEN BEFORE THE CHART WAS CUT, because published chart versions are
+                                       # immutable: on a real k3d cluster running image digest
+                                       # sha256:d07e4f0f23f327659a4af70ab74c054e3bcaf5c49a6f52c4b90981cea49bc80f
+                                       # (the pod's own imageID, checked against the registry), heartbeats read
+                                       # at the receiving socket rather than from the operator's log — gate
+                                       # unset on a fresh cluster gave workload_applications_owner=operator
+                                       # with NO kubenest_sa_token, and an explicit
+                                       # kubenest.workloadApplications.enabled=false gave the bearer and no
+                                       # ownership field. Both directions, so the omission is known to refuse
+                                       # as well as to fire. The published 2.6.16 archive was then installed on
+                                       # a clean cluster and reproduced the first result.
+                                       #
+                                       # THIS PIN STILL CARRIES ONLY THE OPERATOR HALF of the credential
+                                       # sentence. The control plane must ALSO stop holding the bearer it was
+                                       # already given: backend b370dda clears the stored row on the ownership
+                                       # handover and a66c441 makes that clear fire on the ownership STATE
+                                       # rather than only on the transition. Neither is pinnable from here.
+                                       # Until a control plane carries both, an operator-owned cluster stops
+                                       # SENDING a credential the control plane may still be HOLDING.
+                                       #
+                                       # 2.6.14 pinned image 3c1e510. It establishes the configured GitOps
                                        # branch before the initial commit in a pre-existing empty repository,
                                        # verifies the remote ref after a push, and rejects a no-write signal
                                        # that previously looked like success. A real empty Gitea bootstrap
@@ -143,8 +201,17 @@ core:
                                        # 2.6.11 (ownership holes, then cache failure), or 2.6.12 (the cache
                                        # works but the namespace-identity guard was not yet present).
                                        # WHICH INSTALL MODE THIS REACHES: standalone OCI-chart installs
-                                       # consuming platform-1.0. Provisioned clusters receive it NOT AT ALL:
-                                       # the provisioner still installs chart 2.1.0 (kn-5mba, P0).
+                                       # consuming platform-1.0. Provisioned clusters receive it NOT AT ALL —
+                                       # but no longer for the reason this line used to give. The provisioner
+                                       # does not read this pin: it carries its OWN constants, and the
+                                       # published image ghcr.io/kubenesthq/provisioner:latest (revision
+                                       # 56fad137185678dc7d4b71e1143cfc615eeaf464) sets
+                                       # OPERATOR_CHART_VERSION="2.6.15" with an immutable
+                                       # OPERATOR_IMAGE_DIGEST. The old "still installs chart 2.1.0"
+                                       # (kn-5mba) was repaired by kn-provisioner-untraceable-pin-m1b2. So
+                                       # moving THIS line changes nothing for provisioned clusters in either
+                                       # direction, and the two populations now drift apart on purpose:
+                                       # standalone at 2.6.16, provisioned at 2.6.15.
                                        # 2.6.1 through 2.6.4 are immutable rejected recovery experiments;
                                        # never republish or repin them.
                                        # 2.5.0 (kn-sf17) is the first chart that can express a cluster with
