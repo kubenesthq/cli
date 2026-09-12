@@ -16,6 +16,7 @@ func NewClusterCommand() *cobra.Command {
 		Short: "Settings that belong to one cluster",
 	}
 	cmd.AddCommand(newSetWindowCommand())
+	cmd.AddCommand(newRotateTokenCommand())
 	return cmd
 }
 
@@ -54,5 +55,48 @@ a window that silently shifts by an hour is worse than no window at all.`,
 	fs.StringVar(&spec.Start, "start", "", "window start, HH:MM 24-hour (required)")
 	fs.StringVar(&spec.End, "end", "", "window end, HH:MM 24-hour; earlier than start means it crosses midnight (required)")
 	fs.StringVar(&spec.Timezone, "timezone", "", "IANA timezone name, e.g. Asia/Kolkata or UTC (required)")
+	return cmd
+}
+
+// newRotateTokenCommand rotates a cluster's agent token AND delivers it.
+//
+// The endpoint alone is not a hygiene operation: it raises the revocation floor
+// and drops the cluster's hub connection, and the new token only reaches the
+// agent through chart values. Anyone scheduling a fleet-wide rotation against
+// the endpoint would disconnect the fleet and learn about it from the alerts.
+// This command owns the order so that rotation ends where an operator expects
+// it to — with the cluster connected.
+func newRotateTokenCommand() *cobra.Command {
+	var f rotateFlags
+	cmd := &cobra.Command{
+		Use:   "rotate-token",
+		Short: "Rotate this cluster's agent token and deliver it",
+		Long: `Rotate the cluster's agent JWT, revoke every older one, and deliver the new
+token to the cluster.
+
+USE THIS WHEN YOU BELIEVE A TOKEN HAS LEAKED. It is not routine hygiene: the
+cluster is disconnected from the moment the floor is raised until the new token
+is delivered and the operator reconnects, and this command does not return
+success before that happens.
+
+If it fails after the rotation it says so and says the cluster is down. Re-run
+the same command to rotate again and finish delivery — there is no half state
+that needs a different repair.
+
+The server node is read from this machine's install journal. Pass --server when
+running from a machine that did not install the cluster.`,
+		Example: `  kubenest cluster rotate-token --cluster prod-1`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if f.Cluster == "" {
+				return fmt.Errorf("--cluster is required")
+			}
+			return runRotate(cmd.Context(), cmd.OutOrStdout(), f)
+		},
+	}
+	fs := cmd.Flags()
+	fs.StringVar(&f.Cluster, "cluster", "", "cluster whose token to rotate (required)")
+	fs.StringArrayVar(&f.Servers, "server", nil, "server node address (only needed without a local install journal)")
+	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the server node")
+	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	return cmd
 }

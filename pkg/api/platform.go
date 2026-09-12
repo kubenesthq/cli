@@ -257,3 +257,66 @@ func (c *Client) MaintenanceWindow(ctx context.Context, clusterID string) (Maint
 	}
 	return out, nil
 }
+
+// AgentTokenRotation is the result of POST /clusters/{id}/rotate-token (kn-i3c).
+//
+// IT CARRIES THE NEW JWT AND NOTHING ELSE THAT VALUES RENDERING NEEDS — no repo
+// credential, no operator install info. That is deliberate on the backend side
+// and it is why delivery patches the cluster's existing agent manifest rather
+// than re-rendering it: see agent.ReplaceJWTSecret. Re-minting to recover the
+// missing fields would rotate the token a second time.
+type AgentTokenRotation struct {
+	ClusterID string   `json:"cluster_id"`
+	AgentJWT  AgentJWT `json:"agent_jwt"`
+	// Enforcement is "in_force" when the hub confirmed the new revocation floor
+	// before the response was sent, or "pending" when it did not. Pending is not
+	// an error: the rotation already happened and every snapshot carries the
+	// floor, so enforcement follows within one snapshot interval.
+	Enforcement string `json:"enforcement"`
+	Detail      string `json:"detail"`
+	// ConnectionDropped says whether the hub closed a live operator connection.
+	// False does NOT mean the old token still works — usually it means the
+	// cluster was not connected at the time.
+	ConnectionDropped bool `json:"connection_dropped"`
+}
+
+// RotateAgentToken rotates the cluster's agent JWT and revokes every older one.
+//
+// THIS DISCONNECTS THE CLUSTER. The new token reaches the agent through chart
+// values, so the cluster stays disconnected until the token in the response is
+// delivered to it. Callers that stop here have not finished a rotation; they
+// have taken a cluster offline.
+func (c *Client) RotateAgentToken(ctx context.Context, clusterID string) (AgentTokenRotation, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/rotate-token"), nil)
+	if err != nil {
+		return AgentTokenRotation{}, err
+	}
+	var out AgentTokenRotation
+	if err := c.do(req, &out); err != nil {
+		return AgentTokenRotation{}, err
+	}
+	if out.AgentJWT.Token.IsZero() {
+		// The floor has already been raised by the time a response is written,
+		// so a response with no token is a rotation whose result was lost. Say
+		// that rather than delivering an empty secret.
+		return AgentTokenRotation{}, fmt.Errorf(
+			"the control plane rotated %s but returned no token: the cluster is now disconnected and the new token is not recoverable — re-run to rotate again", clusterID)
+	}
+	return out, nil
+}
+
+// Cluster reads one cluster's record, including the status the hub maintains.
+// Used to prove a rotated cluster came back rather than assuming it did.
+func (c *Client) Cluster(ctx context.Context, clusterID string) (Cluster, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)), nil)
+	if err != nil {
+		return Cluster{}, err
+	}
+	var out Cluster
+	if err := c.do(req, &out); err != nil {
+		return Cluster{}, err
+	}
+	return out, nil
+}
