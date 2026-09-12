@@ -36,6 +36,16 @@ type Cluster struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`
 	OrgID  string `json:"org_id"`
+	// LastHeartbeat is the control plane's record of when this cluster last
+	// reported. IT IS HERE BECAUSE Status ALONE CANNOT PROVE A RECONNECTION
+	// (kn-tlmv). Nothing moves Status away from "connected" when a rotation
+	// drops the live connection — the backend's health sweeper decides that
+	// from a clock, deliberately, because "a transport close is not a cluster
+	// being down". So a caller waiting for a cluster to come back must compare
+	// this value against the one it read before, and a pointer is the right
+	// shape: a cluster that has never reported has no timestamp, which is
+	// different from one whose timestamp has not moved.
+	LastHeartbeat *time.Time `json:"last_heartbeat"`
 }
 
 // ListOrgs returns the organizations this credential can see. A token bound to
