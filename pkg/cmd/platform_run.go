@@ -51,6 +51,21 @@ func controlPlaneClient() (*api.Client, error) {
 	return api.New(cfg.ControlPlaneURL, api.WithToken(token))
 }
 
+// controlPlaneConfigured reports whether this machine has a control plane to
+// talk to.
+//
+// A day-2 command has no `--standalone` flag because the cluster already
+// exists and its own record says what it is. The only thing left to decide
+// is where to read that record from, and that is answered by whether a
+// control plane was ever logged in to.
+func controlPlaneConfigured() (bool, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return false, err
+	}
+	return cfg.ControlPlaneURL != "", nil
+}
+
 // installSources resolves the two things an install needs before it starts:
 // the control plane, if there is one, and the bundle manifest.
 //

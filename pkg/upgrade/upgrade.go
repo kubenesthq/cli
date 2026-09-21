@@ -165,9 +165,13 @@ type Session struct {
 
 	// Window is the cluster's maintenance window, nil if none is set.
 	Window *window.Window
-	// Cluster is what the control plane records this cluster as: the bundle
-	// it is on, its profile set, its tier. Read once, at the start.
+	// Cluster is what the cluster's record says it IS: the bundle it is on,
+	// its profile set, its tier. Read once, at the start, from Records.
 	Cluster Recorded
+	// Records is where that record is read from and written back to — the
+	// control plane for a registered cluster, the cluster itself for a
+	// standalone one.
+	Records RecordStore
 	// Drills reports the last verified restore drill. Nil means no evidence
 	// is available, which the gate refuses rather than passes.
 	Drills DrillSource
@@ -377,8 +381,8 @@ func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
 	// The cluster is back on the bundle it came from, and the record must
 	// say so: a record that claims the new version after a rollback is worse
 	// than no record, because every day-2 operation trusts it.
-	if s.API != nil && s.Jnl.ClusterID != "" {
-		if err := s.API.PutBundleRecord(ctx, s.Jnl.ClusterID, api.BundleRecord{
+	if s.Records != nil {
+		if err := s.Records.Save(ctx, api.BundleRecord{
 			BundleVersion:        s.Record.FromBundle,
 			Profiles:             s.Cluster.Profiles,
 			HATier:               s.Cluster.HATier,

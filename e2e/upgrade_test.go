@@ -439,7 +439,8 @@ func upgradeSession(t *testing.T, env upgradeEnv, client *api.Client, from, to s
 	ctx := context.Background()
 	clusterID := clusterIDFor(t, ctx, client, env.cluster)
 
-	recorded, err := upgrade.LoadRecord(ctx, client, clusterID)
+	records := upgrade.ControlPlaneRecords{Client: client, ClusterID: clusterID}
+	recorded, err := records.Load(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +465,7 @@ func upgradeSession(t *testing.T, env upgradeEnv, client *api.Client, from, to s
 		ID: stages.NewRunID(), Opts: opts,
 		From: fromBundle, To: toBundle,
 		Jnl: journal, Reporter: converge.NewTextReporter(testWriter{t}),
-		Out: testWriter{t}, API: client, Cluster: recorded,
+		Out: testWriter{t}, API: client, Cluster: recorded, Records: records,
 		// The restore-drill gate reads real evidence from the cluster
 		// (kn-f9lm). Until that lands, the gate would refuse every upgrade,
 		// so the lab writes a real result object that the real reader reads

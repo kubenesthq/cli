@@ -187,6 +187,24 @@ func NodesFromJournal(j *Journal) (servers, agents []string) {
 	return strings.Fields(j.Identity.Fields["servers"]), strings.Fields(j.Identity.Fields["agents"])
 }
 
+// StandaloneFromJournal reports whether the install this journal records ran
+// with no control plane.
+//
+// It is the answer to "what IS this cluster" for a day-2 command, and it has
+// to come from the cluster's own install rather than from whatever this
+// machine happens to be logged in to: one laptop can hold a control-plane
+// login for one cluster and a standalone journal for another.
+func StandaloneFromJournal(j *Journal) (bool, error) {
+	if j == nil {
+		return false, nil
+	}
+	var rec Record
+	if err := j.DecodeState(&rec); err != nil {
+		return false, err
+	}
+	return rec.Standalone, nil
+}
+
 // Server returns the primary control-plane node — the one that runs kubectl
 // and holds the k3s auto-deploy directory.
 func (s *Session) Server() (k3s.Runner, error) {

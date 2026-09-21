@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/manifest"
 )
 
@@ -23,15 +25,11 @@ func newPlatformDiffCommand() *cobra.Command {
 				return fmt.Errorf("--from and --to are both required")
 			}
 			ctx := cmd.Context()
-			client, err := controlPlaneClient()
+			fromBundle, err := diffManifest(ctx, from)
 			if err != nil {
 				return err
 			}
-			fromBundle, err := fetchManifest(ctx, client, from)
-			if err != nil {
-				return err
-			}
-			toBundle, err := fetchManifest(ctx, client, to)
+			toBundle, err := diffManifest(ctx, to)
 			if err != nil {
 				return err
 			}
@@ -42,6 +40,35 @@ func newPlatformDiffCommand() *cobra.Command {
 	cmd.Flags().StringVar(&from, "from", "", "bundle version to compare from (required)")
 	cmd.Flags().StringVar(&to, "to", "", "bundle version to compare to (required)")
 	return cmd
+}
+
+// diffManifest resolves one side of the comparison.
+//
+// A diff is a question about two documents, and this binary already carries
+// both of the bundles it installs — so it answers from its own pins and only
+// asks a control plane for a version it does not have. It used to require a
+// login for every diff, which made `kubenest platform diff --from 0.9 --to
+// 1.0` — the example in its own help text — refuse to compare two files
+// sitting inside the running binary (kn-y3gt).
+func diffManifest(ctx context.Context, version string) (*manifest.Manifest, error) {
+	if m, err := bundles.Manifest(version); err == nil {
+		return m, nil
+	}
+	configured, err := controlPlaneConfigured()
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
+		// bundles.Manifest already names the versions this binary carries,
+		// so repeat its message rather than a worse one about logging in.
+		_, err := bundles.Manifest(version)
+		return nil, err
+	}
+	client, err := controlPlaneClient()
+	if err != nil {
+		return nil, err
+	}
+	return fetchManifest(ctx, client, version)
 }
 
 // renderDiff reports every component whose pin moves, and says plainly which

@@ -171,12 +171,8 @@ func stageRecordStandalone(ctx context.Context, s *Session) error {
 		VolumeGroupOwnership: string(ownership),
 		Standalone:           true,
 	}
-	doc, err := ClusterRecordManifest(record)
-	if err != nil {
+	if err := WriteClusterRecord(ctx, server, record); err != nil {
 		return err
-	}
-	if err := kubectlApply(ctx, server, doc); err != nil {
-		return fmt.Errorf("writing this cluster's bundle record: %w", err)
 	}
 	s.Logf("  standalone: recorded bundle %s on the cluster (configmap %s/%s)",
 		s.Opts.Bundle, ClusterRecordNamespace, ClusterRecordName)
@@ -212,6 +208,23 @@ func ClusterRecordManifest(record ClusterRecord) (string, error) {
 		return "", err
 	}
 	return string(doc), nil
+}
+
+// WriteClusterRecord writes a standalone cluster's record onto it.
+//
+// It is exported because an upgrade has to move this record forward when it
+// finishes, and a record written by one function and rewritten by another is
+// how the two come to disagree about what is installed. Stage 12 and
+// pkg/upgrade's ClusterRecords both land here.
+func WriteClusterRecord(ctx context.Context, r k3s.Runner, record ClusterRecord) error {
+	doc, err := ClusterRecordManifest(record)
+	if err != nil {
+		return err
+	}
+	if err := kubectlApply(ctx, r, doc); err != nil {
+		return fmt.Errorf("writing this cluster's bundle record: %w", err)
+	}
+	return nil
 }
 
 // ReadClusterRecord reads a standalone cluster's own record back off it.

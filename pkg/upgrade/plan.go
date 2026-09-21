@@ -353,14 +353,14 @@ func stageAgent(ctx context.Context, s *Session) error {
 // It runs last, after verify, so a cluster is never recorded as successfully
 // upgraded before the checks that say it was have passed.
 func stageRecord(ctx context.Context, s *Session) error {
-	if s.API == nil || s.Jnl.ClusterID == "" {
-		return fmt.Errorf("no registered cluster to record against")
+	if s.Records == nil {
+		return fmt.Errorf("no record store for this cluster, so a successful upgrade could not be recorded")
 	}
 	profiles := s.installedProfiles()
 	if profiles == nil {
 		profiles = []string{}
 	}
-	return s.API.PutBundleRecord(ctx, s.Jnl.ClusterID, api.BundleRecord{
+	return s.Records.Save(ctx, api.BundleRecord{
 		BundleVersion:        s.Opts.To,
 		Profiles:             profiles,
 		HATier:               s.haTier(),
