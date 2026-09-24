@@ -65,9 +65,13 @@ func TestPlatformInstallHelpShowsTheFirstClusterPath(t *testing.T) {
 	help := output.String()
 	for _, want := range []string{
 		// The first cluster: the control plane comes with it.
-		"kubenest platform install \\\n    --control-plane \\\n    --bundle 1.0",
-		// A later cluster: registered with the control plane already logged in to.
-		"kubenest platform install \\\n    --bundle 1.0",
+		// The bundle version on the next line is deliberately not asserted: it
+		// moves with every release, and pinning it here only breaks this test
+		// again on the next one.
+		"kubenest platform install \\\n    --control-plane \\\n    --bundle",
+		// A later cluster: registered with the control plane already logged in to,
+		// so it names a bundle and no control plane.
+		"kubenest platform install \\\n    --bundle",
 		"--admin-email",
 	} {
 		if !strings.Contains(help, want) {

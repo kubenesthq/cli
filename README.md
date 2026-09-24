@@ -18,7 +18,7 @@ host you supply:
 ```bash
 kubenest platform install \
   --standalone \
-  --bundle 1.0 \
+  --bundle 1.1 \
   --name prod-1 \
   --server 10.0.1.10 \
   --ha single-server \

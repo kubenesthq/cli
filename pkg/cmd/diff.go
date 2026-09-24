@@ -19,7 +19,7 @@ func newPlatformDiffCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "diff",
 		Short:   "Show what changes between two platform bundles",
-		Example: `  kubenest platform diff --from 0.9 --to 1.0`,
+		Example: `  kubenest platform diff --from 1.0 --to 1.1`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if from == "" || to == "" {
 				return fmt.Errorf("--from and --to are both required")
@@ -47,8 +47,8 @@ func newPlatformDiffCommand() *cobra.Command {
 // A diff is a question about two documents, and this binary already carries
 // both of the bundles it installs — so it answers from its own pins and only
 // asks a control plane for a version it does not have. It used to require a
-// login for every diff, which made `kubenest platform diff --from 0.9 --to
-// 1.0` — the example in its own help text — refuse to compare two files
+// login for every diff, which made `kubenest platform diff --from 1.0 --to
+// 1.1` — the example in its own help text — refuse to compare two files
 // sitting inside the running binary (kn-y3gt).
 func diffManifest(ctx context.Context, version string) (*manifest.Manifest, error) {
 	if m, err := bundles.Manifest(version); err == nil {

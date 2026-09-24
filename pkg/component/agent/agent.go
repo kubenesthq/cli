@@ -51,10 +51,19 @@ const manifestName = "kubenest-agent"
 // the limit, and is what production has always used (AGENTS.md section 5).
 const releaseName = "operator"
 
-// DeploymentName is the operator's Deployment, derived from the release name.
-// Exported because the installer, the upgrade and the acceptance checks all
-// need to name the same object.
-const DeploymentName = releaseName + "-kubenest-operator-2-controller-manager"
+// ChartName is the chart as Helm names it, which is also the prefix of the
+// helm.sh/chart label every object the chart renders carries —
+// "helm.sh/chart: kubenest-operator-2-<chart version>", from the chart's
+// templates/_helpers.tpl ("kubenest-operator.labels"). The agent upgrade
+// reads that label to tell whether helm has applied a new chart version, so
+// the name lives here rather than being spelled out at each reader.
+const ChartName = "kubenest-operator-2"
+
+// DeploymentName is the operator's Deployment: the release name, the chart
+// name and the suffix the chart gives its controller manager. Exported
+// because the installer, the upgrade and the acceptance checks all need to
+// name the same object.
+const DeploymentName = releaseName + "-" + ChartName + "-controller-manager"
 
 // ReleaseName is the Helm release the agent is installed as. Callers that
 // need to find it on a cluster read it from here rather than repeating it.

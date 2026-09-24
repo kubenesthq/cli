@@ -40,7 +40,7 @@ root-readable k3s config, and are removed before k3s restarts.`,
     --endpoint s3.ap-south-1.amazonaws.com \
     --bucket kubenest-backups-prod-1 --region ap-south-1 \
     --server 10.0.1.10 --ssh-user ubuntu \
-    --bundle-manifest bundles/platform-1.0.yaml`,
+    --bundle-manifest bundles/platform-1.1.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !confirm {
 				return fmt.Errorf("datastore restore stops every control-plane server and replaces cluster state: pass --confirm")

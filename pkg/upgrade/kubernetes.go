@@ -295,34 +295,81 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manif
 	return res.Err()
 }
 
-// agentUpgradedProbe waits for the chart resource to report the new version
-// and the deployment to be Available again.
+// agentUpgradedProbe waits for the operator Deployment to be running the new
+// chart: the helm.sh/chart label it carries names the version helm actually
+// applied, its pod template is observed, every replica is from it and
+// available, and none of the previous chart's replicas are left.
+//
+// The HelmChart's spec.version is deliberately not consulted. It is the field
+// this stage patched, so it reads back the target the instant the patch lands —
+// long before k3s's helm controller has rendered anything, and it would still
+// read the target if the controller never applied the chart at all. The
+// evidence that the new chart reached the cluster is the label the chart
+// stamps on its own objects (agent.ChartName): only helm rendering the new
+// version changes it.
+//
+// "Available" alone is not enough either, which is the defect this probe was
+// rewritten for. During a rolling update the previous ReplicaSet keeps the
+// Deployment Available, and before helm applies at all the old ReplicaSet is
+// the only one there is — so an upgrade whose only change is the agent
+// (bundle 1.0 → 1.1) could be recorded complete while the old operator was
+// still the one running. The replica counts say which ReplicaSet's pods are
+// actually up; pkg/controlplane's rolledOut is the same shape for the same
+// measured reason.
 func agentUpgradedProbe(r k3s.Runner, version string) converge.Probe {
+	object := "deployment " + agent.DeploymentName + " -n kubenest-system"
+	want := agent.ChartName + "-" + version
 	return func(ctx context.Context) (bool, converge.State, error) {
-		out, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.version}'")
-		if err != nil {
-			return false, converge.State{Object: "helmchart " + agent.ReleaseName(), Status: "unobservable"}, err
+		var d struct {
+			Metadata struct {
+				Labels     map[string]string `json:"labels"`
+				Generation int64             `json:"generation"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+			Status struct {
+				ObservedGeneration int64 `json:"observedGeneration"`
+				Replicas           int32 `json:"replicas"`
+				UpdatedReplicas    int32 `json:"updatedReplicas"`
+				AvailableReplicas  int32 `json:"availableReplicas"`
+			} `json:"status"`
 		}
-		if got := strings.Trim(strings.TrimSpace(out), "'"); got != version {
+		out, err := k3s.Kubectl(ctx, r,
+			"get deployment "+agent.DeploymentName+" -n kubenest-system -o json")
+		if err != nil {
+			return false, converge.State{Object: object, Status: "not found yet"}, err
+		}
+		if err := json.Unmarshal([]byte(out), &d); err != nil {
+			return false, converge.State{Object: object, Status: "unparsable"}, err
+		}
+		replicas := int32(1)
+		if d.Spec.Replicas != nil {
+			replicas = *d.Spec.Replicas
+		}
+		st := d.Status
+		switch label := d.Metadata.Labels["helm.sh/chart"]; {
+		case label == "":
+			return false, converge.State{Object: object, Status: "no helm.sh/chart label yet"}, nil
+		case label != want:
 			return false, converge.State{
-				Object: "helmchart kubenest-agent",
-				Status: "still at " + got,
+				Object: object,
+				Status: "still on chart " + label,
+				Detail: "the helm controller has not applied " + want + " yet",
+			}, nil
+		case d.Metadata.Generation > st.ObservedGeneration:
+			return false, converge.State{Object: object, Status: "the new pod template is not observed yet"}, nil
+		case st.Replicas > st.UpdatedReplicas:
+			return false, converge.State{
+				Object: object,
+				Status: fmt.Sprintf("%d replica(s) of the previous chart still running", st.Replicas-st.UpdatedReplicas),
+			}, nil
+		case st.UpdatedReplicas < replicas || st.AvailableReplicas < replicas:
+			return false, converge.State{
+				Object: object,
+				Status: fmt.Sprintf("%d/%d replicas updated, %d available", st.UpdatedReplicas, replicas, st.AvailableReplicas),
 			}, nil
 		}
-		out, err = k3s.Kubectl(ctx, r,
-			"get deployment "+agent.DeploymentName+" -n kubenest-system -o jsonpath='{.status.conditions[?(@.type==\"Available\")].status}'")
-		if err != nil {
-			return false, converge.State{Object: "the agent deployment", Status: "unobservable"}, err
-		}
-		statuses := strings.Fields(strings.Trim(out, "'"))
-		if len(statuses) == 0 {
-			return false, converge.State{Object: "the agent deployment", Status: "not found yet"}, nil
-		}
-		for _, s := range statuses {
-			if s != "True" {
-				return false, converge.State{Object: "the agent deployment", Status: "Available=" + s}, nil
-			}
-		}
-		return true, converge.State{Object: "the agent", Status: "Available at chart " + version}, nil
+		return true, converge.State{Object: object, Status: fmt.Sprintf("%d/%d on chart %s", st.AvailableReplicas, replicas, want)}, nil
 	}
 }

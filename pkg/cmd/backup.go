@@ -144,7 +144,7 @@ unconfigured — loud, but never blocking.`,
     --bucket kubenest-backups-prod-1 \
     --region ap-south-1 \
     --server 10.0.1.10 --ssh-user ubuntu \
-    --bundle-manifest bundles/platform-1.0.yaml`,
+    --bundle-manifest bundles/platform-1.1.yaml`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := conn.validate(); err != nil {
 				return err

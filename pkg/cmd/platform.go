@@ -156,7 +156,7 @@ this machine is logged in to; it needs no control plane of its own.`,
 		Example: `  # The first cluster: the platform, and the KubeNest control plane.
   kubenest platform install \
     --control-plane \
-    --bundle 1.0 \
+    --bundle 1.1 \
     --name prod-1 \
     --server 10.0.1.10 \
     --ha single-server \
@@ -166,7 +166,7 @@ this machine is logged in to; it needs no control plane of its own.`,
 
   # Every later cluster: registered with the control plane you are logged in to.
   kubenest platform install \
-    --bundle 1.0 \
+    --bundle 1.1 \
     --name prod-2 \
     --server 10.0.2.10 \
     --ha single-server \
@@ -258,10 +258,10 @@ matters most scans your live workloads for APIs the target Kubernetes version
 removes. If it finds any, the upgrade is blocked and the report names them: an
 upgrade that cleanly upgrades the cluster and takes your product down has
 actively harmed you.`,
-		Example: `  kubenest platform upgrade --cluster prod-1 --to 1.0
+		Example: `  kubenest platform upgrade --cluster prod-1 --to 1.1
 
   # Accept one finding you have judged safe. There is no blanket override.
-  kubenest platform upgrade --cluster prod-1 --to 1.0 \
+  kubenest platform upgrade --cluster prod-1 --to 1.1 \
     --acknowledge payments/Ingress/legacy-gateway`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if f.Cluster == "" {
