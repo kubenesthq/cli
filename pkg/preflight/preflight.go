@@ -173,16 +173,17 @@ type Options struct {
 	Nodes         []Node
 	Egress        []EgressTarget
 	// Catalog is where the offered bundles are read from: the control plane
-	// in a registered install, the versions built into this binary in a
-	// standalone one. Preflight does not care which — the request is checked
-	// against the offer either way.
+	// in an ordinary install, the versions built into this binary in a
+	// control-plane install. Preflight does not care which — the request is
+	// checked against the offer either way.
 	Catalog Catalog
-	// Standalone is an install with no control plane at all (kn-l827,
-	// decision 2026-08-26: nothing is hosted by us). It changes what the
-	// control-plane check REPORTS, not whether the bundle is checked: an
-	// unregistered cluster still may not be handed a tier or a profile its
-	// bundle does not offer.
-	Standalone bool
+	// ControlPlaneInstall is `platform install --control-plane` (decision
+	// D17, 2026-09-24): the install creates a control plane of its own in this
+	// cluster. There is therefore no control plane to reach and no credential
+	// to check yet — the cluster registers through the same API path as every
+	// other cluster, once the control plane it just installed is running. The
+	// bundle check still runs, against the catalog embedded in this binary.
+	ControlPlaneInstall bool
 }
 
 // Run executes every check against every node and returns the full report.
@@ -205,9 +206,9 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 }
 
 // checkControlPlaneAndBundle covers two of the eleven: where this cluster will
-// register — a reachable, logged-in control plane, or nothing at all under
-// --standalone — and whether the requested bundle exists and offers the
-// requested tier and profiles.
+// register — a reachable, logged-in control plane, or the one this install
+// creates under --control-plane — and whether the requested bundle exists and
+// offers the requested tier and profiles.
 //
 // The second check is the same in both modes. Only the first differs, and it
 // differs in what it reports rather than in whether it runs: a check that
@@ -230,7 +231,7 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 	if found == nil {
 		detail := fmt.Sprintf("this control plane does not offer bundle %q", opts.BundleVersion)
 		fix := "it offers " + orNone(offered)
-		if opts.Standalone {
+		if opts.ControlPlaneInstall {
 			detail = fmt.Sprintf("this CLI does not carry bundle %q", opts.BundleVersion)
 			fix = "it carries " + orNone(offered) + "; upgrade the CLI to a release that ships the bundle you want"
 		}
@@ -265,13 +266,14 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 // reports the control-plane check while it is there.
 //
 // The two modes differ in what "Control plane" MEANS, not in whether the
-// bundle is checked. Registered: it must be reachable and this CLI logged in.
-// Standalone: there is nothing to reach, and saying "pass" would be a check
-// reporting on something that does not exist — so it reports what is actually
-// true, which is that this cluster will register with nothing.
+// bundle is checked. Ordinary install: it must be reachable and this CLI
+// logged in. Control-plane install: the control plane is being created by this
+// very run, so there is nothing to reach yet — and saying "pass" would be a
+// check reporting on something that does not exist. It reports what is
+// actually true, which is that the registration happens after the install.
 func offeredBundles(ctx context.Context, opts Options, rep *Report) ([]BundleEntry, bool) {
 	if opts.Catalog == nil {
-		if opts.Standalone {
+		if opts.ControlPlaneInstall {
 			// Not a login problem: the binary is supposed to carry its own
 			// catalog, so this is a build that shipped without one.
 			rep.add(Result{
@@ -284,14 +286,14 @@ func offeredBundles(ctx context.Context, opts Options, rep *Report) ([]BundleEnt
 		rep.add(Result{
 			Check: CheckControlPlane, Outcome: Fail,
 			Detail: "no control plane configured",
-			Fix:    "run `kubenest login` first, or install without one: `kubenest platform install --standalone`",
+			Fix:    "run `kubenest login` first, or install the control plane with this cluster: `kubenest platform install --control-plane`",
 		})
 		return nil, false
 	}
 
 	bundles, err := opts.Catalog.ListBundles(ctx)
 	if err != nil {
-		if opts.Standalone {
+		if opts.ControlPlaneInstall {
 			rep.add(Result{
 				Check: CheckBundle, Outcome: Fail,
 				Detail: "the bundle catalog built into this CLI could not be read: " + err.Error(),
@@ -313,10 +315,10 @@ func offeredBundles(ctx context.Context, opts Options, rep *Report) ([]BundleEnt
 		return nil, false
 	}
 
-	if opts.Standalone {
+	if opts.ControlPlaneInstall {
 		rep.add(Result{
 			Check: CheckControlPlane, Outcome: Pass,
-			Detail: fmt.Sprintf("not applicable: installing standalone, so this cluster registers with nothing and %d bundle(s) come from this CLI", len(bundles)),
+			Detail: fmt.Sprintf("not applicable: this install creates the control plane in this cluster, which then registers through the same API as every other cluster; %d bundle(s) come from this CLI", len(bundles)),
 		})
 		return bundles, true
 	}

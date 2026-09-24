@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -253,6 +254,20 @@ func startSSHServer(t *testing.T, authorized ssh.PublicKey) (addr string, hostKe
 				defer conn.Close()
 				go ssh.DiscardRequests(reqs)
 				for newCh := range chans {
+					if newCh.ChannelType() == "direct-tcpip" {
+						ch, chReqs, err := newCh.Accept()
+						if err != nil {
+							continue
+						}
+						go func(ch ssh.Channel, chReqs <-chan *ssh.Request) {
+							defer ch.Close()
+							go ssh.DiscardRequests(chReqs)
+							// Echo: whatever the caller writes comes back, which
+							// is all a test needs to see the tunnel carry bytes.
+							io.Copy(ch, ch)
+						}(ch, chReqs)
+						continue
+					}
 					if newCh.ChannelType() != "session" {
 						newCh.Reject(ssh.UnknownChannelType, "only session")
 						continue
@@ -425,5 +440,75 @@ func TestChangedHostKeyIsRefused(t *testing.T) {
 	_, err = Dial(context.Background(), ep, opts)
 	if err == nil || !strings.Contains(err.Error(), "HOST KEY CHANGED") {
 		t.Errorf("dial with a changed host key must refuse loudly, got: %v", err)
+	}
+}
+
+// DialTCP opens its connection FROM the remote host, so the CLI reaches the
+// cluster's internal service addresses (kubenest-cp-backend.<ns>.svc:8000)
+// that the installer machine cannot route to. The address is opaque to the
+// CLI: it is the host that resolves it.
+func TestDialTCPConnectsFromTheRemoteHost(t *testing.T) {
+	pemBytes, pub := genKey(t)
+	keyPath := writeKey(t, pemBytes)
+	addr, _ := startSSHServer(t, pub)
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	opts := Options{
+		User: "test", KeyPath: keyPath, Port: port,
+		ConfigPath:     filepath.Join(t.TempDir(), "config"),
+		KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
+		AgentSocket:    noAgent,
+	}
+	ep, err := Resolve(host, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := Dial(context.Background(), ep, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn, err := client.DialTCP(ctx, "kubenest-cp-backend.kubenest-system.svc.cluster.local:8000")
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer conn.Close()
+
+	// ssh's tcpChan has no deadline support, so the read below is bounded by
+	// a timer rather than by the connection.
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write over tunnel: %v", err)
+	}
+	echoed := make([]byte, 4)
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(conn, echoed)
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("read over tunnel: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the tunnel carried nothing back")
+	}
+	if string(echoed) != "ping" {
+		t.Errorf("tunnel echoed %q, want ping", echoed)
+	}
+
+	// A cancelled context abandons the dial rather than blocking until the
+	// host answers.
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if _, err := client.DialTCP(cancelled, "kubenest-cp-backend.kubenest-system.svc.cluster.local:8000"); err == nil {
+		t.Error("DialTCP with a cancelled context returned a connection")
 	}
 }

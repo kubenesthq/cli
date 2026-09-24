@@ -104,7 +104,7 @@ func TestReplaceJWTSecretDoesNotLeakTheOldToken(t *testing.T) {
 }
 
 func TestReplaceJWTSecretRefuses(t *testing.T) {
-	unmanaged := strings.Replace(installedManifest,
+	withoutJWT := strings.Replace(installedManifest,
 		"      jwtSecret: the-old-token\n", "", 1)
 	noValues := `apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -123,7 +123,7 @@ spec:
 		{"an empty token", installedManifest, "", "empty agent JWT"},
 		{"a different kind", strings.Replace(installedManifest, "kind: HelmChart", "kind: ConfigMap", 1), "t", "not HelmChart"},
 		{"no valuesContent", noValues, "t", "no spec.valuesContent"},
-		{"no jwtSecret to replace", unmanaged, "t", "sets no kubenest.jwtSecret"},
+		{"no jwtSecret to replace", withoutJWT, "t", "sets no kubenest.jwtSecret"},
 		{"no targetNamespace", noNamespace, "t", "no spec.targetNamespace"},
 		{"not YAML at all", "\x00\x01 not yaml: [", "t", "parsing"},
 	}

@@ -21,7 +21,7 @@ import (
 // ships a values.schema.json, which is why helm accepts and discards.
 func TestARepoCredentialIsRefusedAgainstAChartThatCannotCarryIt(t *testing.T) {
 	for _, version := range []string{"2.2.0", "2.3.0", "2.3.4", "2.3.5"} {
-		_, err := agent.Chart(bundleWithAgent(t, version), creds(true))
+		_, err := agent.Chart(bundleWithAgent(t, version), creds(true), agent.ValuesOptions{})
 		if err == nil {
 			t.Fatalf("chart %s cannot deliver a working deploy key and must be refused", version)
 		}
@@ -42,7 +42,7 @@ func TestARepoCredentialIsRefusedAgainstAChartThatCannotCarryIt(t *testing.T) {
 // future reader lowering the constant back to 2.3.5 would still see the test
 // above pass on 2.2.0 and think the gate was intact.
 func TestTheChartThatCarriesTheValueButCannotReadItIsAlsoRefused(t *testing.T) {
-	if _, err := agent.Chart(bundleWithAgent(t, "2.3.5"), creds(true)); err == nil {
+	if _, err := agent.Chart(bundleWithAgent(t, "2.3.5"), creds(true), agent.ValuesOptions{}); err == nil {
 		t.Fatal("2.3.5 accepts gitSSHPrivateKey but its operator cannot read it; it must be refused")
 	}
 }
@@ -52,7 +52,7 @@ func TestTheChartThatCarriesTheValueButCannotReadItIsAlsoRefused(t *testing.T) {
 // rather than the ones that cannot work.
 func TestARepoCredentialIsAcceptedAtTheFirstChartThatCarriesIt(t *testing.T) {
 	for _, version := range []string{"2.4.0", "2.4.1", "2.10.0", "3.0.0"} {
-		if _, err := agent.Chart(bundleWithAgent(t, version), creds(true)); err != nil {
+		if _, err := agent.Chart(bundleWithAgent(t, version), creds(true), agent.ValuesOptions{}); err != nil {
 			t.Errorf("chart %s delivers a working deploy key and must be accepted: %v", version, err)
 		}
 	}
@@ -63,7 +63,7 @@ func TestARepoCredentialIsAcceptedAtTheFirstChartThatCarriesIt(t *testing.T) {
 // must keep working — 0.9's pin is deliberate history, not a defect to fix by
 // moving it.
 func TestAnOldChartIsFineWithNoRepoCredential(t *testing.T) {
-	if _, err := agent.Chart(bundleWithAgent(t, "2.2.0"), creds(false)); err != nil {
+	if _, err := agent.Chart(bundleWithAgent(t, "2.2.0"), creds(false), agent.ValuesOptions{}); err != nil {
 		t.Errorf("bundle 0.9 without a GitOps repo must still install: %v", err)
 	}
 }
@@ -72,7 +72,7 @@ func TestAnOldChartIsFineWithNoRepoCredential(t *testing.T) {
 // defaults an unparseable version to "supported" fails open, which is the
 // shape of defect this whole change is about.
 func TestAnUnreadablePinIsRefusedRatherThanAssumedNewEnough(t *testing.T) {
-	_, err := agent.Chart(bundleWithAgent(t, "latest"), creds(true))
+	_, err := agent.Chart(bundleWithAgent(t, "latest"), creds(true), agent.ValuesOptions{})
 	if err == nil {
 		t.Fatal("an unparseable chart pin was treated as carrying the deploy key values")
 	}

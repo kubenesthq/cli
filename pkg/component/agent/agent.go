@@ -60,6 +60,33 @@ const DeploymentName = releaseName + "-kubenest-operator-2-controller-manager"
 // need to find it on a cluster read it from here rather than repeating it.
 func ReleaseName() string { return releaseName }
 
+// platformCAConfigMap is the ConfigMap the install creates when it hands the
+// operator the platform's certificate authority. It lives in the operator's
+// own namespace so the chart's volume reference needs no cross-namespace
+// lookup.
+const platformCAConfigMap = "kubenest-platform-ca"
+
+// platformCAMountPath is where that ConfigMap is mounted. SSL_CERT_DIR points
+// at it, and the Go runtime loads every *.crt-style file in every directory
+// named there — which is why the file inside the ConfigMap is called ca.crt.
+const platformCAMountPath = "/etc/kubenest/platform-ca"
+
+// ValuesOptions carries what an install knows and the mint cannot.
+//
+// BackendURLOverride replaces the hub URL the mint returned. The management
+// cluster's operator talks to the control plane running inside that same
+// cluster, where the control plane is reachable by its in-cluster service name
+// and not by the public hub URL the mint hands every other cluster.
+//
+// ControlPlaneCA is the PEM of the authority the control plane's serving
+// certificate chains to. When it is set the rendered install mounts it and
+// points the operator's runtime at it, so the operator can verify an endpoint
+// whose certificate no public root signs.
+type ValuesOptions struct {
+	BackendURLOverride string
+	ControlPlaneCA     []byte
+}
+
 // Values renders the chart values for one cluster's agent.
 //
 // Three bootstrap dependencies of the operator chart are decided here, and
@@ -100,7 +127,12 @@ func ReleaseName() string { return releaseName }
 // version the value is omitted and the install proceeds unpinned — which is
 // what every install did before this field existed, where refusing would take
 // out an install path over hardening it.
-func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
+//
+// The last two values do not come from the mint at all: ValuesOptions carries
+// what only the caller knows, which is how the management cluster's operator
+// finds the control plane that runs beside it and how it verifies that control
+// plane's certificate.
+func Values(creds *api.AgentCredentials, chartVersion string, opts ValuesOptions) (string, error) {
 	if creds == nil {
 		return "", fmt.Errorf("the agent needs the credentials minted in stage 2")
 	}
@@ -135,16 +167,41 @@ func Values(creds *api.AgentCredentials, chartVersion string) (string, error) {
 			// in-cluster helm controller.
 			"jwtSecret":  creds.AgentJWT.Token.Reveal(),
 			"backendURL": creds.AgentJWT.HubURL,
+			// The operator owns workload Applications on every cluster
+			// (kn-cjqw OPTION A, 2026-09-10). The control plane never creates
+			// one, so the mint's creates_workload_applications is deliberately
+			// not read here: a receiver that was told it owns nothing would
+			// leave every workload Application owned by nobody.
+			"workloadApplications": map[string]any{"enabled": true},
 		},
 		"bootstrap": map[string]any{
 			"certManager": map[string]any{"enabled": false},
 		},
 	}
-	// The control plane declares which side owns workload Applications. A legacy
-	// response with no declaration is deliberately rendered closed: guessing
-	// open would permit two reconcilers to own one workload.
-	values["kubenest"].(map[string]any)["workloadApplications"] = map[string]any{
-		"enabled": !creds.Operator.CreatesWorkloadApplications,
+	if opts.BackendURLOverride != "" {
+		// The management cluster's own operator dials the control plane that
+		// runs inside it, whose in-cluster service name is not the public hub
+		// URL the mint returned.
+		values["kubenest"].(map[string]any)["backendURL"] = opts.BackendURLOverride
+	}
+	if len(opts.ControlPlaneCA) > 0 {
+		values["extraVolumes"] = []any{map[string]any{
+			"name":      platformCAConfigMap,
+			"configMap": map[string]any{"name": platformCAConfigMap},
+		}}
+		values["extraVolumeMounts"] = []any{map[string]any{
+			"name":      platformCAConfigMap,
+			"mountPath": platformCAMountPath,
+			"readOnly":  true,
+		}}
+		// SSL_CERT_DIR and NOT SSL_CERT_FILE: the runtime loads the
+		// certificates found in every directory listed here in ADDITION to the
+		// system roots, while SSL_CERT_FILE would replace them and leave the
+		// operator unable to verify anything the platform CA has not signed.
+		values["extraEnv"] = []any{map[string]any{
+			"name":  "SSL_CERT_DIR",
+			"value": "/etc/ssl/certs:" + platformCAMountPath,
+		}}
 	}
 	if creds.RepoCredential != nil {
 		values["bootstrap"].(map[string]any)["gitea"] = map[string]any{"enabled": false}
@@ -233,21 +290,11 @@ func chartPinsHostKey(version string) bool {
 	return err == nil && cmp >= 0
 }
 
-// minChartForUnmanaged is the first chart that can express "this cluster has
-// no hub" (kn-sf17). Below it the value is not merely unsupported, it is
-// SILENTLY DISCARDED: no chart in this line ships a values.schema.json, so
-// helm accepts kubenest.unmanaged and drops it — the same way it dropped
-// gitSSHPrivateKey on charts before 2.3.5. What saves the reader on 2.4.x is
-// an accident rather than a design: the render then fails on the missing
-// backendURL, loudly, but with a message about the wrong thing. Refuse here
-// instead, naming the version that works.
-const minChartForUnmanaged = "2.5.0"
-
 // Chart renders the agent's HelmChart resource at the bundle's pin. The chart
 // reference comes from the MINT (operator.chart_ref), not from a constant:
 // the control plane composes it from the manifest's sources section, and a
 // hardcoded registry is how kn-z6e4 shipped a chart_ref that did not exist.
-func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChart, error) {
+func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials, opts ValuesOptions) (k3s.HelmChart, error) {
 	version, err := bundle.Core.Version("kubenest-agent")
 	if err != nil {
 		return k3s.HelmChart{}, err
@@ -273,7 +320,7 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials) (k3s.HelmChar
 				version, minChartWithRepoCredential, minChartWithRepoCredential)
 		}
 	}
-	values, err := Values(creds, version)
+	values, err := Values(creds, version, opts)
 	if err != nil {
 		return k3s.HelmChart{}, err
 	}
@@ -324,117 +371,44 @@ func chartRepository(ref string) string {
 	return ref[:slash+1+colon]
 }
 
-// UnmanagedValues renders the agent values for a cluster with no hub
-// (kn-sf17).
-//
-// AN IDENTITY AND NOTHING ELSE. There is no jwtSecret and no backendURL, and
-// their absence is the whole point rather than an omission to be tidied up
-// later: with no hub there is no second party to authenticate to, so there is
-// no bearer to hold. Generating one locally to satisfy the chart would be a
-// credential trusted by nothing that reads as real six months from now — the
-// same reasoning that made stageRegisterStandalone mint nothing.
-//
-// kubenest.unmanaged is what tells the operator the absence is deliberate. The
-// chart refuses to render if it is set alongside either value, so this cannot
-// drift into a half-registered cluster.
-func UnmanagedValues(clusterID string) (string, error) {
-	if clusterID == "" {
-		return "", fmt.Errorf("a standalone cluster still needs an identity: the agent's Secret cannot be rendered without a cluster id, and an operator with an empty one is the kn-z6e4 defect regardless of whether a hub is watching")
-	}
-	values := map[string]any{
-		"kubenest": map[string]any{
-			"clusterID": clusterID,
-			"unmanaged": true,
-		},
-		"bootstrap": map[string]any{
-			"certManager": map[string]any{"enabled": false},
-			// No hub means no control plane means no GitOps repo to be
-			// handed. Gitea stays off for the same reason it is off on the
-			// registered path: the platform installs cert-manager itself.
-			"gitea": map[string]any{"enabled": false},
-		},
-	}
-	out, err := yaml.Marshal(values)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-// UnmanagedChart is Chart for a cluster with no control plane to have minted
-// anything.
-//
-// The chart reference comes from the bundle manifest's sources section rather
-// than from a mint, which is the only difference in where it looks: the
-// VERSION still comes from core, so one pin still lives in one place.
-func UnmanagedChart(bundle *manifest.Manifest, clusterID string) (k3s.HelmChart, error) {
-	version, err := bundle.Core.Version("kubenest-agent")
-	if err != nil {
-		return k3s.HelmChart{}, err
-	}
-	cmp, err := manifest.CompareVersions(version, minChartForUnmanaged)
-	if err != nil {
-		return k3s.HelmChart{}, fmt.Errorf("cannot tell whether kubenest-agent %s supports unmanaged mode: %w", version, err)
-	}
-	if cmp < 0 {
-		return k3s.HelmChart{}, fmt.Errorf(
-			"bundle pins kubenest-agent %s, which cannot express a cluster with no hub: kubenest.unmanaged is accepted and silently discarded (no values.schema.json), so the agent would be installed expecting a hub it will never have. %s is the first chart that carries the mode. Install this cluster from a bundle that pins %s or later",
-			version, minChartForUnmanaged, minChartForUnmanaged)
-	}
-	ref, err := bundle.Sources.Version("kubenest-agent")
-	if err != nil {
-		return k3s.HelmChart{}, fmt.Errorf("a standalone install has no mint to supply the operator chart reference, so the bundle manifest must carry it under sources: %w", err)
-	}
-	values, err := UnmanagedValues(clusterID)
-	if err != nil {
-		return k3s.HelmChart{}, err
-	}
-	return k3s.HelmChart{
-		Name:            releaseName,
-		Chart:           chartRepository(ref),
-		Version:         version,
-		TargetNamespace: UnmanagedNamespace,
-		ValuesYAML:      values,
-	}, nil
-}
-
-// UnmanagedNamespace is where a standalone agent lands. The registered path
-// takes this from the mint (operator.namespace); with no mint the value has to
-// come from somewhere, and this is the namespace every other platform
-// component already uses.
-const UnmanagedNamespace = "kubenest-system"
-
-// InstallUnmanaged places the agent on a cluster with no hub and waits for it
-// to be Ready — which it now can be, because readiness reflects the
-// controllers rather than a hub connection when the operator is unmanaged
-// (kn-sf17, operator 7b84b83 / chart 2.5.0).
-func InstallUnmanaged(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, clusterID string, rep converge.Reporter) error {
-	chart, err := UnmanagedChart(bundle, clusterID)
-	if err != nil {
-		return err
-	}
-	return installChart(ctx, r, bundle, chart, rep)
-}
-
 // Install places the agent and waits for it to be Ready.
-func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, creds *api.AgentCredentials, rep converge.Reporter) error {
-	chart, err := Chart(bundle, creds)
+//
+// Every cluster — the management cluster included — reaches this with
+// credentials minted by a control plane, because every cluster registers
+// through the same API path (decision D17, 2026-09-24). The management
+// cluster's difference is in opts, not in the path taken.
+func Install(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, creds *api.AgentCredentials, opts ValuesOptions, rep converge.Reporter) error {
+	chart, err := Chart(bundle, creds, opts)
 	if err != nil {
 		return err
 	}
-	return installChart(ctx, r, bundle, chart, rep)
+	return installChart(ctx, r, bundle, chart, opts.ControlPlaneCA, rep)
 }
 
-// installChart is the half of Install that does not care how the chart was
-// built. Shared with InstallUnmanaged so the two paths cannot drift in how
-// they write, restrict and wait — the 0600 in particular, which is not
-// conditional on there being a secret in the file today: the manifest
-// directory is world-readable, and a standalone values file still names the
-// cluster's identity.
-func installChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, chart k3s.HelmChart, rep converge.Reporter) error {
+// installChart writes the agent's manifest, restricts it, and waits for it to
+// be Ready.
+//
+// The 0600 is not conditional on there being a secret in the file today: the
+// manifest directory is world-readable, and every values document this package
+// renders names the cluster's identity or its credentials.
+//
+// controlPlaneCA, when set, is written as a manifest of its own BEFORE the
+// chart's, so the ConfigMap the operator's Pod mounts is on the way to the
+// cluster first. The agent's own manifest stays a single HelmChart document,
+// which is what pkg/component/agent's rotation reads and patches.
+func installChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, chart k3s.HelmChart, controlPlaneCA []byte, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
+	}
+	if len(controlPlaneCA) > 0 {
+		configMap, err := platformCAManifest(chart.TargetNamespace, controlPlaneCA)
+		if err != nil {
+			return err
+		}
+		if err := k3s.WriteManifest(ctx, r, platformCAConfigMap, configMap); err != nil {
+			return err
+		}
 	}
 	doc, err := chart.Manifest()
 	if err != nil {
@@ -456,6 +430,27 @@ func installChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, 
 		return err
 	}
 	return res.Err()
+}
+
+// platformCAManifest renders the ConfigMap the operator mounts when the
+// install hands it the platform's certificate authority.
+//
+// The namespace is the OPERATOR's, taken from the mint rather than fixed here,
+// because a ConfigMap can only be mounted from the namespace the pod runs in.
+func platformCAManifest(namespace string, ca []byte) ([]byte, error) {
+	if namespace == "" {
+		return nil, fmt.Errorf("the platform CA ConfigMap needs the operator's namespace")
+	}
+	return yaml.Marshal(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      platformCAConfigMap,
+			"namespace": namespace,
+			"labels":    map[string]string{"app.kubernetes.io/managed-by": "kubenest-cli"},
+		},
+		"data": map[string]string{"ca.crt": string(ca)},
+	})
 }
 
 func restrict(ctx context.Context, r k3s.Runner, path string) error {

@@ -164,6 +164,50 @@ func TestHelmChartWithoutVersionIsAnError(t *testing.T) {
 	}
 }
 
+// An inline chart archive is self-contained: the spec carries chartContent
+// and must NOT carry repo, chart or version, which helm-controller rejects
+// alongside it. This is how the control-plane chart is installed — it is
+// published nowhere.
+func TestHelmChartWithChartContentRendersInlineArchive(t *testing.T) {
+	raw, err := HelmChart{
+		Name:            "kubenest-control-plane",
+		ChartContent:    "UEsDBAoAAAAAAA==",
+		TargetNamespace: "kubenest-system",
+		ValuesYAML:      "domain: example.com\n",
+	}.Manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Spec map[string]any `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Spec["chartContent"] != "UEsDBAoAAAAAAA==" {
+		t.Errorf("spec.chartContent = %v, want the archive", doc.Spec["chartContent"])
+	}
+	for _, key := range []string{"repo", "chart", "version"} {
+		if _, ok := doc.Spec[key]; ok {
+			t.Errorf("spec.%s is set beside chartContent: %v", key, doc.Spec[key])
+		}
+	}
+	if doc.Spec["targetNamespace"] != "kubenest-system" {
+		t.Errorf("targetNamespace = %v", doc.Spec["targetNamespace"])
+	}
+}
+
+func TestHelmChartRejectsChartContentWithRepoOrChart(t *testing.T) {
+	for _, hc := range []HelmChart{
+		{Name: "x", ChartContent: "UEsDBAoAAAAAAA==", Repo: "https://charts.example.com", TargetNamespace: "ns"},
+		{Name: "x", ChartContent: "UEsDBAoAAAAAAA==", Chart: "some-chart", TargetNamespace: "ns"},
+	} {
+		if _, err := hc.Manifest(); err == nil {
+			t.Errorf("HelmChart %+v accepted two chart sources", hc)
+		}
+	}
+}
+
 const podsCmd = "sudo -n k3s kubectl get pods -n openebs -o json"
 
 func TestCheckPodsReadyReportsTheStuckPodWithItsReason(t *testing.T) {

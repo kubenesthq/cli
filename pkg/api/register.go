@@ -246,71 +246,16 @@ type RepoCredential struct {
 }
 
 // OperatorInstallInfo is where and what to install — no secrets.
+//
+// CreatesWorkloadApplications is the control plane's answer about who owns
+// workload Applications. It is purely informational: the in-cluster operator
+// owns them on every cluster (kn-cjqw OPTION A, 2026-09-10), so the renderer
+// installs it that way whatever this says. The field is modelled so the wire
+// stays documented, not because a decision hangs on it.
 type OperatorInstallInfo struct {
-	Namespace                             string `json:"namespace"`
-	ChartRef                              string `json:"chart_ref"`
-	CreatesWorkloadApplications           bool   `json:"creates_workload_applications"`
-	WorkloadApplicationsOwnershipDeclared bool   `json:"-"`
-}
-
-func (o *OperatorInstallInfo) UnmarshalJSON(data []byte) error {
-	var v struct {
-		Namespace string `json:"namespace"`
-		ChartRef  string `json:"chart_ref"`
-		Creates   *bool  `json:"creates_workload_applications"`
-	}
-	if err := json.Unmarshal(data, &v); err != nil {
-		return err
-	}
-	o.Namespace, o.ChartRef = v.Namespace, v.ChartRef
-	o.WorkloadApplicationsOwnershipDeclared = v.Creates != nil
-	// Older control planes do not declare ownership. Keep the operator closed
-	// in that case: an explicit false is safer than guessing that a second
-	// reconciler is absent. The field remains modelled, so a caller can tell
-	// whether a newer control plane actually made the declaration.
-	o.CreatesWorkloadApplications = true
-	if v.Creates != nil {
-		o.CreatesWorkloadApplications = *v.Creates
-	}
-	return nil
-}
-
-type WorkloadApplicationsDetachResult struct {
-	Workload    string `json:"workload"`
-	Application string `json:"application"`
-	Result      string `json:"result"`
-}
-
-type WorkloadApplicationsDetachResponse struct {
-	ClusterID string                             `json:"cluster_id"`
-	State     string                             `json:"state"`
-	Results   []WorkloadApplicationsDetachResult `json:"results"`
-	Message   string                             `json:"message"`
-}
-
-// DetachWorkloadApplications hands host Applications to the in-cluster
-// operator before an upgrade opens its ownership gate. The backend performs
-// the host-cluster mutation; the CLI must not attempt to reproduce it.
-func (c *Client) DetachWorkloadApplications(ctx context.Context, clusterID string) (*WorkloadApplicationsDetachResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/workload-applications/detach"), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	var out WorkloadApplicationsDetachResponse
-	if err := c.do(req, &out); err != nil {
-		return nil, err
-	}
-	for _, result := range out.Results {
-		if result.Result != "detached" && result.Result != "already_absent" {
-			return nil, fmt.Errorf("workload application %s was not detached: %s", result.Application, result.Result)
-		}
-	}
-	if out.State != "migrating" && out.State != "operator" {
-		return nil, fmt.Errorf("workload-application detach returned unsafe state %q", out.State)
-	}
-	return &out, nil
+	Namespace                   string `json:"namespace"`
+	ChartRef                    string `json:"chart_ref"`
+	CreatesWorkloadApplications bool   `json:"creates_workload_applications"`
 }
 
 // AgentCredentials is the mint response. Returned exactly once: there is no

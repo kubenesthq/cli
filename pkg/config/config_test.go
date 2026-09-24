@@ -14,6 +14,7 @@ func TestRoundTrip(t *testing.T) {
 		ControlPlaneURL: "https://api.example.com",
 		Token:           "tok-123",
 		UserEmail:       "op@example.com",
+		ControlPlaneCA:  "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
 	}
 	if err := saveTo(path, want); err != nil {
 		t.Fatalf("save: %v", err)

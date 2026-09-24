@@ -73,9 +73,12 @@ func creds(withRepo bool) *api.AgentCredentials {
 			TokenVersion: 2,
 		},
 		Operator: api.OperatorInstallInfo{
-			Namespace:                   "kubenest-system",
-			ChartRef:                    "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.2.0",
-			CreatesWorkloadApplications: true,
+			Namespace: "kubenest-system",
+			ChartRef:  "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2:2.2.0",
+			// The control plane always answers false now (kn-cjqw OPTION A).
+			// Option A has no receiver that creates workload Applications, so
+			// this is what a mint looks like.
+			CreatesWorkloadApplications: false,
 		},
 	}
 	if withRepo {
@@ -92,7 +95,7 @@ func creds(withRepo bool) *api.AgentCredentials {
 // one pin, one place. A hardcoded registry is how kn-z6e4 shipped a chart_ref
 // that did not exist.
 func TestChartUsesTheMintedRefAndTheBundlePin(t *testing.T) {
-	chart, err := agent.Chart(bundle(t), creds(false))
+	chart, err := agent.Chart(bundle(t), creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +131,7 @@ func TestChartUsesTheMintedRefAndTheBundlePin(t *testing.T) {
 // chart's bootstrap cert-manager is a different version from the one stage 6
 // installed, and both claim the same CRDs.
 func TestBootstrapCertManagerIsDisabled(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart)
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,21 +140,174 @@ func TestBootstrapCertManagerIsDisabled(t *testing.T) {
 	}
 }
 
-func TestOperatorGateFollowsReceiverOwnership(t *testing.T) {
-	c := creds(false)
-	c.Operator.CreatesWorkloadApplications = false
-	values, err := agent.Values(c, repoCapableChart)
+// The operator owns workload Applications on EVERY cluster (kn-cjqw OPTION A,
+// 2026-09-10): the control plane no longer creates them at all, and it answers
+// this field false. A receiver that read the field would install an operator
+// that deploys nothing, so the value reaches no decision here — including the
+// one a legacy control plane could still send.
+func TestWorkloadApplicationsAreEnabledWhateverTheMintDeclares(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		c := creds(false)
+		c.Operator.CreatesWorkloadApplications = declared
+		values, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(values), &doc); err != nil {
+			t.Fatal(err)
+		}
+		k := doc["kubenest"].(map[string]any)
+		w := k["workloadApplications"].(map[string]any)
+		if w["enabled"] != true {
+			t.Errorf("a mint declaring creates_workload_applications=%v produced operator gate %v, want true", declared, w["enabled"])
+		}
+	}
+}
+
+// The management cluster's operator dials the control plane that runs inside
+// that same cluster. The mint knows only the public hub URL, so the caller
+// overrides it with the in-cluster service address; every other cluster keeps
+// what the mint returned.
+func TestBackendURLOverrideReplacesTheMintedHubURL(t *testing.T) {
+	override := "ws://kubenest-cp-hub.kubenest-system.svc.cluster.local:8001/ws/operator"
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{BackendURLOverride: override})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var doc map[string]any
-	if err := yaml.Unmarshal([]byte(values), &doc); err != nil {
+	var document struct {
+		Kubenest map[string]any `yaml:"kubenest"`
+	}
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
 		t.Fatal(err)
 	}
-	k := doc["kubenest"].(map[string]any)
-	w := k["workloadApplications"].(map[string]any)
-	if w["enabled"] != true {
-		t.Fatalf("operator gate = %v, want true when backend no longer owns workloads", w["enabled"])
+	if got := document.Kubenest["backendURL"]; got != override {
+		t.Errorf("kubenest.backendURL = %v, want the override %q", got, override)
+	}
+}
+
+// The operator must be able to verify the control plane's certificate, which
+// no public root signs. The platform CA reaches it as a mounted ConfigMap and
+// an environment variable that ADDS that directory to the system roots —
+// which is why the value is SSL_CERT_DIR with /etc/ssl/certs still listed
+// first, and not SSL_CERT_FILE, which would replace them.
+func TestControlPlaneCARendersTheConfigMapAndTheTrustOptions(t *testing.T) {
+	ca := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{ControlPlaneCA: ca})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		ExtraVolumes      []map[string]any `yaml:"extraVolumes"`
+		ExtraVolumeMounts []map[string]any `yaml:"extraVolumeMounts"`
+		ExtraEnv          []map[string]any `yaml:"extraEnv"`
+	}
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.ExtraVolumes) != 1 {
+		t.Fatalf("extraVolumes = %v, want exactly the platform CA ConfigMap", document.ExtraVolumes)
+	}
+	volume := document.ExtraVolumes[0]
+	if volume["name"] != "kubenest-platform-ca" {
+		t.Errorf("volume name = %v", volume["name"])
+	}
+	if configMap, ok := volume["configMap"].(map[string]any); !ok || configMap["name"] != "kubenest-platform-ca" {
+		t.Errorf("volume is not the kubenest-platform-ca ConfigMap: %v", volume)
+	}
+	if len(document.ExtraVolumeMounts) != 1 {
+		t.Fatalf("extraVolumeMounts = %v, want exactly the platform CA mount", document.ExtraVolumeMounts)
+	}
+	mount := document.ExtraVolumeMounts[0]
+	if mount["name"] != "kubenest-platform-ca" || mount["mountPath"] != "/etc/kubenest/platform-ca" || mount["readOnly"] != true {
+		t.Errorf("mount = %v, want the platform CA mounted read-only at /etc/kubenest/platform-ca", mount)
+	}
+	if len(document.ExtraEnv) != 1 {
+		t.Fatalf("extraEnv = %v, want exactly SSL_CERT_DIR", document.ExtraEnv)
+	}
+	env := document.ExtraEnv[0]
+	if env["name"] != "SSL_CERT_DIR" {
+		t.Errorf("environment variable = %v, want SSL_CERT_DIR (SSL_CERT_FILE would discard the system roots)", env["name"])
+	}
+	dirs, _ := env["value"].(string)
+	if !strings.Contains(dirs, "/etc/ssl/certs") {
+		t.Errorf("SSL_CERT_DIR = %q, which drops the system roots: a platform CA is one authority, not the whole trust store", dirs)
+	}
+	if !strings.Contains(dirs, "/etc/kubenest/platform-ca") {
+		t.Errorf("SSL_CERT_DIR = %q, which does not include the mounted platform CA", dirs)
+	}
+}
+
+// No CA means no mount, no volume and no environment variable: a cluster whose
+// control plane has a publicly trusted certificate must not be handed
+// directories that do not exist.
+func TestNoControlPlaneCARendersNoTrustOptions(t *testing.T) {
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal([]byte(values), &document); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"extraVolumes", "extraVolumeMounts", "extraEnv"} {
+		if _, present := document[key]; present {
+			t.Errorf("%s rendered with no platform CA:\n%s", key, values)
+		}
+	}
+	if strings.Contains(values, "kubenest-platform-ca") || strings.Contains(values, "SSL_CERT_DIR") {
+		t.Errorf("the platform CA values rendered with no CA to trust:\n%s", values)
+	}
+}
+
+// The ConfigMap is written ahead of the chart's own manifest, so the object
+// the operator's Pod mounts is on the way to the cluster first — and the
+// agent's manifest stays a single HelmChart document, which is the shape the
+// JWT-rotation path parses and patches.
+func TestInstallWritesThePlatformCAManifestBeforeTheChart(t *testing.T) {
+	fake := &componenttest.FakeRunner{Respond: func(cmd string) (sshx.Result, error) {
+		if strings.Contains(cmd, "get deployment") || strings.Contains(cmd, "kubectl get") {
+			return sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Available","status":"True"}]}}`}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	ca := "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(false),
+		agent.ValuesOptions{ControlPlaneCA: []byte(ca)}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	var configMap, chart []byte
+	configMapAt, chartAt := -1, -1
+	for i, e := range fake.Executions() {
+		switch {
+		case strings.Contains(string(e.Stdin), "kind: ConfigMap"):
+			configMap, configMapAt = e.Stdin, i
+		case strings.Contains(string(e.Stdin), "kind: HelmChart"):
+			chart, chartAt = e.Stdin, i
+		}
+	}
+	if configMapAt < 0 {
+		t.Fatal("the platform CA ConfigMap did not reach the cluster")
+	}
+	if chartAt < 0 {
+		t.Fatal("the HelmChart did not reach the cluster")
+	}
+	if configMapAt > chartAt {
+		t.Error("the ConfigMap was written after the HelmChart: the operator's Pod would mount an object that is not there yet")
+	}
+	text := string(configMap)
+	if !strings.Contains(text, "ca.crt") || !strings.Contains(text, "BEGIN CERTIFICATE") || !strings.Contains(text, "MIIB") {
+		t.Errorf("the ConfigMap does not carry the CA under the ca.crt key:\n%s", text)
+	}
+	if !strings.Contains(text, "namespace: kubenest-system") {
+		t.Errorf("the ConfigMap is not in the operator's namespace:\n%s", text)
+	}
+	if !strings.Contains(text, "name: kubenest-platform-ca") {
+		t.Errorf("the ConfigMap is not the one the values reference:\n%s", text)
+	}
+	if strings.Contains(string(chart), "kind: ConfigMap") {
+		t.Errorf("the agent manifest must stay a single HelmChart document:\n%s", chart)
 	}
 }
 
@@ -161,7 +317,7 @@ func TestOperatorGateFollowsReceiverOwnership(t *testing.T) {
 // Helm command once copied the API name into a nonexistent kubenest.hubURL
 // key; Helm ignored it and the operator silently dialled the chart default.
 func TestHubURLMapsToTheChartBackendURLKey(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart)
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,14 +339,14 @@ func TestHubURLMapsToTheChartBackendURLKey(t *testing.T) {
 // GitOps repo is that one; an in-cluster Gitea would be a second source of
 // truth. With no repo credential the chart's own fallback is left alone.
 func TestGiteaFollowsTheMintedRepoCredential(t *testing.T) {
-	withRepo, err := agent.Values(creds(true), repoCapableChart)
+	withRepo, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(withRepo, "gitea") {
 		t.Errorf("a minted repo credential must disable the in-cluster Gitea:\n%s", withRepo)
 	}
-	withoutRepo, err := agent.Values(creds(false), repoCapableChart)
+	withoutRepo, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +380,7 @@ func carries(text, needle string) bool { return leakscan.Carries(text, needle) }
 // matched nothing would make every assertion below pass forever, which is the
 // failure mode being corrected, reintroduced one level up.
 func TestTheLeakScannerCatchesTheShapeThatShippedTheDefect(t *testing.T) {
-	values, err := agent.Values(creds(true), repoCapableChart)
+	values, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +413,7 @@ func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), nil); err != nil {
+	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -300,12 +456,12 @@ func TestMissingIdentityIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := creds(false)
 			mutate(c)
-			if _, err := agent.Values(c, repoCapableChart); err == nil {
+			if _, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{}); err == nil {
 				t.Fatal("want a refusal")
 			}
 		})
 	}
-	if _, err := agent.Values(nil, repoCapableChart); err == nil {
+	if _, err := agent.Values(nil, repoCapableChart, agent.ValuesOptions{}); err == nil {
 		t.Fatal("want a refusal with no credentials at all")
 	}
 }
@@ -327,7 +483,7 @@ func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
 	for ref, want := range cases {
 		c := creds(false)
 		c.Operator.ChartRef = ref
-		chart, err := agent.Chart(bundle(t), c)
+		chart, err := agent.Chart(bundle(t), c, agent.ValuesOptions{})
 		if err != nil {
 			t.Fatalf("%s: %v", ref, err)
 		}
@@ -346,7 +502,7 @@ func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
 // Disabling Gitea without this leaves the operator with NEITHER a Git server
 // nor the external repo.
 func TestRepoCredentialRendersIntoTheBootstrapControllerKeys(t *testing.T) {
-	values, err := agent.Values(creds(true), repoCapableChart)
+	values, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -386,7 +542,7 @@ func TestRepoCredentialRendersIntoTheBootstrapControllerKeys(t *testing.T) {
 // chart's own Gitea fallback stands, and no external credential values may
 // render — a gitRepoURL of "" with Gitea disabled reproduces kn-rnyl.2.
 func TestNoRepoCredentialRendersNoBootstrapController(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart)
+	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +574,7 @@ func TestTheRepoKeyNeverReachesACommandLineNorAJournal(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), nil); err != nil {
+	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, cmd := range fake.Commands() {
@@ -466,7 +622,7 @@ func TestAMalformedRepoCredentialIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := creds(true)
 			mutate(c)
-			if _, err := agent.Values(c, repoCapableChart); err == nil {
+			if _, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{}); err == nil {
 				t.Fatal("want a refusal for a repo credential missing its " + name)
 			}
 		})
@@ -481,7 +637,7 @@ func TestHostKeyPinRendersOnAChartThatConsumesIt(t *testing.T) {
 	c := creds(true)
 	c.RepoCredential.KnownHosts = knownHosts
 
-	values, err := agent.Values(c, hostKeyChart)
+	values, err := agent.Values(c, hostKeyChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +660,7 @@ func TestHostKeyPinIsWithheldFromChartsThatWouldBreakOnIt(t *testing.T) {
 		c := creds(true)
 		c.RepoCredential.KnownHosts = knownHosts
 
-		values, err := agent.Values(c, version)
+		values, err := agent.Values(c, version, agent.ValuesOptions{})
 		if err != nil {
 			t.Fatalf("chart %s: %v", version, err)
 		}
@@ -529,7 +685,7 @@ func TestHostKeyPinIsWithheldFromChartsThatWouldBreakOnIt(t *testing.T) {
 // empty file as "no pin" only because it checks — an empty file handed to
 // go-git's parser fails every clone with "no valid known_hosts".
 func TestNoHostKeyPinRendersNoValue(t *testing.T) {
-	values, err := agent.Values(creds(true), hostKeyChart)
+	values, err := agent.Values(creds(true), hostKeyChart, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -146,5 +147,76 @@ func TestLogoutDeletesLocalCredentialAndSaysTokenSurvives(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "revoke") {
 		t.Errorf("logout must say the token survives until revoked in the console:\n%s", out.String())
+	}
+}
+
+// --ca-file is how a control plane whose certificate no public root signed is
+// trusted: the PEM is used for this login and remembered, so the later
+// commands that talk to the same control plane verify the same authority.
+func TestLoginCACertFileIsStoredForLaterCommands(t *testing.T) {
+	home := isolateHome(t)
+
+	// Any certificate will do: --token-stdin makes no request at all.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	caPath := filepath.Join(home, "platform-ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"login", "--control-plane", srv.URL, "--token-stdin", "--ca-file", caPath})
+	root.SetIn(strings.NewReader("knp_from_console\n"))
+	var out bytes.Buffer
+	root.SetOut(&out)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ControlPlaneCA != string(caPEM) {
+		t.Errorf("stored CA = %q, want the PEM given with --ca-file", cfg.ControlPlaneCA)
+	}
+}
+
+// A file carrying no certificate is refused as that, before any request and
+// before anything is stored. The likely causes are the wrong path and a DER
+// file, and a TLS handshake failure would blame neither.
+func TestLoginCACertFileRefusesAFileWithNoCertificate(t *testing.T) {
+	home := isolateHome(t)
+
+	caPath := filepath.Join(home, "not-a-cert.pem")
+	if err := os.WriteFile(caPath, []byte("this is not a certificate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := NewRootCommand()
+	root.SetArgs([]string{"login", "--control-plane", "https://api.example.com", "--token-stdin", "--ca-file", caPath})
+	root.SetIn(strings.NewReader("knp_from_console\n"))
+	var out bytes.Buffer
+	root.SetOut(&out)
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("a --ca-file with no certificate in it must be refused")
+	}
+	if !strings.Contains(err.Error(), "no certificate found") {
+		t.Errorf("the refusal does not say what is wrong with the file: %v", err)
+	}
+	if strings.Contains(out.String(), "Logged in") {
+		t.Errorf("a refused --ca-file must stop before the login is reported:\n%s", out.String())
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ControlPlaneCA != "" {
+		t.Errorf("the refused file was stored anyway: %q", cfg.ControlPlaneCA)
 	}
 }

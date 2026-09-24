@@ -27,11 +27,19 @@ func (r *recorder) Emit(_ context.Context, e install.Event) error {
 
 func newSession(t *testing.T, rec *recorder) *install.Session {
 	t.Helper()
+	return sessionWithOpts(t, install.Options{
+		Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server",
+	}, rec)
+}
+
+// sessionWithOpts is newSession for a test that cares which install MODE it is
+// building, because the plan and the resume identity differ between them.
+func sessionWithOpts(t *testing.T, opts install.Options, rec *recorder) *install.Session {
+	t.Helper()
 	m, err := manifest.Parse([]byte("bundle: \"1.0\"\nlimits:\n  timeouts:\n    install-total: 30m\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := install.Options{Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server"}
 	j, err := install.OpenJournal(filepath.Join(t.TempDir(), "journal.json"), opts.Identity())
 	if err != nil {
 		t.Fatal(err)
@@ -149,25 +157,128 @@ func TestEveryPlanComponentIsAManifestKey(t *testing.T) {
 }
 
 // The plan is the contract's stage list, in order, fully wired.
+//
+// A registered install runs install.mdx's thirteen, with register second: the
+// cluster must exist in the control plane before anything is written to a
+// machine. A --control-plane install runs fourteen, with the control-plane
+// stage between platform-day2 and register — the control plane has to be up
+// and logged in to before the cluster hosting it can be registered through it.
 func TestPlanMatchesTheStageContract(t *testing.T) {
-	plan := install.Plan(newSession(t, &recorder{}))
-	if len(plan) != len(install.StageNames) {
-		t.Fatalf("plan has %d stages, want %d", len(plan), len(install.StageNames))
+	registered := []string{
+		install.StagePreflight,
+		install.StageRegister,
+		install.StageK3sServer,
+		install.StageK3sAgents,
+		install.StageNetworking,
+		install.StageCerts,
+		install.StageStorage,
+		install.StageBackup,
+		install.StageDay2,
+		install.StageAgent,
+		install.StageProfiles,
+		install.StageRecord,
+		install.StageVerify,
 	}
-	alwaysRun := map[string]bool{
-		install.StagePreflight: true,
-		install.StageRegister:  true,
-		install.StageVerify:    true,
+	if install.StageControlPlane == "" {
+		t.Fatal("the control-plane stage has no name, so no journal or wire record can carry it")
 	}
-	for i, stage := range plan {
-		if stage.Name != install.StageNames[i] {
-			t.Errorf("stage %d is %q, want %q", i+1, stage.Name, install.StageNames[i])
+	controlPlane := []string{
+		install.StagePreflight,
+		install.StageK3sServer,
+		install.StageK3sAgents,
+		install.StageNetworking,
+		install.StageCerts,
+		install.StageStorage,
+		install.StageBackup,
+		install.StageDay2,
+		install.StageControlPlane,
+		install.StageRegister,
+		install.StageAgent,
+		install.StageProfiles,
+		install.StageRecord,
+		install.StageVerify,
+	}
+	if len(install.StageNames) != len(registered) {
+		t.Fatalf("StageNames has %d stages, the registered install has %d", len(install.StageNames), len(registered))
+	}
+	for i, name := range registered {
+		if install.StageNames[i] != name {
+			t.Fatalf("StageNames[%d] is %q, the registered plan wants %q", i, install.StageNames[i], name)
 		}
-		if stage.Run == nil {
-			t.Errorf("stage %s has no implementation", stage.Name)
-		}
-		if stage.AlwaysRun != alwaysRun[stage.Name] {
-			t.Errorf("stage %s AlwaysRun = %v, want %v", stage.Name, stage.AlwaysRun, alwaysRun[stage.Name])
-		}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		opts      install.Options
+		want      []string
+		alwaysRun map[string]bool
+	}{
+		{
+			name: "registered",
+			opts: install.Options{Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server"},
+			want: registered,
+			alwaysRun: map[string]bool{
+				install.StagePreflight: true,
+				install.StageRegister:  true,
+				install.StageVerify:    true,
+			},
+		},
+		{
+			name: "control-plane",
+			opts: install.Options{
+				Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server",
+				ControlPlaneInstall: true, Domain: "10-0-1-10.sslip.io", AdminEmail: "admin@10-0-1-10.sslip.io",
+			},
+			want: controlPlane,
+			alwaysRun: map[string]bool{
+				install.StagePreflight:    true,
+				install.StageControlPlane: true,
+				install.StageRegister:     true,
+				install.StageVerify:       true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := install.Plan(sessionWithOpts(t, tc.opts, &recorder{}))
+			if len(plan) != len(tc.want) {
+				t.Fatalf("plan has %d stages, want %d", len(plan), len(tc.want))
+			}
+			for i, stage := range plan {
+				if stage.Name != tc.want[i] {
+					t.Errorf("stage %d is %q, want %q", i+1, stage.Name, tc.want[i])
+				}
+				if stage.Run == nil {
+					t.Errorf("stage %s has no implementation", stage.Name)
+				}
+				if stage.AlwaysRun != tc.alwaysRun[stage.Name] {
+					t.Errorf("stage %s AlwaysRun = %v, want %v", stage.Name, stage.AlwaysRun, tc.alwaysRun[stage.Name])
+				}
+			}
+		})
+	}
+}
+
+// A journal belongs to one install mode. Resuming a registered journal as a
+// control-plane install (or the reverse) would skip the stages that make the
+// mode true — a registered install's register already ran, a control-plane
+// install's has not — so the identity has to carry which one this is.
+func TestIdentityRefusesAResumeInTheOtherMode(t *testing.T) {
+	base := install.Options{
+		Bundle: "1.0", Name: "prod-1", Servers: []string{"10.0.1.10"}, HATier: "single-server",
+		Domain: "10-0-1-10.sslip.io",
+	}
+	other := base
+	other.ControlPlaneInstall = true
+
+	registered, controlPlane := base.Identity(), other.Identity()
+	if registered.Fields["mode"] == controlPlane.Fields["mode"] {
+		t.Errorf("both modes identify as %q, so a resume cannot tell them apart", registered.Fields["mode"])
+	}
+	if diff := registered.Differences(controlPlane); len(diff) == 0 {
+		t.Error("the two modes compare as the same install, so a resume in the other mode would be allowed")
+	}
+	if registered.Fields["domain"] != controlPlane.Fields["domain"] {
+		t.Errorf("the domain is part of the request in both modes, so it must be compared in both: %q vs %q",
+			registered.Fields["domain"], controlPlane.Fields["domain"])
 	}
 }

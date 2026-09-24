@@ -320,6 +320,20 @@ func (c *Client) run(ctx context.Context, command string, stdin io.Reader) (Resu
 
 func (c *Client) Close() error { return c.conn.Close() }
 
+// DialTCP opens a TCP connection to addr from the remote host, tunnelled
+// through this SSH connection (an ssh direct-tcpip channel). The connection
+// is opened BY the host, so it reaches the host's own network — the cluster
+// node's service or pod IPs, which the installer machine may not route to.
+// A cancelled context abandons the dial and closes the connection if it
+// lands anyway.
+func (c *Client) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	conn, err := c.conn.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s from %s over ssh: %w", addr, c.Endpoint.HostName, err)
+	}
+	return conn, nil
+}
+
 // limitedBuffer caps captured output at 8 MiB so a runaway remote command
 // cannot exhaust memory on the installer machine.
 type limitedBuffer struct {

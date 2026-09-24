@@ -34,13 +34,43 @@ type InstallFlags struct {
 	SSHKey        string
 	StorageDevice string
 	BackupTarget  string
-	// Standalone installs a cluster that registers with nothing: no control
-	// plane, no `kubenest login`, no fleet record anywhere but the cluster
-	// itself (kn-l827). It is an explicit flag and not an inference from a
-	// missing config, because "you were logged out and we quietly installed
-	// an unregistered cluster instead" is a discovery for the customer's
-	// next audit, not for install time.
-	Standalone bool
+	// ControlPlane installs the KubeNest control plane INTO this cluster and
+	// registers the cluster to it: this is how the FIRST cluster of a fleet
+	// is built, and it leaves the CLI logged in to https://api.<domain>.
+	// Every later cluster is added with a plain `kubenest platform install`
+	// against that login.
+	ControlPlane bool
+	// Domain is the name the control plane is served under: console at
+	// app.<domain>, API at api.<domain>, and hub.<domain> for the agents of
+	// every cluster added later. Defaults to <first --server
+	// address>.sslip.io, which resolves to that address without any DNS
+	// setup, so a first cluster needs nothing arranged in advance.
+	Domain string
+	// AdminEmail is the control plane's administrator account, which is
+	// created during the install. Defaults to admin@<domain>.
+	AdminEmail string
+}
+
+// controlPlaneDomain is the domain this install serves the control plane
+// under: the value given with --domain, or one derived from the first
+// --server's address.
+func (f InstallFlags) controlPlaneDomain() string {
+	if f.Domain != "" {
+		return f.Domain
+	}
+	if len(f.Servers) == 0 {
+		return ""
+	}
+	return f.Servers[0] + ".sslip.io"
+}
+
+// controlPlaneAdminEmail is the control plane's administrator account: the
+// value given with --admin-email, or admin@<domain>.
+func (f InstallFlags) controlPlaneAdminEmail(domain string) string {
+	if f.AdminEmail != "" {
+		return f.AdminEmail
+	}
+	return "admin@" + domain
 }
 
 // Validate applies the checks that need no manifest and no network: flag
@@ -53,8 +83,14 @@ func (f *InstallFlags) Validate() error {
 	if f.Name == "" {
 		return fmt.Errorf("--name is required: the cluster is recorded under this name")
 	}
-	if f.Standalone && f.Org != "" {
-		return fmt.Errorf("--org names the organization to register under, and --standalone registers with nothing: pass one or the other")
+	if f.ControlPlane && f.Org != "" {
+		return fmt.Errorf("--org does not apply to --control-plane: the control plane being installed has one organization, and this cluster registers into it")
+	}
+	if f.Domain != "" && !f.ControlPlane {
+		return fmt.Errorf("--domain only means anything with --control-plane: a cluster added to a fleet is served by the domain of the control plane it registers with")
+	}
+	if f.AdminEmail != "" && !f.ControlPlane {
+		return fmt.Errorf("--admin-email only means anything with --control-plane: the administrator account belongs to the control plane, not to this cluster")
 	}
 	if len(f.Servers) == 0 {
 		return fmt.Errorf("at least one --server is required")
@@ -106,15 +142,33 @@ Preflight checks everything before the first byte is written to any machine.
 SSH keys come from --ssh-key, ssh-agent or ~/.ssh/config and never leave this
 machine.
 
-With --standalone the cluster registers with nothing: no control plane, no
-login, and the record of what was installed lives on the cluster itself. Add a
-control plane later for the fleet view; a standalone cluster is a complete
-platform, not a degraded one.`,
-		Example: `  kubenest platform install \
-    --standalone \
+With --control-plane this install also puts the KubeNest control plane on the
+first cluster: the console at https://app.<domain>, the API at
+https://api.<domain>, an administrator account whose generated password is
+printed once and stored on the cluster, and a CLI login on this machine. The
+cluster is registered to that control plane. --domain defaults to
+<first --server address>.sslip.io, which is public DNS answering with that
+address, so nothing has to be set up in advance, and --admin-email defaults to
+admin@<domain>.
+
+Every later cluster is added with a plain install against the control plane
+this machine is logged in to; it needs no control plane of its own.`,
+		Example: `  # The first cluster: the platform, and the KubeNest control plane.
+  kubenest platform install \
+    --control-plane \
     --bundle 1.0 \
     --name prod-1 \
     --server 10.0.1.10 \
+    --ha single-server \
+    --ssh-user ubuntu \
+    --ssh-key ~/.ssh/id_ed25519 \
+    --storage-device /dev/nvme1n1
+
+  # Every later cluster: registered with the control plane you are logged in to.
+  kubenest platform install \
+    --bundle 1.0 \
+    --name prod-2 \
+    --server 10.0.2.10 \
     --ha single-server \
     --ssh-user ubuntu \
     --ssh-key ~/.ssh/id_ed25519 \
@@ -131,7 +185,9 @@ platform, not a degraded one.`,
 	fs.StringVar(&f.Bundle, "bundle", "", "platform bundle version to install (required)")
 	fs.StringVar(&f.Name, "name", "", "cluster name, recorded against the control plane (required)")
 	fs.StringVar(&f.Org, "org", "", "organization slug or id (only needed when your credential can see more than one)")
-	fs.BoolVar(&f.Standalone, "standalone", false, "install a cluster that registers with nothing: no control plane, no login, the record lives on the cluster")
+	fs.BoolVar(&f.ControlPlane, "control-plane", false, "install the KubeNest control plane into this cluster and register the cluster to it (the first cluster)")
+	fs.StringVar(&f.Domain, "domain", "", "control-plane domain: console at app.<domain>, API at api.<domain>, agents of added clusters at hub.<domain> (default <first --server address>.sslip.io; only with --control-plane)")
+	fs.StringVar(&f.AdminEmail, "admin-email", "", "the control plane's administrator account (default admin@<domain>; only with --control-plane)")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (repeat three times for --ha ha)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (repeatable)")
 	fs.StringVar(&f.HATier, "ha", "", "HA tier: single-server or ha (required, permanent)")
@@ -221,7 +277,6 @@ actively harmed you.`,
 	fs.StringVar(&f.Cluster, "cluster", "", "cluster to upgrade (required)")
 	fs.StringVar(&f.To, "to", "", "bundle version to upgrade to (required)")
 	fs.StringArrayVar(&f.Acknowledge, "acknowledge", nil, "accept one deprecated-API finding by namespace/Kind/name (repeatable; there is deliberately no blanket override)")
-	fs.BoolVar(&f.MigrateWorkloadApplications, "migrate-workload-applications", false, "explicitly hand workload Application ownership from the backend to the in-cluster operator during this bundle upgrade")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without a local install journal)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")

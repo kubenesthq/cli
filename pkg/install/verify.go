@@ -244,114 +244,6 @@ func boundVolumeProbe(r k3s.Runner) converge.Probe {
 	}
 }
 
-// verifyReconcileProject is the throwaway Project the standalone acceptance
-// drives. The operator's ProjectReconciler creates a namespace named after it,
-// so the name is also the namespace that gets cleaned up.
-const verifyReconcileProject = "kubenest-verify-reconcile"
-
-// verifyAgentReconciles is acceptance check 4 for a cluster with no hub
-// (kn-sf17).
-//
-// The registered path asks the control plane whether the cluster reported in.
-// A standalone cluster has nobody to report to, so the equivalent question has
-// to be answered from inside: not "does the agent's pod look healthy" — it is
-// already Available or stage 10 would not have returned — but "does the agent
-// actually RECONCILE".
-//
-// This matters more here than on the registered path, not less. Unmanaged mode
-// means readiness no longer reflects a hub connection, so the probe that used
-// to prove the agent was alive and doing something now proves only that a
-// process is listening. Something has to take up that work, and a pod phase
-// cannot: it is the same standard verifyStorageProvisions holds storage to
-// when it refuses to accept that a StorageClass exists as proof that storage
-// works, and writes bytes to a volume instead.
-//
-// A Project is the cheapest CR with an observable side effect: the operator
-// creates a namespace for it and sets status.phase. If the controllers are not
-// running, or the CRDs never installed, or the operator is wedged, phase stays
-// empty and this fails with what it saw.
-func verifyAgentReconciles(ctx context.Context, s *Session) error {
-	server, err := s.Server()
-	if err != nil {
-		return err
-	}
-	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
-	if err != nil {
-		return err
-	}
-
-	doc := fmt.Sprintf(`apiVersion: apps.kubenest.io/v1
-kind: Project
-metadata:
-  name: %[1]s
-  namespace: %[2]s
-spec:
-  displayName: kubenest install verification
-`, verifyReconcileProject, agent.UnmanagedNamespace)
-
-	if err := kubectlApply(ctx, server, doc); err != nil {
-		return fmt.Errorf("applying the verification Project: %w (if the CRDs are absent, the agent did not install its own)", err)
-	}
-	defer cleanupVerifyReconcile(context.WithoutCancel(ctx), server)
-
-	res, err := converge.Wait(ctx, reconciledProjectProbe(server), converge.Options{
-		Name: "agent-reconciles", Deadline: deadline, Reporter: s.Reporter,
-	})
-	if err != nil {
-		return err
-	}
-	return res.Err()
-}
-
-// reconciledProjectProbe reports whether the operator has acted on the Project
-// — both halves, because either alone can be true while the agent is broken:
-// the status subresource can be written by a controller that then fails, and a
-// namespace can pre-exist.
-func reconciledProjectProbe(r k3s.Runner) converge.Probe {
-	return func(ctx context.Context) (bool, converge.State, error) {
-		object := "project/" + verifyReconcileProject
-		out, err := k3s.Kubectl(ctx, r,
-			"get project "+verifyReconcileProject+" -n "+agent.UnmanagedNamespace+" -o json")
-		if err != nil {
-			return false, converge.State{Object: object, Status: "not readable"}, err
-		}
-		var project struct {
-			Status struct {
-				Phase string `json:"phase"`
-			} `json:"status"`
-		}
-		if err := json.Unmarshal([]byte(out), &project); err != nil {
-			return false, converge.State{Object: object, Status: "unparsable"}, err
-		}
-		if project.Status.Phase != "Ready" {
-			status := project.Status.Phase
-			if status == "" {
-				// No phase at all is the diagnostic case: the CR was accepted
-				// by the API server and nothing has looked at it, which means
-				// the controllers are not running.
-				status = "no status written — the agent is installed but its controllers have not reconciled"
-			}
-			detail, _ := k3s.Kubectl(ctx, r,
-				"get pods -n "+agent.UnmanagedNamespace+" -l control-plane=controller-manager -o jsonpath='{.items[*].status.phase}'")
-			return false, converge.State{
-				Object: object,
-				Status: status,
-				Detail: strings.Trim(strings.TrimSpace(detail), "'"),
-			}, nil
-		}
-		return true, converge.State{Object: object, Status: "Ready"}, nil
-	}
-}
-
-func cleanupVerifyReconcile(ctx context.Context, r k3s.Runner) {
-	// Best effort, like cleanupVerifyNamespace: leftovers are untidy, not
-	// dangerous, and a failed cleanup must not fail a passing install.
-	_, _ = k3s.Kubectl(ctx, r,
-		"delete project "+verifyReconcileProject+" -n "+agent.UnmanagedNamespace+" --wait=false --ignore-not-found")
-	_, _ = k3s.Kubectl(ctx, r,
-		"delete namespace "+verifyReconcileProject+" --wait=false --ignore-not-found")
-}
-
 func cleanupVerifyNamespace(ctx context.Context, r k3s.Runner) {
 	// Best effort: a leftover verify namespace is untidy, not dangerous, and
 	// a failed cleanup must not turn a passing install into a failing one.
@@ -361,22 +253,12 @@ func cleanupVerifyNamespace(ctx context.Context, r k3s.Runner) {
 // verifyClusterReportsIn is the check that the cluster is not just installed
 // but MANAGED: the control plane shows it connected, which only happens once
 // the agent has dialled the hub and the first heartbeat has arrived.
+//
+// This is the same check in both install modes. A --control-plane install
+// registered this cluster through the control plane it now hosts, so there is
+// a control plane to ask from stage 9 onwards — and the tunnel stage 9 built
+// is what reaches it.
 func verifyClusterReportsIn(ctx context.Context, s *Session) error {
-	if s.Standalone() {
-		// A standalone cluster has nothing to report to, so this check
-		// cannot be run as written — and it must not therefore PASS. What
-		// replaces it is the equivalent question answered from inside the
-		// cluster: not "does a pod look healthy" but "does the agent
-		// actually reconcile", the same standard verifyStorageProvisions
-		// holds storage to when it refuses to accept that a StorageClass
-		// exists as proof that storage works.
-		//
-		// That replacement is verifyAgentReconciles, landed with kn-sf17
-		// alongside the agent that can run without a hub. Until then this
-		// returned an error saying so, on the reasoning that a check which
-		// cannot run must not pass.
-		return verifyAgentReconciles(ctx, s)
-	}
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to check: stage 2 must run before stage 13")
 	}
@@ -502,9 +384,10 @@ func chartComponents(s *Session) map[string]string {
 	// credentials to render a chart reference it does not need here: what
 	// this check matches on is the HelmChart RESOURCE name, and that is the
 	// release name, a constant. Deriving it from the credentials meant that
-	// any install without them — every standalone one — silently dropped the
-	// agent from the record check and still reported a pass. A check that
-	// quietly stops checking is worse than one that fails.
+	// any run without them — a resumed install whose agent was already
+	// installed in an earlier process — silently dropped the agent from the
+	// record check and still reported a pass. A check that quietly stops
+	// checking is worse than one that fails.
 	out["kubenest-agent"] = agent.ReleaseName()
 	return out
 }

@@ -89,6 +89,28 @@ func (r *reconnectingRunner) RunInput(ctx context.Context, command string, stdin
 	})
 }
 
+// DialTCP opens a TCP connection to addr FROM the node, over this node's SSH
+// connection. It is how the CLI reaches a control plane installed on the node
+// whose API is a ClusterIP only the node can route to: the client talks to the
+// remote end, never to a local socket.
+//
+// It is deliberately not retried like Run is: the returned connection is long
+// lived and owned by the caller (pkg/api's dialer), which sees a reset on it
+// the same way it would see one on any network connection.
+func (r *reconnectingRunner) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	conn, err := r.connection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tunnel, ok := conn.(interface {
+		DialTCP(ctx context.Context, addr string) (net.Conn, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("the connection to %s cannot open a tunnel to %s", r.address, addr)
+	}
+	return tunnel.DialTCP(ctx, addr)
+}
+
 func (r *reconnectingRunner) attempt(ctx context.Context, do func(runConn) (sshx.Result, error)) (sshx.Result, error) {
 	conn, err := r.connection(ctx)
 	if err != nil {

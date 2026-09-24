@@ -2,8 +2,11 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,23 +24,23 @@ import (
 	"kubenest.io/cli/pkg/uninstall"
 )
 
-// controlPlaneClient builds an authenticated client from the stored config.
+// controlPlaneClient builds an authenticated client from the stored config,
+// trusting the control plane's own CA when one is stored.
 //
-// A control plane is how a cluster JOINS A FLEET: it is the console, the
-// health view and the multi-cluster day-2 surface. It is NOT a prerequisite
-// for installing a cluster (kn-l827, decision 2026-08-26: nothing is hosted
-// by us), and `--standalone` takes the other path. What has to be true either
-// way is that the cluster records what was installed on it — without that
-// there is no safe upgrade — so standalone writes that record onto the
-// cluster instead of into a control plane.
+// A control plane is what makes a cluster part of a fleet: the console, the
+// health view and the multi-cluster day-2 surface. A cluster joins a fleet in
+// one of two ways, and the flags say which: it installs the control plane
+// itself (`kubenest platform install --control-plane`, the first cluster), or
+// it is added to a fleet this machine is already logged in to
+// (`kubenest login --control-plane https://api.<domain>`).
 func controlPlaneClient() (*api.Client, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
 	}
 	if cfg.ControlPlaneURL == "" {
-		return nil, fmt.Errorf("no control plane configured: run `kubenest login --control-plane https://...` first, " +
-			"or install a cluster that registers with nothing: `kubenest platform install --standalone`")
+		return nil, fmt.Errorf("no control plane configured: run `kubenest login --control-plane https://api.<domain>` first, " +
+			"or install the first cluster with `kubenest platform install --control-plane`, which installs the control plane and logs this machine in to it")
 	}
 	creds, err := config.LoadCredentials()
 	if err != nil {
@@ -45,19 +48,25 @@ func controlPlaneClient() (*api.Client, error) {
 	}
 	token := creds.TokenFor(cfg.ControlPlaneURL)
 	if token == "" {
-		return nil, fmt.Errorf("not logged in to %s: run `kubenest login` first, "+
-			"or install a cluster that registers with nothing: `kubenest platform install --standalone`", cfg.ControlPlaneURL)
+		return nil, fmt.Errorf("not logged in to %s: run `kubenest login --control-plane %s` first, "+
+			"or install the first cluster with `kubenest platform install --control-plane`", cfg.ControlPlaneURL, cfg.ControlPlaneURL)
 	}
-	return api.New(cfg.ControlPlaneURL, api.WithToken(token))
+	opts := []api.Option{api.WithToken(token)}
+	if cfg.ControlPlaneCA != "" {
+		// A self-hosted control plane issues its own CA, which no system
+		// trust store has ever seen.
+		opts = append(opts, api.WithCACert([]byte(cfg.ControlPlaneCA)))
+	}
+	return api.New(cfg.ControlPlaneURL, opts...)
 }
 
 // controlPlaneConfigured reports whether this machine has a control plane to
 // talk to.
 //
-// A day-2 command has no `--standalone` flag because the cluster already
-// exists and its own record says what it is. The only thing left to decide
-// is where to read that record from, and that is answered by whether a
-// control plane was ever logged in to.
+// A day-2 command has no flag for this because the cluster already exists and
+// its own record says what it is. The only thing left to decide is where to
+// read that record from, and that is answered by whether a control plane was
+// ever logged in to.
 func controlPlaneConfigured() (bool, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -72,13 +81,15 @@ func controlPlaneConfigured() (bool, error) {
 // THE MANIFEST IS THE POINT. Every version pin and every deadline in the
 // installer comes out of it (a missing timeout is an error, never a default),
 // so where it comes from decides whether an install can happen at all. A
-// registered install fetches it from the control plane, because the record
-// written in stage 12 has to be checkable against the same document the
-// control plane validates against. A standalone install reads the copy built
-// into this binary — see pkg/bundles for why the pins travel with the binary
-// that installs them.
+// first cluster (--control-plane) reads the copy built into this binary — see
+// pkg/bundles for why the pins travel with the binary that installs them —
+// and gets NO client: the control plane it would talk to is the one this
+// install is still putting on the cluster, so the control-plane stage builds
+// that client once it exists. A cluster added to a fleet fetches the manifest
+// from its control plane, because the record written in stage 12 has to be
+// checkable against the same document the control plane validates against.
 func installSources(ctx context.Context, f InstallFlags) (*api.Client, *manifest.Manifest, error) {
-	if f.Standalone {
+	if f.ControlPlane {
 		bundle, err := bundles.Manifest(f.Bundle)
 		if err != nil {
 			return nil, nil, err
@@ -122,6 +133,26 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 		BackupTarget:  f.BackupTarget,
 	}
 
+	// The two install shapes differ in where the cluster's record lives and in
+	// how this machine reaches it. A first cluster carries its own control
+	// plane and has its domain settled before a byte is written. A cluster
+	// added to a fleet records into the control plane this machine is logged
+	// in to, and verifies that fleet's self-issued CA, which no system trust
+	// store has.
+	domain := ""
+	if f.ControlPlane {
+		domain = f.controlPlaneDomain()
+		opts.ControlPlaneInstall = true
+		opts.Domain = domain
+		opts.AdminEmail = f.controlPlaneAdminEmail(domain)
+	} else {
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		opts.ControlPlaneCA = []byte(cfg.ControlPlaneCA)
+	}
+
 	journalPath, err := install.JournalPath(f.Name)
 	if err != nil {
 		return err
@@ -148,9 +179,11 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 
 	// Printed locally AND, when there is one, published to the control plane
 	// from the same transition: the operator at the terminal and the console
-	// watching the install see the same thirteen stages. A standalone install
-	// has only the terminal, and attaching a nil-client emitter would be a
-	// publisher that silently drops everything.
+	// watching the install see the same stages. A first cluster has only the
+	// terminal, because the control plane it would publish to is the one this
+	// install is still putting on the cluster — the control-plane stage
+	// builds that client, and a nil-client emitter would be a publisher that
+	// silently drops everything.
 	emitters := install.Emitters{install.TextEmitter{W: out}}
 	if client != nil {
 		emitters = append(emitters, install.NewControlPlaneEmitter(client, func() string { return journal.ClusterID }))
@@ -159,8 +192,8 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 
 	fmt.Fprintf(out, "Installing platform bundle %s on %d node(s), %s tier.\n",
 		f.Bundle, len(f.Servers)+len(f.Agents), f.HATier)
-	if f.Standalone {
-		fmt.Fprintf(out, "Standalone: this cluster registers with nothing, and its record lives on the cluster.\n")
+	if f.ControlPlane {
+		fmt.Fprintf(out, "This is the first cluster: it gets the KubeNest control plane, serving %s.\n", domain)
 	}
 	fmt.Fprintf(out, "Nothing is written to any machine until stage 3.\n\n")
 
@@ -175,6 +208,75 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 			len(result.Skipped), strings.Join(result.Skipped, ", "))
 	}
 	fmt.Fprintf(out, "Journal: %s\n", journal.Path())
+
+	if f.ControlPlane {
+		fmt.Fprintf(out, "\nConsole:      https://app.%s\n", domain)
+		fmt.Fprintf(out, "Logged in to https://api.%s\n", domain)
+		warnIfControlPlaneUnreachable(ctx, out, domain)
+	}
+	return nil
+}
+
+// warnIfControlPlaneUnreachable makes ONE request to the control plane's
+// health endpoint and warns rather than failing.
+//
+// The install has already succeeded on the cluster; this machine not being
+// able to open api.<domain> is a fact about where the operator is sitting and
+// what DNS and the firewall allow, not about whether the platform came up.
+// The same reachability is what every later cluster needs, which is why the
+// warning points at hub.<domain> as well.
+func warnIfControlPlaneUnreachable(ctx context.Context, out io.Writer, domain string) {
+	apiURL := "https://api." + domain
+	var caPEM []byte
+	if cfg, err := config.Load(); err == nil {
+		// The control-plane stage saved the CA it generated; without a CA
+		// the request falls back to the system roots, which is the honest
+		// check for a domain that has a public certificate.
+		caPEM = []byte(cfg.ControlPlaneCA)
+	}
+	if err := checkControlPlaneHealth(ctx, apiURL, caPEM); err != nil {
+		fmt.Fprintf(out, "\nWarning: this machine cannot reach %s on 443 (%v).\n"+
+			"The cluster is up and was not affected by this. The agents of every cluster you add\n"+
+			"later must reach hub.%s on 443 as well, so check DNS and the firewall before adding one.\n",
+			apiURL, err, domain)
+	}
+}
+
+// checkControlPlaneHealth makes one short-timeout GET of the control plane's
+// health endpoint, trusting the platform CA the same way api.WithCACert does.
+//
+// It is a plain HTTP client rather than pkg/api's: every call pkg/api exposes
+// is an authenticated control-plane operation, and /api/v1/health is
+// deliberately open. The only thing this shares with them is the trust
+// decision, so the CA is folded into a pool seeded from the system roots —
+// exactly as the api client's transport does it.
+func checkControlPlaneHealth(ctx context.Context, apiURL string, caPEM []byte) error {
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if len(caPEM) > 0 && !pool.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("the control plane CA stored in the config is not valid PEM")
+	}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+	defer client.CloseIdleConnections()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(apiURL, "/")+"/api/v1/health", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<12))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("the health endpoint answered %s", resp.Status)
+	}
 	return nil
 }
 

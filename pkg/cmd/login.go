@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"crypto/x509"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -25,10 +27,16 @@ import (
 //
 // --token-stdin is the manual fallback for a token created in the console
 // under CLI tokens.
+//
+// --ca-file exists because a self-hosted control plane — the one
+// `kubenest platform install --control-plane` installs — issues its own CA,
+// which no system trust store has ever seen. The PEM is trusted for this
+// login and stored for every later command.
 func NewLoginCommand() *cobra.Command {
 	var (
 		controlPlane string
 		tokenStdin   bool
+		caFile       string
 	)
 
 	cmd := &cobra.Command{
@@ -41,7 +49,11 @@ By default this starts a device authorization: approve the printed code in
 your console from any browser, and the CLI receives a token scoped to what
 the installer needs. Your password never passes through the CLI.
 
-For automation, create a token in the console and pipe it to --token-stdin.`,
+For automation, create a token in the console and pipe it to --token-stdin.
+
+Pass --ca-file when the control plane serves a certificate no public root
+signed: the PEM file is trusted for this login and remembered, so later
+commands (adding a cluster to this control plane among them) verify it too.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
@@ -55,7 +67,20 @@ For automation, create a token in the console and pipe it to --token-stdin.`,
 				return fmt.Errorf("no control plane given: kubenest login --control-plane https://api.your-domain.com")
 			}
 
-			client, err := api.New(controlPlane)
+			// Read and check the CA before anything is sent anywhere: a
+			// mistyped path or a DER file has to fail as that, not as a TLS
+			// failure halfway through a login.
+			opts := []api.Option{}
+			if caFile != "" {
+				caPEM, err := readCACertFile(caFile)
+				if err != nil {
+					return err
+				}
+				cfg.ControlPlaneCA = string(caPEM)
+				opts = append(opts, api.WithCACert(caPEM))
+			}
+
+			client, err := api.New(controlPlane, opts...)
 			if err != nil {
 				return err
 			}
@@ -117,7 +142,23 @@ For automation, create a token in the console and pipe it to --token-stdin.`,
 
 	cmd.Flags().StringVar(&controlPlane, "control-plane", "", "control plane URL, e.g. https://api.your-domain.com")
 	cmd.Flags().BoolVar(&tokenStdin, "token-stdin", false, "read a console-created CLI token from stdin instead of the device flow")
+	cmd.Flags().StringVar(&caFile, "ca-file", "", "PEM file of the control plane's own CA, when its certificate is not signed by a public root")
 	return cmd
+}
+
+// readCACertFile reads a PEM file and refuses anything that is not at least
+// one certificate, so a mistyped path or a DER file is reported as that
+// rather than surfacing as a TLS failure later.
+func readCACertFile(path string) ([]byte, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("--ca-file: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("--ca-file %s: no certificate found in it (expected PEM: -----BEGIN CERTIFICATE-----)", path)
+	}
+	return pemBytes, nil
 }
 
 // NewLogoutCommand discards the stored credential for the configured control

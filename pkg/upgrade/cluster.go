@@ -8,7 +8,6 @@ import (
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
-	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/k3s"
 )
 
@@ -22,14 +21,15 @@ type Recorded struct {
 	api.ClusterBundle
 }
 
-// RecordStore is where a cluster's bundle record lives: the control plane for
-// a registered cluster, the cluster's own ConfigMap for a standalone one.
+// RecordStore is where a cluster's bundle record lives: the control plane it
+// registered with. Every cluster registers with a control plane (decision D17,
+// 2026-09-24) — including the one running it, which registers through the same
+// API path as any other — so there is one implementation, not two.
 //
-// It is one seam with two implementations rather than a nil-check at each
-// call site, because the record is READ at the start of a run and WRITTEN at
-// the end of it. A run that could read one place and write another would
-// leave the two disagreeing about what is installed, and every later day-2
-// operation trusts that answer.
+// It is a seam rather than a direct call because the record is READ at the
+// start of a run and WRITTEN at the end of it. A run that could read one place
+// and write another would leave the two disagreeing about what is installed,
+// and every later day-2 operation trusts that answer.
 type RecordStore interface {
 	Load(ctx context.Context) (Recorded, error)
 	Save(ctx context.Context, record api.BundleRecord) error
@@ -61,47 +61,6 @@ func (r ControlPlaneRecords) Save(ctx context.Context, record api.BundleRecord) 
 		return fmt.Errorf("no registered cluster to record against")
 	}
 	return r.Client.PutBundleRecord(ctx, r.ClusterID, record)
-}
-
-// ClusterRecords is the record of a standalone cluster, which lives on the
-// cluster itself because in that mode there is nowhere else (kn-y3gt).
-//
-// The install journal is deliberately not carried here. On the control plane
-// the journal is how an operator reads an install they did not run; on a
-// standalone cluster it stays on the machine that ran it, and what the
-// cluster records is what an upgrade needs in order to know its own
-// starting point.
-type ClusterRecords struct {
-	Runner k3s.Runner
-}
-
-func (r ClusterRecords) Load(ctx context.Context) (Recorded, error) {
-	record, err := install.ReadClusterRecord(ctx, r.Runner)
-	if err != nil {
-		return Recorded{}, err
-	}
-	return Recorded{ClusterBundle: api.ClusterBundle{
-		BundleVersion:        record.BundleVersion,
-		Profiles:             record.Profiles,
-		HATier:               record.HATier,
-		VolumeGroupOwnership: record.VolumeGroupOwnership,
-	}}, nil
-}
-
-// Save moves the recorded bundle forward while preserving the fields an
-// upgrade has no business changing: the cluster's identity, its name, and
-// that it is standalone. It re-reads rather than reconstructing them, so a
-// field added to the record later is carried through instead of erased.
-func (r ClusterRecords) Save(ctx context.Context, record api.BundleRecord) error {
-	current, err := install.ReadClusterRecord(ctx, r.Runner)
-	if err != nil {
-		return err
-	}
-	current.BundleVersion = record.BundleVersion
-	current.Profiles = record.Profiles
-	current.HATier = record.HATier
-	current.VolumeGroupOwnership = record.VolumeGroupOwnership
-	return install.WriteClusterRecord(ctx, r.Runner, current)
 }
 
 // installedProfiles is the profile set the cluster has, which does not change

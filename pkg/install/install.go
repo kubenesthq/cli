@@ -7,8 +7,11 @@
 // not have to learn which of two they are looking at.
 //
 // What lives HERE is what is specific to building a cluster from nothing:
-// the thirteen stage names, what each one does, the eleven preflight checks,
-// the five acceptance checks, and uninstall.
+// the stage names, what each one does, the eleven preflight checks, the five
+// acceptance checks, and uninstall. A registered install runs the thirteen
+// stages install.mdx names; a --control-plane install runs fourteen, adding
+// the stage that installs the KubeNest control plane into the first cluster
+// so that first cluster is registered through the control plane it hosts.
 package install
 
 import (
@@ -84,9 +87,9 @@ func JournalPath(cluster string) (string, error) {
 	return stages.JournalPath(Kind, cluster)
 }
 
-// The thirteen stage names, exactly as install.mdx names them. They are the
-// journal's vocabulary and the wire's payload.stage (kn-w051) — one
-// vocabulary, two views — so renaming one is a coordinated change.
+// The stage names, exactly as install.mdx names them. They are the journal's
+// vocabulary and the wire's payload.stage (kn-w051) — one vocabulary, two
+// views — so renaming one is a coordinated change.
 const (
 	StagePreflight  = "preflight"
 	StageRegister   = "register"
@@ -97,14 +100,20 @@ const (
 	StageStorage    = "platform-storage"
 	StageBackup     = "platform-backup"
 	StageDay2       = "platform-day2"
-	StageAgent      = "kubenest-agent"
-	StageProfiles   = "profiles"
-	StageRecord     = "record"
-	StageVerify     = "verify"
+	// StageControlPlane installs the KubeNest control plane into this
+	// cluster. It is the one stage a registered install does not run; in a
+	// --control-plane install it sits between platform-day2 and register, so
+	// the cluster hosting the control plane registers through it.
+	StageControlPlane = "control-plane"
+	StageAgent        = "kubenest-agent"
+	StageProfiles     = "profiles"
+	StageRecord       = "record"
+	StageVerify       = "verify"
 )
 
-// StageNames is the order. It is not arbitrary — every stage depends on the
-// ones above it.
+// StageNames is the order a REGISTERED install runs, which is also the
+// bundle's thirteen. It is not arbitrary — every stage depends on the ones
+// above it. Plan adds StageControlPlane for --control-plane.
 var StageNames = []string{
 	StagePreflight,
 	StageRegister,

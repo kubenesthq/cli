@@ -134,28 +134,49 @@ type HelmChart struct {
 	// ValuesYAML is the chart values document, verbatim. Empty means chart
 	// defaults.
 	ValuesYAML string
+	// ChartContent is a base64-encoded chart archive to install instead of
+	// fetching a chart from a repo. It is how a chart that is not published
+	// anywhere — the control-plane chart bundle — is installed: the archive
+	// travels in the HelmChart itself and carries its own version, so
+	// ChartContent excludes Repo, Chart and Version.
+	ChartContent string
 }
 
-// Manifest renders the HelmChart custom resource.
+// Manifest renders the HelmChart custom resource. There are two mutually
+// exclusive chart sources: an inline archive (ChartContent) and a chart
+// fetched from a repo or an oci:// reference.
 func (h HelmChart) Manifest() ([]byte, error) {
-	oci := strings.HasPrefix(h.Chart, "oci://")
-	if h.Name == "" || h.Chart == "" || h.TargetNamespace == "" || (h.Repo == "" && !oci) {
-		return nil, fmt.Errorf("HelmChart needs Name, Repo, Chart and TargetNamespace (an oci:// chart carries its own registry and needs no Repo)")
-	}
-	if h.Version == "" {
-		return nil, fmt.Errorf("HelmChart %s has no version: pins come from the bundle manifest's core section", h.Name)
+	if h.Name == "" || h.TargetNamespace == "" {
+		return nil, fmt.Errorf("HelmChart needs Name and TargetNamespace")
 	}
 	spec := map[string]any{
-		"chart":           h.Chart,
-		"version":         h.Version,
 		"targetNamespace": h.TargetNamespace,
 		"createNamespace": true,
 	}
-	// An oci:// reference carries its own registry; helm-controller rejects a
-	// HelmChart that sets both. The kubenest-agent chart is distributed that
-	// way (oci://ghcr.io/kubenesthq/charts/kubenest-operator-2, kn-z6e4).
-	if !oci {
-		spec["repo"] = h.Repo
+	if h.ChartContent != "" {
+		// chartContent is the whole chart archive: helm-controller takes the
+		// chart identity and version from it and rejects a spec that also
+		// names a repo, chart or version.
+		if h.Repo != "" || h.Chart != "" {
+			return nil, fmt.Errorf("HelmChart %s sets ChartContent together with Repo/Chart: chartContent is the whole archive and is the only chart source", h.Name)
+		}
+		spec["chartContent"] = h.ChartContent
+	} else {
+		oci := strings.HasPrefix(h.Chart, "oci://")
+		if h.Chart == "" || (h.Repo == "" && !oci) {
+			return nil, fmt.Errorf("HelmChart needs Name, Repo, Chart and TargetNamespace (an oci:// chart carries its own registry and needs no Repo)")
+		}
+		if h.Version == "" {
+			return nil, fmt.Errorf("HelmChart %s has no version: pins come from the bundle manifest's core section", h.Name)
+		}
+		spec["chart"] = h.Chart
+		spec["version"] = h.Version
+		// An oci:// reference carries its own registry; helm-controller rejects
+		// a HelmChart that sets both. The kubenest-agent chart is distributed
+		// that way (oci://ghcr.io/kubenesthq/charts/kubenest-operator-2, kn-z6e4).
+		if !oci {
+			spec["repo"] = h.Repo
+		}
 	}
 	if h.ValuesYAML != "" {
 		spec["valuesContent"] = h.ValuesYAML

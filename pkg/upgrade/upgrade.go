@@ -100,10 +100,6 @@ type Options struct {
 	// Acknowledge accepts individual deprecation findings by
 	// namespace/Kind/name. There is deliberately no blanket override.
 	Acknowledge []string
-	// MigrateWorkloadApplications is an explicit ownership hand-off, not an
-	// ordinary chart upgrade. It remains false unless the caller asks to detach
-	// the backend-owned Applications and open the in-cluster operator gate.
-	MigrateWorkloadApplications bool
 	// Now overrides the clock, for tests.
 	Now func() time.Time
 }
@@ -116,11 +112,10 @@ func (o Options) Identity(from string) stages.Identity {
 		Kind:    Kind,
 		Cluster: o.Cluster,
 		Fields: map[string]string{
-			"from bundle":                   from,
-			"to bundle":                     o.To,
-			"servers":                       stages.List(o.Servers),
-			"agents":                        stages.List(o.Agents),
-			"migrate workload applications": fmt.Sprintf("%t", o.MigrateWorkloadApplications),
+			"from bundle": from,
+			"to bundle":   o.To,
+			"servers":     stages.List(o.Servers),
+			"agents":      stages.List(o.Agents),
 		},
 	}
 }
@@ -168,9 +163,8 @@ type Session struct {
 	// Cluster is what the cluster's record says it IS: the bundle it is on,
 	// its profile set, its tier. Read once, at the start, from Records.
 	Cluster Recorded
-	// Records is where that record is read from and written back to — the
-	// control plane for a registered cluster, the cluster itself for a
-	// standalone one.
+	// Records is where that record is read from and written back to: the
+	// control plane the cluster registered with.
 	Records RecordStore
 	// Drills reports the last verified restore drill. Nil means no evidence
 	// is available, which the gate refuses rather than passes.

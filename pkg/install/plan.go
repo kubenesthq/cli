@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/component/gatewayapi"
 	"kubenest.io/cli/pkg/component/traefik"
+	"kubenest.io/cli/pkg/config"
+	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -38,17 +41,42 @@ type Options struct {
 	SSHKey        string
 	StorageDevice string
 	BackupTarget  string
+	// ControlPlaneInstall is --control-plane: install the KubeNest control
+	// plane into the first cluster and register that cluster through it,
+	// instead of registering with a control plane that already exists.
+	ControlPlaneInstall bool
+	// Domain is the DNS suffix the control plane serves — api.<domain> for the
+	// API, app.<domain> for the console. Defaults to the first server's
+	// address as an sslip.io name.
+	Domain string
+	// AdminEmail is the control plane's first administrator, admin@<domain>
+	// by default.
+	AdminEmail string
+	// ControlPlaneCA is the PEM of the authority the control plane's serving
+	// certificate chains to. A registered install carries it so the agent
+	// trusts the API it reports to; a --control-plane install learns it from
+	// the cluster it just installed.
+	ControlPlaneCA []byte
 }
 
-// Identity is the part of the request a resume must match exactly.
+// Identity is the part of the request a resume must match exactly. The install
+// MODE is part of it: a journal started as a registered install must not be
+// resumed as a control-plane one, because the stages that already ran would
+// have been aiming at a different control plane.
 func (o Options) Identity() Identity {
+	mode := "registered"
+	if o.ControlPlaneInstall {
+		mode = "control-plane"
+	}
 	return Identity{
 		Kind:    Kind,
 		Cluster: o.Name,
 		Fields: map[string]string{
+			"mode":             mode,
 			"bundle":           o.Bundle,
 			"HA tier":          o.HATier,
 			"--storage-device": o.StorageDevice,
+			"domain":           o.Domain,
 			"servers":          stages.List(o.Servers),
 			"agents":           stages.List(o.Agents),
 			"profiles":         stages.List(o.Profiles),
@@ -88,12 +116,6 @@ type Record struct {
 	Adopted      bool              `json:"adopted,omitempty"`
 	Device       string            `json:"storage_device,omitempty"`
 	Ownership    storage.Ownership `json:"volume_group_ownership,omitempty"`
-	// Standalone records that this install had no control plane, so the
-	// cluster id in the journal was generated locally rather than assigned
-	// (kn-l827). It is what lets a later adoption tell "this cluster minted
-	// its own identity" apart from "this journal belongs to a different
-	// control plane", which are two very different situations to walk into.
-	Standalone bool `json:"standalone,omitempty"`
 }
 
 // Session is one install run's state.
@@ -108,9 +130,10 @@ type Session struct {
 	Emit     Emitter
 	Reporter converge.Reporter
 	Out      io.Writer
-	// API is the control plane. Stages 2, 12 and 13 need it; nothing else
-	// does, and no stage may hold a credential in it beyond the CLI token
-	// it was built with.
+	// API is the control plane. Stages 2, 12 and 13 need it, and in a
+	// --control-plane install stage 9 builds it and logs the CLI in to the
+	// control plane it installed; nothing else does, and no stage may hold a
+	// credential in it beyond the CLI token it was built with.
 	API *api.Client
 
 	// Nodes is filled by stage 1 (preflight), which is why preflight always
@@ -187,24 +210,6 @@ func NodesFromJournal(j *Journal) (servers, agents []string) {
 	return strings.Fields(j.Identity.Fields["servers"]), strings.Fields(j.Identity.Fields["agents"])
 }
 
-// StandaloneFromJournal reports whether the install this journal records ran
-// with no control plane.
-//
-// It is the answer to "what IS this cluster" for a day-2 command, and it has
-// to come from the cluster's own install rather than from whatever this
-// machine happens to be logged in to: one laptop can hold a control-plane
-// login for one cluster and a standalone journal for another.
-func StandaloneFromJournal(j *Journal) (bool, error) {
-	if j == nil {
-		return false, nil
-	}
-	var rec Record
-	if err := j.DecodeState(&rec); err != nil {
-		return false, err
-	}
-	return rec.Standalone, nil
-}
-
 // Server returns the primary control-plane node — the one that runs kubectl
 // and holds the k3s auto-deploy directory.
 func (s *Session) Server() (k3s.Runner, error) {
@@ -228,15 +233,41 @@ func (s *Session) NodesWithRole(role NodeRole) []Node {
 	return out
 }
 
-// Plan is the thirteen stages wired to what actually does the work.
+// Plan is the stages wired to what actually does the work.
 //
 // The engine (engine.go) owns order, journalling and failure reporting; this
 // file owns which function each stage calls. They are separate so the
 // sequencing is readable without the plumbing, and so a test can exercise
 // resume against a table of fakes.
+//
+// A REGISTERED install runs the thirteen stages install.mdx names. A
+// --control-plane install runs fourteen: the control-plane stage sits between
+// platform-day2 and register, so the cluster that hosts the control plane is
+// registered through the control plane it now hosts, by the normal path.
 func Plan(s *Session) []Stage {
 	bind := func(f func(context.Context, *Session) error) stages.StageFunc {
 		return func(ctx context.Context) error { return f(ctx, s) }
+	}
+	if s.Opts.ControlPlaneInstall {
+		return []Stage{
+			{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
+			{Name: StageK3sServer, Component: "k3s", Run: bind(stageK3sServer)},
+			{Name: StageK3sAgents, Component: "k3s", Run: bind(stageK3sAgents)},
+			{Name: StageNetworking, Component: "traefik", Run: bind(stageNetworking)},
+			{Name: StageCerts, Component: "cert-manager", Run: bind(stageCerts)},
+			{Name: StageStorage, Component: "openebs-lvm-localpv", Run: bind(stageStorage)},
+			{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
+			{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
+			// AlwaysRun: a resume has to re-establish API access before the
+			// register stage can use it, and the chart apply it performs is
+			// idempotent.
+			{Name: StageControlPlane, AlwaysRun: true, Run: bind(stageControlPlane)},
+			{Name: StageRegister, AlwaysRun: true, Run: bind(stageRegister)},
+			{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
+			{Name: StageProfiles, Run: bind(stageProfiles)},
+			{Name: StageRecord, Run: bind(stageRecord)},
+			{Name: StageVerify, AlwaysRun: true, Run: bind(Verify)},
+		}
 	}
 	return []Stage{
 		{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
@@ -285,7 +316,10 @@ func stagePreflight(ctx context.Context, s *Session) error {
 		Nodes:         nodes,
 		Egress:        EgressTargets(s),
 		Catalog:       s.catalog(),
-		Standalone:    s.Standalone(),
+		// The control plane is what this run is installing, so there is no
+		// control-plane connectivity to check yet — the bundle request is
+		// still checked, against the catalog built into this binary.
+		ControlPlaneInstall: s.Opts.ControlPlaneInstall,
 	})
 	for _, warning := range report.Warnings() {
 		s.Logf("  warning: %s", warning)
@@ -338,11 +372,13 @@ func EgressTargets(s *Session) []preflight.EgressTarget {
 }
 
 // catalog is where stage 1 reads the offered bundles from: the control plane
-// when there is one, the versions built into this binary when there is not.
-// Same check either way — a request for a tier or a profile the bundle does
-// not offer is refused before anything is written to a machine.
+// when this cluster is being registered with one that already exists, the
+// versions built into this binary when this run is INSTALLING the control
+// plane — it does not exist yet to be asked. Same check either way — a
+// request for a tier or a profile the bundle does not offer is refused before
+// anything is written to a machine.
 func (s *Session) catalog() preflight.Catalog {
-	if s.Standalone() {
+	if s.Opts.ControlPlaneInstall {
 		return EmbeddedCatalog{}
 	}
 	return bundleCatalog{s.API}
@@ -377,12 +413,6 @@ func (b bundleCatalog) ListBundles(ctx context.Context) ([]preflight.BundleEntry
 // Re-minting on a resume whose agent is already installed and heartbeating
 // would rotate a live cluster's identity to no purpose.
 func stageRegister(ctx context.Context, s *Session) error {
-	if s.Standalone() {
-		// Nothing to register against, by decision rather than by accident
-		// (kn-l827). The cluster generates its own identity and mints no
-		// credential — see stageRegisterStandalone.
-		return stageRegisterStandalone(s)
-	}
 	org, err := register.ResolveOrg(ctx, s.API, s.Opts.Org)
 	if err != nil {
 		return err
@@ -404,7 +434,7 @@ func stageRegister(ctx context.Context, s *Session) error {
 		return err
 	}
 	// In memory, for this process only. Nothing here can reach the journal:
-	// api.Secret refuses to marshal and ClusterRecord has no field for it.
+	// api.Secret refuses to marshal and Record has no field for it.
 	s.Creds = creds
 	s.Record.TokenVersion = creds.AgentJWT.TokenVersion
 	if creds.RepoCredential != nil {
@@ -589,34 +619,160 @@ func stageDay2(ctx context.Context, s *Session) error {
 	return stages.NewComponentError("kured", day2.InstallKured(ctx, server, s.Bundle, s.Reporter))
 }
 
+// stageControlPlane installs the KubeNest control plane into this cluster and
+// leaves the CLI logged in to it, so this cluster — the first one, the
+// management cluster — is registered through the control plane it now hosts
+// by the ordinary register stage that follows.
+//
+// It runs only for --control-plane, and it saves the CLI's login itself: that
+// is what lets a resumed install (whose earlier stages are skipped) still
+// reach the API, and it is why the stage is AlwaysRun — re-establishing
+// access is the work, and the Helm apply it performs is idempotent.
+func stageControlPlane(ctx context.Context, s *Session) error {
+	server, err := s.Server()
+	if err != nil {
+		return err
+	}
+	sec, created, err := controlplane.EnsureSecrets(ctx, server)
+	if err != nil {
+		return err
+	}
+	values, err := controlplane.Values(controlplane.Settings{
+		Domain:     s.Opts.Domain,
+		AdminEmail: s.Opts.AdminEmail,
+	}, sec)
+	if err != nil {
+		return err
+	}
+	if err := controlplane.Install(ctx, server, values, s.Bundle, s.Reporter); err != nil {
+		return err
+	}
+	addr, err := controlplane.BackendAddr(ctx, server)
+	if err != nil {
+		return err
+	}
+	ca, err := controlplane.PlatformCA(ctx, server)
+	if err != nil {
+		return err
+	}
+
+	// The backend is a ClusterIP that only the node can route to, so the CLI
+	// reaches it through a TCP connection opened FROM the node over the SSH
+	// connection this install already holds. Nothing else in the CLI can
+	// reach this control plane until DNS exists for it.
+	tunnel, ok := server.(interface {
+		DialTCP(ctx context.Context, addr string) (net.Conn, error)
+	})
+	if !ok {
+		return fmt.Errorf("the SSH connection to the server cannot open a tunnel to the control plane backend (%s), so the CLI cannot log in to the control plane it just installed", addr)
+	}
+	open := func(opts ...api.Option) (*api.Client, error) {
+		dial := func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return tunnel.DialTCP(ctx, addr)
+		}
+		return api.New("http://"+addr, append([]api.Option{api.WithDialContext(dial)}, opts...)...)
+	}
+	base := "https://api." + s.Opts.Domain
+
+	token, err := s.controlPlaneToken(ctx, open, base, sec.AdminPassword)
+	if err != nil {
+		return err
+	}
+	client, err := open(api.WithToken(token))
+	if err != nil {
+		return err
+	}
+	s.API = client
+
+	// Stored exactly as `kubenest login` stores it, so every later command
+	// finds this control plane without being told its URL or handed its CA.
+	creds, err := config.LoadCredentials()
+	if err != nil {
+		return err
+	}
+	creds.Set(base, token)
+	if err := config.SaveCredentials(creds); err != nil {
+		return fmt.Errorf("the CLI token was obtained but could not be stored: %w", err)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	cfg.ControlPlaneURL = base
+	cfg.ControlPlaneCA = string(ca)
+	cfg.UserEmail = s.Opts.AdminEmail
+	cfg.Token = "" // no legacy password JWT lives in config.json any more
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+
+	s.Logf("  control plane: https://api.%s, console https://app.%s", s.Opts.Domain, s.Opts.Domain)
+	s.Logf("  logged in as %s; the CLI token is stored in credentials.json and the platform CA in config.json", s.Opts.AdminEmail)
+	if created {
+		// The one and only time this is shown: the password is not in the
+		// journal and not in the config, and the cluster Secret EnsureSecrets
+		// wrote is the only copy that outlives this run.
+		s.Logf("  administrator: %s", s.Opts.AdminEmail)
+		s.Logf("  admin password: %s", sec.AdminPassword)
+		s.Logf("  the password is stored in the cluster Secret %s/%s and will not be shown again",
+			controlplane.Namespace, controlplane.SecretName)
+	}
+	return nil
+}
+
+// controlPlaneToken returns a CLI token for the control plane this run just
+// installed: the one already stored for it when that still authenticates (a
+// resumed install), otherwise a fresh one minted from the administrator login.
+//
+// open is the tunneled client factory: every call here goes through the node,
+// because nothing else can reach a control plane that has no DNS yet.
+func (s *Session) controlPlaneToken(ctx context.Context, open func(...api.Option) (*api.Client, error), base, adminPassword string) (string, error) {
+	if cfg, err := config.Load(); err == nil && cfg.ControlPlaneURL == base {
+		creds, err := config.LoadCredentials()
+		if err != nil {
+			return "", err
+		}
+		if stored := creds.TokenFor(base); stored != "" {
+			client, err := open(api.WithToken(stored))
+			if err != nil {
+				return "", err
+			}
+			// The cheapest authenticated call there is: proving the stored
+			// token is still accepted is what makes reusing it safe.
+			if _, err := client.ListOrgs(ctx); err == nil {
+				s.Logf("  reusing the CLI token already stored for %s", base)
+				return stored, nil
+			}
+			s.Logf("  the stored CLI token for %s is no longer accepted; minting a new one", base)
+		}
+	}
+
+	session, err := open()
+	if err != nil {
+		return "", err
+	}
+	sessionToken, err := session.PasswordLogin(ctx, s.Opts.AdminEmail, adminPassword)
+	if err != nil {
+		return "", fmt.Errorf("logging in to the control plane this run installed: %w", err)
+	}
+	authed, err := open(api.WithToken(sessionToken))
+	if err != nil {
+		return "", err
+	}
+	token, err := authed.CreateCLIToken(ctx, "kubenest-cli", cliTokenScopes, 90)
+	if err != nil {
+		return "", fmt.Errorf("minting a CLI token on the control plane this run installed: %w", err)
+	}
+	return token, nil
+}
+
+// cliTokenScopes is what the installer's own token may do, and nothing else.
+var cliTokenScopes = []string{"clusters:read", "clusters:register", "bundles:read", "install:report"}
+
 // stageAgent installs the KubeNest agent — which IS the operator (decision G)
 // — with the identity minted in stage 2, and only ever with THIS process's
 // credentials.
 func stageAgent(ctx context.Context, s *Session) error {
-	if s.Standalone() {
-		// Unmanaged: the cluster has an identity generated in stage 2 and no
-		// hub, no bearer and no mint (kn-sf17). This stage used to REFUSE
-		// here, because readiness was wired to the hub WebSocket and the
-		// Deployment could never go Available — the pod would sit READY 0/1
-		// forever. Operator 7b84b83 makes "no hub configured" a mode of its
-		// own, distinct from "hub configured and unreachable", and chart
-		// 2.5.0 is the first that can express it.
-		//
-		// The identity comes from the journal rather than from credentials
-		// because there are none to hold: stageRegisterStandalone generated
-		// it locally and deliberately minted nothing alongside it.
-		if s.Jnl.ClusterID == "" {
-			return stages.NewComponentError("kubenest-agent", fmt.Errorf(
-				"stage 2 recorded no cluster identity in the journal, so the agent has nothing to install as; "+
-					"re-run from the start rather than installing an operator with an empty cluster id (kn-z6e4)"))
-		}
-		server, err := s.Server()
-		if err != nil {
-			return err
-		}
-		return stages.NewComponentError("kubenest-agent",
-			agent.InstallUnmanaged(ctx, server, s.Bundle, s.Jnl.ClusterID, s.Reporter))
-	}
 	server, err := s.Server()
 	if err != nil {
 		return err
@@ -625,7 +781,18 @@ func stageAgent(ctx context.Context, s *Session) error {
 	if !ok || creds == nil {
 		return fmt.Errorf("no credentials from stage 2: the mint returns them once per run, so this stage cannot be reached with credentials from an earlier process")
 	}
-	return stages.NewComponentError("kubenest-agent", agent.Install(ctx, server, s.Bundle, creds, s.Reporter))
+	// A management cluster's operator talks to the hub running beside it,
+	// inside the cluster, rather than to the public API the mint's hub URL
+	// names. A registered cluster reaches the control plane it was registered
+	// with, and carries the CA to trust it.
+	var opts agent.ValuesOptions
+	if s.Opts.ControlPlaneInstall {
+		opts.BackendURLOverride = controlplane.HubInClusterURL
+	} else {
+		opts.ControlPlaneCA = s.Opts.ControlPlaneCA
+	}
+	return stages.NewComponentError("kubenest-agent",
+		agent.Install(ctx, server, s.Bundle, creds, opts, s.Reporter))
 }
 
 // stageProfiles installs each selected profile, in the order given.
@@ -655,19 +822,16 @@ func stageProfiles(ctx context.Context, s *Session) error {
 		s.Bundle.Bundle, strings.Join(s.Bundle.Profiles.Names(), ", "), strings.Join(unbuilt, ", "))
 }
 
-// stageRecord writes what was installed against the cluster: bundle version,
-// profile set, HA tier and volume-group ownership.
+// stageRecord writes what was installed against the cluster, in the control
+// plane: bundle version, profile set, HA tier and volume-group ownership. It
+// is the same call in both modes — a --control-plane install set s.API in the
+// control-plane stage, so by here there is always a control plane to record
+// against.
 //
 // The ownership value is not bookkeeping — it is what uninstall reads to
 // decide whether it may remove a volume group, which is the difference
 // between a clean teardown and destroying a customer's data.
 func stageRecord(ctx context.Context, s *Session) error {
-	if s.Standalone() {
-		// No control plane to record against, so the record goes where the
-		// cluster is: onto the cluster. See standalone.go — this is the
-		// only copy that exists in this mode, and kn-y3gt is its reader.
-		return stageRecordStandalone(ctx, s)
-	}
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to record against")
 	}

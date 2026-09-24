@@ -7,9 +7,12 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +29,13 @@ type Client struct {
 	baseURL    *url.URL
 	httpClient *http.Client
 	token      string
+	// caCerts is extra trusted PEM, appended in option order and folded into
+	// the transport at the end of New (see transport).
+	caCerts [][]byte
+	// dialContext, when set, replaces the standard network dialer — it is how
+	// the CLI reaches a control plane that is only routable from the cluster
+	// node it was installed on (an ssh tunnel from pkg/sshx).
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	// debugw receives redacted request traces when KUBENEST_DEBUG=1.
 	debugw io.Writer
 	// sleep paces device-token polling; replaced in tests.
@@ -49,6 +59,22 @@ func WithDebugWriter(w io.Writer) Option {
 	return func(c *Client) { c.debugw = w }
 }
 
+// WithCACert trusts the PEM-encoded certificate(s) in pem in addition to the
+// system roots. The platform control plane issues its own CA, which the
+// installer machine has never seen, and trusting it must not mean distrusting
+// the public roots every other hostname resolves through. Invalid PEM fails
+// New.
+func WithCACert(pem []byte) Option {
+	return func(c *Client) { c.caCerts = append(c.caCerts, pem) }
+}
+
+// WithDialContext routes every request through fn instead of the standard
+// network dialer. It composes with WithCACert and WithTimeout: the client
+// keeps one transport carrying all three.
+func WithDialContext(fn func(ctx context.Context, network, addr string) (net.Conn, error)) Option {
+	return func(c *Client) { c.dialContext = fn }
+}
+
 // New builds a client for the given control-plane base URL.
 func New(controlPlane string, opts ...Option) (*Client, error) {
 	if controlPlane == "" {
@@ -67,7 +93,36 @@ func New(controlPlane string, opts ...Option) (*Client, error) {
 	for _, opt := range opts {
 		opt(c)
 	}
+	transport, err := c.transport()
+	if err != nil {
+		return nil, err
+	}
+	c.httpClient.Transport = transport
 	return c, nil
+}
+
+// transport assembles the HTTP transport from the connection-affecting
+// options. TLS is untouched unless extra CAs were supplied, and the extra
+// CAs are added to a pool seeded from the system roots so both remain valid.
+func (c *Client) transport() (*http.Transport, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if c.dialContext != nil {
+		tr.DialContext = c.dialContext
+	}
+	if len(c.caCerts) == 0 {
+		return tr, nil
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	for _, pemBytes := range c.caCerts {
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			return nil, fmt.Errorf("control-plane CA is not valid PEM: no certificate found in it")
+		}
+	}
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool}
+	return tr, nil
 }
 
 // BaseURL reports the control plane this client targets.

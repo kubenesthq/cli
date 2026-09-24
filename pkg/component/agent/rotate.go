@@ -20,12 +20,11 @@ const ManifestPath = k3s.ManifestDir + "/" + manifestName + ".yaml"
 //
 // WHY A PATCH RATHER THAN A RE-RENDER, because the obvious implementation is
 // wrong in a way that is invisible until a cluster loses something. Rendering
-// values from scratch needs the repo credential and the control plane's
-// workload-Applications declaration, and a token rotation response carries
-// neither: POST /clusters/{id}/rotate-token returns the new JWT alone. Fetching
-// the rest means re-minting, and minting is not idempotent — every mint rotates
-// the JWT again, so a rotate built that way invalidates the token it just
-// delivered.
+// values from scratch needs the repo credential and the operator's namespace,
+// and a token rotation response carries neither: POST /clusters/{id}/rotate-token
+// returns the new JWT alone. Fetching the rest means re-minting, and minting is
+// not idempotent — every mint rotates the JWT again, so a rotate built that way
+// invalidates the token it just delivered.
 //
 // So this reads what the cluster already has and replaces one leaf. An operator
 // who set a value by hand keeps it, a gate-closed cluster stays gate-closed,
@@ -58,8 +57,9 @@ func ReplaceJWTSecret(manifest []byte, token string) ([]byte, string, error) {
 	}
 	raw, ok := spec["valuesContent"].(string)
 	if !ok || raw == "" {
-		// An unmanaged install renders no jwtSecret at all (UnmanagedValues).
-		// Adding one here would hand a hub token to a cluster that has no hub.
+		// Every install renders a jwtSecret, so a missing valuesContent means
+		// this is not an agent manifest at all. Adding the key here would
+		// write a value nothing reads.
 		return nil, "", fmt.Errorf("%s carries no spec.valuesContent: this cluster was not installed with an agent JWT, so there is nothing to rotate", ManifestPath)
 	}
 

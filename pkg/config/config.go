@@ -23,6 +23,11 @@ type Config struct {
 	// token when the control plane ships one (kn-odqp).
 	Token     string `json:"token,omitempty"`
 	UserEmail string `json:"email,omitempty"`
+	// ControlPlaneCA is the PEM of the CA the control plane's certificate
+	// chains to. A self-hosted platform issues its own CA, which no system
+	// trust store has; the CLI passes this to api.WithCACert so the
+	// management cluster can reach the API it just installed.
+	ControlPlaneCA string `json:"control_plane_ca,omitempty"`
 
 	// LegacyAPIURL is read (never written) so a config written by the
 	// pre-platform CLI still logs in against the same control plane.
