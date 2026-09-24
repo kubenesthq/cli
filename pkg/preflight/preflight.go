@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
 )
@@ -210,6 +211,11 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 // creates under --control-plane — and whether the requested bundle exists and
 // offers the requested tier and profiles.
 //
+// It also refuses a bundle whose kubenest-agent pin predates the operator's
+// ownership of workload Applications (agent.CheckChart): that bundle installs
+// green and then deploys nothing, and preflight is the last cheap moment to
+// say so.
+//
 // The second check is the same in both modes. Only the first differs, and it
 // differs in what it reports rather than in whether it runs: a check that
 // silently disappeared in one mode would make the difference between the two
@@ -254,6 +260,27 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 				Fix:    "it offers " + orNone(found.Profiles),
 			})
 			return
+		}
+	}
+	// The bundle's kubenest-agent pin decides whether ANYTHING will create
+	// this cluster's workload Argo CD Applications: the control plane never
+	// does (kn-cjqw OPTION A), so the operator must, and only charts from
+	// agent.MinChartOwningApplications on know how. A bundle pinning less
+	// installs green and then deploys nothing, so it is refused HERE — before
+	// stage 3 writes a byte to a host, rather than after k3s and the whole
+	// platform are on it. A bundle that pins no kubenest-agent at all is not
+	// this check's business: it keeps whatever refusal the install path
+	// already has for a missing pin.
+	if opts.Bundle != nil {
+		if version, err := opts.Bundle.Core.Version("kubenest-agent"); err == nil {
+			if err := agent.CheckChart(version); err != nil {
+				rep.add(Result{
+					Check: CheckBundle, Outcome: Fail,
+					Detail: err.Error(),
+					Fix:    "choose a bundle whose kubenest-agent chart is " + agent.MinChartOwningApplications + " or later",
+				})
+				return
+			}
 		}
 	}
 	rep.add(Result{

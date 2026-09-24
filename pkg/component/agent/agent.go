@@ -115,24 +115,22 @@ type ValuesOptions struct {
 // the agent JWT: chart values, written to a 0600 file, never a command
 // argument, never the journal.
 //
-// The fifth is whether to pin the GitOps host's SSH key, which is why this
-// takes a chart version. The mint now carries known_hosts (kn-rnyl.1) and
-// gitSSHKnownHosts has existed since chart 2.3.5 — but on any chart before
-// minChartWithHostKeyPin, rendering it BREAKS the cluster rather than
-// hardening it: those operator builds react to a known_hosts file by dropping
-// insecureIgnoreHostKey from the ArgoCD repository Secret, and nothing puts
-// the host into argocd-ssh-known-hosts-cm, so ArgoCD refuses the repository
-// outright and no desired state syncs at all. The pin is therefore rendered
-// only where the operator also teaches ArgoCD the same host key. Below that
-// version the value is omitted and the install proceeds unpinned — which is
-// what every install did before this field existed, where refusing would take
-// out an install path over hardening it.
+// The fifth is whether to pin the GitOps host's SSH key: whenever the mint
+// carries known_hosts (kn-rnyl.1), this renders it into gitSSHKnownHosts AND
+// into argo-cd.configs.ssh.extraHosts, so go-git verifies the host and ArgoCD
+// is taught the same key. That pairing is safe on every chart this package
+// accepts, which is why the version is no longer an input here: Chart refuses
+// anything below MinChartOwningApplications, 2.6.5, and 2.6.0 was the first
+// whose operator writes the host into argocd-ssh-known-hosts-cm instead of
+// only dropping insecureIgnoreHostKey. A pin below 2.6.0 was an outage rather
+// than weaker hardening — ArgoCD refused a repository it had no entry for —
+// and 2.6.0 is unreachable now.
 //
 // The last two values do not come from the mint at all: ValuesOptions carries
 // what only the caller knows, which is how the management cluster's operator
 // finds the control plane that runs beside it and how it verifies that control
 // plane's certificate.
-func Values(creds *api.AgentCredentials, chartVersion string, opts ValuesOptions) (string, error) {
+func Values(creds *api.AgentCredentials, opts ValuesOptions) (string, error) {
 	if creds == nil {
 		return "", fmt.Errorf("the agent needs the credentials minted in stage 2")
 	}
@@ -221,7 +219,7 @@ func Values(creds *api.AgentCredentials, chartVersion string, opts ValuesOptions
 		// known_hosts is the server's PUBLIC key. It is not revealed from a
 		// Secret because it was never one, and it is what stops an attacker
 		// on the path to Gitea from serving forged desired state (kn-rnyl.1).
-		if chartPinsHostKey(chartVersion) && creds.RepoCredential.KnownHosts != "" {
+		if creds.RepoCredential.KnownHosts != "" {
 			bootstrapController["gitSSHKnownHosts"] = creds.RepoCredential.KnownHosts
 			// The Argo CD subchart owns argocd-ssh-known-hosts-cm. Give Helm
 			// the same public pin it gives the operator, rather than making the
@@ -244,50 +242,44 @@ func Values(creds *api.AgentCredentials, chartVersion string, opts ValuesOptions
 	return string(out), nil
 }
 
-// minChartWithRepoCredential is the first chart on which a per-cluster GitOps
-// deploy key actually WORKS end to end — not merely the first whose values
-// surface accepts one.
+// MinChartOwningApplications is the first kubenest-agent chart whose operator
+// creates the cluster's workload Argo CD Applications itself.
 //
-// 2.3.5 was the tempting answer and it is wrong. Charts 2.2.0 through 2.3.4
-// have no gitSSHPrivateKey value at all, and no chart in this line ships a
-// values.schema.json, so helm ACCEPTS the value and discards it: the install
-// goes green with bootstrap.gitea disabled and no Git credential of any kind.
-// 2.3.5 was the first to carry the value and wire GIT_SSH_PRIVATE_KEY_FILE in
-// its deployment — but it pins appVersion dcc8d25, a build from before kn-gjew
-// (19a611e) taught the operator to READ that variable. That binary reads
-// GIT_TOKEN only, which this package deliberately leaves empty, so it logs
-// "Warning: GIT_TOKEN not set - only public repositories will be accessible"
-// and carries on against a private repo.
+// The control plane never creates them (kn-cjqw OPTION A, 2026-09-10):
+// Values renders kubenest.workloadApplications.enabled true on EVERY install
+// and the mint's creates_workload_applications is deliberately not read.
+// The operator's half of that bargain first shipped in chart 2.6.5: op3
+// 0ba157a taught the operator to own the workload's ArgoCD Application, made
+// to survive `helm upgrade --reuse-values` in 5c965a8, and 2.6.5 (op3 f767d97)
+// is the first RELEASE carrying both — 5c965a8 did not bump the chart version.
 //
-// So 2.3.5 reaches the same silent no-credential end state as 2.2.0, one layer
-// down. A constant of 2.3.5 refused 2.2.0 while telling the reader "2.3.5 or
-// later carries it" — an assurance that a 2.3.5 install works. It does not.
-// 2.4.0 pins appVersion 8411f91, which does read the key.
-//
-// Verified against the published artifacts, not inferred: every tag from 2.2.0
-// to 2.4.0 pulled from ghcr and inspected.
-const minChartWithRepoCredential = "2.4.0"
+// Below it the value is accepted and silently discarded, because no chart in
+// this line ships a values.schema.json: helm has no schema to reject
+// kubenest.workloadApplications against, the install goes green, and NOTHING
+// creates that cluster's workload Applications. That end state is the defect;
+// CheckChart is the refusal that prevents it.
+const MinChartOwningApplications = "2.6.5"
 
-// minChartWithHostKeyPin is the first chart whose operator teaches BOTH sides
-// of the GitOps path the same host key: go-git verifies against the mounted
-// known_hosts, and the bootstrap controller writes the same lines into
-// argocd-ssh-known-hosts-cm before it stops setting insecureIgnoreHostKey on
-// the repository Secret.
+// CheckChart refuses a kubenest-agent pin below MinChartOwningApplications.
 //
-// Order matters more than the version does. Charts 2.3.5 through 2.5.x mount
-// known_hosts and their operators already drop insecureIgnoreHostKey when the
-// file is present — but they teach ArgoCD nothing, so ArgoCD then refuses a
-// repository it has no entry for and the cluster syncs nothing. A pin sent to
-// those charts is not weaker hardening, it is an outage.
-const minChartWithHostKeyPin = "2.6.0"
-
-// chartPinsHostKey reports whether this chart consumes gitSSHKnownHosts on
-// both sides. An unreadable version answers no: the cost of not pinning is
-// the unverified host every install had before kn-rnyl.1, and the cost of
-// guessing wrong is a cluster whose ArgoCD refuses its own repository.
-func chartPinsHostKey(version string) bool {
-	cmp, err := manifest.CompareVersions(version, minChartWithHostKeyPin)
-	return err == nil && cmp >= 0
+// It lives here rather than at the install call site because BOTH ends need
+// it and they are far apart: preflight runs it before a single byte reaches a
+// host (pkg/preflight), and Chart runs it before rendering, so a caller that
+// skipped preflight still cannot install a cluster whose applications would be
+// owned by nobody. An unreadable version is refused too — a gate that defaults
+// an unparseable pin to "new enough" fails open, which is the shape of defect
+// this whole check exists to stop.
+func CheckChart(version string) error {
+	cmp, err := manifest.CompareVersions(version, MinChartOwningApplications)
+	if err != nil {
+		return fmt.Errorf("cannot tell whether kubenest-agent %s creates the cluster's workload Argo CD Applications: %w", version, err)
+	}
+	if cmp < 0 {
+		return fmt.Errorf(
+			"bundle pins kubenest-agent %s, whose operator does not create the cluster's workload Argo CD Applications, and the control plane never creates them, so this cluster would install and then deploy nothing. %s is the first agent chart that creates them. Install this cluster from a bundle that pins kubenest-agent %s or later",
+			version, MinChartOwningApplications, MinChartOwningApplications)
+	}
+	return nil
 }
 
 // Chart renders the agent's HelmChart resource at the bundle's pin. The chart
@@ -299,6 +291,12 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials, opts ValuesOp
 	if err != nil {
 		return k3s.HelmChart{}, err
 	}
+	// Before anything else: an accepted pin is one whose operator creates the
+	// cluster's workload Applications, and every later decision in this
+	// function — including the host-key pin — is safe only on such a chart.
+	if err := CheckChart(version); err != nil {
+		return k3s.HelmChart{}, err
+	}
 	if creds == nil || creds.Operator.ChartRef == "" {
 		return k3s.HelmChart{}, fmt.Errorf("the minted credentials carry no operator chart reference")
 	}
@@ -306,21 +304,7 @@ func Chart(bundle *manifest.Manifest, creds *api.AgentCredentials, opts ValuesOp
 	if namespace == "" {
 		return k3s.HelmChart{}, fmt.Errorf("the minted credentials carry no operator namespace")
 	}
-	// Refuse rather than render a credential the pinned chart cannot consume.
-	// An error naming both versions is recoverable; a green install with no Git
-	// credential is discovered later, by whoever wonders why nothing deploys.
-	if creds.RepoCredential != nil {
-		cmp, err := manifest.CompareVersions(version, minChartWithRepoCredential)
-		if err != nil {
-			return k3s.HelmChart{}, fmt.Errorf("cannot tell whether kubenest-agent %s carries the GitOps deploy key values: %w", version, err)
-		}
-		if cmp < 0 {
-			return k3s.HelmChart{}, fmt.Errorf(
-				"bundle pins kubenest-agent %s, on which the per-cluster GitOps deploy key does not work: it is accepted and then silently dropped, leaving the cluster with no Git credential at all. Charts before 2.3.5 have no gitSSHPrivateKey value and helm discards it; 2.3.5 carries the value but pins an operator build that cannot read it. %s is the first that works end to end. Install this cluster from a bundle that pins %s or later, or register it without a GitOps repository",
-				version, minChartWithRepoCredential, minChartWithRepoCredential)
-		}
-	}
-	values, err := Values(creds, version, opts)
+	values, err := Values(creds, opts)
 	if err != nil {
 		return k3s.HelmChart{}, err
 	}

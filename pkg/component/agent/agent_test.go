@@ -25,31 +25,20 @@ const agentJWT = "eyJhbGciOiJIUzI1NiJ9.AGENT_TOKEN_VALUE.signature"
 // key and every push fails at ssh.
 const repoKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----"
 
-// bundle pins kubenest-agent 2.2.0 — the pin platform-0.9 carries, and the one
-// that has no gitSSHPrivateKey value. Tests that render a repo credential must
-// use repoCapableBundle instead; agent.Chart refuses this pairing on purpose.
+// bundle pins kubenest-agent 2.6.16 — the pin platform-1.0 carries. Every
+// test here renders against a chart at or above agent.MinChartOwningApplications
+// because agent.Chart refuses anything below it: below 2.6.5 the operator does
+// not create the cluster's workload Argo CD Applications and nothing else does
+// either (chartgate_test.go has the refused pins and the measured reason).
 func bundle(t *testing.T) *manifest.Manifest {
 	t.Helper()
-	return bundleWithAgent(t, "2.2.0")
+	return bundleWithAgent(t, chartOwningApplications)
 }
 
-// repoCapableBundle pins the first chart on which the GitOps deploy key
-// actually works end to end. Not 2.3.5: that one carries the value and pins an
-// operator build that cannot read it (see chartgate_test.go).
-func repoCapableBundle(t *testing.T) *manifest.Manifest {
-	t.Helper()
-	return bundleWithAgent(t, repoCapableChart)
-}
-
-// repoCapableChart is the pin repoCapableBundle carries. Values renders
-// against a chart version because the chart decides what it can consume — and
-// 2.4.0 consumes the deploy key but not the host-key pin (kn-rnyl.1).
-const repoCapableChart = "2.4.0"
-
-// hostKeyChart is the first chart that teaches BOTH go-git and ArgoCD the same
-// GitOps host key. See minChartWithHostKeyPin in agent.go for why sending the
-// pin to anything older is an outage rather than weaker hardening.
-const hostKeyChart = "2.6.0"
+// chartOwningApplications is the pin bundle carries. The chart version is no
+// longer an input to Values: the host-key pin renders whenever the mint
+// carries known_hosts, which is safe on every chart Chart accepts.
+const chartOwningApplications = "2.6.16"
 
 // knownHosts is a host-key pin as the mint returns it: OpenSSH known_hosts
 // lines for the host in repo_url. Public key material, not a secret.
@@ -102,7 +91,7 @@ func TestChartUsesTheMintedRefAndTheBundlePin(t *testing.T) {
 	if chart.Chart != "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2" {
 		t.Errorf("chart ref is %q — the version must not be carried twice", chart.Chart)
 	}
-	if chart.Version != "2.2.0" {
+	if chart.Version != chartOwningApplications {
 		t.Errorf("version is %q, want the bundle pin", chart.Version)
 	}
 	if chart.Repo != "" {
@@ -131,7 +120,7 @@ func TestChartUsesTheMintedRefAndTheBundlePin(t *testing.T) {
 // chart's bootstrap cert-manager is a different version from the one stage 6
 // installed, and both claim the same CRDs.
 func TestBootstrapCertManagerIsDisabled(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +138,7 @@ func TestWorkloadApplicationsAreEnabledWhateverTheMintDeclares(t *testing.T) {
 	for _, declared := range []bool{false, true} {
 		c := creds(false)
 		c.Operator.CreatesWorkloadApplications = declared
-		values, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{})
+		values, err := agent.Values(c, agent.ValuesOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +160,7 @@ func TestWorkloadApplicationsAreEnabledWhateverTheMintDeclares(t *testing.T) {
 // what the mint returned.
 func TestBackendURLOverrideReplacesTheMintedHubURL(t *testing.T) {
 	override := "ws://kubenest-cp-hub.kubenest-system.svc.cluster.local:8001/ws/operator"
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{BackendURLOverride: override})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{BackendURLOverride: override})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +182,7 @@ func TestBackendURLOverrideReplacesTheMintedHubURL(t *testing.T) {
 // first, and not SSL_CERT_FILE, which would replace them.
 func TestControlPlaneCARendersTheConfigMapAndTheTrustOptions(t *testing.T) {
 	ca := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{ControlPlaneCA: ca})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{ControlPlaneCA: ca})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +231,7 @@ func TestControlPlaneCARendersTheConfigMapAndTheTrustOptions(t *testing.T) {
 // control plane has a publicly trusted certificate must not be handed
 // directories that do not exist.
 func TestNoControlPlaneCARendersNoTrustOptions(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +261,7 @@ func TestInstallWritesThePlatformCAManifestBeforeTheChart(t *testing.T) {
 		return sshx.Result{}, nil
 	}}
 	ca := "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
-	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(false),
+	if err := agent.Install(context.Background(), fake, bundle(t), creds(false),
 		agent.ValuesOptions{ControlPlaneCA: []byte(ca)}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +306,7 @@ func TestInstallWritesThePlatformCAManifestBeforeTheChart(t *testing.T) {
 // Helm command once copied the API name into a nonexistent kubenest.hubURL
 // key; Helm ignored it and the operator silently dialled the chart default.
 func TestHubURLMapsToTheChartBackendURLKey(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,14 +328,14 @@ func TestHubURLMapsToTheChartBackendURLKey(t *testing.T) {
 // GitOps repo is that one; an in-cluster Gitea would be a second source of
 // truth. With no repo credential the chart's own fallback is left alone.
 func TestGiteaFollowsTheMintedRepoCredential(t *testing.T) {
-	withRepo, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
+	withRepo, err := agent.Values(creds(true), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(withRepo, "gitea") {
 		t.Errorf("a minted repo credential must disable the in-cluster Gitea:\n%s", withRepo)
 	}
-	withoutRepo, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	withoutRepo, err := agent.Values(creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +369,7 @@ func carries(text, needle string) bool { return leakscan.Carries(text, needle) }
 // matched nothing would make every assertion below pass forever, which is the
 // failure mode being corrected, reintroduced one level up.
 func TestTheLeakScannerCatchesTheShapeThatShippedTheDefect(t *testing.T) {
-	values, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(true), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +402,7 @@ func TestTheAgentJWTNeverReachesACommandLineAndItsFileIsPrivate(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
+	if err := agent.Install(context.Background(), fake, bundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -456,12 +445,12 @@ func TestMissingIdentityIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := creds(false)
 			mutate(c)
-			if _, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{}); err == nil {
+			if _, err := agent.Values(c, agent.ValuesOptions{}); err == nil {
 				t.Fatal("want a refusal")
 			}
 		})
 	}
-	if _, err := agent.Values(nil, repoCapableChart, agent.ValuesOptions{}); err == nil {
+	if _, err := agent.Values(nil, agent.ValuesOptions{}); err == nil {
 		t.Fatal("want a refusal with no credentials at all")
 	}
 }
@@ -490,7 +479,7 @@ func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
 		if chart.Chart != want {
 			t.Errorf("Chart ref %q became %q, want %q", ref, chart.Chart, want)
 		}
-		if chart.Version != "2.2.0" {
+		if chart.Version != chartOwningApplications {
 			t.Errorf("%s: version is %q, want the bundle pin", ref, chart.Version)
 		}
 	}
@@ -502,7 +491,7 @@ func TestTheChartRefNeverCarriesTheVersion(t *testing.T) {
 // Disabling Gitea without this leaves the operator with NEITHER a Git server
 // nor the external repo.
 func TestRepoCredentialRendersIntoTheBootstrapControllerKeys(t *testing.T) {
-	values, err := agent.Values(creds(true), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(true), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +531,7 @@ func TestRepoCredentialRendersIntoTheBootstrapControllerKeys(t *testing.T) {
 // chart's own Gitea fallback stands, and no external credential values may
 // render — a gitRepoURL of "" with Gitea disabled reproduces kn-rnyl.2.
 func TestNoRepoCredentialRendersNoBootstrapController(t *testing.T) {
-	values, err := agent.Values(creds(false), repoCapableChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(false), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,7 +563,7 @@ func TestTheRepoKeyNeverReachesACommandLineNorAJournal(t *testing.T) {
 		}
 		return sshx.Result{}, nil
 	}}
-	if err := agent.Install(context.Background(), fake, repoCapableBundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
+	if err := agent.Install(context.Background(), fake, bundle(t), creds(true), agent.ValuesOptions{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, cmd := range fake.Commands() {
@@ -622,7 +611,7 @@ func TestAMalformedRepoCredentialIsRefused(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := creds(true)
 			mutate(c)
-			if _, err := agent.Values(c, repoCapableChart, agent.ValuesOptions{}); err == nil {
+			if _, err := agent.Values(c, agent.ValuesOptions{}); err == nil {
 				t.Fatal("want a refusal for a repo credential missing its " + name)
 			}
 		})
@@ -631,13 +620,21 @@ func TestAMalformedRepoCredentialIsRefused(t *testing.T) {
 
 // kn-rnyl.1: the deploy key proves the CLIENT to Gitea. Nothing proved Gitea
 // to the cluster, so an attacker on the path could serve forged desired state
-// to the operator and to ArgoCD. When the mint carries a host-key pin and the
-// chart can consume it on both sides, it must reach the chart.
-func TestHostKeyPinRendersOnAChartThatConsumesIt(t *testing.T) {
+// to the operator and to ArgoCD. When the mint carries a host-key pin it must
+// reach the chart on BOTH sides — go-git verifies against gitSSHKnownHosts and
+// Helm teaches ArgoCD the same key through argo-cd.configs.ssh.extraHosts.
+//
+// This renders unconditionally now, with no chart version to consult: every
+// chart agent.Chart accepts is >= 2.6.5, and 2.6.0 was the first whose operator
+// both stops setting insecureIgnoreHostKey and writes the host into
+// argocd-ssh-known-hosts-cm. Below 2.6.0 the pin was an outage rather than
+// weaker hardening (ArgoCD refuses a repository it has no entry for), and that
+// range is refused before Values runs.
+func TestHostKeyPinRendersOnEveryAcceptedChart(t *testing.T) {
 	c := creds(true)
 	c.RepoCredential.KnownHosts = knownHosts
 
-	values, err := agent.Values(c, hostKeyChart, agent.ValuesOptions{})
+	values, err := agent.Values(c, agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -650,42 +647,13 @@ func TestHostKeyPinRendersOnAChartThatConsumesIt(t *testing.T) {
 	}
 }
 
-// The pin must NOT be sent to an older chart. Those operator builds stop
-// setting insecureIgnoreHostKey on the ArgoCD repository Secret as soon as a
-// known_hosts file exists, and none of them writes the host into
-// argocd-ssh-known-hosts-cm — so ArgoCD refuses the repository and the cluster
-// syncs nothing at all. Unpinned is the status quo; refused is an outage.
-func TestHostKeyPinIsWithheldFromChartsThatWouldBreakOnIt(t *testing.T) {
-	for _, version := range []string{"2.3.5", "2.4.0", "2.4.1", "2.5.0", "not-a-version"} {
-		c := creds(true)
-		c.RepoCredential.KnownHosts = knownHosts
-
-		values, err := agent.Values(c, version, agent.ValuesOptions{})
-		if err != nil {
-			t.Fatalf("chart %s: %v", version, err)
-		}
-		bc := bootstrapControllerOf(t, values)
-		if _, present := bc["gitSSHKnownHosts"]; present {
-			t.Errorf("chart %s: gitSSHKnownHosts was rendered; that chart's ArgoCD would refuse the repo:\n%s", version, values)
-		}
-		if _, present := argoSSHExtraHostsOf(t, values); present {
-			t.Errorf("chart %s: argo-cd.configs.ssh.extraHosts was rendered alongside a withheld pin:\n%s", version, values)
-		}
-		// The credential itself still has to render, or withholding the pin
-		// would have cost the cluster its GitOps access entirely.
-		if bc["gitSSHPrivateKey"] != repoKey {
-			t.Errorf("chart %s: the deploy key must still render:\n%s", version, values)
-		}
-	}
-}
-
 // A mint from a control plane that could not establish the host key returns
 // none, and an empty pin must not be rendered: gitSSHKnownHosts: "" writes an
 // empty known_hosts key into the bootstrap Secret, and the operator reads an
 // empty file as "no pin" only because it checks — an empty file handed to
 // go-git's parser fails every clone with "no valid known_hosts".
 func TestNoHostKeyPinRendersNoValue(t *testing.T) {
-	values, err := agent.Values(creds(true), hostKeyChart, agent.ValuesOptions{})
+	values, err := agent.Values(creds(true), agent.ValuesOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

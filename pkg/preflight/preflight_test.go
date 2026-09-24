@@ -50,11 +50,28 @@ func (f fakeCatalog) ListBundles(context.Context) ([]preflight.BundleEntry, erro
 	return f.entries, f.err
 }
 
+// testManifest is the bundle the preflight tests run against. It pins no
+// kubenest-agent on purpose: most of the checks below are about hosts, and a
+// pin would drag the agent-chart gate into every one of them. The Bundle gate
+// has its own test, and a bundle with no pin must keep passing — see
+// manifestWithAgent.
 func testManifest(t *testing.T) *manifest.Manifest {
 	t.Helper()
+	return manifestWithAgent(t, "")
+}
+
+// manifestWithAgent is testManifest plus the core.kubenest-agent pin the
+// Bundle check reads. An empty pin leaves the core section out, which is what
+// a bundle with no agent pin looks like.
+func manifestWithAgent(t *testing.T, pin string) *manifest.Manifest {
+	t.Helper()
+	core := ""
+	if pin != "" {
+		core = "core:\n  kubenest-agent: " + pin + "\n"
+	}
 	m, err := manifest.Parse([]byte(`
 bundle: "1.0"
-os:
+` + core + `os:
   supported: [ubuntu-24.04]
 ha-tiers: [single-server, ha]
 limits:
@@ -287,6 +304,51 @@ func TestUnknownBundleAndTierAreRefused(t *testing.T) {
 		_, err := preflight.Run(context.Background(), opts)
 		if err == nil || !strings.Contains(err.Error(), "profile named") {
 			t.Fatalf("an unknown profile must be rejected, not ignored, got %v", err)
+		}
+	})
+}
+
+// The agent chart the bundle pins decides whether ANYTHING creates this
+// cluster's workload Argo CD Applications: the control plane never does
+// (kn-cjqw OPTION A, 2026-09-10) and the operator only learned to from chart
+// 2.6.5 on. A bundle pinned below that installs green and then deploys
+// nothing, so preflight refuses it — here, where a re-run costs nothing,
+// rather than after stage 3 has put k3s and the whole platform on the
+// customer's hosts.
+func TestABundleWhoseAgentChartCannotOwnTheApplicationsIsRefused(t *testing.T) {
+	t.Run("2.2.0, the pin platform-0.9 carries", func(t *testing.T) {
+		opts := baseOptions(t, healthyHost(nil))
+		opts.Bundle = manifestWithAgent(t, "2.2.0")
+		rep, err := preflight.Run(context.Background(), opts)
+		if err == nil {
+			t.Fatal("a bundle whose agent chart does not create the workload Applications must be refused")
+		}
+		result, ok := outcomeOf(rep, preflight.CheckBundle)
+		if !ok || result.Outcome != preflight.Fail {
+			t.Fatalf("the refusal must be the Bundle check: %+v (present %v)", result, ok)
+		}
+		// The detail has to name the refused pin as well as the floor, and
+		// the fix has to name the floor, or the reader cannot tell which
+		// bundle to pick instead.
+		for _, want := range []string{"2.2.0", "2.6.5"} {
+			if !strings.Contains(result.Detail, want) {
+				t.Errorf("the refusal detail must name %q: %s", want, result.Detail)
+			}
+		}
+		if !strings.Contains(result.Fix, "2.6.5") {
+			t.Errorf("the fix must name the floor 2.6.5: %s", result.Fix)
+		}
+	})
+
+	t.Run("2.6.16, the pin platform-1.0 carries", func(t *testing.T) {
+		opts := baseOptions(t, healthyHost(nil))
+		opts.Bundle = manifestWithAgent(t, "2.6.16")
+		rep, err := preflight.Run(context.Background(), opts)
+		if err != nil {
+			t.Fatalf("a bundle whose agent chart owns the Applications must pass:\n%v", err)
+		}
+		if result, ok := outcomeOf(rep, preflight.CheckBundle); !ok || result.Outcome != preflight.Pass {
+			t.Fatalf("Bundle = %+v (present %v), want a pass", result, ok)
 		}
 	})
 }
