@@ -102,10 +102,11 @@ type Entry struct {
 
 // Catalog is every bundle this binary carries, parsed.
 //
-// It is the standalone stand-in for the control plane's bundle list, and it
-// is deliberately the SAME check: a request for a tier or a profile the
-// bundle does not offer is refused at preflight in both modes, rather than
-// discovered at the stage that would have installed it.
+// It stands in for the control plane's bundle list when there is no control
+// plane to ask yet — the --control-plane install — and it is deliberately the
+// SAME check: a request for a tier or a profile the bundle does not offer is
+// refused at preflight wherever the list came from, rather than discovered at
+// the stage that would have installed it.
 func Catalog() ([]Entry, error) {
 	var out []Entry
 	for _, v := range Versions() {

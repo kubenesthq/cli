@@ -5,9 +5,8 @@
 // --control-plane` has to install the control plane on a cluster that has no
 // control plane to ask, and nothing is hosted by us (decision 2026-08-26), so
 // the chart has to travel with the binary that installs it. That is the same
-// reason pkg/bundles embeds the bundle manifests: the pinned artifact is in
-// the installer, so a standalone install and a registered install of the same
-// CLI release cannot install different things.
+// reason pkg/bundles embeds the bundle manifests: a --control-plane install
+// has nowhere to fetch them from.
 //
 // The archive is packaged from kubenest-helm/kubenest by
 //

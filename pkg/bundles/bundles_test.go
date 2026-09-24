@@ -14,7 +14,7 @@ import (
 func TestEveryEmbeddedManifestParses(t *testing.T) {
 	versions := Versions()
 	if len(versions) == 0 {
-		t.Fatal("this binary carries no bundle manifests: standalone install has no version pins at all")
+		t.Fatal("this binary carries no bundle manifests: a --control-plane install has no version pins at all")
 	}
 	for _, v := range versions {
 		m, err := Manifest(v)
@@ -34,7 +34,7 @@ func TestEveryEmbeddedManifestParses(t *testing.T) {
 
 // Every deadline and every pin the install path reads must be present, in
 // every embedded bundle. A missing key is an error at the stage that needed
-// it — which on a standalone install is a customer's host, mid-run.
+// it — which on a --control-plane install is a customer's host, mid-run.
 func TestEmbeddedManifestsCarryWhatInstallReads(t *testing.T) {
 	// The component keys the install plan can act on, and the timeout keys
 	// its stages ask for. Both are named here rather than imported to keep
@@ -94,11 +94,11 @@ func TestCatalogMatchesTheManifests(t *testing.T) {
 	}
 }
 
-// DRIFT. kubenest-contracts owns these documents; the copies here are a
-// convenience so the binary can install without a control plane. If the two
-// ever disagree, a standalone install and a registered install of the SAME
-// bundle version would install different things — which is the one thing the
-// bundle is for.
+// DRIFT. kubenest-contracts owns these documents; the copies here are what a
+// --control-plane install uses, because it has no control plane to fetch them
+// from yet. If the two ever disagree, the first cluster and the clusters added
+// to it would install different things for the SAME bundle version — which is
+// the one thing the bundle is for.
 //
 // Skips when the umbrella workspace is not checked out beside this repo
 // (which is the case in this repo's own CI), because a check that cannot run
