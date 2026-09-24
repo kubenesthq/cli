@@ -116,6 +116,10 @@ type Record struct {
 	Adopted      bool              `json:"adopted,omitempty"`
 	Device       string            `json:"storage_device,omitempty"`
 	Ownership    storage.Ownership `json:"volume_group_ownership,omitempty"`
+	// AdminPasswordShown records that a --control-plane install has printed
+	// its administrator password, so it is printed exactly once per install
+	// however many runs that install takes.
+	AdminPasswordShown bool `json:"admin_password_shown,omitempty"`
 }
 
 // Session is one install run's state.
@@ -633,7 +637,7 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	sec, created, err := controlplane.EnsureSecrets(ctx, server)
+	sec, _, err := controlplane.EnsureSecrets(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -708,16 +712,27 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 
 	s.Logf("  control plane: https://api.%s, console https://app.%s", s.Opts.Domain, s.Opts.Domain)
 	s.Logf("  logged in as %s; the CLI token is stored in credentials.json and the platform CA in config.json", s.Opts.AdminEmail)
-	if created {
-		// The one and only time this is shown: the password is not in the
-		// journal and not in the config, and the cluster Secret EnsureSecrets
-		// wrote is the only copy that outlives this run.
-		s.Logf("  administrator: %s", s.Opts.AdminEmail)
-		s.Logf("  admin password: %s", sec.AdminPassword)
-		s.Logf("  the password is stored in the cluster Secret %s/%s and will not be shown again",
-			controlplane.Namespace, controlplane.SecretName)
+	return s.showAdminPasswordOnce(sec.AdminPassword)
+}
+
+// showAdminPasswordOnce prints the administrator password the first time this
+// install's control-plane stage completes, and records that it did.
+//
+// Keyed to the journal, not to whether this run generated the password: on
+// real hardware the first run generated it and then failed at this stage's
+// readiness check, and every resumed run found the Secret already there, so
+// an install keyed on "generated in this run" never showed the password at
+// all. Only the flag is journalled; the password lives in the cluster Secret.
+func (s *Session) showAdminPasswordOnce(password string) error {
+	if s.Record.AdminPasswordShown {
+		return nil
 	}
-	return nil
+	s.Logf("  administrator: %s", s.Opts.AdminEmail)
+	s.Logf("  admin password: %s", password)
+	s.Logf("  the password is stored in the cluster Secret %s/%s and will not be shown again",
+		controlplane.Namespace, controlplane.SecretName)
+	s.Record.AdminPasswordShown = true
+	return s.saveRecord()
 }
 
 // controlPlaneToken returns a CLI token for the control plane this run just
