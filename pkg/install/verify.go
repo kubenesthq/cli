@@ -196,6 +196,16 @@ spec:
         claimName: verify
 `, verifyNamespace, storage.StorageClassName, verifyImage)
 
+	// The previous run deleted this namespace without waiting for it
+	// (cleanupVerifyNamespace), so a run started soon after can find it still
+	// terminating, and Kubernetes refuses to create anything inside it. Delete
+	// a leftover and wait until it is gone first. Re-running `platform install
+	// --control-plane` is how the control plane is upgraded, so back-to-back
+	// runs are routine rather than rare.
+	if _, err := k3s.Kubectl(ctx, server, "delete namespace "+verifyNamespace+" --ignore-not-found --wait=true --timeout="+deadline.String()); err != nil {
+		return fmt.Errorf("the previous storage probe's namespace %s is still being removed: %w", verifyNamespace, err)
+	}
+
 	// Applied directly rather than through the auto-deploy directory: this is
 	// a throwaway probe, and a file left in the auto-deploy directory would be
 	// reconciled back after deletion.

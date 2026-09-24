@@ -10,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,10 +41,17 @@ limits:
 	return m
 }
 
-// deploymentProbeCmd is the command component.CheckCondition runs for a
-// Deployment in this namespace.
+// deploymentProbeCmd is the command the readiness probe runs for a Deployment
+// in this namespace.
 func deploymentProbeCmd(name string) string {
 	return "sudo -n k3s kubectl get deployment/" + name + " -o json -n " + Namespace
+}
+
+// deploymentJSON is a Deployment as kubectl reports it: the revision its pod
+// template carries, and its generation and replica counts.
+func deploymentJSON(revision string, generation, observed int64, replicas, updated, available int32) string {
+	return fmt.Sprintf(`{"metadata":{"generation":%d},"spec":{"replicas":1,"template":{"metadata":{"annotations":{%q:%q}}}},"status":{"observedGeneration":%d,"replicas":%d,"updatedReplicas":%d,"availableReplicas":%d}}`,
+		generation, revisionAnnotation, revision, observed, replicas, updated, available)
 }
 
 // The chart reaches the cluster inside the HelmChart resource itself
@@ -58,12 +67,16 @@ func TestInstallAppliesTheEmbeddedChartAndWaitsForTheControlPlane(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	applied, revision, err := withRevision(values)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	available := sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Available","status":"True"}]}}`}
+	rolled := sshx.Result{Stdout: deploymentJSON(revision, 2, 2, 1, 1, 1)}
 	answers := map[string]sshx.Result{
-		deploymentProbeCmd(ReleaseName + "-backend"): available,
-		deploymentProbeCmd(ReleaseName + "-hub"):     available,
-		deploymentProbeCmd(ReleaseName + "-ui"):      available,
+		deploymentProbeCmd(ReleaseName + "-backend"): rolled,
+		deploymentProbeCmd(ReleaseName + "-hub"):     rolled,
+		deploymentProbeCmd(ReleaseName + "-ui"):      rolled,
 		"sudo -n k3s kubectl get statefulset " + postgresStatefulSet + " -n " + Namespace + " -o json": {
 			Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`,
 		},
@@ -112,8 +125,23 @@ func TestInstallAppliesTheEmbeddedChartAndWaitsForTheControlPlane(t *testing.T) 
 	if spec["chartContent"] != base64.StdEncoding.EncodeToString(ChartArchive()) {
 		t.Error("chartContent is not the embedded chart archive: the install would fetch a chart from somewhere instead")
 	}
-	if spec["valuesContent"] != values {
-		t.Errorf("valuesContent = %v, want the values document verbatim", spec["valuesContent"])
+	if spec["valuesContent"] != applied {
+		t.Errorf("valuesContent = %v, want the values document plus its installRevision", spec["valuesContent"])
+	}
+	var sent map[string]any
+	if err := yaml.Unmarshal([]byte(applied), &sent); err != nil {
+		t.Fatal(err)
+	}
+	var original map[string]any
+	if err := yaml.Unmarshal([]byte(values), &original); err != nil {
+		t.Fatal(err)
+	}
+	if sent["installRevision"] != revision {
+		t.Errorf("installRevision = %v, want %s", sent["installRevision"], revision)
+	}
+	delete(sent, "installRevision")
+	if !reflect.DeepEqual(sent, original) {
+		t.Errorf("the applied values differ from Values() beyond installRevision:\n got %v\nwant %v", sent, original)
 	}
 
 	// The chart has to be READY, not merely applied.
@@ -123,6 +151,43 @@ func TestInstallAppliesTheEmbeddedChartAndWaitsForTheControlPlane(t *testing.T) 
 	last := events[len(events)-1]
 	if last.Outcome != converge.Pass || last.Check != "kubenest-control-plane-ready" {
 		t.Errorf("last event = %s %s, want a pass of kubenest-control-plane-ready", last.Check, last.Outcome)
+	}
+}
+
+// The control plane is upgraded by re-running the install, so readiness has
+// to mean "running what this run applied". On real hardware a probe on the
+// Available condition passed in seconds while the previous backend still
+// served, because a rolling update keeps the old ReplicaSet Available. Each
+// case here is a Deployment that is Available and must still not count.
+func TestReadinessWaitsForThisRevisionToRollOut(t *testing.T) {
+	const revision = "0123456789abcdef"
+	cases := []struct {
+		name       string
+		deployment string
+		ready      bool
+	}{
+		{"the helm job has not applied this revision", deploymentJSON("fedcba9876543210", 1, 1, 1, 1, 1), false},
+		{"the controller has not observed the new template", deploymentJSON(revision, 2, 1, 1, 0, 1), false},
+		{"the new pod is not available yet", deploymentJSON(revision, 2, 2, 1, 1, 0), false},
+		{"a pod of the previous revision is still running", deploymentJSON(revision, 2, 2, 2, 1, 2), false},
+		{"rolled out at this revision", deploymentJSON(revision, 2, 2, 1, 1, 1), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+				if command != deploymentProbeCmd(ReleaseName+"-backend") {
+					t.Fatalf("unscripted command: %q", command)
+				}
+				return sshx.Result{Stdout: tc.deployment}, nil
+			}}
+			ready, state, err := rolledOut(context.Background(), r, ReleaseName+"-backend", revision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ready != tc.ready {
+				t.Errorf("ready = %v (%s), want %v", ready, state.Status, tc.ready)
+			}
+		})
 	}
 }
 

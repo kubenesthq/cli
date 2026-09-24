@@ -2,13 +2,16 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 
-	"kubenest.io/cli/pkg/component"
+	"gopkg.in/yaml.v3"
+
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -39,8 +42,13 @@ const (
 	caTLSKey     = "tls.crt"
 )
 
+// revisionAnnotation is the pod-template annotation the chart stamps with the
+// installRevision value (templates/*-deployment.yaml).
+const revisionAnnotation = "kubenest.io/install-revision"
+
 // Install applies the control-plane chart and converges until its three
-// Deployments and its PostgreSQL StatefulSet are up.
+// Deployments run exactly what this call applied and its PostgreSQL
+// StatefulSet is up.
 //
 // The chart is applied as a k3s HelmChart holding the archive in
 // spec.chartContent (k3s.HelmChart.ChartContent), which is how the pinned
@@ -51,12 +59,16 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 	if err != nil {
 		return err
 	}
+	values, revision, err := withRevision(valuesYAML)
+	if err != nil {
+		return err
+	}
 	chart := k3s.HelmChart{
 		Name:            ReleaseName,
 		TargetNamespace: Namespace,
 		ChartContent:    base64.StdEncoding.EncodeToString(ChartArchive()),
 		// valuesContent carries the generated secrets, so it is readable by anyone who can read HelmCharts in kube-system — the same cluster-admin audience as the Secret they came from.
-		ValuesYAML: valuesYAML,
+		ValuesYAML: values,
 	}
 	doc, err := chart.Manifest()
 	if err != nil {
@@ -66,7 +78,7 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 		return err
 	}
 
-	res, err := converge.Wait(ctx, readyProbe(r), converge.Options{
+	res, err := converge.Wait(ctx, readyProbe(r, revision), converge.Options{
 		Name:     "kubenest-control-plane-ready",
 		Deadline: deadline,
 		Reporter: rep,
@@ -77,20 +89,107 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 	return res.Err()
 }
 
-// readyProbe observes the whole control plane: each of its Deployments
-// Available — k3s's helm-install job is still running until the first of them
-// exists, so "not there yet" is the normal first observation — and PostgreSQL
-// with every replica ready.
-func readyProbe(r k3s.Runner) converge.Probe {
+// withRevision adds installRevision to the values document: a hash of the
+// chart archive and the values, so it changes exactly when what is applied
+// changes. An identical re-run therefore applies an identical HelmChart and
+// rolls nothing.
+func withRevision(valuesYAML string) (string, string, error) {
+	sum := sha256.New()
+	sum.Write(ChartArchive())
+	sum.Write([]byte{0})
+	sum.Write([]byte(valuesYAML))
+	revision := hex.EncodeToString(sum.Sum(nil))[:16]
+
+	doc := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		return "", "", fmt.Errorf("reading the control-plane values: %w", err)
+	}
+	doc["installRevision"] = revision
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", "", fmt.Errorf("rendering the control-plane values: %w", err)
+	}
+	return string(out), revision, nil
+}
+
+// readyProbe observes the whole control plane: each Deployment rolled out at
+// this install's revision, and PostgreSQL with every replica ready.
+//
+// "Available" is not enough, and a re-run proved it: k3s's helm-install job
+// applies the chart asynchronously, and during a rolling update the previous
+// ReplicaSet keeps a Deployment Available. A probe on that condition passed in
+// seconds while the old backend was still the one serving, so a new backend
+// that could not start would have been reported installed.
+func readyProbe(r k3s.Runner, revision string) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
 		for _, workload := range []string{"backend", "hub", "ui"} {
-			done, state, err := component.CheckCondition(ctx, r, "deployment/"+ReleaseName+"-"+workload, Namespace, "Available")
+			done, state, err := rolledOut(ctx, r, ReleaseName+"-"+workload, revision)
 			if err != nil || !done {
 				return false, state, err
 			}
 		}
 		return postgresReady(ctx, r)
 	}
+}
+
+// rolledOut reports whether a Deployment runs exactly the given revision: its
+// pod template carries it, the Deployment controller has observed that
+// template, and every replica is from it and available, with none of the
+// previous ReplicaSet's pods left.
+func rolledOut(ctx context.Context, r k3s.Runner, name, revision string) (bool, converge.State, error) {
+	var d struct {
+		Metadata struct {
+			Generation int64 `json:"generation"`
+		} `json:"metadata"`
+		Spec struct {
+			Replicas *int32 `json:"replicas"`
+			Template struct {
+				Metadata struct {
+					Annotations map[string]string `json:"annotations"`
+				} `json:"metadata"`
+			} `json:"template"`
+		} `json:"spec"`
+		Status struct {
+			ObservedGeneration int64 `json:"observedGeneration"`
+			Replicas           int32 `json:"replicas"`
+			UpdatedReplicas    int32 `json:"updatedReplicas"`
+			AvailableReplicas  int32 `json:"availableReplicas"`
+		} `json:"status"`
+	}
+	object := "deployment/" + name + " in " + Namespace
+	out, err := k3s.Kubectl(ctx, r, "get deployment/"+name+" -o json -n "+Namespace)
+	if err != nil {
+		return false, converge.State{Object: object, Status: "not found yet"}, err
+	}
+	if err := json.Unmarshal([]byte(out), &d); err != nil {
+		return false, converge.State{Object: object, Status: "unparsable"}, err
+	}
+	want := int32(1)
+	if d.Spec.Replicas != nil {
+		want = *d.Spec.Replicas
+	}
+	st := d.Status
+	switch {
+	case d.Spec.Template.Metadata.Annotations[revisionAnnotation] != revision:
+		return false, converge.State{
+			Object: object,
+			Status: "not at this install's revision yet",
+			Detail: "the helm-install job has not applied this revision of the chart; the previous one is still what runs",
+		}, nil
+	case d.Metadata.Generation > st.ObservedGeneration:
+		return false, converge.State{Object: object, Status: "the new pod template is not observed yet"}, nil
+	case st.UpdatedReplicas < want || st.AvailableReplicas < want:
+		return false, converge.State{
+			Object: object,
+			Status: fmt.Sprintf("%d/%d replicas updated, %d available", st.UpdatedReplicas, want, st.AvailableReplicas),
+		}, nil
+	case st.Replicas > st.UpdatedReplicas:
+		return false, converge.State{
+			Object: object,
+			Status: fmt.Sprintf("%d replica(s) of the previous revision still running", st.Replicas-st.UpdatedReplicas),
+		}, nil
+	}
+	return true, converge.State{Object: object, Status: fmt.Sprintf("%d/%d at revision %s", st.AvailableReplicas, want, revision)}, nil
 }
 
 // postgresReady observes whether every replica of the PostgreSQL StatefulSet

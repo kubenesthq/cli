@@ -165,12 +165,21 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 		fmt.Fprintf(out, "Resuming: the previous run stopped at stage %s (%s).\nCompleted stages will be skipped.\n\n",
 			entry.Stage, entry.At.Format(time.RFC3339))
 	}
+	// What earlier runs remembered, chiefly who created kubenest-vg. A resume
+	// skips the storage stage that records it, so without this preflight
+	// refuses the install's own volume group and the record stage reports no
+	// ownership for it.
+	record, err := install.Recorded(journal)
+	if err != nil {
+		return err
+	}
 
 	session := &install.Session{
 		ID:       install.NewRunID(),
 		Opts:     opts,
 		Bundle:   bundle,
 		Jnl:      journal,
+		Record:   record,
 		Reporter: converge.NewTextReporter(out),
 		Out:      out,
 		API:      client,
