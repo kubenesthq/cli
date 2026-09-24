@@ -12,6 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/component"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -30,6 +31,10 @@ const backendPort = "8000"
 const (
 	backendService      = ReleaseName + "-backend"
 	postgresStatefulSet = ReleaseName + "-postgresql"
+	// The chart's own TLS certificate and Gateway (templates/gateway.yaml)
+	// for app., api. and hub.<domain>.
+	tlsCertificate = ReleaseName + "-tls"
+	gatewayName    = ReleaseName
 )
 
 // The platform CA cert-manager signs the bundle's certificates from. It is a
@@ -113,13 +118,22 @@ func withRevision(valuesYAML string) (string, string, error) {
 }
 
 // readyProbe observes the whole control plane: each Deployment rolled out at
-// this install's revision, and PostgreSQL with every replica ready.
+// this install's revision, PostgreSQL with every replica ready, and the
+// chart's own certificate and Gateway serving app., api. and hub.<domain>.
 //
 // "Available" is not enough, and a re-run proved it: k3s's helm-install job
 // applies the chart asynchronously, and during a rolling update the previous
 // ReplicaSet keeps a Deployment Available. A probe on that condition passed in
 // seconds while the old backend was still the one serving, so a new backend
 // that could not start would have been reported installed.
+//
+// Nor are running pods enough. The CLI reaches the backend through an SSH
+// tunnel during the install, so nothing in the install itself needs the
+// public route, and on a fresh install it can still be settling when the
+// command ends. Measured on real hardware on 2026-09-24: the first install's
+// closing check of https://api.<domain> timed out, and the same machine
+// reached that API minutes later. Added clusters dial hub.<domain> through
+// this route, so it is part of the control plane being ready.
 func readyProbe(r k3s.Runner, revision string) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
 		for _, workload := range []string{"backend", "hub", "ui"} {
@@ -128,7 +142,13 @@ func readyProbe(r k3s.Runner, revision string) converge.Probe {
 				return false, state, err
 			}
 		}
-		return postgresReady(ctx, r)
+		if done, state, err := postgresReady(ctx, r); err != nil || !done {
+			return false, state, err
+		}
+		if done, state, err := component.CheckCondition(ctx, r, "certificate/"+tlsCertificate, Namespace, "Ready"); err != nil || !done {
+			return false, state, err
+		}
+		return component.CheckCondition(ctx, r, "gateway/"+gatewayName, Namespace, "Programmed")
 	}
 }
 

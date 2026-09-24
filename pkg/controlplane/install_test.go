@@ -41,6 +41,70 @@ limits:
 	return m
 }
 
+// conditionProbeCmd is the command component.CheckCondition runs for an
+// object in this namespace.
+func conditionProbeCmd(resource string) string {
+	return "sudo -n k3s kubectl get " + resource + " -o json -n " + Namespace
+}
+
+func conditionJSON(condType, status string) sshx.Result {
+	return sshx.Result{Stdout: fmt.Sprintf(`{"status":{"conditions":[{"type":%q,"status":%q}]}}`, condType, status)}
+}
+
+// The CLI reaches the backend through an SSH tunnel during the install, so a
+// control plane whose pods are all ready can still be unreachable at
+// https://api.<domain>. On real hardware the first install's closing
+// reachability check timed out while the route was still settling. The
+// public route is what added clusters use, so the control plane is not ready
+// until its certificate is issued and its Gateway is programmed.
+func TestReadinessWaitsForTheControlPlanesCertificateAndGateway(t *testing.T) {
+	const revision = "0123456789abcdef"
+	rolled := sshx.Result{Stdout: deploymentJSON(revision, 1, 1, 1, 1, 1)}
+	base := map[string]sshx.Result{
+		deploymentProbeCmd(ReleaseName + "-backend"): rolled,
+		deploymentProbeCmd(ReleaseName + "-hub"):     rolled,
+		deploymentProbeCmd(ReleaseName + "-ui"):      rolled,
+		"sudo -n k3s kubectl get statefulset " + postgresStatefulSet + " -n " + Namespace + " -o json": {
+			Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`,
+		},
+	}
+	cases := []struct {
+		name        string
+		certificate sshx.Result
+		gateway     sshx.Result
+		ready       bool
+	}{
+		{"the certificate is not issued yet", conditionJSON("Ready", "False"), conditionJSON("Programmed", "True"), false},
+		{"the Gateway is not programmed yet", conditionJSON("Ready", "True"), conditionJSON("Programmed", "False"), false},
+		{"both serve", conditionJSON("Ready", "True"), conditionJSON("Programmed", "True"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			answers := map[string]sshx.Result{
+				conditionProbeCmd("certificate/" + tlsCertificate): tc.certificate,
+				conditionProbeCmd("gateway/" + gatewayName):        tc.gateway,
+			}
+			for k, v := range base {
+				answers[k] = v
+			}
+			r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+				res, ok := answers[command]
+				if !ok {
+					t.Fatalf("unscripted command: %q", command)
+				}
+				return res, nil
+			}}
+			ready, state, err := readyProbe(r, revision)(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ready != tc.ready {
+				t.Errorf("ready = %v (%s: %s), want %v", ready, state.Object, state.Status, tc.ready)
+			}
+		})
+	}
+}
+
 // deploymentProbeCmd is the command the readiness probe runs for a Deployment
 // in this namespace.
 func deploymentProbeCmd(name string) string {
@@ -80,6 +144,8 @@ func TestInstallAppliesTheEmbeddedChartAndWaitsForTheControlPlane(t *testing.T) 
 		"sudo -n k3s kubectl get statefulset " + postgresStatefulSet + " -n " + Namespace + " -o json": {
 			Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`,
 		},
+		conditionProbeCmd("certificate/" + tlsCertificate): conditionJSON("Ready", "True"),
+		conditionProbeCmd("gateway/" + gatewayName):        conditionJSON("Programmed", "True"),
 	}
 	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		if strings.HasPrefix(command, "sudo -n install -m 0600 ") {
