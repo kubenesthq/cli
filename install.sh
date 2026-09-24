@@ -420,7 +420,7 @@ main() {
 
   printf '\n'
   ok "kubenest is installed at ${INSTALL_DIR}/${BIN_NAME}"
-  info "next: install a standalone platform (no login required) — see https://docs.kubenest.io/quickstart"
+  info "next: install your first cluster, with the control plane in it: kubenest platform install --control-plane — see https://docs.kubenest.io/quickstart"
 }
 
 main "$@"
