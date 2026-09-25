@@ -555,8 +555,13 @@ func fenceObjects(ctx context.Context, r k3s.Runner) ([]byte, error) {
 				"name": fenceName, "key": fenceMessageKey,
 			}},
 		}},
+		// A TCP check, not an HTTP one: the fence answers 503 to every request,
+		// and an HTTP probe passes only on 2xx/3xx, so it could never be Ready
+		// (measured on hardware, 2026-09-25). Listening is what readiness means
+		// for a page whose only answer is "unavailable".
 		"readinessProbe": map[string]any{
-			"httpGet": map[string]any{"path": "/", "port": "http"},
+			"tcpSocket":     map[string]any{"port": "http"},
+			"periodSeconds": 2,
 		},
 	}
 

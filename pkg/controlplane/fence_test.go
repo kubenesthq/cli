@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -453,4 +454,32 @@ func renderedBackendImage(t *testing.T, rendered string) string {
 	}
 	t.Fatalf("the rendered chart carries no Deployment named %s", backendService)
 	return ""
+}
+
+// The fence answers 503 to every HTTP request, so an HTTP readiness probe can
+// never pass: on hardware (2026-09-25) the fence pod ran and served its page,
+// was never Ready, and the upgrade stopped after the component-ready deadline
+// waiting for it. Earlier runs had hidden this, because a route resting on a
+// Service with no ready endpoints ALSO answers 503. Readiness must ask whether
+// the fence is listening, not what it answers.
+func TestTheFenceCanBecomeReadyWhileAnsweringOnly503(t *testing.T) {
+	r := newFenceRunner(true)
+	if _, err := Raise(context.Background(), r, fenceTestValues); err != nil {
+		t.Fatal(err)
+	}
+	var manifest componenttest.Execution
+	for _, run := range r.Executions() {
+		if strings.Contains(run.Command, fenceName+".yaml") {
+			manifest = run
+		}
+	}
+	deployment := fenceObject(t, fenceObjectsOf(t, manifest), "Deployment")
+	probe := fenceDigMap(t, deployment, "spec", "template", "spec", "containers", "0", "readinessProbe")
+	if _, http := probe["httpGet"]; http {
+		t.Fatalf("the fence's readiness probe is an HTTP GET, which only passes on 2xx/3xx, and the fence answers 503 to everything: %v", probe)
+	}
+	tcp, _ := probe["tcpSocket"].(map[string]any)
+	if tcp == nil || fmt.Sprint(tcp["port"]) != "http" && fmt.Sprint(tcp["port"]) != fmt.Sprint(fencePort) {
+		t.Errorf("the fence's readiness probe does not check that the fence is listening on its port: %v", probe)
+	}
 }
