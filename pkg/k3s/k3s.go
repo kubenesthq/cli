@@ -204,6 +204,50 @@ func (h HelmChart) Manifest() ([]byte, error) {
 	return yaml.Marshal(doc)
 }
 
+// HelmChartConfig overrides the values of a HelmChart that already exists.
+//
+// The two objects are separate, and that separation is load-bearing (plan 7.4
+// item 6): the CLI owns the HelmChart — its version, and the values that hold
+// kured off a node — while the window is delivered to the cluster by the
+// OPERATOR, writing this config over the hub. k3s merges the config's values
+// over the chart's, so a later re-apply of the chart DOES NOT revert the
+// window, and the deploy controller's drift check does not flag it either. One
+// document carrying both would set two owners to reconciling against each
+// other, and the window would lose.
+//
+// The k3s deploy controller matches this object to its HelmChart by
+// metadata.name and metadata.namespace, so those must be the chart's exactly;
+// the object's file name in the auto-deploy directory is irrelevant.
+type HelmChartConfig struct {
+	// Name is the targeted HelmChart's metadata.name.
+	Name string
+	// Namespace is the targeted HelmChart's metadata.namespace; k3s's own
+	// charts live in kube-system, which is where the helm-controller watches.
+	Namespace string
+	// ValuesYAML is the values document this config overrides with, verbatim.
+	ValuesYAML string
+}
+
+// Manifest renders the HelmChartConfig custom resource.
+func (h HelmChartConfig) Manifest() ([]byte, error) {
+	if h.Name == "" || h.Namespace == "" {
+		return nil, fmt.Errorf("HelmChartConfig needs Name and Namespace: the deploy controller matches it to its HelmChart by exactly those two, and a config that matches nothing is silently ignored")
+	}
+	if h.ValuesYAML == "" {
+		return nil, fmt.Errorf("HelmChartConfig %s carries no values: an override with nothing in it would silently do nothing, which is how a window that is not in force comes to read as if it were", h.Name)
+	}
+	doc := map[string]any{
+		"apiVersion": "helm.cattle.io/v1",
+		"kind":       "HelmChartConfig",
+		"metadata": map[string]any{
+			"name":      h.Name,
+			"namespace": h.Namespace,
+		},
+		"spec": map[string]any{"valuesContent": h.ValuesYAML},
+	}
+	return yaml.Marshal(doc)
+}
+
 // Kubectl runs `k3s kubectl <args>` on the server node and returns stdout.
 // A non-zero exit is an error carrying stderr — for converge probes that is
 // an observation, never a verdict (pkg/converge doc).
