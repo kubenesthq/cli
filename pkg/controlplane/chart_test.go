@@ -562,3 +562,37 @@ func TestGatewayCertificateUsesTheControlPlaneIssuer(t *testing.T) {
 		}
 	}
 }
+
+// A security change (a raised token floor, a removed member, a revoked CLI
+// token) makes the backend create a Job from the checkpoint CronJob's template,
+// so its Role must let it read THAT CronJob. On a real control plane
+// (2026-09-25) the grant was missing, every request failed with HTTP 403, and no
+// revocation was ever covered by a checkpoint.
+func TestBackendMayReadTheCheckpointCronJob(t *testing.T) {
+	root := siblingChartRoot(t)
+	cronJob := objectOfKind(t, chartObjects(t, root, "checkpoint-cronjob.yaml"), "CronJob")
+	name := dig(t, cronJob, "metadata", "name")
+
+	role := objectOfKind(t, chartObjects(t, root, "backend-rbac.yaml"), "Role")
+	rules, _ := role["rules"].([]any)
+	for _, entry := range rules {
+		rule, _ := entry.(map[string]any)
+		if !listHas(rule["apiGroups"], "batch") || !listHas(rule["resources"], "cronjobs") || !listHas(rule["verbs"], "get") {
+			continue
+		}
+		if names, scoped := rule["resourceNames"]; !scoped || listHas(names, name) {
+			return
+		}
+	}
+	t.Errorf("the backend's Role grants no get on CronJob %v: a security-triggered checkpoint cannot read the template it is created from", name)
+}
+
+func listHas(list any, want any) bool {
+	items, _ := list.([]any)
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
