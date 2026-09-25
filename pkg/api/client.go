@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -227,12 +228,20 @@ func (c *Client) do(req *http.Request, out any) error {
 		}
 	case resp.StatusCode >= 400:
 		detail := apiErrorDetail(resp.StatusCode, body)
-		return &Error{
+		fenced := resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(FenceHeader) == FenceHeaderUp
+		err := &Error{
 			Method: req.Method, Path: req.URL.Path, Status: resp.StatusCode,
 			Code:   apiErrorCode(body),
 			Detail: detail,
 			msg:    fmt.Sprintf("%s %s: %s", req.Method, req.URL.Path, detail),
 		}
+		if fenced {
+			// A 503 the FENCE gave is not a failure to reach the control
+			// plane: it is the fence saying so. Wrapped, so a caller can tell
+			// the two apart while still reading the status and the detail.
+			return fmt.Errorf("%w: %w", ErrControlPlaneFenced, err)
+		}
+		return err
 	}
 
 	if out == nil {
@@ -243,6 +252,32 @@ func (c *Client) do(req *http.Request, out any) error {
 	}
 	return nil
 }
+
+// THE FENCE IDENTIFIES ITSELF, and that is the whole point of this header.
+//
+// A control-plane upgrade fences the public API route while the backend is
+// stopped, migrated or unproven. A command that must run BEHIND that fence —
+// the resume of the upgrade that raised it — cannot tell "this control plane is
+// fenced by my own operation" from "this control plane is broken" by the status
+// code alone: a load balancer, an ingress timeout and a fenced route all answer
+// 503. The fence's own server stamps every answer with FenceHeader, so a 503
+// that carries it is a FACT about the state of the control plane, and a 503
+// that does not is a failure.
+const (
+	// FenceHeader is set on every answer the fence's static page gives.
+	FenceHeader = "X-Kubenest-Fence"
+	// FenceHeaderUp is its value while the fence is up.
+	FenceHeaderUp = "up"
+)
+
+// ErrControlPlaneFenced is returned for a 503 that carries FenceHeader. Its
+// callers may take the fence's own state as an answer: see
+// pkg/cmd's controlPlaneClientForUpgrade, which reaches the backend through the
+// node's tunnel exactly while this is the answer.
+var ErrControlPlaneFenced = errors.New("the control plane is fenced for an upgrade")
+
+// IsControlPlaneFenced reports whether err is the fence answering.
+func IsControlPlaneFenced(err error) bool { return errors.Is(err, ErrControlPlaneFenced) }
 
 // Error is a non-2xx response from the control plane. It carries the pieces a
 // caller needs to decide what to do — status, the contract's machine-readable

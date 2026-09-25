@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 )
@@ -609,6 +611,12 @@ func fenceObjects(ctx context.Context, r k3s.Runner, stamp string) ([]byte, erro
 				"class F(h.BaseHTTPRequestHandler):\n" +
 				"    def r(s):\n" +
 				"        s.send_response(503)\n" +
+				// THE FENCE IDENTIFIES ITSELF (kn-t70...4xso.1). A command that
+				// must run behind the fence — the resume of the upgrade that
+				// raised it — cannot tell "fenced" from "broken" by the status
+				// code: a load balancer answers 503 too. This header is what
+				// makes the difference checkable.
+				"        s.send_header('" + api.FenceHeader + "', '" + api.FenceHeaderUp + "')\n" +
 				"        s.send_header('Content-Type', 'text/plain; charset=utf-8')\n" +
 				"        s.send_header('Retry-After', '60')\n" +
 				"        s.send_header('Content-Length', str(len(BODY)))\n" +
@@ -722,4 +730,27 @@ func waitForService(ctx context.Context, r k3s.Runner, name string, within time.
 			return err
 		}
 	}
+}
+
+// NodeClient builds a client for the backend at the address only the NODE can
+// route to, over the SSH connection the caller already holds.
+//
+// It is the same path the upgrade's validation uses (BackendAddr + the
+// connection's DialTCP + api.New with WithDialContext), extracted because a
+// command that must run behind the fence needs it for its ordinary reads too:
+// while the public route points at the fence, the node is the only way to the
+// backend, and after a failed migration the backend may not be there at all
+// (kn-t70-control-plane-version-identity-4xso.1).
+func NodeClient(ctx context.Context, server k3s.Runner, open ClientOpener) (*api.Client, error) {
+	addr, err := BackendAddr(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+	tunnel, ok := server.(portDialer)
+	if !ok {
+		return nil, fmt.Errorf("the SSH connection to the server cannot open a tunnel to the control plane backend (%s), so the control plane cannot be reached while the fence is up", addr)
+	}
+	return open(func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return tunnel.DialTCP(ctx, addr)
+	})
 }

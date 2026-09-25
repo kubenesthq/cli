@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +24,7 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/operation"
+	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/upgrade"
 	"kubenest.io/cli/pkg/version"
@@ -50,11 +53,6 @@ func addControlPlaneUpgradeFlags(cmd *cobra.Command, f *UpgradeFlags) {
 // the cluster — the field-ownership assertion and the PostgreSQL pin — are run
 // by the gates stage itself.
 func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
-	client, err := controlPlaneClientChecked(ctx, "platform upgrade")
-	if err != nil {
-		return err
-	}
-
 	// The management cluster's name is needed to find its record, its window
 	// and its journal. Without --cluster it is the only install journal on this
 	// machine; several is a question rather than a guess, because upgrading the
@@ -67,6 +65,32 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 		f.Cluster = name
 	}
 
+	// THE NODE CONNECTION COMES FIRST, before any control-plane read.
+	//
+	// EVERY API READ THIS COMMAND MAKES CAN BE BEHIND THE FENCE THIS CLI RAISED
+	// (kn-t70-control-plane-version-identity-4xso.1): the public route is the
+	// fence, so the version check, the cluster's record, the maintenance window
+	// and the bundle manifest all answer 503 while an upgrade of this very
+	// control plane is in flight. The node is the only way to the backend, and
+	// on a resume it is the only thing the CLI can reach before it has decided
+	// anything.
+	nodeRunner, err := controlPlaneNodeRunner(ctx, f)
+	if err != nil {
+		return err
+	}
+	nodeClient := func(ctx context.Context) (*api.Client, error) {
+		return controlplane.NodeClient(ctx, nodeRunner, controlPlaneOpener())
+	}
+	// What the operation recorded when it began, when this run continues one.
+	// It is the last resort: a failed migration leaves the backend at zero
+	// replicas, so neither the public route nor the tunnel answers.
+	recorded, recordedWindow := recordedOperationFacts(ctx, nodeRunner, f.Resume)
+
+	client, before, err := controlPlaneForUpgrade(ctx, nodeClient, recorded)
+	if err != nil {
+		return err
+	}
+
 	// AN INTERRUPT IS NOT A FAILURE. SIGINT/SIGTERM cancels the run and leaves
 	// the operation record STOPPED rather than terminal-failed, because the
 	// whole point of a recorded step is that a second laptop can continue it —
@@ -76,11 +100,22 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	session, err := buildUpgradeSession(ctx, out, f)
+	session, err := buildUpgradeSessionWith(ctx, out, f, client)
 	if err != nil {
 		return err
 	}
 	defer session.Close()
+	// A WINDOW THAT COULD NOT BE READ IS STILL A WINDOW THE OPERATION KNOWS:
+	// while the fence is up the read goes through the node, and if the backend
+	// is at zero replicas there is nothing to read it from. The record names the
+	// window this upgrade was started inside, and refusing on "unreadable" would
+	// refuse the resume the CLI promised.
+	if session.Window == nil && recordedWindow != "" {
+		if spec, ok := parseRecordedWindow(recordedWindow); ok {
+			session.Window, session.WindowErr = &spec, nil
+			fmt.Fprintf(out, "  the maintenance window came from the operation record: %s\n", spec)
+		}
+	}
 	if err := session.Connect(ctx); err != nil {
 		return err
 	}
@@ -99,13 +134,10 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 		return err
 	}
 
-	// What the control plane says it is NOW. It is the floor the validation
-	// measures against, because the contract counter never goes down: a lower
+	// WHAT THE CONTROL PLANE SAYS IT IS NOW was read by controlPlaneForUpgrade,
+	// behind the fence if the fence is up: it is the floor the validation
+	// measures against, because the contract counter never goes down, so a lower
 	// era after the upgrade means an older build is still the one serving.
-	before, err := client.ControlPlaneVersion(ctx)
-	if err != nil && !api.IsVersionEndpointAbsent(err) {
-		return err
-	}
 
 	checkpointConfigured, err := valuesFlagEnabled(values, "checkpoint", "enabled")
 	if err != nil {
@@ -159,7 +191,7 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 
 	// THE RECORD IS THE LOCK. Taking it is the "no other operation" gate, and
 	// it is what refuses a second laptop while this upgrade is unfinished.
-	store, handle, skip, err := controlPlaneLock(ctx, server, f, session, out)
+	store, handle, skip, err := controlPlaneLock(ctx, server, f, session, out, before)
 	if err != nil {
 		return err
 	}
@@ -279,12 +311,26 @@ func controlPlaneLock(
 	f UpgradeFlags,
 	session *upgrade.Session,
 	out io.Writer,
+	before api.ControlPlaneVersion,
 ) (*operation.Store, *operation.Handle, map[string]bool, error) {
 	store := &operation.Store{Runner: server}
 	req := operation.Request{
-		Kind:     operation.KindControlPlaneUpgrade,
-		Cluster:  f.Cluster,
-		Versions: map[string]string{"bundle": session.From.Bundle + " -> " + f.To},
+		Kind:    operation.KindControlPlaneUpgrade,
+		Cluster: f.Cluster,
+		Versions: map[string]string{
+			"bundle":            session.From.Bundle + " -> " + f.To,
+			recordedContractKey: strconv.Itoa(before.Contract),
+			recordedBuildKey:    before.Build,
+		},
+	}
+	// THE WINDOW IS RECORDED WITH THEM, and it has to be: the resume of THIS
+	// operation may find the public route fenced and the backend at zero
+	// replicas, and the window gate refuses a window it cannot read. The record
+	// is in the cluster and needs no backend.
+	if session.Window != nil {
+		if spec, err := json.Marshal(session.Window.Spec()); err == nil {
+			req.Versions[recordedWindowKey] = string(spec)
+		}
 	}
 	for _, node := range session.Nodes {
 		req.Targets = append(req.Targets, operation.Target{HostID: node.Address})
@@ -446,4 +492,104 @@ func valuesFlagEnabled(valuesYAML string, path ...string) (bool, error) {
 	}
 	enabled, _ := current.(bool)
 	return enabled, nil
+}
+
+// controlPlaneNodeRunner dials the management cluster's first server node.
+//
+// It is the same connection the upgrade's stages use (buildUpgradeSession dials
+// them again; one extra session on a resume path is cheaper than making every
+// read wait for a dialect that a fenced control plane cannot answer).
+func controlPlaneNodeRunner(ctx context.Context, f UpgradeFlags) (k3s.Runner, error) {
+	servers, _, err := upgradeNodes(f)
+	if err != nil {
+		return nil, err
+	}
+	endpoint, err := sshx.Resolve(servers[0], sshx.Options{User: f.SSHUser, KeyPath: f.SSHKey})
+	if err != nil {
+		return nil, err
+	}
+	return sshx.Dial(ctx, endpoint, sshx.Options{KeyPath: f.SSHKey})
+}
+
+// recordedOperationFacts is what the operation recorded when it began: the
+// control plane's version and the maintenance window.
+//
+// IT READS THE OPERATION RECORD, which lives in the CLUSTER and needs no
+// backend: that is the whole point. A resume whose migration failed has a
+// backend at zero replicas, so neither the public route nor the tunnel answers,
+// and the record is the only thing left that knows which control plane is being
+// upgraded and inside which window.
+func recordedOperationFacts(ctx context.Context, runner k3s.Runner, operationID string) (api.ControlPlaneVersion, string) {
+	if operationID == "" {
+		return api.ControlPlaneVersion{}, ""
+	}
+	stored, err := (&operation.Store{Runner: runner}).Find(ctx, operationID)
+	if err != nil || stored == nil || stored.Record == nil {
+		return api.ControlPlaneVersion{}, ""
+	}
+	versions := stored.Record.Request.Versions
+	contract, _ := strconv.Atoi(versions[recordedContractKey])
+	return api.ControlPlaneVersion{Contract: contract, Build: versions[recordedBuildKey]}, versions[recordedWindowKey]
+}
+
+// The keys the operation record carries the control plane's own identity and
+// the window under. They are part of the record's wire shape: a second laptop
+// reads what the first one wrote.
+const (
+	recordedContractKey = "control-plane contract"
+	recordedBuildKey    = "control-plane build"
+	recordedWindowKey   = "maintenance window"
+)
+
+// parseRecordedWindow turns the recorded window back into a Window.
+func parseRecordedWindow(recorded string) (window.Window, bool) {
+	var spec window.Spec
+	if err := json.Unmarshal([]byte(recorded), &spec); err != nil {
+		return window.Window{}, false
+	}
+	parsed, err := window.Parse(spec)
+	if err != nil {
+		return window.Window{}, false
+	}
+	return parsed, true
+}
+
+// controlPlaneForUpgrade chooses the client every read of this command uses, and
+// reads the control plane's version with it.
+//
+// THE CHOICE IS MADE ONCE, deliberately. A per-call fallback would mean every
+// future read remembering to ask; one decision point means a read added later
+// cannot forget. The order:
+//
+//	the public route answers        use it, which is the ordinary case;
+//	it answers 404 (no counter)     use it: nothing is fenced and the other
+//	                                routes exist;
+//	it answers the FENCE's 503      use the node's tunnel — the fence is this
+//	                                CLI's own state, and the backend is behind
+//	                                the node while the route is the fence;
+//	the node cannot either          fall back for the VERSION to what the
+//	                                operation recorded, and let each read that
+//	                                fails say so.
+func controlPlaneForUpgrade(ctx context.Context, node func(context.Context) (*api.Client, error), recorded api.ControlPlaneVersion) (*api.Client, api.ControlPlaneVersion, error) {
+	public, err := controlPlaneClient()
+	if err != nil {
+		return nil, api.ControlPlaneVersion{}, err
+	}
+	source := fencedVersionSource{Public: public, Node: node, Recorded: recorded}
+	reported, known, err := source.version(ctx)
+	if err != nil {
+		return nil, api.ControlPlaneVersion{}, err
+	}
+	if err := requireControlPlaneForUpgrade(reported, known); err != nil {
+		return nil, reported, err
+	}
+	if _, err := public.ControlPlaneVersion(ctx); err == nil || api.IsVersionEndpointAbsent(err) {
+		return public, reported, nil
+	}
+	if node != nil {
+		if viaNode, nerr := node(ctx); nerr == nil {
+			return viaNode, reported, nil
+		}
+	}
+	return public, reported, nil
 }

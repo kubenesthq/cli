@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/version"
@@ -116,4 +117,82 @@ func controlPlaneClientChecked(ctx context.Context, path string) (*api.Client, e
 		return nil, err
 	}
 	return client, nil
+}
+
+// fencedVersionSource is where a FENCED command gets the version it needs.
+//
+// THREE ANSWERS, IN ORDER, and the order is the argument:
+//
+//	the public route   answers unless the fence is up;
+//	the node's tunnel  where the backend is while the fence is up, because the
+//	                   public route is the fence;
+//	the record         what the operation wrote down when it began, which is the
+//	                   only source left once the chart has stopped the backend
+//	                   (`backend.replicas: 0`) for a migration that then failed.
+//
+// A source is a value rather than three branches inside one function so the
+// fallbacks can be exercised without a cluster (kn-t70...4xso.1).
+type fencedVersionSource struct {
+	// Public is the client for the configured control-plane URL.
+	Public *api.Client
+	// Node builds a client for the backend THROUGH the node's SSH connection.
+	// Nil means this command holds no node connection, which is a different
+	// answer from "the node could not reach the backend".
+	Node func(ctx context.Context) (*api.Client, error)
+	// Recorded is the version the operation recorded when it began: from the
+	// operation record on a resume, and from the live read on a first run.
+	Recorded api.ControlPlaneVersion
+}
+
+// version answers with the control plane's version, behind the fence if the
+// fence is up.
+// version answers with the control plane's version behind the fence, and says
+// whether it could be established at all.
+//
+// KNOWN IS A THIRD OUTCOME, not a zero version: a control plane that does not
+// serve /api/v1/version at all is "cannot tell", which is not a refusal, and a
+// control plane that reports contract 0 is a malformed answer the floor check
+// must refuse.
+func (s fencedVersionSource) version(ctx context.Context) (reported api.ControlPlaneVersion, known bool, err error) {
+	reported, err = s.Public.ControlPlaneVersion(ctx)
+	if err == nil {
+		return reported, true, nil
+	}
+	if api.IsVersionEndpointAbsent(err) {
+		return api.ControlPlaneVersion{}, false, nil
+	}
+	if !api.IsControlPlaneFenced(err) {
+		// ANY OTHER FAILURE IS A FAILURE. A 503 without the fence's header is a
+		// load balancer, an ingress or a dead backend — none of them is
+		// permission to proceed, and none of them says anything about the
+		// control plane's era.
+		return api.ControlPlaneVersion{}, false, err
+	}
+	if s.Node != nil {
+		if node, nerr := s.Node(ctx); nerr == nil {
+			if reported, nerr = node.ControlPlaneVersion(ctx); nerr == nil {
+				return reported, true, nil
+			}
+		}
+	}
+	if s.Recorded != (api.ControlPlaneVersion{}) {
+		return s.Recorded, true, nil
+	}
+	return api.ControlPlaneVersion{}, false, fmt.Errorf(
+		"the control plane's public route is fenced (%w) and the backend behind the node does not answer, and this operation recorded no version when it began: a resume cannot establish which control plane it is resuming, and guessing an era is how a resume walks into a control plane it does not understand — run `kubenest platform upgrade --control-plane` from the machine that started it, whose journal records what was recorded",
+		err)
+}
+
+// requireControlPlaneForUpgrade is requireControlPlane for a command that may be
+// running BEHIND the fence it raised: it takes the version the source
+// established, so the read happens once and the floor check is the only thing
+// this adds.
+//
+// A version that could NOT be established is passed through as nil, exactly as
+// a 404 is: absence is not a determination.
+func requireControlPlaneForUpgrade(reported api.ControlPlaneVersion, known bool) error {
+	if !known {
+		return nil
+	}
+	return version.RequireControlPlane(version.Report{Era: reported.Contract, Build: reported.Build})
 }

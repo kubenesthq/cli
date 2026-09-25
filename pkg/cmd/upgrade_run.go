@@ -66,6 +66,17 @@ func buildUpgradeSession(ctx context.Context, out io.Writer, f UpgradeFlags) (*u
 	if err != nil {
 		return nil, err
 	}
+	return buildUpgradeSessionWith(ctx, out, f, client)
+}
+
+// buildUpgradeSessionWith is buildUpgradeSession with the client already chosen.
+//
+// The control-plane upgrade chooses it through controlPlaneClientForUpgrade,
+// because every read below — the cluster's record, the window, both bundle
+// manifests — is behind the fence while an upgrade of this control plane is in
+// flight, and a resume must not depend on the public route it fenced off itself
+// (kn-t70-control-plane-version-identity-4xso.1).
+func buildUpgradeSessionWith(ctx context.Context, out io.Writer, f UpgradeFlags, client *api.Client) (*upgrade.Session, error) {
 
 	clusterID, err := resolveCluster(ctx, client, f.Cluster)
 	if err != nil {
