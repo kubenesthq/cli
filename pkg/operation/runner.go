@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/sshx"
@@ -71,6 +72,25 @@ func (g *Guarded) Run(ctx context.Context, command string) (sshx.Result, error) 
 // RunInput submits one remote command with stdin streamed.
 func (g *Guarded) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
 	return g.submit(ctx, command, stdin)
+}
+
+// DialTCP opens a tunnel through the real transport to an address only the
+// node can reach.
+//
+// A tunnel is not an action: it changes nothing on the cluster, so it is
+// neither recorded nor skipped. It has to pass through this decorator because
+// every stage's transport is one, and the control-plane upgrade validates the
+// new backend through the node while the public route is fenced. On hardware,
+// a decorator that hid the tunnel stopped that upgrade at validation, after the
+// migration and the new chart were already applied.
+func (g *Guarded) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
+	dialer, ok := g.Inner.(interface {
+		DialTCP(ctx context.Context, addr string) (net.Conn, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("the transport under this operation cannot open a tunnel to %s", addr)
+	}
+	return dialer.DialTCP(ctx, addr)
 }
 
 func (g *Guarded) submit(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {

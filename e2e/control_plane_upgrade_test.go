@@ -47,6 +47,8 @@ package e2e
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"io"
 	"net"
@@ -54,6 +56,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -191,35 +194,34 @@ func cpDial(t *testing.T, ctx context.Context, env cpUpgradeEnv) *sshx.Client {
 // than a reading taken afterwards.
 type cpFenceWatcher struct {
 	url      string
+	client   *http.Client
 	stop     chan struct{}
 	done     chan struct{}
+	mu       sync.Mutex
 	sawFence bool
 	answers  []int
 	leaked   []int
 }
 
-func cpStartWatcher(url string) *cpFenceWatcher {
-	w := &cpFenceWatcher{url: url, stop: make(chan struct{}), done: make(chan struct{})}
+// cpStartWatcher polls the public route with the control plane's own CA; the
+// lab's certificate is issued by it, and a watcher that could not verify it
+// recorded no answers at all (third hardware run: "answers were []").
+func cpStartWatcher(url string, ca []byte) *cpFenceWatcher {
+	w := &cpFenceWatcher{url: url, client: cpHTTPClient(ca), stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(w.done)
-		client := &http.Client{Timeout: 10 * time.Second}
 		for {
 			select {
 			case <-w.stop:
 				return
 			default:
 			}
-			resp, err := client.Get(w.url)
+			resp, err := w.client.Get(w.url)
 			if err == nil {
-				w.answers = append(w.answers, resp.StatusCode)
 				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusServiceUnavailable {
-					w.sawFence = true
-				} else if w.sawFence {
-					// After the fence was up, anything other than a 503 is a
-					// request that reached a backend: the interval S2 forbids.
-					w.leaked = append(w.leaked, resp.StatusCode)
-				}
+				w.mu.Lock()
+				w.answers = append(w.answers, resp.StatusCode)
+				w.mu.Unlock()
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -227,9 +229,60 @@ func cpStartWatcher(url string) *cpFenceWatcher {
 	return w
 }
 
+// close stops the poller and judges what it saw. The fenced interval runs from
+// the first 503 to the last one; any other answer inside it is a request that
+// reached a backend while the fence was meant to be up, which is what S2
+// forbids. Answers after the last 503 are the fence lowered on purpose, so a
+// successful upgrade's closing 200s are not leaks.
 func (w *cpFenceWatcher) close() {
 	close(w.stop)
 	<-w.done
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	first, last := -1, -1
+	for i, code := range w.answers {
+		if code == http.StatusServiceUnavailable {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	w.sawFence = first >= 0
+	for i := first + 1; first >= 0 && i < last; i++ {
+		if w.answers[i] != http.StatusServiceUnavailable {
+			w.leaked = append(w.leaked, w.answers[i])
+		}
+	}
+}
+
+func (w *cpFenceWatcher) snapshot() []int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]int(nil), w.answers...)
+}
+
+// cpHTTPClient trusts the control plane's CA, from the install's laptop state.
+func cpHTTPClient(ca []byte) *http.Client {
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(ca)
+	return &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+}
+
+// cpLaptopCA is the control plane's CA as the install recorded it in home.
+func cpLaptopCA(t *testing.T, home string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, ".kubenest", "config.json"))
+	if err != nil {
+		t.Fatalf("reading the install's laptop config: %v", err)
+	}
+	var config struct {
+		CA string `json:"control_plane_ca"`
+	}
+	if err := json.Unmarshal(raw, &config); err != nil || config.CA == "" {
+		t.Fatalf("the install's laptop config carries no control-plane CA (%v)", err)
+	}
+	return []byte(config.CA)
 }
 
 // cpEligibleAt reads the eligible checkpoint's timestamp from the status
@@ -381,7 +434,7 @@ func TestControlPlaneUpgradeGate(t *testing.T) {
 	}
 
 	// ---------------------------------------------------------------- (b)
-	watcher := cpStartWatcher("https://api." + env.domain + "/api/v1/health")
+	watcher := cpStartWatcher("https://api."+env.domain+"/api/v1/health", cpLaptopCA(t, home))
 	var out strings.Builder
 	runErr := cpRunCLI(t, &out, home, cpUpgradeArgs(env, name)...)
 	watcher.close()
@@ -424,7 +477,7 @@ func TestControlPlaneUpgradeGate(t *testing.T) {
 
 	// The new backend answers through the node's port-forward, which is what
 	// the validation did while the fence was up.
-	cpAssertVersionThroughTheNode(t, ctx, env, server)
+	cpAssertVersionThroughTheNode(t, ctx, env, server, cpLaptopCA(t, home))
 
 	// ---------------------------------------------------------------- (f)
 	// A PostgreSQL whose major or distribution differs is REFUSED, by name.
@@ -533,7 +586,7 @@ func cpOpenWindowAllWeek(t *testing.T, ctx context.Context, home, name string) {
 // cpAssertVersionThroughTheNode reads the deployed backend's identity through
 // the node's port-forward — the same route the upgrade's validation used, and
 // the only one that works while the fence is up.
-func cpAssertVersionThroughTheNode(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner) {
+func cpAssertVersionThroughTheNode(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, ca []byte) {
 	t.Helper()
 	addr, err := controlplane.BackendAddr(ctx, server)
 	if err != nil {
@@ -547,11 +600,12 @@ func cpAssertVersionThroughTheNode(t *testing.T, ctx context.Context, env cpUpgr
 	// The CLI's own validation ran inside the upgrade and would have failed the
 	// run above; this asserts the ROUTE half from outside, with the fence down,
 	// so a fence that never lifted cannot hide behind a port-forward.
-	watcher := cpStartWatcher("https://api." + env.domain + "/api/v1/health")
+	watcher := cpStartWatcher("https://api."+env.domain+"/api/v1/health", ca)
 	defer watcher.close()
+	client := cpHTTPClient(ca)
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		resp, err := http.Get("https://api." + env.domain + "/api/v1/health")
+		resp, err := client.Get("https://api." + env.domain + "/api/v1/health")
 		if err == nil {
 			code := resp.StatusCode
 			_ = resp.Body.Close()
@@ -560,7 +614,7 @@ func cpAssertVersionThroughTheNode(t *testing.T, ctx context.Context, env cpUpgr
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the public route never answered 200 after the fence came down; last answers %v", watcher.answers)
+			t.Fatalf("the public route never answered 200 after the fence came down; last answers %v", watcher.snapshot())
 		}
 		time.Sleep(2 * time.Second)
 	}
