@@ -409,15 +409,18 @@ func TestKitAndBucketExposure(t *testing.T) {
 				hits[key] = true
 			}
 		}
+		// Velero's layout at the pinned version: the resource archive is
+		// backups/<name>/<name>.tar.gz (the first hardware run found the Secret
+		// there and this test, matching on "resources", filed it as volume data);
+		// file-system volume data is the kopia (or restic) repository.
 		var archives, datastores, volumes []string
 		for key := range hits {
+			workload := filepath.Join(kit.prefixA, "workload") + "/"
 			switch {
-			case strings.HasPrefix(key, filepath.Join(kit.prefixA, "workload")):
-				if strings.Contains(key, "resources") {
-					archives = append(archives, key)
-				} else {
-					volumes = append(volumes, key)
-				}
+			case strings.HasPrefix(key, workload) && isVeleroResourceArchive(strings.TrimPrefix(key, workload)):
+				archives = append(archives, key)
+			case strings.HasPrefix(key, workload+"kopia/") || strings.HasPrefix(key, workload+"restic/"):
+				volumes = append(volumes, key)
 			case strings.HasPrefix(key, filepath.Join(kit.prefixA, "datastore")):
 				datastores = append(datastores, key)
 			default:
@@ -432,6 +435,18 @@ func TestKitAndBucketExposure(t *testing.T) {
 		}
 		if len(volumes) != 0 {
 			t.Errorf("the planted Secret is readable from the volume backup(s) %v: the per-cluster repository password is not protecting the volume data", volumes)
+		}
+		// Not vacuous: the planted claim's data really is in the repository,
+		// encrypted, which is what the absence of a plaintext hit is about.
+		repository := filepath.Join(kit.prefixA, "workload", "kopia", kit.plantedNS) + "/"
+		stored := 0
+		for _, key := range keys {
+			if strings.HasPrefix(key, repository) {
+				stored++
+			}
+		}
+		if stored == 0 {
+			t.Errorf("no volume data for %s under %s: the planted claim was never backed up, so 'the volume data does not expose it' proves nothing", kit.plantedNS, repository)
 		}
 	})
 
@@ -639,6 +654,21 @@ type: Opaque
 stringData:
   token: %[2]s
 ---
+# The value must reach VOLUME DATA, not only a Secret volume: Velero's
+# file-system backup skips secret volumes, so a Secret mounted as a volume
+# never reaches the kopia repository and "the repository password protects
+# the volume data" would be vacuous (the first hardware run found no kopia
+# data for this namespace at all). An init container copies it onto a claim.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: holds-the-secret
+  namespace: %[1]s
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -652,16 +682,26 @@ spec:
     metadata:
       labels: {app: holds-the-secret}
     spec:
+      initContainers:
+        - name: copy
+          image: busybox:1.36
+          command: [sh, -c, "cp /etc/planted/token /data/token && sync"]
+          volumeMounts:
+            - {name: planted, mountPath: /etc/planted}
+            - {name: data, mountPath: /data}
       containers:
         - name: holder
           image: registry.k8s.io/pause:3.9
           volumeMounts:
-            - name: planted
-              mountPath: /etc/planted
+            - {name: planted, mountPath: /etc/planted}
+            - {name: data, mountPath: /data}
       volumes:
         - name: planted
           secret:
             secretName: planted
+        - name: data
+          persistentVolumeClaim:
+            claimName: holds-the-secret
 `, ns, secret)
 
 	res, err := client.RunInput(ctx, "sudo -n k3s kubectl apply -f -", strings.NewReader(doc))
@@ -799,4 +839,11 @@ func randomSuffix() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf[:])
+}
+
+// isVeleroResourceArchive reports whether a key under the workload prefix is a
+// backup's resource archive, backups/<name>/<name>.tar.gz.
+func isVeleroResourceArchive(key string) bool {
+	parts := strings.Split(key, "/")
+	return len(parts) == 3 && parts[0] == "backups" && parts[2] == parts[1]+".tar.gz"
 }
