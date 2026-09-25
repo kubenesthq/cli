@@ -45,6 +45,22 @@ const (
 	MechanismNothing Mechanism = "nothing"
 )
 
+// HostStepNote is what a rollback deliberately does NOT undo, printed with
+// every plan that has something to undo.
+//
+// The host step is neither a Helm release nor a datastore: it is Ubuntu's own
+// configuration and a node label, and it stays exactly as the upgrade left it.
+// Reverting the drop-in would restore the distro's random install time and its
+// self-chosen reboot — the behaviour the host step exists to replace — and
+// lifting the servers' hold would let a server reboot itself, which 1.2 does
+// not promise. So the operator is TOLD it is still there rather than finding
+// it later, and `platform rollback` never depends on the host step having run:
+// a cluster that failed before it is rolled back with nothing extra to undo.
+const HostStepNote = "The host step is NOT undone: the APT policy under /etc/apt/apt.conf.d and the\n" +
+	"servers' kubenest.io/auto-reboot=false hold stay exactly as they are. Reverting the\n" +
+	"drop-in would restore Ubuntu's own random install time and its self-chosen reboot,\n" +
+	"which is the behaviour the host step replaces.\n"
+
 // Plan describes what a rollback would do, so it can be reported BEFORE
 // anything happens and confirmed when it is the expensive kind.
 type RollbackPlan struct {
@@ -73,6 +89,7 @@ func (p RollbackPlan) String() string {
 			fmt.Fprintf(&b, "  revert %s\n", c)
 		}
 		b.WriteString("\nThis takes seconds and has no data implications: each component is a Helm\nrelease and reverts to its previous revision.\n")
+		b.WriteString("\n" + HostStepNote)
 	case MechanismRestore:
 		fmt.Fprintf(&b, "Rolling back %s → %s by RESTORING THE DATASTORE SNAPSHOT.\n", p.To, p.From)
 		fmt.Fprintf(&b, "  %s\n", p.Reason)
@@ -85,6 +102,7 @@ func (p RollbackPlan) String() string {
 		b.WriteString("  - a PersistentVolumeClaim created during the upgrade window will not exist in\n")
 		b.WriteString("    the restored cluster while its volume still exists on disk. Any found are\n")
 		b.WriteString("    named in the report afterwards.\n")
+		b.WriteString("\n" + HostStepNote)
 	}
 	return b.String()
 }
@@ -95,6 +113,11 @@ func (p RollbackPlan) String() string {
 // started, everything that changed is a Helm release and reverting is cheap.
 // Once it has started, the datastore may already hold data in the new schema
 // and only a restore goes back.
+//
+// The host step sits between those two cases and is deliberately invisible
+// here: it is never undone (HostStepNote) and nothing about a rollback depends
+// on it having run, so a cluster that failed before it is rolled back exactly
+// as one that failed after it.
 func PlanRollback(j *stages.Journal, from, to *manifest.Manifest, rec record) RollbackPlan {
 	plan := RollbackPlan{
 		From: rec.FromBundle, To: rec.ToBundle,

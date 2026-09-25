@@ -19,13 +19,18 @@ import (
 	"kubenest.io/cli/pkg/storage"
 )
 
-// Plan is the eight stages, wired.
+// Plan is the nine stages, wired.
 //
 // Components first, Kubernetes last: everything before StageKubernetes is a
 // Helm release that reverts in seconds, and StageKubernetes is the point of
 // no return. The ordering is the argument — five of the seven ways this can
 // fail cost seconds because of where the irreversible step sits, not because
 // of any recovery machinery.
+//
+// `host-policy` sits immediately before StageKubernetes for the same reason,
+// from the other side: it is the last thing an existing cluster is given
+// while retreating is still cheap, so the nodes are held and their APT policy
+// pinned before the one stage that takes them down deliberately.
 func Plan(s *Session) []stages.Stage {
 	// Every stage checks the maintenance window before it starts. THE RULE:
 	// no new stage starts once the window has closed, but the stage in
@@ -46,6 +51,7 @@ func Plan(s *Session) []stages.Stage {
 		{Name: StageComponents, Run: bind(StageComponents, stageComponents)},
 		{Name: StageProfiles, Run: bind(StageProfiles, stageProfiles)},
 		{Name: StageAgent, Component: "kubenest-agent", Run: bind(StageAgent, stageAgent)},
+		{Name: StageHostPolicy, Run: bind(StageHostPolicy, stageHostPolicy)},
 		{Name: StageKubernetes, Component: "k3s", Run: bind(StageKubernetes, stageKubernetes)},
 		{Name: StageVerify, AlwaysRun: true, Run: bind(StageVerify, stageVerify)},
 		{Name: StageRecord, Run: bind(StageRecord, stageRecord)},

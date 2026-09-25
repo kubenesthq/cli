@@ -155,27 +155,56 @@ func NeedrestartConf() []byte { return []byte(needrestartConf) }
 // on both, and the ignore list names both units so a host whose role changes
 // (an agent promoted to a server) is already covered.
 func Apply(ctx context.Context, r k3s.Runner) error {
+	_, err := Converge(ctx, r)
+	return err
+}
+
+// Report is what one host's converge DID.
+type Report struct {
+	// Written names the policy files whose content on the host differed and
+	// were therefore written, in the order they were written. Empty means the
+	// host already held exactly what the platform writes — the state a re-run
+	// must reach, and the difference between "converged" and "changed" that
+	// `kubenest platform upgrade` reports per host for the host step (T7.3).
+	Written []string
+}
+
+// Converge is Apply, reporting which files it wrote.
+//
+// The upgrade host step needs that difference and Apply cannot express it: a
+// second run must converge with NO write, and a stage that only called Apply
+// could not say whether it had written anything at all — it would report the
+// same thing about a host it had just changed and one it had left alone.
+// Apply is this function without the report, so the install path is unchanged
+// and there is one implementation of the write discipline.
+func Converge(ctx context.Context, r k3s.Runner) (Report, error) {
+	var rep Report
 	for _, f := range []struct{ path, content string }{
 		{APTConfPath, aptDropIn},
 		{NeedrestartConfPath, needrestartConf},
 	} {
-		if err := applyFile(ctx, r, f.path, f.content); err != nil {
-			return err
+		written, err := applyFile(ctx, r, f.path, f.content)
+		if err != nil {
+			return rep, err
+		}
+		if written {
+			rep.Written = append(rep.Written, f.path)
 		}
 	}
-	return nil
+	return rep, nil
 }
 
 // applyFile writes content to path when, and only when, the file there
-// differs. The comparison is the file's own bytes: a policy that is already
-// what we would write is left alone, timestamp and all.
-func applyFile(ctx context.Context, r k3s.Runner, file, content string) error {
+// differs, and reports whether it wrote. The comparison is the file's own
+// bytes: a policy that is already what we would write is left alone, timestamp
+// and all.
+func applyFile(ctx context.Context, r k3s.Runner, file, content string) (bool, error) {
 	current, err := readFile(ctx, r, file)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", file, err)
+		return false, fmt.Errorf("read %s: %w", file, err)
 	}
 	if current == content {
-		return nil
+		return false, nil
 	}
 	// The parent directory is created when it is missing: needrestart's
 	// conf.d exists only while its package is installed, and a host that gets
@@ -183,9 +212,9 @@ func applyFile(ctx context.Context, r k3s.Runner, file, content string) error {
 	// is a no-op on a directory that exists.
 	dir := path.Dir(file)
 	if res, err := r.Run(ctx, "sudo -n install -d -m 0755 "+dir); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
+		return false, fmt.Errorf("create %s: %w", dir, err)
 	} else if res.ExitCode != 0 {
-		return fmt.Errorf("create %s: exit %d: %s", dir, res.ExitCode, firstLine(res.Stderr))
+		return false, fmt.Errorf("create %s: exit %d: %s", dir, res.ExitCode, firstLine(res.Stderr))
 	}
 
 	tmp := file + ".tmp"
@@ -199,12 +228,12 @@ func applyFile(ctx context.Context, r k3s.Runner, file, content string) error {
 			" || { sudo -n rm -f "+tmp+"; false; }",
 		strings.NewReader(content))
 	if err != nil {
-		return fmt.Errorf("write %s: %w", file, err)
+		return false, fmt.Errorf("write %s: %w", file, err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("write %s: exit %d: %s", file, res.ExitCode, firstLine(res.Stderr))
+		return false, fmt.Errorf("write %s: exit %d: %s", file, res.ExitCode, firstLine(res.Stderr))
 	}
-	return nil
+	return true, nil
 }
 
 // readFile returns the file's current content, or nothing when it is not

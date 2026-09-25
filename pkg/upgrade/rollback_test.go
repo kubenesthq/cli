@@ -48,6 +48,7 @@ func TestTheMechanismFollowsFromWhereItFailed(t *testing.T) {
 				t.Errorf("the plan does not mention %q:\n%s", want, report)
 			}
 		}
+		assertTheHostStepIsLeftInPlace(t, report)
 	})
 
 	t.Run("kubernetes started", func(t *testing.T) {
@@ -68,7 +69,21 @@ func TestTheMechanismFollowsFromWhereItFailed(t *testing.T) {
 				t.Errorf("the plan does not mention %q:\n%s", want, report)
 			}
 		}
+		assertTheHostStepIsLeftInPlace(t, report)
 	})
+}
+
+// A rollback never undoes the host step, and the plan SAYS so: reverting the
+// APT drop-in would restore Ubuntu's own random install time and its
+// self-chosen reboot, which is the behaviour the host step replaces (T7.3).
+// The operator is told what was left in place rather than discovering it.
+func assertTheHostStepIsLeftInPlace(t *testing.T, report string) {
+	t.Helper()
+	for _, want := range []string{"/etc/apt/apt.conf.d", "auto-reboot=false", "NOT undone"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("the plan must name what it leaves in place (%q):\n%s", want, report)
+		}
+	}
 }
 
 // A restore with no snapshot is refused rather than attempted: there is

@@ -41,20 +41,31 @@ import (
 // install journal can never be opened as each other.
 const Kind = "upgrade"
 
-// The eight stage names, exactly as upgrades.mdx names them. They are the
+// The nine stage names, exactly as upgrades.mdx names them. They are the
 // journal's vocabulary and the wire's payload.stage — the same contract the
-// installer emits on (kn-w051), with the four names an upgrade adds.
+// installer emits on (kn-w051), with the five names an upgrade adds.
 //
 // `backup` is not install's `platform-backup`: that one INSTALLS Velero, this
 // one TAKES a backup. Same for `agent` against `kubenest-agent`, and
 // `kubernetes` against `k3s-server`/`k3s-agents` — an upgrade moves every
 // node through one stage rather than splitting servers from agents.
+//
+// `host-policy` is the host step an EXISTING workload cluster needs and a
+// freshly installed one does not: Ubuntu's APT policy and the reboot hold are
+// written by the installer at install time, and a cluster that predates them
+// gets them here (pkg/upgrade/hostpolicy.go, plan 7.10).
 const (
 	StagePreflight  = "preflight"
 	StageBackup     = "backup"
 	StageComponents = "platform-components"
 	StageProfiles   = "profiles"
 	StageAgent      = "agent"
+	// StageHostPolicy is the APT drop-in and the reboot hold. It sits
+	// IMMEDIATELY BEFORE the point of no return, and that place is the whole
+	// argument for it: a failure here still costs a Helm revert rather than a
+	// datastore restore, and the nodes are held before the one stage that
+	// takes them down deliberately.
+	StageHostPolicy = "host-policy"
 	StageKubernetes = "kubernetes"
 	StageVerify     = "verify"
 	StageRecord     = "record"
@@ -68,6 +79,7 @@ var StageNames = []string{
 	StageComponents,
 	StageProfiles,
 	StageAgent,
+	StageHostPolicy,
 	StageKubernetes,
 	StageVerify,
 	StageRecord,
@@ -148,6 +160,13 @@ type record struct {
 	SnapshotAt time.Time `json:"snapshot_at,omitempty"`
 	// BackupName is the workload backup taken alongside it.
 	BackupName string `json:"backup_name,omitempty"`
+	// HostPolicy is the host step's own record: per node, the reboot-hold
+	// value that was there BEFORE the operation and what the step wrote. It is
+	// in the journal's state rather than in this process's memory on purpose —
+	// a run whose laptop dies between applying the holds and lifting them
+	// leaves a resume with the ORIGINAL values to restore, not the operation's
+	// (pkg/upgrade/hostpolicy.go).
+	HostPolicy []hostPolicyNode `json:"host_policy,omitempty"`
 }
 
 // Session is one upgrade run.
