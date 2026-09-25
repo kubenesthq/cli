@@ -35,11 +35,21 @@ const migrationCheckName = "kubenest-control-plane-migrate"
 // schema its code does not match, and the Job is what brings the database to
 // the code's revision.
 func MigrationValues(valuesYAML string) (string, error) {
+	return migrationValues(valuesYAML, true)
+}
+
+// migrationValues sets the chart's migration Job on or off.
+//
+// OFF IS NOT THE ABSENCE OF THE KEY: the values a release runs with may have it
+// ON (a previous upgrade's applies keep it on so helm does not delete the Job
+// that records the schema step), and re-applying a release whose Job has a
+// different pod template would fail on the immutable field.
+func migrationValues(valuesYAML string, enabled bool) (string, error) {
 	doc := map[string]any{}
 	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
 		return "", fmt.Errorf("reading the control-plane values: %w", err)
 	}
-	doc["migration"] = map[string]any{"enabled": true}
+	doc["migration"] = map[string]any{"enabled": enabled}
 	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return "", fmt.Errorf("rendering the control-plane values: %w", err)

@@ -679,6 +679,10 @@ func cpRunningImage(t *testing.T, ctx context.Context, server k3s.Runner) string
 func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name, installingHome, values string) {
 	t.Helper()
 	cpResetToThePreviousCandidate(t, ctx, env, server, values)
+	// The image the restored control plane must be running afterwards: it is
+	// the previous candidate's, and the failed migration's chart is the current
+	// one, so the two are different values.
+	previousImage := cpBackendImage(t, ctx, server)
 	home := cpLaptopHome(t, installingHome)
 
 	var (
@@ -715,16 +719,20 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceUp {
 		t.Errorf("the failed migration left the fence %q: a customer request could reach a control plane whose schema was not brought forward", report.State)
 	}
-	// NO CODE SERVES A HALF-MIGRATED SCHEMA, which is what the plan protects —
-	// and it is NOT "the image is unchanged". The chart has ONE backend image
-	// for the migration Job and the Deployment, and the migration stage's stop
-	// apply sets `backend.replicas: 0`, so the Deployment's SPEC carries the new
-	// image with zero replicas. What matters is that nothing is serving: no
-	// backend replica is Ready, and the public route is still the fence.
-	// (An earlier version of this arm compared the images and failed a correct
-	// product for a state the upgrade intends.)
+	// THE PREVIOUS CHART IS WHAT RUNS, at the previous image, with the fence
+	// still up. The migration applied the CURRENT chart with
+	// `backend.replicas: 0` and the new image (the chart has ONE backend image
+	// for the Job and the Deployment), so the restore is what puts the old code
+	// back — and the plan's step (e) is exactly that sentence
+	// (kn-t70-control-plane-version-identity-4xso.2).
+	if after := cpBackendImage(t, ctx, server); after != previousImage {
+		t.Errorf("the backend runs %s after a failed migration, want the previous chart's %s: the control plane must run the code its schema matches", after, previousImage)
+	}
+	// IT IS NOT READY YET, and that is CORRECT: PostgreSQL is still down, which
+	// is why the migration failed. Readiness is asserted below, after the
+	// database is restored.
 	if ready := cpBackendReady(t, ctx, server); ready != 0 {
-		t.Errorf("the failed migration left %d backend replica(s) Ready, so a build that was never migrated is serving", ready)
+		t.Errorf("the failed migration left %d backend replica(s) Ready with the database down", ready)
 	}
 	// THE CHECKPOINT THIS RUN TOOK is the one that must survive. Comparing with
 	// the checkpoint from before the run is wrong: the run publishes its own in
@@ -750,6 +758,15 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if err := cpWaitForPostgres(ctx, server); err != nil {
 		t.Fatal(err)
 	}
+	// AND NOW IT IS READY, still behind the fence: the restored backend was
+	// waiting for exactly this.
+	cpWaitFor(t, 5*time.Minute, 5*time.Second, "the restored backend to become Ready behind the fence", func() (bool, string) {
+		if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceUp {
+			return false, "the fence is " + string(report.State)
+		}
+		ready := cpBackendReady(t, ctx, server)
+		return ready >= 1, fmt.Sprintf("%d backend replica(s) Ready", ready)
+	})
 	rerun := cpLaptopHome(t, installingHome)
 	var rerunOut strings.Builder
 	if err := cpRunCLI(t, &rerunOut, rerun, cpUpgradeArgs(env, name)...); err != nil {

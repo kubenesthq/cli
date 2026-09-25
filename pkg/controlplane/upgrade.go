@@ -212,6 +212,11 @@ type UpgradeSession struct {
 	Record       UpgradeRecord
 	FenceState   FenceState
 
+	// Restored is the previous release's rollout, set by the migration stage
+	// when its Job failed and the previous chart was put back. It carries the
+	// readiness as an observation: see restorePreviousRelease.
+	Restored *Rollout
+
 	// Validation is what the validation stage will require, established by the
 	// gates stage while the OLD backend is still the one running.
 	Validation ValidationOptions
@@ -455,6 +460,17 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	if err := s.saveRecord(); err != nil {
 		return err
 	}
+	// THE RELEASE THIS UPGRADE REPLACES IS CAPTURED FIRST, and it has to be
+	// first: after the apply below, the HelmChart IS this upgrade's and the
+	// release it replaced exists nowhere (kn-t70-control-plane-version-identity-4xso.2).
+	previous, err := CapturePreviousRelease(ctx, r, replicas)
+	if err != nil {
+		return err
+	}
+	if err := StorePreviousRelease(ctx, r, previous); err != nil {
+		return err
+	}
+
 	// THE STAMP IS THIS RAISE'S IDENTITY. k3s's deploy controller records the
 	// fence manifest as an Addon carrying its checksum and skips an apply whose
 	// content matches, so two raises of identical values are ONE raise as far as
@@ -580,6 +596,28 @@ func stageMigration(ctx context.Context, s *UpgradeSession) error {
 		return err
 	}
 	if err := WaitForMigration(ctx, r, revision, deadline, s.Opts.Reporter); err != nil {
+		// PUT THE PREVIOUS CHART BACK BEFORE REPORTING, because the migration
+		// applied this chart with `backend.replicas: 0` and the NEW image — the
+		// chart has one image value for the Job and the Deployment — so a
+		// failure otherwise leaves the control plane running NOTHING. Every
+		// read then fails, through the fenced route and through the node's
+		// tunnel alike, and the advertised way on ("fix what the error names,
+		// then run the identical command again") is refused for want of a
+		// backend (hardware, 2026-09-26; kn-t70-control-plane-version-identity-4xso.2).
+		//
+		// The fence STAYS UP: the backend this puts back has not been
+		// validated, and the checkpoint that would justify lowering the fence
+		// is the one the failed migration was meant to be preceded by.
+		if rerr := s.restorePreviousRelease(ctx); rerr != nil {
+			return fmt.Errorf("%w; and the previous release could not be put back behind the fence (%v), so the control plane is running nothing: restore it by hand before doing anything else", err, rerr)
+		}
+		// THE READINESS IS REPORTED SEPARATELY, because it is a different fact:
+		// the previous chart IS what runs, and its backend is waiting for the
+		// database the failed migration was denied.
+		if s.Restored != nil && s.Restored.Ready < s.Restored.Want {
+			return fmt.Errorf("%w. The previous release is what runs behind the fence: its backend has rolled out at install revision %s and %d/%d replicas are Ready — the previous backend is running and not Ready yet; it becomes Ready once its database answers. Restore the database and run the identical command again",
+				err, s.Restored.Revision, s.Restored.Ready, s.Restored.Want)
+		}
 		return err
 	}
 	s.Record.MigratedRevision = revision
@@ -771,6 +809,57 @@ func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) er
 		return err
 	}
 	return WaitForFenceAvailable(ctx, s.runner(stage), deadline, s.PollInterval, s.Opts.Reporter)
+}
+
+// restorePreviousRelease re-applies the release the control plane ran before
+// this upgrade, with the fence still up and the migration off, and waits for its
+// backend to serve again.
+//
+// THE VALUES ARE THE ONES IT RAN WITH, plus two changes and only two: the fence
+// stays up, and the migration Job is off. The chart has ONE backend image for
+// the Job and the Deployment and the Job's pod template is immutable, so an
+// apply that re-enabled the Job would be patched onto the failed attempt's Job
+// and refused.
+func (s *UpgradeSession) restorePreviousRelease(ctx context.Context) error {
+	r := s.runner(StageMigration)
+	previous, ok, err := ReadPreviousRelease(ctx, r)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no previous release is recorded in Secret %s/%s, so the chart this upgrade replaced cannot be put back: nothing was captured at the fence stage", Namespace, PreviousReleaseSecret)
+	}
+	replicas := previous.Replicas
+	values, err := FenceValues(previous.ValuesContent, FenceOptions{Up: true, BackendReplicas: &replicas})
+	if err != nil {
+		return err
+	}
+	values, err = migrationValues(values, false)
+	if err != nil {
+		return err
+	}
+	revision, err := ApplyArchive(ctx, r, []byte(previous.ChartContent), values)
+	if err != nil {
+		return err
+	}
+	deadline, err := s.componentReady()
+	if err != nil {
+		return err
+	}
+	// ONLY THE ROLLOUT IS WAITED FOR, NOT READINESS, and that is not a
+	// weakening: the migration failed because PostgreSQL went away, so the
+	// previous backend's pods start and sit NotReady until the database answers.
+	// Demanding readiness here would time out and report "the control plane is
+	// running nothing" about a control plane whose previous chart IS what runs
+	// (hardware, 2026-09-26; kn-t70-control-plane-version-identity-4xso.2).
+	rollout, err := WaitRolledOut(ctx, r, revision, deadline, s.PollInterval, s.Opts.Reporter)
+	if err != nil {
+		return err
+	}
+	s.Logf("  the previous release is back behind the fence at install revision %s (%d/%d backend replicas ready), with the fence up and the migration off",
+		revision, rollout.Ready, rollout.Want)
+	s.Restored = &rollout
+	return nil
 }
 
 // fenceFacts is what this raise records on the fence about the control plane

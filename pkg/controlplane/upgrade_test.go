@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -83,6 +84,16 @@ func newStageRunner(t *testing.T, values string) *stageRunner {
 		runningImage: runningBackendRepository + ":" + recordedPinTag}
 	s.FakeRunner = &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		switch {
+		case strings.Contains(command, "get helmchart ") && strings.Contains(command, "chartContent"):
+			// The release the upgrade replaces, captured by the fence stage
+			// before its first apply (kn-t70...4xso.2).
+			return sshx.Result{Stdout: base64.StdEncoding.EncodeToString([]byte("previous-archive"))}, nil
+		case strings.Contains(command, "get helmchart ") && strings.Contains(command, "valuesContent"):
+			return sshx.Result{Stdout: "domain: kn.example.com\n"}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl apply -f -"):
+			// The previous release's Secret.
+			return sshx.Result{Stdout: "secret/configured"}, nil
+
 		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
 			stdin := s.lastInput(t)
 			switch {

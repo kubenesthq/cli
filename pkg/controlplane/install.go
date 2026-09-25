@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -99,9 +100,129 @@ func WaitReady(ctx context.Context, r k3s.Runner, revision string, bundle *manif
 	if err != nil {
 		return err
 	}
+	return waitReadyWithin(ctx, r, revision, deadline, 0, rep)
+}
+
+// Rollout is how far a Deployment got towards a revision: whether it runs that
+// revision everywhere, and how many replicas are READY (which is a different
+// question, and not one a restore can always answer).
+type Rollout struct {
+	Revision string
+	Updated  int32
+	Want     int32
+	Ready    int32
+}
+
+// RolledOut reports whether every replica runs the revision and no pod of the
+// previous one is left.
+func (r Rollout) RolledOut() bool { return r.Updated == r.Want }
+
+// WaitRolledOut converges until the control plane's workloads run the revision,
+// WITHOUT requiring readiness.
+//
+// READINESS IS NOT ALWAYS ESTABLISHABLE, and demanding it would lie. The case
+// this exists for: a migration Job failed because PostgreSQL went away, and the
+// restore puts the previous backend back onto a cluster whose database is still
+// down — the pods roll out, run the previous image, and sit NotReady until the
+// database answers (hardware, 2026-09-26, kn-t70-control-plane-version-identity-4xso.2).
+// A restore that timed out there would report "the control plane is running
+// nothing" about a control plane whose previous chart IS what runs.
+//
+// The returned Rollout carries the readiness as an OBSERVATION, so the caller
+// can say which of the two it found.
+func WaitRolledOut(ctx context.Context, r k3s.Runner, revision string, deadline, interval time.Duration, rep converge.Reporter) (Rollout, error) {
+	observed := Rollout{Revision: revision}
+	probe := func(ctx context.Context) (bool, converge.State, error) {
+		done, state, err := rolloutState(ctx, r, revision, &observed)
+		return done, state, err
+	}
+	res, err := converge.Wait(ctx, probe, converge.Options{
+		Name:     "kubenest-control-plane-rollout",
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: rep,
+	})
+	if err != nil {
+		return observed, err
+	}
+	if err := res.Err(); err != nil {
+		return observed, fmt.Errorf("the control plane did not roll out at install revision %s: %w", revision, err)
+	}
+	return observed, nil
+}
+
+// rolloutState reads the three Deployments once: rolled out at this revision,
+// and how many replicas are ready.
+func rolloutState(ctx context.Context, r k3s.Runner, revision string, observed *Rollout) (bool, converge.State, error) {
+	rollout := Rollout{Revision: revision}
+	for _, workload := range []string{"backend", "hub", "ui"} {
+		var d struct {
+			Metadata struct {
+				Generation int64 `json:"generation"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+				Template struct {
+					Metadata struct {
+						Annotations map[string]string `json:"annotations"`
+					} `json:"metadata"`
+				} `json:"template"`
+			} `json:"spec"`
+			Status struct {
+				ObservedGeneration int64 `json:"observedGeneration"`
+				Replicas           int32 `json:"replicas"`
+				UpdatedReplicas    int32 `json:"updatedReplicas"`
+				AvailableReplicas  int32 `json:"availableReplicas"`
+			} `json:"status"`
+		}
+		object := "deployment/" + ReleaseName + "-" + workload + " in " + Namespace
+		out, err := k3s.Kubectl(ctx, r, "get deployment/"+ReleaseName+"-"+workload+" -n "+Namespace+" -o json")
+		if err != nil {
+			return false, converge.State{Object: object, Status: "not found yet"}, err
+		}
+		if err := json.Unmarshal([]byte(out), &d); err != nil {
+			return false, converge.State{Object: object, Status: "unparsable"}, err
+		}
+		want := int32(1)
+		if d.Spec.Replicas != nil {
+			want = *d.Spec.Replicas
+		}
+		if d.Spec.Template.Metadata.Annotations[revisionAnnotation] != revision {
+			return false, converge.State{
+				Object: object,
+				Status: "not at this install's revision yet",
+				Detail: "the helm-install job has not applied this revision of the chart; the previous one is still what runs",
+			}, nil
+		}
+		if d.Metadata.Generation > d.Status.ObservedGeneration {
+			return false, converge.State{Object: object, Status: "the new pod template is not observed yet"}, nil
+		}
+		if d.Status.UpdatedReplicas < want || d.Status.Replicas > d.Status.UpdatedReplicas {
+			return false, converge.State{
+				Object: object,
+				Status: fmt.Sprintf("%d/%d replicas updated, %d running", d.Status.UpdatedReplicas, want, d.Status.Replicas),
+			}, nil
+		}
+		rollout.Updated, rollout.Want = d.Status.UpdatedReplicas, want
+		if workload == "backend" {
+			rollout.Ready = d.Status.AvailableReplicas
+		}
+	}
+	*observed = rollout
+	return true, converge.State{
+		Object: "the control plane's Deployments",
+		Status: fmt.Sprintf("all at install revision %s (%d/%d backend replicas ready)", revision, rollout.Ready, rollout.Want),
+	}, nil
+}
+
+// waitReadyWithin is WaitReady with the deadline and the poll interval given,
+// for the callers that carry their own (the upgrade session's, which a test
+// shortens so an arm that asserts a wait FAILS does not spend a real minute).
+func waitReadyWithin(ctx context.Context, r k3s.Runner, revision string, deadline, interval time.Duration, rep converge.Reporter) error {
 	res, err := converge.Wait(ctx, readyProbe(r, revision), converge.Options{
 		Name:     "kubenest-control-plane-ready",
 		Deadline: deadline,
+		Interval: interval,
 		Reporter: rep,
 	})
 	if err != nil {
