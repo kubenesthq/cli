@@ -270,6 +270,40 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 			})
 	})
 
+	// The weekly restore drill, run once from its own CronJob. A fresh fixture has
+	// never drilled, and "checkpoints exist but none has ever been restored" is a
+	// warning of its own that outranks the staleness the next arm is about (the
+	// third hardware run of this gate saw exactly that), so the drill runs first:
+	// it is also the plan's "the weekly drill's result appears in the management
+	// cluster's backup group".
+	t.Run("the weekly drill restores the newest checkpoint and its result is published", func(t *testing.T) {
+		job := "kubenest-cp-checkpoint-drill-gate-" + strconv.FormatInt(time.Now().Unix(), 10)
+		res, err := runner.Run(ctx, "sudo -n k3s kubectl create job "+job+" --from=cronjob/"+controlplane.CheckpointCronJobName+"-drill -n "+controlplane.Namespace)
+		if err != nil || res.ExitCode != 0 {
+			t.Fatalf("creating the drill Job from its CronJob: %v / exit %d: %s", err, res.ExitCode, res.Stderr)
+		}
+		started := time.Now()
+		t47WaitFor(t, 15*time.Minute, 10*time.Second, "the drill Job to finish", func() (bool, string) {
+			out, err := k3s.Kubectl(ctx, runner, "get job "+job+" -n "+controlplane.Namespace+" -o jsonpath={.status.conditions[*].type}")
+			if err != nil {
+				return false, err.Error()
+			}
+			if strings.Contains(out, "Failed") {
+				t.Fatalf("the drill Job failed: read it with `kubectl logs job/%s -n %s`", job, controlplane.Namespace)
+			}
+			return strings.Contains(out, "Complete"), "conditions: " + out
+		})
+		document, err := t47StatusDocument(ctx, runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drill, _ := document["drill"].(map[string]any)
+		if drill["status"] != "passed" {
+			t.Fatalf("the drill finished but published %v, want status passed", drill)
+		}
+		t.Logf("drill of %v passed in %s (row counts matched: %v)", drill["checkpoint"], time.Since(started).Round(time.Second), drill["row_counts_matched"])
+	})
+
 	t.Run("a stopped checkpoint CronJob shows up as a stale checkpoint", func(t *testing.T) {
 		// The CronJob is SUSPENDED so the rewound timestamp cannot be
 		// overwritten by the next scheduled run while this subtest watches —
