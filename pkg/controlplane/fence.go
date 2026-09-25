@@ -48,6 +48,35 @@ const (
 	// fenceMessageKey is the ConfigMap key carrying the body the fence serves.
 	fenceMessageKey = "message"
 
+	// fenceRaiseAnnotation carries the identity of ONE raise, and exists
+	// because of a defect that made every second control-plane upgrade fail on
+	// a cluster (hardware, 2026-09-25).
+	//
+	// k3s's deploy controller records every manifest it applies as an `Addon`
+	// in kube-system, named after the file and carrying the manifest's
+	// CHECKSUM (pkg/deploy/controller.go compares the file's checksum with the
+	// addon's and skips the apply when they match). Lower deleted the fence's
+	// objects and the manifest file but not the Addon, so the next Raise wrote
+	// byte-identical content, the checksum matched, and the controller never
+	// re-created the Service: `control-plane-fence FAILED: the fence Service
+	// kubenest-system/kubenest-cp-fence did not appear after 2m0s`.
+	//
+	// STAMPING THE OBJECTS IS THE FIX THAT CANNOT LOSE A RACE. Deleting the
+	// Addon is the other half, but k3s only consults an Addon it can READ: a
+	// ClusterRole without `addons` access would fail the deletion silently (the
+	// kubectl call is best-effort) and a raise that trusted only that would
+	// still be skipped. A raise whose content has never been applied before is
+	// applied whatever a cluster's RBAC allows.
+	fenceRaiseAnnotation = "kubenest.io/fence-raise"
+
+	// addonName is the k3s Addon object for the fence's manifest: the file's
+	// base name, in kube-system. It is the object whose checksum decides
+	// whether the file is applied.
+	addonName = fenceName
+
+	// addonNamespace is where k3s keeps its Addons.
+	addonNamespace = "kube-system"
+
 	// fenceServiceAttempts and fenceServicePoll bound how long Raise waits for
 	// the Service object to exist. It is a k3s manifest apply, not a pod
 	// coming up, so the wait is short: the pod only decides whether the body
@@ -55,6 +84,35 @@ const (
 	fenceServiceAttempts = 60
 	fenceServicePoll     = 2 * time.Second
 )
+
+// RaiseOptions is what a raise needs beyond the values: the identity stamped on
+// the objects, and how long to wait for them.
+type RaiseOptions struct {
+	// Stamp is written to every fence object, and makes this raise's manifest
+	// differ from the last one's. Empty falls back to the clock, which is right
+	// for a raise made outside an operation and wrong to omit: two raises of the
+	// same values would otherwise write the same bytes.
+	Stamp string
+	// ServiceWait bounds the wait for the fence's Service to exist. Zero uses
+	// the production bound.
+	ServiceWait time.Duration
+}
+
+// fenceStamp is the identity this raise stamps, never empty.
+func (o RaiseOptions) fenceStamp() string {
+	if o.Stamp != "" {
+		return o.Stamp
+	}
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+// fenceWait is how long to wait for the fence's objects to appear.
+func (o RaiseOptions) fenceWait() time.Duration {
+	if o.ServiceWait > 0 {
+		return o.ServiceWait
+	}
+	return fenceServicePoll * time.Duration(fenceServiceAttempts)
+}
 
 // sleepCtx waits for d or for ctx to end, whichever is first.
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -238,15 +296,18 @@ func FenceValues(valuesYAML string, o FenceOptions) (string, error) {
 // rather than an error nobody can explain. The Service is up as soon as the
 // manifest is applied; the fence's pod only decides whether the body comes
 // from the fence or from the data plane's own no-endpoints 503.
-func Raise(ctx context.Context, r k3s.Runner, valuesYAML string) (string, error) {
-	manifest, err := fenceObjects(ctx, r)
+func Raise(ctx context.Context, r k3s.Runner, valuesYAML string, o RaiseOptions) (string, error) {
+	manifest, err := fenceObjects(ctx, r, o.fenceStamp())
 	if err != nil {
 		return "", err
 	}
+	// THE MANIFEST MUST NEVER BE THE BYTES THE LAST RAISE WROTE. k3s skips a
+	// file whose checksum matches the Addon it recorded, so an identical raise
+	// is an apply that never happens — see fenceRaiseAnnotation.
 	if err := k3s.WriteManifest(ctx, r, fenceName, manifest); err != nil {
 		return "", err
 	}
-	if err := waitForService(ctx, r, FenceService); err != nil {
+	if err := waitForService(ctx, r, FenceService, o.fenceWait()); err != nil {
 		return "", err
 	}
 	return FenceValues(valuesYAML, FenceOptions{Up: true})
@@ -460,6 +521,15 @@ func DeleteFenceObjects(ctx context.Context, r k3s.Runner) error {
 		" configmap/"+fenceName+" -n "+Namespace+" --ignore-not-found"); err != nil {
 		return fmt.Errorf("removing the fence objects: %w", err)
 	}
+	// THE ADDON GOES TOO, or the next raise's manifest is one k3s may decide is
+	// already applied (see fenceRaiseAnnotation). It is a SECOND, BELT-AND-
+	// BRACES step: the raise stamps its objects, so this is not what makes the
+	// next raise work — it is what stops a stale Addon from being consulted at
+	// all, and it is best-effort because a cluster whose RBAC does not grant
+	// `addons` cannot be repaired by an object this CLI cannot see.
+	if _, err := k3s.Kubectl(ctx, r, "delete addon "+addonName+" -n "+addonNamespace+" --ignore-not-found"); err != nil {
+		return fmt.Errorf("removing the fence's k3s Addon %s/%s: %w", addonNamespace, addonName, err)
+	}
 	res, err := r.Run(ctx, "sudo -n rm -f "+k3s.ManifestDir+"/"+fenceName+".yaml")
 	if err != nil {
 		return fmt.Errorf("removing the fence manifest: %w", err)
@@ -487,7 +557,7 @@ func Replicas(ctx context.Context, r k3s.Runner) (int32, error) {
 
 // fenceObjects renders the ConfigMap, Deployment and Service the fence is made
 // of, using the image the backend Deployment already runs.
-func fenceObjects(ctx context.Context, r k3s.Runner) ([]byte, error) {
+func fenceObjects(ctx context.Context, r k3s.Runner, stamp string) ([]byte, error) {
 	image, err := k3s.Kubectl(ctx, r, backendDeploymentImageCmd)
 	if err != nil {
 		return nil, fmt.Errorf("the fence needs the backend's image, which could not be read: %w", err)
@@ -503,11 +573,18 @@ func fenceObjects(ctx context.Context, r k3s.Runner) ([]byte, error) {
 		"app.kubernetes.io/component": "fence",
 		"app.kubernetes.io/part-of":   "kubenest",
 	}
+	// One annotation, on the object's metadata rather than on the Deployment's
+	// pod template: what has to differ is the DOCUMENT's checksum, and a pod
+	// template that changed would roll the fence for no reason.
+	annotations := map[string]any{fenceRaiseAnnotation: stamp}
+	objectMeta := func(name string) map[string]any {
+		return map[string]any{"name": name, "namespace": Namespace, "labels": labels, "annotations": annotations}
+	}
 
 	configMap := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
-		"metadata":   map[string]any{"name": fenceName, "namespace": Namespace, "labels": labels},
+		"metadata":   objectMeta(fenceName),
 		"data": map[string]any{
 			fenceMessageKey: "The KubeNest control plane is being upgraded and is briefly unavailable. " +
 				"Your clusters keep running and their agents stay connected to the relay; reports sent " +
@@ -568,7 +645,7 @@ func fenceObjects(ctx context.Context, r k3s.Runner) ([]byte, error) {
 	deployment := map[string]any{
 		"apiVersion": "apps/v1",
 		"kind":       "Deployment",
-		"metadata":   map[string]any{"name": fenceName, "namespace": Namespace, "labels": labels},
+		"metadata":   objectMeta(fenceName),
 		"spec": map[string]any{
 			"replicas": 1,
 			"selector": map[string]any{"matchLabels": map[string]any{
@@ -586,7 +663,7 @@ func fenceObjects(ctx context.Context, r k3s.Runner) ([]byte, error) {
 	service := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Service",
-		"metadata":   map[string]any{"name": fenceName, "namespace": Namespace, "labels": labels},
+		"metadata":   objectMeta(fenceName),
 		"spec": map[string]any{
 			"type":     "ClusterIP",
 			"selector": map[string]any{"app.kubernetes.io/name": "kubenest-fence"},
@@ -627,8 +704,9 @@ func serviceExists(ctx context.Context, r k3s.Runner, name string) (bool, error)
 }
 
 // waitForService blocks until the fence's Service exists.
-func waitForService(ctx context.Context, r k3s.Runner, name string) error {
-	for i := 0; i < fenceServiceAttempts; i++ {
+func waitForService(ctx context.Context, r k3s.Runner, name string, within time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
 		exists, err := serviceExists(ctx, r, name)
 		if err != nil {
 			return err
@@ -636,10 +714,12 @@ func waitForService(ctx context.Context, r k3s.Runner, name string) error {
 		if exists {
 			return nil
 		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("the fence Service %s/%s did not appear after %s, so the API route was not switched to it; nothing else has been changed. If a previous raise deleted the fence's objects while k3s still records the manifest as applied, the Addon %s/%s is what must go: `kubectl delete addon %s -n %s`",
+				Namespace, name, within, addonNamespace, addonName, addonName, addonNamespace)
+		}
 		if err := sleepCtx(ctx, fenceServicePoll); err != nil {
 			return err
 		}
 	}
-	return fmt.Errorf("the fence Service %s/%s did not appear after %s, so the API route was not switched to it; nothing else has been changed",
-		Namespace, name, fenceServicePoll*fenceServiceAttempts)
 }

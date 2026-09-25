@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -70,7 +71,7 @@ func TestRaiseRepointsTheApiRouteAtA503Service(t *testing.T) {
 	ctx := context.Background()
 	r := newFenceRunner(true)
 
-	values, err := Raise(ctx, r, fenceTestValues)
+	values, err := Raise(ctx, r, fenceTestValues, RaiseOptions{Stamp: "test-raise", ServiceWait: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +225,7 @@ func TestTheHubIsNeverScaledOrFenced(t *testing.T) {
 	ctx := context.Background()
 	r := newFenceRunner(true)
 
-	if _, err := Raise(ctx, r, fenceTestValues); err != nil {
+	if _, err := Raise(ctx, r, fenceTestValues, RaiseOptions{Stamp: "test-raise", ServiceWait: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	for _, run := range r.Executions() {
@@ -464,7 +465,7 @@ func renderedBackendImage(t *testing.T, rendered string) string {
 // the fence is listening, not what it answers.
 func TestTheFenceCanBecomeReadyWhileAnsweringOnly503(t *testing.T) {
 	r := newFenceRunner(true)
-	if _, err := Raise(context.Background(), r, fenceTestValues); err != nil {
+	if _, err := Raise(context.Background(), r, fenceTestValues, RaiseOptions{Stamp: "test-raise", ServiceWait: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	var manifest componenttest.Execution

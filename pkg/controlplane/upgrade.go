@@ -454,7 +454,14 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	if err := s.saveRecord(); err != nil {
 		return err
 	}
-	fenced, err := Raise(ctx, r, s.Opts.Values)
+	// THE STAMP IS THIS RAISE'S IDENTITY. k3s's deploy controller records the
+	// fence manifest as an Addon carrying its checksum and skips an apply whose
+	// content matches, so two raises of identical values are ONE raise as far as
+	// the cluster is concerned (hardware, 2026-09-25: every second
+	// control-plane upgrade failed at the fence). The operation id is stable
+	// across a resume — the same raise retried is the same raise — and the run
+	// id covers a run that holds no record.
+	fenced, err := Raise(ctx, r, s.Opts.Values, RaiseOptions{Stamp: s.fenceStamp()})
 	if err != nil {
 		return err
 	}
@@ -760,6 +767,17 @@ func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) er
 		return err
 	}
 	return WaitForFenceAvailable(ctx, s.runner(stage), deadline, s.PollInterval, s.Opts.Reporter)
+}
+
+// fenceStamp identifies one raise. The operation id when this run holds the
+// record — a resume of the same operation is the same raise — and the run id
+// otherwise, which is new on every process. It is never empty: a raise that
+// stamped nothing would write the same bytes as the last one.
+func (s *UpgradeSession) fenceStamp() string {
+	if s.handle != nil && s.handle.OperationID() != "" {
+		return s.handle.OperationID()
+	}
+	return s.ID
 }
 
 // componentReady is the bundle's component-ready deadline. Every wait in this
