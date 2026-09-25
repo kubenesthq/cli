@@ -53,6 +53,31 @@ jobs:
             done
           done
 
+      # The command tree as JSON, from the same tree the binaries are built
+      # from. kubenest-docs' CLI-example guard compares its pages against the
+      # RELEASED CLI's command metadata (PLAN section 7.12), and this is how the
+      # metadata gets there without a docs run building Go. It lands in dist/,
+      # so the `files: dist/*` upload ships it as a release asset, and it is
+      # covered by checksums.txt -- which is what the release signature covers.
+      #
+      # It also closes the gap between the assets and what the binary believes:
+      # the first release cut from this workflow and the version stamped in the
+      # metadata come from the same COMMIT and TAG, because both are read here.
+      - name: Command metadata
+        run: |
+          TAG=${GITHUB_REF##*/}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          go run -ldflags="-s -w \
+            -X kubenest.io/cli/pkg/version.Version=${TAG} \
+            -X kubenest.io/cli/pkg/version.Commit=${COMMIT} \
+            -X kubenest.io/cli/pkg/version.Date=${DATE}" \
+            ./cmd/gen-command-metadata > dist/command-metadata.json
+          python3 -c 'import json, sys
+          doc = json.load(open("dist/command-metadata.json"))
+          assert doc["cli_version"] != "dev", "the release metadata carries a dev version"
+          assert doc["commands"], "the release metadata carries no commands"'
+
       - name: Checksums
         run: cd dist && sha256sum * > checksums.txt
 

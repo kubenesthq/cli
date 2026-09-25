@@ -17,6 +17,17 @@ func errNotYetImplemented(what string) error {
 	return fmt.Errorf("%s is not available in this build of the CLI yet — the command surface is final, the implementation is landing. Watch https://github.com/kubenesthq/cli/releases", what)
 }
 
+// AnnotationUnavailable marks a registered command that is not built yet.
+//
+// It is the machine-readable half of the skeleton rule. The metadata generator
+// (cmd/gen-command-metadata) reads it and reports the path as available: false,
+// so the docs checker
+// (kubenest-docs/scripts/check_examples_against_cli.py) refuses a runnable
+// example of a stub by asking the command tree rather than by matching a
+// sentence in the help text. errNotYetImplemented remains the runtime half;
+// both are set together, or a path reports available and exits non-zero.
+const AnnotationUnavailable = "kubenest.io/unavailable"
+
 // InstallFlags is the flag surface of `kubenest platform install`, exactly as
 // documented on the install page.
 type InstallFlags struct {

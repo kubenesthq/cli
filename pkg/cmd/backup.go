@@ -79,7 +79,8 @@ func NewBackupCommand() *cobra.Command {
 		newBackupSetTargetCommand(),
 		newBackupNowCommand(),
 		newBackupDrillCommand(),
-		newBackupSkeletonCommand("restore", "Restore from a backup", "kubenest backup restore"),
+		newBackupSkeletonCommand("restore", "Restore from a backup", "kubenest backup restore",
+			"workload restores need a running cluster with workloads; they land with the wave-3 half of kn-mzn"),
 	)
 	return cmd
 }
@@ -230,11 +231,13 @@ not a silent log line.`,
 
 // newBackupSkeletonCommand marks the wave-3 half of kn-mzn: the scheduled
 // verified restore drill and restores need a running cluster with workloads
-// and land with that wave. Non-zero exit, per the skeleton rule.
-func newBackupSkeletonCommand(use, short, what string) *cobra.Command {
+// and land with that wave. Non-zero exit, per the skeleton rule, and
+// AnnotationUnavailable so the command metadata reports the path as a stub.
+func newBackupSkeletonCommand(use, short, what, reason string) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   use,
-		Short: short,
+		Use:         use,
+		Short:       short,
+		Annotations: map[string]string{AnnotationUnavailable: reason},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return errNotYetImplemented(what)
 		},
