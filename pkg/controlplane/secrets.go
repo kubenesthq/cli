@@ -3,12 +3,19 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -36,13 +43,24 @@ const (
 	SecretName = "kubenest-cp-install"
 )
 
-// Keys of the four values inside SecretName. The backend and the chart read
-// the first two by name, so they are part of the install contract.
+// Keys of the values inside SecretName. The backend and the chart read them by
+// name — jwt-secret and agent-jwt-secret through templates/secret.yaml, the
+// postgres password through the chart's own credential, the two gateway-CA
+// keys as gatewayCA.certificate/privateKey — so they are part of the install
+// contract.
 const (
 	keyJWTSecret        = "jwt-secret"
+	keyAgentJWTSecret   = "agent-jwt-secret"
 	keyEncryptionKey    = "encryption-key"
 	keyPostgresPassword = "postgres-password"
 	keyAdminPassword    = "admin-password"
+	// The control plane's certificate authority, certificate and private key.
+	// The key is a SECRET and the certificate is not, but they are one
+	// identity: a restore that fetched only the certificate could not renew
+	// the control plane's serving certificate, and every CLI and agent pins
+	// this CA.
+	keyGatewayCACertificate = "gateway-ca-certificate"
+	keyGatewayCAPrivateKey  = "gateway-ca-private-key"
 )
 
 // Settings is what the operator decided: the domain the control plane's
@@ -57,8 +75,18 @@ type Settings struct {
 // values the backend cannot re-derive from anywhere. They are named for the
 // chart values they fill.
 type Secrets struct {
-	// JWTSecret signs the backend's tokens (chart value jwtSecret).
+	// JWTSecret signs the backend's USER SESSIONS (chart value jwtSecret). It
+	// is the one key of this set that never leaves the backend and never
+	// travels in a recovery kit.
 	JWTSecret string
+	// AgentJWTSecret signs every agent token and the backend's own
+	// `client_type: backend` token to the hub (chart value agentJwtSecret).
+	//
+	// A SEPARATE KEY ON PURPOSE (kn-t47). The hub verifies agent tokens and
+	// must be rebuildable from the control-plane kit's contents alone, so the
+	// key it holds has to be the key the kit carries — and a leaked session
+	// key must not be able to mint an agent token, nor the reverse.
+	AgentJWTSecret string
 	// EncryptionKey encrypts stored cloud credentials at rest. A Fernet key,
 	// because the backend decrypts with cryptography.fernet.
 	EncryptionKey string
@@ -66,6 +94,28 @@ type Secrets struct {
 	PostgresPassword string
 	// AdminPassword is the initial administrator's password.
 	AdminPassword string
+	// GatewayCACertificate is the PEM certificate of the control plane's OWN
+	// certificate authority, and GatewayCAPrivateKey is its PEM private key
+	// (chart value gatewayCA.certificate/privateKey).
+	//
+	// The CLI mints this CA at install because the control plane used to take
+	// its TLS identity from the host cluster's CA, which every CLI and agent
+	// pins: a control plane restored or moved onto another cluster was then
+	// rejected as an unknown authority, and no restore could be trusted. The
+	// key travels in the control-plane kit, so the identity survives one.
+	GatewayCACertificate string
+	GatewayCAPrivateKey  string
+}
+
+// CABundle is the CA's certificate and its private key as one PEM stream.
+//
+// THIS IS WHAT THE CONTROL-PLANE KIT CARRIES under
+// recoverykit.KeyControlPlaneCA. The kit's vocabulary has one entry for the
+// control plane's authority, and an authority without its key cannot renew the
+// certificate every CLI and agent pinned — which is the one thing the kit
+// exists to make possible after a restore.
+func (s Secrets) CABundle() string {
+	return s.GatewayCACertificate + s.GatewayCAPrivateKey
 }
 
 // errNoSecret reports that the install Secret is not on the cluster. Every
@@ -130,8 +180,8 @@ func EnsureSecrets(ctx context.Context, r k3s.Runner) (sec Secrets, created bool
 	return stored, true, nil
 }
 
-// readSecrets reads the four keys of the install Secret. errNoSecret means it
-// is not there; any other error means it is there and unusable.
+// readSecrets reads the keys of the install Secret. errNoSecret means it is
+// not there; any other error means it is there and unusable.
 func readSecrets(ctx context.Context, r k3s.Runner) (Secrets, error) {
 	out, err := k3s.Kubectl(ctx, r, "get secret "+SecretName+" -n "+Namespace+" -o json")
 	if err != nil {
@@ -152,9 +202,12 @@ func readSecrets(ctx context.Context, r k3s.Runner) (Secrets, error) {
 		into *string
 	}{
 		{keyJWTSecret, &sec.JWTSecret},
+		{keyAgentJWTSecret, &sec.AgentJWTSecret},
 		{keyEncryptionKey, &sec.EncryptionKey},
 		{keyPostgresPassword, &sec.PostgresPassword},
 		{keyAdminPassword, &sec.AdminPassword},
+		{keyGatewayCACertificate, &sec.GatewayCACertificate},
+		{keyGatewayCAPrivateKey, &sec.GatewayCAPrivateKey},
 	} {
 		encoded, ok := stored.Data[key.name]
 		if !ok {
@@ -193,10 +246,13 @@ func secretManifest(sec Secrets) ([]byte, error) {
 		},
 		"type": "Opaque",
 		"stringData": map[string]any{
-			keyJWTSecret:        sec.JWTSecret,
-			keyEncryptionKey:    sec.EncryptionKey,
-			keyPostgresPassword: sec.PostgresPassword,
-			keyAdminPassword:    sec.AdminPassword,
+			keyJWTSecret:            sec.JWTSecret,
+			keyAgentJWTSecret:       sec.AgentJWTSecret,
+			keyEncryptionKey:        sec.EncryptionKey,
+			keyPostgresPassword:     sec.PostgresPassword,
+			keyAdminPassword:        sec.AdminPassword,
+			keyGatewayCACertificate: sec.GatewayCACertificate,
+			keyGatewayCAPrivateKey:  sec.GatewayCAPrivateKey,
 		},
 	}
 	out, err := yaml.Marshal(doc)
@@ -383,12 +439,42 @@ func Values(s Settings, sec Secrets) (string, error) {
 	// may hold any character YAML gives meaning to, and one that did would
 	// otherwise silently change the chart's values instead of failing.
 	doc := map[string]any{
-		"domain":        s.Domain,
-		"jwtSecret":     sec.JWTSecret,
-		"encryptionKey": sec.EncryptionKey,
+		"domain":         s.Domain,
+		"jwtSecret":      sec.JWTSecret,
+		"agentJwtSecret": sec.AgentJWTSecret,
+		"encryptionKey":  sec.EncryptionKey,
+		// The control plane's own CA. The chart refuses to render without it:
+		// its Gateway certificate is signed by this Issuer, and every CLI and
+		// agent pins this authority.
+		"gatewayCA": map[string]any{
+			"certificate": sec.GatewayCACertificate,
+			"privateKey":  sec.GatewayCAPrivateKey,
+		},
 		"postgresql": map[string]any{
 			"auth": map[string]any{"password": sec.PostgresPassword},
 		},
+		// THE CHECKPOINT CRONJOB IS RENDERED OFF, and this is a limitation of
+		// the installer rather than a decision about recovery (kn-t47).
+		//
+		// The chart turns it on by default and refuses to render without two
+		// values: the checkpoint tools image PINNED BY DIGEST
+		// (checkpoint.tools.image.digest) and the fleet recipient
+		// (checkpoint.recipient). The recipient is known here — it is the
+		// public half of the fleet recovery key this install generated — but
+		// the digest has NO source on this path: no constant, bundle manifest
+		// or catalog entry in this wave carries the digest of
+		// ghcr.io/kubenesthq/checkpoint-tools, and a digest invented here
+		// would name an image nobody built. Helm refuses the whole release
+		// over a value it cannot render, so leaving the group on would mean
+		// the control plane does not install at all.
+		//
+		// Off, the install works and the omission is visible where it matters:
+		// the management cluster's `backup` verdict reports that the control
+		// plane has no checkpoint. Turning it on needs the digest to be
+		// recorded somewhere the installer reads (the bundle catalog is the
+		// natural home) and the checkpoint bucket and its separate principal
+		// to be configured, which is the rest of the checkpoint wiring.
+		"checkpoint": map[string]any{"enabled": false},
 		"backend": map[string]any{
 			"admin": map[string]any{
 				"email":    s.AdminEmail,
@@ -412,6 +498,12 @@ func generateSecrets() (Secrets, error) {
 	if err != nil {
 		return Secrets{}, err
 	}
+	// Drawn separately from jwtSecret, which is the point: the hub is given
+	// this key and never the session key.
+	agentJWTSecret, err := randomHex(32)
+	if err != nil {
+		return Secrets{}, err
+	}
 	encryptionKey, err := fernetKey()
 	if err != nil {
 		return Secrets{}, err
@@ -424,12 +516,96 @@ func generateSecrets() (Secrets, error) {
 	if err != nil {
 		return Secrets{}, err
 	}
+	caCertificate, caPrivateKey, err := generateControlPlaneCA()
+	if err != nil {
+		return Secrets{}, err
+	}
 	return Secrets{
-		JWTSecret:        jwtSecret,
-		EncryptionKey:    encryptionKey,
-		PostgresPassword: postgresPassword,
-		AdminPassword:    adminPassword,
+		JWTSecret:            jwtSecret,
+		AgentJWTSecret:       agentJWTSecret,
+		EncryptionKey:        encryptionKey,
+		PostgresPassword:     postgresPassword,
+		AdminPassword:        adminPassword,
+		GatewayCACertificate: caCertificate,
+		GatewayCAPrivateKey:  caPrivateKey,
 	}, nil
+}
+
+// The control plane's own certificate authority (kn-t47).
+//
+// It is an ECDSA P-256 self-signed CA, because a P-256 key and certificate are
+// small enough to travel in a kit, a values document and a chart Secret without
+// anyone thinking about size, and every consumer (cert-manager's CA issuer,
+// Go's crypto/tls, OpenSSL) reads the format without a flag.
+const (
+	// controlPlaneCAName is the subject common name. It is what shows up in
+	// `openssl s_client` on a control plane nobody can explain, so it names
+	// the platform rather than the instance: the instance's identity is the
+	// key, not the label.
+	controlPlaneCAName = "kubenest-control-plane-ca"
+	// controlPlaneCAValidity is deliberately longer than any cluster's life.
+	// The CA is pinned by every CLI and every agent through
+	// Config.ControlPlaneCA and the kubenest-platform-ca ConfigMap, so its
+	// expiry is the expiry of the whole fleet's trust — and it can only be
+	// replaced by re-pinning every one of them.
+	controlPlaneCAValidity = 10 * 365 * 24 * time.Hour
+)
+
+// generateControlPlaneCA mints the control plane's own certificate authority:
+// one self-signed CA certificate and the private key that signs with it, both
+// PEM.
+//
+// The certificate is the CA — IsCA with CertSign — because cert-manager's
+// Issuer reads this key pair and signs the Gateway's certificate with it. Its
+// path length is zero: it signs the control plane's serving certificates and
+// nothing below them.
+func generateControlPlaneCA() (certificate, privateKey string, err error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generating the control-plane CA key: %w", err)
+	}
+	// A 128-bit random serial. RFC 5280 requires a positive one, and a
+	// collision is the one thing a serial must not have: a reissued
+	// certificate would look like a different one signed by the same CA.
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return "", "", fmt.Errorf("generating the control-plane CA serial: %w", err)
+	}
+	serial.Add(serial, big.NewInt(1))
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   controlPlaneCAName,
+			Organization: []string{"KubeNest"},
+		},
+		// Backdated: the CA is minted and used within the same install, and a
+		// certificate whose NotBefore is a moment in the future is refused by
+		// a verifier whose clock is a second behind this machine's.
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(controlPlaneCAValidity),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		// Only end-entity certificates below this CA: an intermediate it
+		// signed would be an authority nobody pinned.
+		MaxPathLen:     0,
+		MaxPathLenZero: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		return "", "", fmt.Errorf("minting the control-plane CA certificate: %w", err)
+	}
+	// SEC1 rather than PKCS#8, which is the form the chart's sample values
+	// show and the one `openssl ec` writes. crypto/tls and cert-manager both
+	// read it.
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return "", "", fmt.Errorf("encoding the control-plane CA key: %w", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})), nil
 }
 
 // randomHex returns n random bytes as 2n lowercase hex characters.

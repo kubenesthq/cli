@@ -58,9 +58,12 @@ type Options struct {
 	// by default.
 	AdminEmail string
 	// ControlPlaneCA is the PEM of the authority the control plane's serving
-	// certificate chains to. A registered install carries it so the agent
-	// trusts the API it reports to; a --control-plane install learns it from
-	// the cluster it just installed.
+	// certificate chains to. A registered install reads it from this machine's
+	// config, where `kubenest login --ca-file` or a --control-plane install
+	// stored it, so the agent trusts the API it reports to; a --control-plane
+	// install MINTS that authority itself (kn-t47) and fills this in during
+	// the control-plane stage, which is what lets the management cluster's own
+	// agent trust the control plane beside it.
 	ControlPlaneCA []byte
 	// FleetRecipient is the PUBLIC age recipient of the instance's fleet
 	// recovery key, and InstanceID is the instance's immutable id. A
@@ -136,6 +139,16 @@ type Record struct {
 	// its administrator password, so it is printed exactly once per install
 	// however many runs that install takes.
 	AdminPasswordShown bool `json:"admin_password_shown,omitempty"`
+	// ControlPlaneMigration is the migration step a --control-plane install
+	// ran, as "<job>@<install revision>", and is empty when the install had
+	// nothing to migrate (a first install's database is empty).
+	//
+	// It is journalled because the step's completion is what a resume must be
+	// able to read without re-deriving it: the Job object expires from the
+	// cluster (ttlSecondsAfterFinished), so after a day nothing on the cluster
+	// says whether the schema was brought forward or the database was simply
+	// never behind. No credential fits into it — it names a Job and a hash.
+	ControlPlaneMigration string `json:"control_plane_migration,omitempty"`
 }
 
 // Session is one install run's state.
@@ -176,8 +189,8 @@ type Session struct {
 	orgID      string
 	instanceID string
 	// cpMaterial is the control plane's own key material (ENCRYPTION_KEY,
-	// AGENT_JWT_SECRET, the platform CA), held in memory by the stage that
-	// installed the control plane so the kit stage can seal it. It is not
+	// AGENT_JWT_SECRET, the control plane's CA), held in memory by the stage
+	// that installed the control plane so the kit stage can seal it. It is not
 	// journalled and not logged: Record has no field a credential fits into.
 	cpMaterial map[string]string
 	// kit is the kit this run wrote, held so the stage that first allows an
@@ -936,7 +949,49 @@ func (s *Session) sealAndUpload(ctx context.Context, client backup.Bucket, scope
 	if err := client.Put(ctx, recoverykit.SetKey(scope, pathSegment, kind, artifactID), setDoc); err != nil {
 		return nil, fmt.Errorf("writing the %s recovery set: %w", kind, err)
 	}
+
+	// And the control plane records that the kit exists — by fingerprint, never
+	// by key. It cannot re-create the private material (it never holds any), so
+	// its job is to know which kit is whose, which is what makes an export
+	// authorisable. A failure here fails the stage: a kit the control plane
+	// does not know about is a kit nothing will offer to export on the day the
+	// cluster is gone.
+	if err := s.recordKit(ctx, kind, binding, kit); err != nil {
+		return nil, err
+	}
 	return kit, nil
+}
+
+// recordKit posts the kit's record: when it was written, its artifact id and a
+// fingerprint of each key it carries.
+func (s *Session) recordKit(ctx context.Context, kind recoverykit.Kind, binding recoverykit.Binding, kit *recoverykit.Kit) error {
+	if s.API == nil || s.orgID == "" {
+		return fmt.Errorf("cannot record the %s recovery kit with the control plane: this install has no authenticated control-plane client or no organisation id (stage 2 fills the latter). The control plane has to know the kit exists, or nothing will offer to export it", kind)
+	}
+	location := map[string]any{
+		"endpoint": kit.S3Location.Endpoint,
+		"bucket":   kit.S3Location.Bucket,
+		"region":   kit.S3Location.Region,
+		"prefix":   kit.S3Location.Prefix,
+	}
+	record := api.RecoveryKitRecord{
+		ArtifactID:   kit.ArtifactID,
+		Fingerprints: kit.Fingerprints,
+		WrittenAt:    kit.WrittenAt,
+		ClusterID:    binding.ClusterID,
+		InstanceID:   binding.InstanceID,
+		S3Location:   location,
+	}
+	if kind == recoverykit.KindCluster {
+		// The route's path carries a cluster kit's cluster, and the backend
+		// refuses a body that names a DIFFERENT one — so the body names the
+		// same one rather than naming none and leaving a gap.
+		record.VeleroRepositoryID = kit.VeleroRepositoryID
+	}
+	if err := s.API.RecordRecoveryKit(ctx, s.orgID, binding.ClusterID, string(kind), record); err != nil {
+		return fmt.Errorf("recording the %s recovery kit %s with the control plane: %w", kind, kit.ArtifactID, err)
+	}
+	return nil
 }
 
 func writeLocalKit(path string, doc []byte) error {
@@ -1043,7 +1098,7 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 		return err
 	}
 	s.instanceID = inst.ID
-	sec, _, err := controlplane.EnsureSecrets(ctx, server)
+	sec, created, err := controlplane.EnsureSecrets(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1054,14 +1109,50 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := controlplane.Install(ctx, server, values, s.Bundle, s.Reporter); err != nil {
-		return err
-	}
-	addr, err := controlplane.BackendAddr(ctx, server)
+	// The control plane's OWN certificate authority, minted by this install
+	// and handed to the chart (gatewayCA): its Gateway certificate is signed by
+	// this authority rather than by the host cluster's, so a control plane
+	// restored or moved onto another cluster keeps the identity every CLI and
+	// agent pins. The CLI itself trusts it next, and so does every agent this
+	// machine installs (Options.ControlPlaneCA, consumed by the agent stage).
+	ca := []byte(sec.GatewayCACertificate)
+	// Said out loud rather than left in the values document: the chart's
+	// checkpoint CronJob is the control plane's only supported recovery path,
+	// and an install that omits it has to report that plainly. It is off
+	// because the chart requires the tools image pinned by a digest that
+	// nothing in this release records (see Values).
+	s.Logf("  the control-plane checkpoint CronJob is NOT installed: its tools image has no pinned digest on this path yet, so the management cluster will report the control plane as unprotected until it is")
+	revision, err := controlplane.Apply(ctx, server, values)
 	if err != nil {
 		return err
 	}
-	ca, err := controlplane.PlatformCA(ctx, server)
+	// THE MIGRATION STEP, before the control plane is allowed to serve.
+	//
+	// It runs only when this cluster ALREADY HAD this control plane's install
+	// Secret — that is, when a database may already hold a schema. A first
+	// install's database is empty: the backend builds that schema from its
+	// models, and migrating an empty database is exactly what the plan forbids
+	// (it would create a schema a restored checkpoint could not then load).
+	// Any later run of this stage is the opposite case: the schema may predate
+	// this build, the backend refuses to start on a schema it does not match,
+	// and the Job is what brings the database to the code's revision.
+	if !created {
+		revision, err = controlplane.Migrate(ctx, server, values, s.Bundle, s.Reporter)
+		if err != nil {
+			return err
+		}
+		// Recorded, because "did the migration run, and which revision did the
+		// control plane come up at" is what a resume has to answer without
+		// re-deriving it: the Job object expires from the cluster.
+		s.Record.ControlPlaneMigration = controlplane.MigrationJobName + "@" + revision
+		if err := s.saveRecord(); err != nil {
+			return err
+		}
+	}
+	if err := controlplane.WaitReady(ctx, server, revision, s.Bundle, s.Reporter); err != nil {
+		return err
+	}
+	addr, err := controlplane.BackendAddr(ctx, server)
 	if err != nil {
 		return err
 	}
@@ -1069,11 +1160,20 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	// the kit stage can seal it. A CLUSTER kit must never carry any of it, so
 	// it is kept apart from everything else the session holds and is never
 	// journalled.
+	//
+	// The CA travels as one PEM stream, certificate and key: the kit's entry
+	// for the control plane's authority has to be able to renew the
+	// certificate every CLI and agent pinned, and a certificate without its
+	// key cannot.
 	s.cpMaterial = map[string]string{
 		recoverykit.KeyEncryptionKey:  sec.EncryptionKey,
-		recoverykit.KeyAgentJWTSecret: sec.JWTSecret,
-		recoverykit.KeyControlPlaneCA: string(ca),
+		recoverykit.KeyAgentJWTSecret: sec.AgentJWTSecret,
+		recoverykit.KeyControlPlaneCA: sec.CABundle(),
 	}
+	// The agent stage trusts this CA: it is the authority of the control plane
+	// the management cluster's own operator talks to, and of the endpoint
+	// every cluster added later reports through.
+	s.Opts.ControlPlaneCA = ca
 
 	// The backend is a ClusterIP that only the node can route to, so the CLI
 	// reaches it through a TCP connection opened FROM the node over the SSH
@@ -1132,7 +1232,7 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	}
 
 	s.Logf("  control plane: https://api.%s, console https://app.%s", s.Opts.Domain, s.Opts.Domain)
-	s.Logf("  logged in as %s; the CLI token is stored in credentials.json and the platform CA in config.json", s.Opts.AdminEmail)
+	s.Logf("  logged in as %s; the CLI token is stored in credentials.json and the control plane's CA in config.json", s.Opts.AdminEmail)
 	return s.showAdminPasswordOnce(sec.AdminPassword)
 }
 
@@ -1221,12 +1321,17 @@ func stageAgent(ctx context.Context, s *Session) error {
 	// inside the cluster, rather than to the public API the mint's hub URL
 	// names. A registered cluster reaches the control plane it was registered
 	// with, and carries the CA to trust it.
+	//
+	// Both shapes carry the CA (kn-t47), because in both the operator verifies
+	// an endpoint whose certificate the control plane's own authority signed,
+	// and no public trust store has that authority: for a --control-plane
+	// install the control-plane stage just minted it and filled this in; for
+	// every other cluster it is the CA this machine stored when it logged in.
 	var opts agent.ValuesOptions
 	if s.Opts.ControlPlaneInstall {
 		opts.BackendURLOverride = controlplane.HubInClusterURL
-	} else {
-		opts.ControlPlaneCA = s.Opts.ControlPlaneCA
 	}
+	opts.ControlPlaneCA = s.Opts.ControlPlaneCA
 	return stages.NewComponentError("kubenest-agent",
 		agent.Install(ctx, server, s.Bundle, creds, opts, s.Reporter))
 }

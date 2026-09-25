@@ -458,6 +458,45 @@ func TestBackendDeploymentHasNoMigrateInitContainerAndUsesRecreate(t *testing.T)
 	}
 }
 
+// A migration is a step the CLI runs, not something a pod does on the way up:
+// the image's entrypoint migrates when MIGRATE_ON_START is not "false", so both
+// the backend Deployment and the migration Job have to turn it off (kn-t47).
+// Without it on the backend, every pod start migrated the database — including
+// a freshly restored checkpoint's, before pg_restore had loaded it — and the
+// schema check that is meant to refuse a mismatched start could never fire.
+func TestNeitherTheBackendNorTheMigrationJobMigratesOnStart(t *testing.T) {
+	root := siblingChartRoot(t)
+
+	deployment := objectOfKind(t, chartObjects(t, root, "backend-deployment.yaml"), "Deployment")
+	podSpec := dig(t, deployment, "spec", "template", "spec").(map[string]any)
+	backend := containerNamed(t, podSpec, "containers", "backend")
+	if backend == nil {
+		t.Fatal("no backend container")
+	}
+	env := envOf(t, backend, "MIGRATE_ON_START")
+	if env == nil {
+		t.Fatal("the backend container does not set MIGRATE_ON_START: the image's entrypoint would migrate the database on every pod start")
+	}
+	if env["value"] != "false" {
+		t.Errorf("the backend's MIGRATE_ON_START = %v, want \"false\"", env["value"])
+	}
+
+	job := objectOfKind(t, chartObjects(t, root, "migration-job.yaml"), "Job")
+	jobSpec := dig(t, job, "spec", "template", "spec").(map[string]any)
+	migrate := containerNamed(t, jobSpec, "containers", "migrate")
+	if migrate == nil {
+		t.Fatal("no migrate container")
+	}
+	command, _ := migrate["command"].([]any)
+	if len(command) != 3 || command[0] != "alembic" || command[2] != "head" {
+		t.Fatalf("the migrate container's command = %v, want alembic upgrade head", command)
+	}
+	env = envOf(t, migrate, "MIGRATE_ON_START")
+	if env == nil || env["value"] != "false" {
+		t.Errorf("the Job's MIGRATE_ON_START = %v, want \"false\": its entrypoint would migrate once and its command would migrate again", env)
+	}
+}
+
 func TestHubReadsAgentJWTSecretAndNoJWTSecret(t *testing.T) {
 	objects := chartObjects(t, siblingChartRoot(t), "hub-deployment.yaml")
 	deployment := objectOfKind(t, objects, "Deployment")

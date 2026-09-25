@@ -2,20 +2,11 @@ package controlplane
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -277,74 +268,9 @@ func TestBackendAddrIsTheServiceClusterIPAndPort(t *testing.T) {
 	}
 }
 
-// The platform CA is what lets every later CLI command verify a control plane
-// whose certificate no public trust anchor signed.
-func TestPlatformCAReadsTheCAAndFallsBackToTheTLSKey(t *testing.T) {
-	ctx := context.Background()
-	ca := testCA(t)
-	cmd := "sudo -n k3s kubectl get secret " + caSecretName + " -n " + caNamespace + " -o json"
-	stored := func(keys map[string]string) sshx.Result {
-		encoded := map[string]string{}
-		for key, value := range keys {
-			encoded[key] = base64.StdEncoding.EncodeToString([]byte(value))
-		}
-		body, err := json.Marshal(map[string]any{"data": encoded})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return sshx.Result{Stdout: string(body)}
-	}
-
-	for _, tc := range []struct {
-		name string
-		keys map[string]string
-		want string
-	}{
-		{"ca.crt", map[string]string{caCertKey: string(ca)}, string(ca)},
-		{"ca.crt empty, tls.crt holds the CA", map[string]string{caCertKey: "", caTLSKey: string(ca)}, string(ca)},
-		{"ca.crt absent, tls.crt holds the CA", map[string]string{caTLSKey: string(ca)}, string(ca)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := PlatformCA(ctx, fakeRunner(t, map[string]sshx.Result{cmd: stored(tc.keys)}))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(got) != tc.want {
-				t.Errorf("PlatformCA = %q, want %q", got, tc.want)
-			}
-		})
-	}
-
-	t.Run("not a certificate", func(t *testing.T) {
-		_, err := PlatformCA(ctx, fakeRunner(t, map[string]sshx.Result{
-			cmd: stored(map[string]string{caCertKey: "ssh-rsa AAAA not a certificate"}),
-		}))
-		if err == nil || !strings.Contains(err.Error(), "x509") {
-			t.Fatalf("error = %v, want one saying the value is not an x509 certificate", err)
-		}
-	})
-}
-
-// testCA is a self-signed CA certificate in PEM, which is what cert-manager
-// stores in the platform CA Secret.
-func testCA(t *testing.T) []byte {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "kubenest-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-}
+// The control plane's certificate authority is minted by the install and never
+// read from the cluster (kn-t47). What a caller trusts is
+// Secrets.GatewayCACertificate, handed to the chart as gatewayCA and stored as
+// Config.ControlPlaneCA — so there is no host-cluster CA to read, and
+// TestEnsureSecretsMintsTheControlPlaneCAOnceAndKeepsIt is where that CA is
+// checked.

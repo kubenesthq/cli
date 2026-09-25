@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -37,36 +36,23 @@ const (
 	gatewayName    = ReleaseName
 )
 
-// The platform CA cert-manager signs the bundle's certificates from. It is a
-// self-signed CA, so the same certificate appears under both keys: ca.crt is
-// the canonical one and tls.crt the fallback.
-const (
-	caNamespace  = "cert-manager"
-	caSecretName = "kubenest-ca"
-	caCertKey    = "ca.crt"
-	caTLSKey     = "tls.crt"
-)
-
 // revisionAnnotation is the pod-template annotation the chart stamps with the
 // installRevision value (templates/*-deployment.yaml).
 const revisionAnnotation = "kubenest.io/install-revision"
 
-// Install applies the control-plane chart and converges until its three
-// Deployments run exactly what this call applied and its PostgreSQL
-// StatefulSet is up.
+// Apply writes the control-plane chart's HelmChart and returns the install
+// revision it applied.
 //
-// The chart is applied as a k3s HelmChart holding the archive in
-// spec.chartContent (k3s.HelmChart.ChartContent), which is how the pinned
-// artifact gets to a cluster that cannot reach a registry: no repo, no OCI
-// reference and no version field — the archive carries its own.
-func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manifest.Manifest, rep converge.Reporter) error {
-	deadline, err := bundle.Limits.Timeouts.For("component-ready")
-	if err != nil {
-		return err
-	}
+// It is separate from WaitReady because a control-plane install has one step
+// between the two: the schema migration (migrate.go). The chart is applied
+// first so PostgreSQL exists — the migration Job has backoffLimit 0, so a Job
+// created before the database accepts connections is a FAILED Job — and the
+// readiness check follows the step, so a control plane whose migration failed
+// is never reported installed.
+func Apply(ctx context.Context, r k3s.Runner, valuesYAML string) (string, error) {
 	values, revision, err := withRevision(valuesYAML)
 	if err != nil {
-		return err
+		return "", err
 	}
 	chart := k3s.HelmChart{
 		Name:            ReleaseName,
@@ -77,12 +63,21 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 	}
 	doc, err := chart.Manifest()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := k3s.WriteManifest(ctx, r, ReleaseName, doc); err != nil {
+		return "", err
+	}
+	return revision, nil
+}
+
+// WaitReady converges until the control plane runs exactly the revision Apply
+// applied.
+func WaitReady(ctx context.Context, r k3s.Runner, revision string, bundle *manifest.Manifest, rep converge.Reporter) error {
+	deadline, err := bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
 		return err
 	}
-
 	res, err := converge.Wait(ctx, readyProbe(r, revision), converge.Options{
 		Name:     "kubenest-control-plane-ready",
 		Deadline: deadline,
@@ -92,6 +87,22 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 		return err
 	}
 	return res.Err()
+}
+
+// Install applies the control-plane chart and converges until its three
+// Deployments run exactly what this call applied and its PostgreSQL
+// StatefulSet is up.
+//
+// The chart is applied as a k3s HelmChart holding the archive in
+// spec.chartContent (k3s.HelmChart.ChartContent), which is how the pinned
+// artifact gets to a cluster that cannot reach a registry: no repo, no OCI
+// reference and no version field — the archive carries its own.
+func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manifest.Manifest, rep converge.Reporter) error {
+	revision, err := Apply(ctx, r, valuesYAML)
+	if err != nil {
+		return err
+	}
+	return WaitReady(ctx, r, revision, bundle, rep)
 }
 
 // withRevision adds installRevision to the values document: a hash of the
@@ -268,53 +279,10 @@ func BackendAddr(ctx context.Context, r k3s.Runner) (string, error) {
 	return ip + ":" + backendPort, nil
 }
 
-// PlatformCA is the platform's certificate authority in PEM, read from
-// cert-manager's copy of it. The CLI stores it as the control plane's CA, so
-// every later command verifies the API without a public trust anchor — the
-// control plane is served by a certificate this CA signed.
-func PlatformCA(ctx context.Context, r k3s.Runner) ([]byte, error) {
-	out, err := k3s.Kubectl(ctx, r, "get secret "+caSecretName+" -n "+caNamespace+" -o json")
-	if err != nil {
-		return nil, fmt.Errorf("reading the platform CA from secret %s/%s: %w", caNamespace, caSecretName, err)
-	}
-	var stored struct {
-		Data map[string]string `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(out), &stored); err != nil {
-		return nil, fmt.Errorf("secret %s/%s is unparsable: %w", caNamespace, caSecretName, err)
-	}
-	// A self-signed CA stores itself under both keys; ca.crt is the canonical
-	// one and is empty on some issuer versions, which is why tls.crt is read
-	// as the fallback.
-	pem, err := decodeCAKey(stored.Data, caCertKey)
-	if err != nil {
-		return nil, err
-	}
-	if len(pem) == 0 {
-		pem, err = decodeCAKey(stored.Data, caTLSKey)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("secret %s/%s holds no x509 certificate: the platform CA is not a PEM certificate, so the CLI cannot verify the control plane it just installed",
-			caNamespace, caSecretName)
-	}
-	return pem, nil
-}
-
-// decodeCAKey returns one base64 key of the platform CA Secret as raw bytes.
-// A key that is not there is empty rather than an error: which of ca.crt and
-// tls.crt the CA is stored under varies, so the caller has to be able to try
-// the next one.
-func decodeCAKey(data map[string]string, key string) ([]byte, error) {
-	encoded, ok := data[key]
-	if !ok {
-		return nil, nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return nil, fmt.Errorf("secret %s/%s key %q is not base64: %w", caNamespace, caSecretName, key, err)
-	}
-	return raw, nil
-}
+// The control plane's CA is NOT read from the cluster (kn-t47). It used to be:
+// this file read cert-manager/kubenest-ca, the host cluster's platform CA, and
+// stored it as the control plane's authority — which made every CLI and agent
+// pin the host cluster's identity, so a control plane restored or moved onto
+// another cluster was rejected as an unknown authority. The CLI now mints the
+// control plane's own CA (Secrets.GatewayCACertificate) and it is that
+// certificate every caller trusts.
