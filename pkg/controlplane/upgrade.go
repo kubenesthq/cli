@@ -130,14 +130,12 @@ type UpgradeOptions struct {
 	// chart's backend image has changed.
 	Before api.ControlPlaneVersion
 
-	// WantBuild is an exact stamp to require, when the caller knows one.
-	WantBuild string
-
-	// StaleBuild is the build stamp the current backend image reports — the
-	// one the validation must NOT see after the upgrade. It is set to the
-	// pre-upgrade stamp when the chart's backend image differs from the one
-	// running, because "the same build is still serving" is then a failure.
-	StaleBuild string
+	// StaleBuild and WantBuild are NOT fields here, and that is deliberate: the
+	// gates stage derives them from the TWO IMAGES (ValidationExpectations),
+	// because the caller cannot know before the run which build is legitimate
+	// to report. A caller-set StaleBuild was the defect — hardware ran an
+	// upgrade that changed nothing and validation passed, because nothing had
+	// told it the old build was stale.
 
 	// Gates are the caller's pre-flight verdicts (compatibility, window, kits
 	// present, no other operation). They are run by the gates stage, in order,
@@ -212,6 +210,10 @@ type UpgradeSession struct {
 	Fence        FenceReport
 	Record       UpgradeRecord
 	FenceState   FenceState
+
+	// Validation is what the validation stage will require, established by the
+	// gates stage while the OLD backend is still the one running.
+	Validation ValidationOptions
 
 	// handle and skip come from the operation record — the lock — when the
 	// command took it. Without them every remote action still happens; with
@@ -357,6 +359,17 @@ func stageGates(ctx context.Context, s *UpgradeSession) error {
 		return fmt.Errorf("this control-plane upgrade is refused before anything is changed: %s. Nothing has been touched, the fence is down and the control plane is running as it was",
 			strings.Join(failed, ", "))
 	}
+	// WHAT THE VALIDATION MUST SEE, established HERE because this is the last
+	// moment the backend is still the OLD one: after the fence stage the
+	// Deployments are the chart's, and comparing the chart's image with itself
+	// would answer "unchanged" for every upgrade.
+	expectations, err := ValidationExpectations(ctx, r, s.Opts.Before, s.Opts.Values)
+	if err != nil {
+		return err
+	}
+	s.Validation = expectations
+	s.Logf("  validation will require: contract era >= %d, build not %q, build prefix %q",
+		expectations.MinContract, expectations.StaleBuild, expectations.WantBuild)
 	return nil
 }
 
@@ -610,13 +623,12 @@ func stageChart(ctx context.Context, s *UpgradeSession) error {
 
 // stageValidate proves the new backend through the node's port-forward, while
 // the fence is still up.
+//
+// IT VALIDATES AGAINST WHAT THE GATES STAGE ESTABLISHED, not against the era
+// alone: see stageGates.
 func stageValidate(ctx context.Context, s *UpgradeSession) error {
 	r := s.runner(StageValidate)
-	return ValidationReporter(ctx, r, s.Opts.Open, ValidationOptions{
-		MinContract: s.Opts.Before.Contract,
-		StaleBuild:  s.Opts.StaleBuild,
-		WantBuild:   s.Opts.WantBuild,
-	}, s.Opts.Reporter)
+	return ValidationReporter(ctx, r, s.Opts.Open, s.Validation, s.Opts.Reporter)
 }
 
 // stageUnfence restores the route and dismantles the fence.

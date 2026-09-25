@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/converge"
@@ -55,7 +58,8 @@ type ClientOpener func(dial func(ctx context.Context, network, addr string) (net
 //	StaleBuild   the build stamp the OLD backend reported, when the chart's
 //	             backend image has changed. The new one must not answer with
 //	             it: that is exactly "the old code is still the one serving".
-//	WantBuild    an exact stamp, for a caller that does know it.
+//	WantBuild    a PREFIX the build must start with: the chart's backend tag,
+//	             which is short while the image reports the full sha.
 type ValidationOptions struct {
 	// MinContract is the lowest contract era this may report.
 	MinContract int
@@ -94,17 +98,8 @@ func ValidateThroughThePortForward(ctx context.Context, server k3s.Runner, open 
 		}
 		return fmt.Errorf("reading the upgraded backend's version through %s: %w", addr, err)
 	}
-	if got.Contract < o.MinContract {
-		return fmt.Errorf("the backend behind %s reports contract era %d, below the era %d the control plane reported before this upgrade: the counter never goes down, so an older build is still the one serving and the fence stays up", addr, got.Contract, o.MinContract)
-	}
-	if o.WantBuild != "" && got.Build != o.WantBuild {
-		return fmt.Errorf("the backend behind %s reports build %q, but this upgrade applied %q: the fence stays up", addr, got.Build, o.WantBuild)
-	}
-	if o.StaleBuild != "" && got.Build == o.StaleBuild {
-		return fmt.Errorf("the backend behind %s still reports build %q, the build that was serving before this upgrade: the new image did not roll, so the fence stays up", addr, got.Build)
-	}
-	if got.Build == "" {
-		return fmt.Errorf("the backend behind %s reports no build stamp, so nothing can say which image is serving; the upgrade pins the backend by digest and an unstamped image cannot be shown to be the one it applied", addr)
+	if err := checkReportedVersion(o, got, addr); err != nil {
+		return err
 	}
 
 	// A REAL REQUEST. The version route answers from a constant, so it proves
@@ -143,4 +138,132 @@ func ValidationReporter(ctx context.Context, server k3s.Runner, open ClientOpene
 		rep.Report(event)
 	}
 	return err
+}
+
+// checkReportedVersion is the identity half of the validation, on its own so its
+// terms can be tested without a tunnel to a live backend.
+func checkReportedVersion(o ValidationOptions, got api.ControlPlaneVersion, addr string) error {
+	if got.Contract < o.MinContract {
+		return fmt.Errorf("the backend behind %s reports contract era %d, below the era %d the control plane reported before this upgrade: the counter never goes down, so an older build is still the one serving and the fence stays up", addr, got.Contract, o.MinContract)
+	}
+	if o.StaleBuild != "" && got.Build == o.StaleBuild {
+		return fmt.Errorf("the backend behind %s still reports the build that was serving before this upgrade (%q): the new image did not roll, so the fence stays up", addr, got.Build)
+	}
+	if o.WantBuild != "" && !strings.HasPrefix(got.Build, o.WantBuild) {
+		return fmt.Errorf("the backend behind %s reports build %q, which is not the chart's backend tag %q: the image this upgrade applied cannot be tied to the build that is serving, so the fence stays up", addr, got.Build, o.WantBuild)
+	}
+	if got.Build == "" {
+		return fmt.Errorf("the backend behind %s reports no build stamp, so nothing can say which image is serving; the upgrade pins the backend by digest and an unstamped image cannot be shown to be the one it applied", addr)
+	}
+	return nil
+}
+
+// ValidationExpectations works out what the upgraded backend must report, from
+// the TWO IMAGES: the one the chart will run and the one the Deployment runs
+// now.
+//
+// THE ERA ALONE IS NOT A DISCRIMINATOR. Hardware (2026-09-25) ran an upgrade
+// whose every stage was skipped — it changed nothing — and the validation passed
+// in 0 s against the PREVIOUS candidate's image, because the only checks were
+// "the era is not below the one before" and "the build is not empty". Both held.
+//
+//	the images differ  the chart is moving the backend, so the build that was
+//	                   serving is STALE: it must not answer, and the chart's tag
+//	                   is the prefix the new one must report;
+//	the images match   nothing is moving, so the same build is exactly what a
+//	                   correct run reports — refusing it would refuse every
+//	                   re-run and every resume.
+func ValidationExpectations(ctx context.Context, r k3s.Runner, before api.ControlPlaneVersion, valuesYAML string) (ValidationOptions, error) {
+	out := ValidationOptions{MinContract: before.Contract, StaleBuild: before.Build}
+	declared, ok, err := backendImageFromValues(valuesYAML)
+	if err != nil {
+		return out, err
+	}
+	if !ok {
+		body, err := ChartFile("values.yaml")
+		if err != nil {
+			return out, fmt.Errorf("reading the control-plane chart's values: %w", err)
+		}
+		declared, ok, err = backendImageFromValues(string(body))
+		if err != nil {
+			return out, fmt.Errorf("reading the control-plane chart's values: %w", err)
+		}
+		if !ok {
+			return out, fmt.Errorf("the control-plane chart's values.yaml declares no backend.image, so which build the upgrade applies cannot be established; a validation that cannot say what it is looking for is not one")
+		}
+	}
+	running, err := RunningBackendImage(ctx, r)
+	if err != nil {
+		return out, err
+	}
+	if sameImage(declared, running) {
+		out.StaleBuild = ""
+		return out, nil
+	}
+	out.WantBuild = declared.tag
+	return out, nil
+}
+
+// RunningBackendImage reads the image the backend Deployment runs now.
+func RunningBackendImage(ctx context.Context, r k3s.Runner) (postgresImage, error) {
+	out, err := k3s.Kubectl(ctx, r, backendDeploymentImageCmd)
+	if err != nil {
+		return postgresImage{}, fmt.Errorf("reading the backend Deployment %s/%s: %w", Namespace, backendService, err)
+	}
+	ref := strings.TrimSpace(out)
+	if ref == "" {
+		return postgresImage{}, fmt.Errorf("the backend Deployment %s/%s names no image, so which build is serving cannot be established", Namespace, backendService)
+	}
+	return parsePostgresImage(ref), nil
+}
+
+// backendImageFromValues extracts backend.image from a values document. It uses
+// the same splitter the PostgreSQL pin uses — both are container references and
+// one parser is enough — and the same precedence: a values override wins over
+// the chart's own defaults, because a document that sets backend.image IS the
+// chart this upgrade applies.
+func backendImageFromValues(valuesYAML string) (postgresImage, bool, error) {
+	if strings.TrimSpace(valuesYAML) == "" {
+		return postgresImage{}, false, nil
+	}
+	doc := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		return postgresImage{}, false, err
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	if backend == nil {
+		return postgresImage{}, false, nil
+	}
+	image, _ := backend["image"].(map[string]any)
+	if image == nil {
+		return postgresImage{}, false, nil
+	}
+	repository, _ := image["repository"].(string)
+	tag, _ := image["tag"].(string)
+	digest, _ := image["digest"].(string)
+	if repository == "" && tag == "" && digest == "" {
+		return postgresImage{}, false, nil
+	}
+	ref := repository
+	if tag != "" {
+		ref += ":" + tag
+	}
+	if digest != "" {
+		ref += "@" + digest
+	}
+	return parsePostgresImage(ref), true, nil
+}
+
+// sameImage reports whether two references name the same image.
+//
+// THE DIGEST DECIDES WHEN BOTH CARRY ONE, because that is what Kubernetes
+// resolves and what the chart pins; otherwise repository and tag do. The
+// repository is compared with its registry host normalised away, for the reason
+// postgresImage.distribution gives: the chart declares an unqualified
+// repository while the Deployment renders a qualified one.
+func sameImage(a, b postgresImage) bool {
+	if a.digest != "" && b.digest != "" {
+		return a.digest == b.digest
+	}
+	return a.distribution() == b.distribution() && a.tag == b.tag
 }

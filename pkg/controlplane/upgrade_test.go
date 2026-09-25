@@ -118,6 +118,13 @@ func newStageRunner(t *testing.T, values string) *stageRunner {
 			return sshx.Result{Stdout: `{"metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"availableReplicas":1}}`}, nil
 		case strings.Contains(command, backendReplicasCmd):
 			return sshx.Result{Stdout: "1"}, nil
+		case strings.Contains(command, releaseObjectsCmd):
+			// The field-ownership gate: no object has a field two managers own.
+			return sshx.Result{Stdout: `{"items":[{"kind":"Deployment","metadata":{"name":"` + ReleaseName + `-backend","managedFields":[{"manager":"helm","fieldsV1":{"f:spec":{"f:replicas":{}}}}]}}]}`}, nil
+		case strings.Contains(command, postgresStatefulSetImageCmd):
+			// The chart's own PostgreSQL: the same distribution and major, so
+			// the pin gate passes and the arm this test is about is reached.
+			return sshx.Result{Stdout: "docker.io/bitnami/postgresql:18.3.0-debian-12-r0"}, nil
 		case strings.Contains(command, backendDeploymentImageCmd):
 			return sshx.Result{Stdout: s.runningImage}, nil
 		case strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName):

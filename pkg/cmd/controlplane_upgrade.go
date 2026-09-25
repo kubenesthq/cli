@@ -176,7 +176,38 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	if runErr != nil {
 		return runErr
 	}
+	if err := finishControlPlaneJournal(out, journal, nil); err != nil {
+		// Reported, never fatal: the upgrade succeeded, and a warning about a
+		// file is not a reason to report it as failed.
+		_ = err
+	}
 	fmt.Fprintf(out, "\nUpgraded the control plane to %s in %s.\n", opts.To, result.Elapsed.Round(time.Second))
+	return nil
+}
+
+// finishControlPlaneJournal removes the journal of a control-plane upgrade that
+// COMPLETED, and keeps the one of a run that did not.
+//
+// THE JOURNAL HAS SERVED ITS PURPOSE ONCE THE RUN SUCCEEDED, as the workload
+// upgrade's does after a rollback. Kept, it would make the next upgrade to the
+// same bundle skip the fence, the migration and the chart BY NAME and report
+// success over a control plane that has moved since — measured on hardware
+// (2026-09-25): after the control plane was put back on the previous candidate,
+// a second run printed "Upgraded the control plane to 1.1 in 14s" having
+// changed nothing at all.
+//
+// A RUN THAT DID NOT COMPLETE KEEPS ITS JOURNAL, and that is the other half:
+// the journal is where an interrupted or failed attempt stopped, and the
+// identical command is meant to continue it rather than start over.
+func finishControlPlaneJournal(out io.Writer, journal *stages.Journal, runErr error) error {
+	if journal == nil || runErr != nil {
+		return nil
+	}
+	if err := journal.Remove(); err != nil {
+		fmt.Fprintf(out, "\nWarning: the upgrade journal %s could not be removed (%v); delete it before the next upgrade, or that upgrade will skip the stages it names.\n",
+			journal.Path(), err)
+		return err
+	}
 	return nil
 }
 
