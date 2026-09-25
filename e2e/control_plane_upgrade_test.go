@@ -470,9 +470,12 @@ func cpPrepareControlPlane(t *testing.T, ctx context.Context, env cpUpgradeEnv, 
 }
 
 // cpOpenWindowAllWeek gives the management cluster a window that is open at
-// every minute and waits until it is ACTIVE. The upgrade is a disruptive
-// operation and refuses to start without a window in force (T3.1); this gate
-// is about the upgrade, so its window must never be the reason it cannot run.
+// every minute. The upgrade is a disruptive operation and refuses to start
+// without a stored window (T3.1: upgrade.ControlPlaneRecords.Window reads the
+// STORED window); this gate is about the upgrade, so its window must never be
+// the reason it cannot run. It does not wait for `active`: the second hardware
+// run did, and the bundle 1.1 operator, which predates the window handler,
+// never acknowledges one, so the window stays `stored`.
 // The client is built from the install's own laptop state in home.
 func cpOpenWindowAllWeek(t *testing.T, ctx context.Context, home, name string) {
 	t.Helper()
@@ -517,13 +520,14 @@ func cpOpenWindowAllWeek(t *testing.T, ctx context.Context, home, name string) {
 	}, current.CurrentRevision()); err != nil {
 		t.Fatalf("storing an all-week window: %v", err)
 	}
-	cpWaitFor(t, 5*time.Minute, 5*time.Second, "the all-week window is active", func() (bool, string) {
-		record, err := client.MaintenanceWindow(ctx, journal.ClusterID)
-		if err != nil {
-			return false, err.Error()
-		}
-		return record.State == api.WindowStateActive, record.State
-	})
+	record, err := client.MaintenanceWindow(ctx, journal.ClusterID)
+	if err != nil {
+		t.Fatalf("reading the stored window back: %v", err)
+	}
+	if record.Window == nil || len(record.Window.Days) != 7 {
+		t.Fatalf("the all-week window was not stored: state %s, window %+v", record.State, record.Window)
+	}
+	t.Logf("all-week window stored at state %s", record.State)
 }
 
 // cpAssertVersionThroughTheNode reads the deployed backend's identity through
