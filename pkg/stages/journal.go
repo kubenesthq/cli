@@ -175,6 +175,17 @@ func safeFileName(name string) string {
 // silently reused: resuming into a half-finished cluster with changed
 // arguments is how a cluster ends up not matching its own record, and the
 // record is what every day-2 operation trusts.
+//
+// The refusal needs something to resume. A run that completed no stage
+// changed nothing — a maintenance-window refusal, for instance, writes the
+// journal's identity and then stops before the first stage — so its journal
+// must not bind the next run to an identity it never acted on. When the
+// stored identity differs and no stage has completed (hasCompletedStage,
+// the journal's own notion of completion), OpenJournal returns a fresh
+// journal for want at the same path instead; the first Append or Save
+// overwrites the file through the existing write path. Once a stage has
+// completed the journal IS the record of a cluster that changed, and the
+// identity binds.
 func OpenJournal(path string, want Identity) (*Journal, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -189,12 +200,30 @@ func OpenJournal(path string, want Identity) (*Journal, error) {
 	}
 	j.path = path
 	if diffs := j.Identity.Differences(want); len(diffs) > 0 {
+		if !j.hasCompletedStage() {
+			// Nothing was done under the stored identity, so there is
+			// nothing to resume and nothing to protect: start clean.
+			return &Journal{Identity: want, path: path}, nil
+		}
 		return nil, fmt.Errorf(
 			"this journal records a different %s:\n  %s\n\nresume re-runs the IDENTICAL command (%s). Fix the argument, or start from a known state",
 			j.Identity.Kind, strings.Join(diffs, "\n  "), path)
 	}
 	// Keep the loaded identity; it and want are equal by the check above.
 	return &j, nil
+}
+
+// hasCompletedStage reports whether any stage in the journal has a completed
+// last word — the same notion of completion Completed reads. A journal with
+// one is the record of a cluster that changed; a journal without one is the
+// record of a run that never got anywhere, and nothing to resume.
+func (j *Journal) hasCompletedStage() bool {
+	for i := range j.Entries {
+		if _, ok := j.Completed(j.Entries[i].Stage); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Append records a transition and persists immediately. Persisting on every

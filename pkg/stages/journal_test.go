@@ -227,6 +227,70 @@ func TestCompletedReadsTheLastWordOnAStage(t *testing.T) {
 	}
 }
 
+// A run that completed no stage changed nothing, so it must not bind the
+// next run's identity. Observed on hardware: a maintenance-window refusal
+// writes the upgrade journal's identity before the first stage runs, and the
+// next command — a different target — was told to re-run the identical one.
+func TestARunThatCompletedNoStageDoesNotBindTheNextIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.json")
+	first := stages.Identity{Kind: "upgrade", Cluster: "lab-w10", Fields: map[string]string{"to bundle": "1.1"}}
+	j, err := stages.OpenJournal(path, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(stages.Entry{Stage: stagePreflight, Status: stages.StatusStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(stages.Entry{Stage: stagePreflight, Status: stages.StatusFailed, Detail: "outside the maintenance window"}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := stages.Identity{Kind: "upgrade", Cluster: "lab-w10", Fields: map[string]string{"to bundle": "1.0"}}
+	got, err := stages.OpenJournal(path, second)
+	if err != nil {
+		t.Fatalf("a run that completed no stage must not bind the next identity: %v", err)
+	}
+	if diffs := got.Identity.Differences(second); len(diffs) > 0 {
+		t.Errorf("the fresh journal must carry the requested identity %+v, got %+v: %v", second, got.Identity, diffs)
+	}
+	if n := len(got.Entries); n != 0 {
+		t.Errorf("the fresh journal must have no entries, got %d: %+v", n, got.Entries)
+	}
+}
+
+// A completed stage means the cluster changed under that identity, and a
+// cluster must never be resumed into with different arguments. The refusal
+// stays exactly as it was — including when a later stage failed.
+func TestACompletedStageStillBindsTheIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "journal.json")
+	first := stages.Identity{Kind: "upgrade", Cluster: "lab-w10", Fields: map[string]string{"to bundle": "1.1"}}
+	j, err := stages.OpenJournal(path, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(stages.Entry{Stage: stagePreflight, Status: stages.StatusStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(stages.Entry{Stage: stagePreflight, Status: stages.StatusCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Append(stages.Entry{Stage: stageRegister, Status: stages.StatusFailed, Detail: "token rejected"}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := stages.Identity{Kind: "upgrade", Cluster: "lab-w10", Fields: map[string]string{"to bundle": "1.0"}}
+	_, err = stages.OpenJournal(path, second)
+	if err == nil {
+		t.Fatal("a journal with a completed stage must still refuse a different identity")
+	}
+	if !strings.Contains(err.Error(), "records a different") {
+		t.Errorf("the refusal must be the identity error, not something else:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "to bundle") {
+		t.Errorf("the refusal must name the differing field:\n%s", err)
+	}
+}
+
 func TestRemoveDeletesTheJournal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "journal.json")
 	j, err := stages.OpenJournal(path, identity("prod-1", map[string]string{"bundle": "1.0"}))
