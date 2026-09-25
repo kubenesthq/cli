@@ -136,7 +136,23 @@ commands (adding a cluster to this control plane among them) verify it too.`,
 			}
 
 			fmt.Fprintf(cmd.OutOrStdout(), "Logged in to %s\n", client.BaseURL())
-			return nil
+
+			// THE DEVICE FLOW'S OWN EXCHANGE IS THE PLACE THE FLOOR IS ASKED.
+			// The CLI has just talked to this control plane and holds a fresh
+			// token, so a refusal here costs the operator nothing and names the
+			// only fix — upgrade the control plane — rather than leaving it to
+			// surface later on a route the older control plane does not serve.
+			//
+			// --token-stdin IS DELIBERATELY NOT CHECKED. That path exists for a
+			// console-created token and must reach NOTHING: an operator whose
+			// control plane is unreachable, fenced or being restored still has
+			// to be able to store the credential they hold. The check runs on
+			// the next command that needs the control plane.
+			if tokenStdin {
+				return nil
+			}
+			client.SetToken(token)
+			return checkControlPlaneForCommand(cmd.Context(), "login", client)
 		},
 	}
 

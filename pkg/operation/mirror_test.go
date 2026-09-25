@@ -200,17 +200,38 @@ func TestTheMirrorNeverNamesACommandTheKindHasNoVerbFor(t *testing.T) {
 	m := &mirrorServer{}
 	s := mirroredStore(t, k, m)
 
+	// A HOST RECOVERY, whose verb this CLI does not have: the property is
+	// about the KIND, not about one of them. A control-plane upgrade gained a
+	// verb in T7.0 (`platform upgrade --control-plane`, which is what an
+	// interrupted fence is continued with), so it is asserted below instead.
 	req := testRequest("host-1")
-	req.Kind = KindControlPlaneUpgrade
+	req.Kind = KindHostRecovery
 	h, err := s.Acquire(ctx, req)
 	if err != nil {
 		t.Fatalf("acquiring: %v", err)
 	}
 	if h.Record().ResumeCommand() != "" {
-		t.Fatalf("a control-plane upgrade named a resume command: %q", h.Record().ResumeCommand())
+		t.Fatalf("a host recovery named a resume command: %q", h.Record().ResumeCommand())
 	}
 	if _, ok := m.raw(t, 0)["resume_command"]; ok {
 		t.Fatalf("the mirror carried a resume command for a kind with no verb: %s", m.bodies[0])
+	}
+
+	// And the kind that DID gain one names a command this CLI can run, with
+	// the operation id an operator types. The record is the lock, so the first
+	// operation is finished before the second is acquired.
+	if err := s.Complete(ctx, h, ResultSucceeded); err != nil {
+		t.Fatalf("completing the first operation: %v", err)
+	}
+	cpReq := testRequest("host-1")
+	cpReq.Kind = KindControlPlaneUpgrade
+	cph, err := s.Acquire(ctx, cpReq)
+	if err != nil {
+		t.Fatalf("acquiring: %v", err)
+	}
+	want := "kubenest platform upgrade --control-plane --resume " + cph.Record().OperationID
+	if got := cph.Record().ResumeCommand(); got != want {
+		t.Fatalf("a control-plane upgrade names %q, want %q", got, want)
 	}
 	// A verb this CLI does have is named, with the operation id the operator
 	// types.

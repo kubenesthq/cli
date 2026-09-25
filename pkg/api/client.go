@@ -163,6 +163,38 @@ func (c *Client) endpoint(p string) string {
 	return u.String()
 }
 
+// Get performs an authenticated GET against one path and returns the HTTP
+// status and body.
+//
+// IT DOES NOT TURN A NON-2XX INTO AN ERROR, unlike every other call here, and
+// that is the whole reason it exists: a caller validating a backend it has just
+// rolled needs the STATUS. A 503 or a 500 is an answer about the deployment,
+// while an error would be indistinguishable from not reaching it, and those two
+// mean opposite things about whether the fence may come down.
+func (c *Client) Get(ctx context.Context, path string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(path), nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	req.Header.Set("User-Agent", "kubenest-cli/"+version.Version)
+	c.debugf(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("control plane %s is unreachable: %w", c.baseURL.Host, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
 // do executes the request, decodes a JSON response into out (if non-nil), and
 // converts non-2xx responses into actionable errors.
 func (c *Client) do(req *http.Request, out any) error {

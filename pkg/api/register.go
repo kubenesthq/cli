@@ -46,6 +46,20 @@ type Cluster struct {
 	// shape: a cluster that has never reported has no timestamp, which is
 	// different from one whose timestamp has not moved.
 	LastHeartbeat *time.Time `json:"last_heartbeat"`
+	// ControlPlane is the identity of the control plane that ANSWERED: its
+	// contract era and its build stamp (T7.0 item 2).
+	//
+	// IT IS HERE BECAUSE THE VERSION ENDPOINT CANNOT ANSWER THIS QUESTION TO
+	// THE READER WHO NEEDS IT. /health and /api/v1/version both live ON the
+	// control plane, so the only reader who can use them is one who already has
+	// access to the cluster it runs in. A cluster record is read without that
+	// access, and the question "which control plane is behind this" is asked by
+	// exactly that reader.
+	//
+	// Nil when the control plane serving the record does not publish it (an
+	// older control plane) — absence is not a value, and a caller must not read
+	// a zero struct as "contract era 0".
+	ControlPlane *ControlPlaneVersion `json:"control_plane"`
 }
 
 // ListOrgs returns the organizations this credential can see. A token bound to

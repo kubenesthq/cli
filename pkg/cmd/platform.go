@@ -284,11 +284,14 @@ actively harmed you.`,
   kubenest platform upgrade --cluster prod-1 --to 1.1 \
     --acknowledge payments/Ingress/legacy-gateway`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if f.Cluster == "" {
+			if f.Cluster == "" && !f.ControlPlane {
 				return fmt.Errorf("--cluster is required: which cluster to upgrade")
 			}
 			if f.To == "" {
 				return fmt.Errorf("--to is required: the bundle version to upgrade to (see `kubenest platform diff`)")
+			}
+			if f.Resume != "" && !f.ControlPlane {
+				return fmt.Errorf("--resume continues an interrupted CONTROL-PLANE upgrade, so it needs --control-plane: a workload cluster's upgrade resumes by re-running the identical command, which reads its own journal")
 			}
 			if f.Now && f.Wait {
 				return fmt.Errorf("--now and --wait ask for opposite things: --now acts immediately regardless of the maintenance window, --wait holds until the window opens")
@@ -306,6 +309,7 @@ actively harmed you.`,
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")
 	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
+	addControlPlaneUpgradeFlags(cmd, &f)
 	return cmd
 }
 

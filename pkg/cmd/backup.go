@@ -325,6 +325,14 @@ func runControlPlaneNow(cmd *cobra.Command, conn backupConn) error {
 		return err
 	}
 	defer client.Close()
+	// THE CONTROL PLANE'S OWN IDENTITY IS CHECKED HERE, after the transport is
+	// up and before the checkpoint Job is created. This command's subject is
+	// the control plane rather than a workload cluster, so it is the backup
+	// entry point that needs the control plane — and the check is what stops an
+	// operator taking a checkpoint of a control plane this CLI cannot describe.
+	if err := checkControlPlaneNow(cmd.Context(), "backup"); err != nil {
+		return err
+	}
 	out := cmd.OutOrStdout()
 	run, err := controlplane.OnDemandCheckpoint(cmd.Context(), client, bundle, converge.NewTextReporter(out))
 	if err != nil {

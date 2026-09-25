@@ -75,10 +75,33 @@ func ChartVersion() (string, error) {
 	return meta.Version, nil
 }
 
+// ChartFileIn returns one file of a chart archive, named by its path inside
+// the chart. It is ChartFile against a SPECIFIC archive, for the callers that
+// reason about a candidate artifact rather than the one this binary embeds.
+func ChartFileIn(archive []byte, name string) ([]byte, error) {
+	return archiveFileIn(archive, chartDir+"/"+name)
+}
+
+// ChartFile returns one file of the embedded control-plane chart, named by its
+// path inside the chart ("values.yaml", "templates/routes.yaml").
+//
+// It exists because some facts about a control plane are facts about the CHART
+// rather than about the values document — the PostgreSQL image is the one that
+// matters most, since the CLI's own values carry the database's password and
+// nothing about which database it is.
+func ChartFile(name string) ([]byte, error) {
+	return archiveFile(chartDir + "/" + name)
+}
+
 // archiveFile returns one entry of the embedded chart archive. The name is
 // the full path inside the archive, e.g. "kubenest/Chart.yaml".
 func archiveFile(name string) ([]byte, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(chartArchive))
+	return archiveFileIn(chartArchive, name)
+}
+
+// archiveFileIn reads one entry of a chart archive.
+func archiveFileIn(archive []byte, name string) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(archive))
 	if err != nil {
 		return nil, fmt.Errorf("the chart archive built into this CLI is not a gzip stream: %w", err)
 	}
@@ -97,7 +120,7 @@ func archiveFile(name string) ([]byte, error) {
 		}
 		content, err := io.ReadAll(tr)
 		if err != nil {
-			return nil, fmt.Errorf("the %s entry of the embedded chart archive is unreadable: %w", name, err)
+			return nil, fmt.Errorf("the %s entry of the chart archive is unreadable: %w", name, err)
 		}
 		return content, nil
 	}

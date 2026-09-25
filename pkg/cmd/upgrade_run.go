@@ -41,6 +41,16 @@ type UpgradeFlags struct {
 	// maintenance window and nothing else: the other six gates still run,
 	// because asking to act now is not asking to act on a degraded cluster.
 	Now bool
+	// ControlPlane upgrades the control plane itself — the management
+	// cluster's own chart — through the fenced procedure of PLAN 7.8, rather
+	// than a workload cluster's bundle. The flag spelling mirrors
+	// `platform install --control-plane`.
+	ControlPlane bool
+	// Resume continues an INTERRUPTED control-plane upgrade by operation id.
+	// It is a different thing from re-running: a re-run starts a new operation
+	// over the state the record describes, while a resume takes the recorded
+	// operation over and does not repeat the steps it already carried out.
+	Resume string
 }
 
 // buildUpgradeSession assembles everything an upgrade needs: the cluster's
@@ -200,6 +210,15 @@ func fetchManifest(ctx context.Context, client *api.Client, version string) (*ma
 //	              cluster as it is at that moment rather than as it was when the
 //	              command was typed
 func runUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
+	if f.ControlPlane {
+		return runControlPlaneUpgrade(ctx, out, f)
+	}
+	// THE FLOOR IS CHECKED BEFORE THE SESSION IS BUILT, because building it
+	// reads the cluster's record and both bundle manifests — three calls that
+	// assume the control plane's API is one this CLI understands.
+	if err := checkControlPlaneNow(ctx, "platform upgrade"); err != nil {
+		return err
+	}
 	session, err := buildUpgradeSession(ctx, out, f)
 	if err != nil {
 		return err

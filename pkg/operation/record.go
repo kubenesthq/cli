@@ -398,6 +398,11 @@ func (k Kind) resumeVerb() string {
 	switch k {
 	case KindUpgrade:
 		return "kubenest platform upgrade"
+	case KindControlPlaneUpgrade:
+		// The flag is part of the verb: a resume line that named
+		// `platform upgrade` would start a WORKLOAD cluster's upgrade against
+		// the management cluster's name.
+		return "kubenest platform upgrade --control-plane"
 	case KindDatastoreRollback:
 		return "kubenest platform rollback"
 	case KindRestoreNamespace, KindRestoreVolume:

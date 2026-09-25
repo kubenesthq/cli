@@ -23,8 +23,10 @@ var migrationJobCmd = "sudo -n k3s kubectl get job " + MigrationJobName + " -n "
 var postgresCmd = "sudo -n k3s kubectl get statefulset " + postgresStatefulSet + " -n " + Namespace + " -o json"
 
 // jobJSON renders the answer `kubectl get job -o json` gives for a Job that is
-// complete, running, or failed.
-func jobJSON(t *testing.T, condition string) string {
+// complete, running, or failed, stamped with the install revision it belongs
+// to. THE STAMP IS NOT OPTIONAL: the wait matches the Job to the revision the
+// step applied, so a Job without one is a Job that cannot be accepted.
+func jobJSON(t *testing.T, condition, revision string) string {
 	t.Helper()
 	status := map[string]any{"succeeded": 0, "failed": 0}
 	if condition != "" {
@@ -40,13 +42,31 @@ func jobJSON(t *testing.T, condition string) string {
 	}
 	body, err := json.Marshal(map[string]any{
 		"apiVersion": "batch/v1", "kind": "Job",
-		"metadata": map[string]any{"name": MigrationJobName, "namespace": Namespace},
-		"status":   status,
+		"metadata": map[string]any{
+			"name": MigrationJobName, "namespace": Namespace,
+			"annotations": map[string]any{migrationJobRevisionAnnotation: revision},
+		},
+		"status": status,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return string(body)
+}
+
+// migrationRevision is the install revision the migration step will apply for
+// these values — the same value the chart stamps on the Job.
+func migrationRevision(t *testing.T, values string) string {
+	t.Helper()
+	migrated, err := MigrationValues(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := Revision(migrated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
 }
 
 func postgresReadyJSON() string {
@@ -72,6 +92,7 @@ func TestMigrateWaitsForTheDatabaseAppliesTheJobAndReturnsItsRevision(t *testing
 		jobRead int
 	)
 	var r *componenttest.FakeRunner
+	wantRevision := migrationRevision(t, values)
 	r = &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		switch {
 		case command == postgresCmd:
@@ -80,10 +101,10 @@ func TestMigrateWaitsForTheDatabaseAppliesTheJobAndReturnsItsRevision(t *testing
 			jobRead++
 			// The Job is applied by the helm-install job asynchronously: the
 			// first observation is "not there yet", which is not a failure.
-			if jobRead == 1 {
+			if jobRead <= 2 {
 				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): jobs.batch "kubenest-cp-migrate" not found`}, nil
 			}
-			return sshx.Result{Stdout: jobJSON(t, "Complete")}, nil
+			return sshx.Result{Stdout: jobJSON(t, "Complete", wantRevision)}, nil
 		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
 			inputs := r.Inputs()
 			if len(inputs) == 0 {
@@ -103,6 +124,9 @@ func TestMigrateWaitsForTheDatabaseAppliesTheJobAndReturnsItsRevision(t *testing
 	}
 	if revision == "" {
 		t.Error("Migrate returned no revision: the caller would converge on the revision of the chart it applied BEFORE the migration")
+	}
+	if revision != wantRevision {
+		t.Errorf("Migrate returned revision %s, want %s", revision, wantRevision)
 	}
 
 	// What was applied is the chart with the migration Job enabled, not the
@@ -167,7 +191,12 @@ func TestMigrateFailsAsSoonAsTheJobFails(t *testing.T) {
 		case command == postgresCmd:
 			return sshx.Result{Stdout: postgresReadyJSON()}, nil
 		case command == migrationJobCmd:
-			return sshx.Result{Stdout: jobJSON(t, "Failed")}, nil
+			return sshx.Result{Stdout: jobJSON(t, "Failed", migrationRevision(t, values))}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName):
+			// The failed Job is removed before the chart is applied, so a
+			// resume can create a new one: backoffLimit 0 means this one will
+			// never try again.
+			return sshx.Result{}, nil
 		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
 			return sshx.Result{}, nil
 		default:
@@ -188,10 +217,11 @@ func TestMigrateFailsAsSoonAsTheJobFails(t *testing.T) {
 	if time.Since(start) > 20*time.Second {
 		t.Errorf("the failure took %s: a Job that has already failed must not be waited out to the deadline", time.Since(start))
 	}
-	// The failure was reached without waiting for the deadline, so the probe
-	// ran once.
-	if got := len(r.Commands()); got > 4 {
-		t.Errorf("made %d calls before failing, want the database read, the apply and one Job read", got)
+	// The failure was reached without waiting for the deadline: the database
+	// read, the stale-Job read that removes the failed Job, the apply, and the
+	// one Job read that answers Failed.
+	if got := len(r.Commands()); got > 5 {
+		t.Errorf("made %d calls before failing, want the database read, the stale-Job read, the apply and one Job read", got)
 	}
 }
 
@@ -201,6 +231,7 @@ func TestWaitForMigrationTreatsAnAbsentJobAsConvergingAndFailedAsFatal(t *testin
 	ctx := context.Background()
 
 	t.Run("absent then complete", func(t *testing.T) {
+		revision := "rev0000000000001"
 		var calls int
 		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 			if command != migrationJobCmd {
@@ -210,10 +241,10 @@ func TestWaitForMigrationTreatsAnAbsentJobAsConvergingAndFailedAsFatal(t *testin
 			if calls == 1 {
 				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): jobs.batch "kubenest-cp-migrate" not found`}, nil
 			}
-			return sshx.Result{Stdout: jobJSON(t, "Complete")}, nil
+			return sshx.Result{Stdout: jobJSON(t, "Complete", revision)}, nil
 		}}
 		done := make(chan error, 1)
-		go func() { done <- WaitForMigration(ctx, r, 10*time.Second, nil) }()
+		go func() { done <- WaitForMigration(ctx, r, revision, 10*time.Second, nil) }()
 		select {
 		case err := <-done:
 			if err != nil {
@@ -225,16 +256,17 @@ func TestWaitForMigrationTreatsAnAbsentJobAsConvergingAndFailedAsFatal(t *testin
 	})
 
 	t.Run("failed", func(t *testing.T) {
+		revision := "rev0000000000002"
 		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 			if command != migrationJobCmd {
 				t.Fatalf("unscripted command: %q", command)
 			}
-			return sshx.Result{Stdout: jobJSON(t, "Failed")}, nil
+			return sshx.Result{Stdout: jobJSON(t, "Failed", revision)}, nil
 		}}
 		var events []converge.Event
 		done := make(chan error, 1)
 		go func() {
-			done <- WaitForMigration(ctx, r, 10*time.Second, converge.ReporterFunc(func(e converge.Event) {
+			done <- WaitForMigration(ctx, r, revision, 10*time.Second, converge.ReporterFunc(func(e converge.Event) {
 				events = append(events, e)
 			}))
 		}()
@@ -257,14 +289,15 @@ func TestWaitForMigrationTreatsAnAbsentJobAsConvergingAndFailedAsFatal(t *testin
 // A migration that never completes fails at the deadline with the object named,
 // like every other converge check.
 func TestWaitForMigrationReportsAJobThatNeverCompletes(t *testing.T) {
+	revision := "rev0000000000003"
 	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		if command != migrationJobCmd {
 			t.Fatalf("unscripted command: %q", command)
 		}
-		return sshx.Result{Stdout: jobJSON(t, "")}, nil
+		return sshx.Result{Stdout: jobJSON(t, "", revision)}, nil
 	}}
 	var events []converge.Event
-	err := WaitForMigration(context.Background(), r, time.Millisecond, converge.ReporterFunc(func(e converge.Event) {
+	err := WaitForMigration(context.Background(), r, revision, time.Millisecond, converge.ReporterFunc(func(e converge.Event) {
 		events = append(events, e)
 	}))
 	if err == nil {
@@ -318,5 +351,204 @@ func testSecrets() Secrets {
 		AdminPassword:        "adm",
 		GatewayCACertificate: "ca-pem",
 		GatewayCAPrivateKey:  "ca-key-pem",
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The four defects hardware found on 2026-09-25. Each of these is a case the
+// step used to get wrong, and each fails without the change it tests.
+// ---------------------------------------------------------------------------
+
+// A chart upgrade that changes the backend image must remove the release's
+// previous migration Job BEFORE the chart is applied.
+//
+// Job.spec.template is immutable, so `helm upgrade` cannot patch the existing
+// Job's pod template: the upgrade fails, and with failurePolicy: abort the
+// whole release is left failed, waiting for an operator with helm on the host.
+// Successive applies of the same chart with one value changed is EXACTLY what
+// an upgrade is, so this is not an edge case — it is the ordinary path.
+func TestAnImageChangeRemovesThePreviousMigrationJobBeforeTheChartIsApplied(t *testing.T) {
+	ctx := context.Background()
+	values, err := Values(Settings{Domain: "kn.example.com", AdminEmail: "admin@kn.example.com"}, testSecrets())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := migrationRevision(t, values)
+	previous := "rev00000000000ff"
+
+	var jobReads int
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case command == postgresCmd:
+			return sshx.Result{Stdout: postgresReadyJSON()}, nil
+		case command == migrationJobCmd:
+			jobReads++
+			switch jobReads {
+			case 1:
+				// The previous revision's Job: Complete, and immutable.
+				return sshx.Result{Stdout: jobJSON(t, "Complete", previous)}, nil
+			case 2:
+				// Removed by the step, and the helm-install job has not
+				// created this revision's yet.
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): jobs.batch "kubenest-cp-migrate" not found`}, nil
+			default:
+				return sshx.Result{Stdout: jobJSON(t, "Complete", want)}, nil
+			}
+		case strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName):
+			return sshx.Result{}, nil
+		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
+			return sshx.Result{}, nil
+		default:
+			t.Fatalf("unscripted command: %q", command)
+		}
+		return sshx.Result{}, nil
+	}}
+
+	revision, err := Migrate(ctx, r, values, installBundle(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != want {
+		t.Fatalf("Migrate returned revision %s, want %s", revision, want)
+	}
+
+	// Order, not just occurrence: a delete AFTER the apply is the failure this
+	// test exists for.
+	var deletedAt, appliedAt = -1, -1
+	for i, command := range r.Commands() {
+		if strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName) {
+			deletedAt = i
+		}
+		if appliedAt < 0 && strings.HasPrefix(command, "sudo -n install -m 0600 ") {
+			appliedAt = i
+		}
+	}
+	if deletedAt < 0 {
+		t.Fatalf("the previous revision's migration Job was never removed, so the chart upgrade would fail on its immutable pod template; commands were %v", r.Commands())
+	}
+	if appliedAt < 0 {
+		t.Fatal("the chart was never applied")
+	}
+	if deletedAt > appliedAt {
+		t.Errorf("the migration Job was removed at call %d but the chart was applied at call %d: the apply would fail on the immutable pod template", deletedAt, appliedAt)
+	}
+	// And the Job the step waited on is the one it applied, not the previous
+	// revision's: a Completed Job from the earlier revision is not this
+	// revision's migration.
+	if jobReads < 2 {
+		t.Errorf("the Job was read %d time(s); the previous revision's Job was still what a single read would have answered", jobReads)
+	}
+}
+
+// A Completed Job stamped for a different install revision is NOT this step's
+// result.
+//
+// Observed on hardware 2026-09-25: the CLI printed
+// `kubenest-control-plane-migrate: pass (1s)` against the previous revision's
+// Completed Job while helm-controller was still installing, and the new
+// revision's Job then failed against a restarting PostgreSQL. A pass that fast
+// was the whole tell.
+func TestWaitForMigrationRefusesAJobFromADifferentRevision(t *testing.T) {
+	ctx := context.Background()
+	applied := "rev00000000abcde"
+	stale := "rev00000000f1234"
+
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if command != migrationJobCmd {
+			t.Fatalf("unscripted command: %q", command)
+		}
+		// Complete — which is exactly why it must not be accepted.
+		return sshx.Result{Stdout: jobJSON(t, "Complete", stale)}, nil
+	}}
+	var events []converge.Event
+	err := WaitForMigration(ctx, r, applied, time.Millisecond, converge.ReporterFunc(func(e converge.Event) {
+		events = append(events, e)
+	}))
+	if err == nil {
+		t.Fatal("a Completed Job from another install revision was accepted as this step's result")
+	}
+	if !strings.Contains(err.Error(), applied) {
+		t.Errorf("the failure does not name the revision that was applied (%s): %v", applied, err)
+	}
+	if len(events) == 0 {
+		t.Fatal("nothing was reported")
+	}
+	if last := events[len(events)-1]; last.Outcome == converge.Pass {
+		t.Errorf("the wait reported a pass on another revision's Job: %+v", last)
+	}
+	// The observation says WHY it was not this step's Job, so the operator is
+	// not left reading a timeout.
+	found := false
+	for _, event := range events {
+		if strings.Contains(event.State.Status, stale) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no observation named the revision the Job carried (%s): %+v", stale, events)
+	}
+}
+
+// A resume after a FAILED migration must create a new Job for the same
+// revision.
+//
+// The Job has backoffLimit 0, so Failed is final; the chart content is
+// unchanged by a resume, so a deleted Job is not recreated by helm-controller
+// either. Without removing it, "fix what the error names, then run the
+// identical command again" names a step that does not exist — which is what the
+// controller on hardware had to work around by patching the chart's migration
+// value off and on by hand.
+func TestAResumeAfterAFailedMigrationJobCreatesANewOne(t *testing.T) {
+	ctx := context.Background()
+	values, err := Values(Settings{Domain: "kn.example.com", AdminEmail: "admin@kn.example.com"}, testSecrets())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := migrationRevision(t, values)
+
+	var jobReads int
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case command == postgresCmd:
+			return sshx.Result{Stdout: postgresReadyJSON()}, nil
+		case command == migrationJobCmd:
+			jobReads++
+			switch jobReads {
+			case 1:
+				// The failed attempt, at THIS revision. A resume must not stop here.
+				return sshx.Result{Stdout: jobJSON(t, "Failed", want)}, nil
+			case 2:
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): jobs.batch "kubenest-cp-migrate" not found`}, nil
+			default:
+				return sshx.Result{Stdout: jobJSON(t, "Complete", want)}, nil
+			}
+		case strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName):
+			return sshx.Result{}, nil
+		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
+			return sshx.Result{}, nil
+		default:
+			t.Fatalf("unscripted command: %q", command)
+		}
+		return sshx.Result{}, nil
+	}}
+
+	revision, err := Migrate(ctx, r, values, installBundle(t), nil)
+	if err != nil {
+		t.Fatalf("the resume did not get past the failed migration Job: %v", err)
+	}
+	if revision != want {
+		t.Errorf("Migrate returned revision %s, want %s", revision, want)
+	}
+	deleted := false
+	for _, command := range r.Commands() {
+		if strings.HasPrefix(command, "sudo -n k3s kubectl delete job "+MigrationJobName) {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Errorf("the failed Job was left in place, so the resumed run waits on it for ever; commands were %v", r.Commands())
+	}
+	if jobReads < 3 {
+		t.Errorf("the Job was read %d time(s), want the failed one, its absence, and the new one", jobReads)
 	}
 }

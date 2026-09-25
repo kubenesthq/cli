@@ -50,14 +50,27 @@ const revisionAnnotation = "kubenest.io/install-revision"
 // readiness check follows the step, so a control plane whose migration failed
 // is never reported installed.
 func Apply(ctx context.Context, r k3s.Runner, valuesYAML string) (string, error) {
-	values, revision, err := withRevision(valuesYAML)
+	return ApplyArchive(ctx, r, ChartArchive(), valuesYAML)
+}
+
+// ApplyArchive applies a SPECIFIC chart archive with these values, and returns
+// the install revision it applied.
+//
+// IT EXISTS FOR ONE REAL CALLER: the candidate-to-candidate gate (PLAN 7.8,
+// S2), which installs the control plane from the PREVIOUS 1.2 candidate — a
+// pinned artifact, not one this binary happens to carry — and then upgrades it
+// to the chart this binary embeds. A gate that could only ever apply the
+// embedded archive would prove nothing about an upgrade, because the state it
+// starts from would be the state it ends in.
+func ApplyArchive(ctx context.Context, r k3s.Runner, archive []byte, valuesYAML string) (string, error) {
+	values, revision, err := withRevisionFor(archive, valuesYAML)
 	if err != nil {
 		return "", err
 	}
 	chart := k3s.HelmChart{
 		Name:            ReleaseName,
 		TargetNamespace: Namespace,
-		ChartContent:    base64.StdEncoding.EncodeToString(ChartArchive()),
+		ChartContent:    base64.StdEncoding.EncodeToString(archive),
 		// valuesContent carries the generated secrets, so it is readable by anyone who can read HelmCharts in kube-system — the same cluster-admin audience as the Secret they came from.
 		ValuesYAML: values,
 		// helm-controller's default, reinstall, answers a failed upgrade of
@@ -118,11 +131,14 @@ func Install(ctx context.Context, r k3s.Runner, valuesYAML string, bundle *manif
 // changes. An identical re-run therefore applies an identical HelmChart and
 // rolls nothing.
 func withRevision(valuesYAML string) (string, string, error) {
-	sum := sha256.New()
-	sum.Write(ChartArchive())
-	sum.Write([]byte{0})
-	sum.Write([]byte(valuesYAML))
-	revision := hex.EncodeToString(sum.Sum(nil))[:16]
+	return withRevisionFor(ChartArchive(), valuesYAML)
+}
+
+func withRevisionFor(archive []byte, valuesYAML string) (string, string, error) {
+	revision, err := RevisionFor(archive, valuesYAML)
+	if err != nil {
+		return "", "", err
+	}
 
 	doc := map[string]any{}
 	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
@@ -134,6 +150,29 @@ func withRevision(valuesYAML string) (string, string, error) {
 		return "", "", fmt.Errorf("rendering the control-plane values: %w", err)
 	}
 	return string(out), revision, nil
+}
+
+// Revision is the install revision a values document will be applied at: a
+// hash of the chart archive and the values, so it changes exactly when what is
+// applied changes.
+//
+// IT IS A PURE FUNCTION OF ITS INPUTS, and that is what makes "the previous
+// release's migration Job" decidable BEFORE anything is applied: the migration
+// step compares the Job on the cluster with the revision it is about to
+// create, and a revision that could only be learned after applying would leave
+// the immutability failure with nothing to avoid it.
+func Revision(valuesYAML string) (string, error) {
+	return RevisionFor(ChartArchive(), valuesYAML)
+}
+
+// RevisionFor is Revision against a specific archive, for the same reason
+// ApplyArchive exists.
+func RevisionFor(archive []byte, valuesYAML string) (string, error) {
+	sum := sha256.New()
+	sum.Write(archive)
+	sum.Write([]byte{0})
+	sum.Write([]byte(valuesYAML))
+	return hex.EncodeToString(sum.Sum(nil))[:16], nil
 }
 
 // readyProbe observes the whole control plane: each Deployment rolled out at

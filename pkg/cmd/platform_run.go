@@ -97,7 +97,7 @@ func installSources(ctx context.Context, f InstallFlags) (*api.Client, *manifest
 		return nil, bundle, nil
 	}
 
-	client, err := controlPlaneClient()
+	client, err := controlPlaneClientChecked(ctx, "platform install")
 	if err != nil {
 		return nil, nil, err
 	}
