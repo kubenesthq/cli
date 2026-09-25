@@ -736,26 +736,58 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if eligibleAfter := cpEligibleMarker(t, ctx, server); eligibleAfter != want {
 		t.Errorf("the eligible checkpoint after the failed migration is %s, but the run published %s: the recovery point this run took is not the one the control plane would return to", eligibleAfter, want)
 	}
-	// AND BACK TO A KNOWN STATE BY HAND, so the arm after this one starts from
-	// a control plane that is running and serving.
-	//
-	// NOT by re-running the upgrade: kn-t70-control-plane-version-identity-4xso.1
-	// is filed for that. A re-run's version check goes through the fenced route
-	// while the backend is at zero replicas, so it fails with HTTP 503 and the
-	// assertion would be asserting the other bead's defect. Until that bead
-	// lands, the harness restores the state itself.
+	// AND THE ADVERTISED WAY ON HAS TO WORK. The failure text promises "fix what
+	// the error names, then run the identical command again", and this is that
+	// sentence being kept: with the database back, the re-run completes and
+	// lowers the fence itself. It is also the harness assertion for
+	// kn-t70-control-plane-version-identity-4xso.1 — the re-run's version check
+	// reads the FENCE's own 503, so it reaches the backend through the node and,
+	// while the backend is still at zero replicas, falls back to the version
+	// this operation recorded.
 	if err := cpScalePostgres(ctx, server, 1); err != nil {
 		t.Fatalf("restoring PostgreSQL: %v", err)
 	}
 	if err := cpWaitForPostgres(ctx, server); err != nil {
 		t.Fatal(err)
 	}
-	cpLowerTheFence(t, ctx, values, server)
-	cpResetToThePreviousCandidate(t, ctx, env, server, values)
+	rerun := cpLaptopHome(t, installingHome)
+	var rerunOut strings.Builder
+	if err := cpRunCLI(t, &rerunOut, rerun, cpUpgradeArgs(env, name)...); err != nil {
+		t.Fatalf("the identical command after a failed migration did not succeed; an operator whose fix worked must be able to run it again: %v\n%s", err, rerunOut.String())
+	}
+	t.Log(rerunOut.String())
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
-		t.Errorf("the hand-restored control plane left the fence %q", report.State)
+		t.Errorf("the re-run finished with the fence %q", report.State)
+	}
+	if _, revision, found := cpMigrationJob(t, ctx, server); !found || revision == "" {
+		t.Error("no migration Job at an install revision is on the cluster after the re-run: the record of the schema step is gone")
 	}
 }
+
+// cpWaitForPostgres waits until the PostgreSQL StatefulSet is ready again,
+// because the migration Job it is about to be given has backoffLimit 0: a Job
+// created before the database accepts connections fails permanently.
+func cpWaitForPostgres(ctx context.Context, server k3s.Runner) error {
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		out, err := k3s.Kubectl(ctx, server, "get statefulset "+controlplane.ReleaseName+"-postgresql"+
+			" -n "+controlplane.Namespace+" -o jsonpath={.status.readyReplicas}")
+		if err == nil && strings.TrimSpace(out) == "1" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the PostgreSQL StatefulSet did not become ready again (%s, last error %v)", strings.TrimSpace(out), err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// cpAssertResumeFromASecondLaptop is (c) and (d): interrupt the run at a
+// recorded step, then finish it from a genuinely fresh process state.
+//
+// THE SECOND LAPTOP IS A SECOND HOME, and a home is not a directory: it is the
+// config, the credential and the cluster journal the installing laptop left
+// behind. A bare t.TempDir() has none of them, cannot reach the control plane,
 
 // cpBackendReady is how many backend replicas are Ready. An absent
 // status.readyReplicas is 0, which is the state a stopped Deployment reports.
@@ -811,52 +843,6 @@ func cpEligibleMarker(t *testing.T, ctx context.Context, server k3s.Runner) stri
 	return checkpoint.Key + "@" + checkpoint.At
 }
 
-// cpLowerTheFence restores the public route and dismantles the fence BY HAND,
-// through the package API the command uses. It is the manual recovery path: the
-// route goes back to the backend FIRST (Lower owns that order), and only then
-// are the fence's objects deleted.
-func cpLowerTheFence(t *testing.T, ctx context.Context, values string, server k3s.Runner) {
-	t.Helper()
-	replicas := int32(1)
-	err := controlplane.Lower(ctx, server, values, &replicas,
-		func(v string) error {
-			_, err := controlplane.Apply(ctx, server, v)
-			return err
-		},
-		func() error {
-			return controlplane.WaitForRouteBackend(ctx, server, controlplane.ReleaseName+"-backend",
-				5*time.Minute, 2*time.Second, converge.NewTextReporter(io.Discard))
-		})
-	if err != nil {
-		t.Fatalf("lowering the fence by hand: %v", err)
-	}
-	t.Log("the fence was lowered by hand and the route is back on the backend")
-}
-
-// cpWaitForPostgres waits until the PostgreSQL StatefulSet is ready again,
-// because the migration Job it is about to be given has backoffLimit 0: a Job
-// created before the database accepts connections fails permanently.
-func cpWaitForPostgres(ctx context.Context, server k3s.Runner) error {
-	deadline := time.Now().Add(5 * time.Minute)
-	for {
-		out, err := k3s.Kubectl(ctx, server, "get statefulset "+controlplane.ReleaseName+"-postgresql"+
-			" -n "+controlplane.Namespace+" -o jsonpath={.status.readyReplicas}")
-		if err == nil && strings.TrimSpace(out) == "1" {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("the PostgreSQL StatefulSet did not become ready again (%s, last error %v)", strings.TrimSpace(out), err)
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-// cpAssertResumeFromASecondLaptop is (c) and (d): interrupt the run at a
-// recorded step, then finish it from a genuinely fresh process state.
-//
-// THE SECOND LAPTOP IS A SECOND HOME, and a home is not a directory: it is the
-// config, the credential and the cluster journal the installing laptop left
-// behind. A bare t.TempDir() has none of them, cannot reach the control plane,
 // and so waited ten minutes for a checkpoint that was never going to be taken.
 //
 // EACH ARM STARTS FROM THE PREVIOUS CANDIDATE, so there is an upgrade to
@@ -938,6 +924,14 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 		t.Error("no migration Job at an install revision is on the cluster after the resumed run finished")
 	}
 }
+
+// cpOperationID reads the live operation record's id.
+//
+// IT READS THE CONFIGMAP AS JSON. The first version used a jsonpath on the key
+// `record.json` — a key with a DOT in it — and the arm reported "an interrupted
+// control-plane upgrade left no operation record" while the record was on the
+// cluster: `kubectl get … -o jsonpath={.data.record\.json}` is one more thing
+// that can silently answer nothing, and it did. A whole-object read cannot.
 
 // cpOperationID reads the live operation record's id.
 //
