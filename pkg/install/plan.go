@@ -1102,9 +1102,17 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
+	// THE CONTROL PLANE'S OWN RECOVERY POINT. Built before the values, because
+	// the chart's checkpoint CronJob and the rest of the control plane are one
+	// apply, and because the fleet recipient this install holds is right here.
+	checkpoint, err := s.checkpointTarget(ctx, server, inst)
+	if err != nil {
+		return err
+	}
 	values, err := controlplane.Values(controlplane.Settings{
 		Domain:     s.Opts.Domain,
 		AdminEmail: s.Opts.AdminEmail,
+		Checkpoint: checkpoint,
 	}, sec)
 	if err != nil {
 		return err
@@ -1116,12 +1124,6 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	// agent pins. The CLI itself trusts it next, and so does every agent this
 	// machine installs (Options.ControlPlaneCA, consumed by the agent stage).
 	ca := []byte(sec.GatewayCACertificate)
-	// Said out loud rather than left in the values document: the chart's
-	// checkpoint CronJob is the control plane's only supported recovery path,
-	// and an install that omits it has to report that plainly. It is off
-	// because the chart requires the tools image pinned by a digest that
-	// nothing in this release records (see Values).
-	s.Logf("  the control-plane checkpoint CronJob is NOT installed: its tools image has no pinned digest on this path yet, so the management cluster will report the control plane as unprotected until it is")
 	revision, err := controlplane.Apply(ctx, server, values)
 	if err != nil {
 		return err
@@ -1234,6 +1236,80 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	s.Logf("  control plane: https://api.%s, console https://app.%s", s.Opts.Domain, s.Opts.Domain)
 	s.Logf("  logged in as %s; the CLI token is stored in credentials.json and the control plane's CA in config.json", s.Opts.AdminEmail)
 	return s.showAdminPasswordOnce(sec.AdminPassword)
+}
+
+// checkpointTarget is the control plane's own recovery target: where its
+// checkpoints are written, what they are sealed to, and who may upload them.
+//
+// WHY THE CONTROL PLANE'S STAGE OWNS THIS, even though the target it derives
+// from is the BACKUP target, which is configured later (StageBackupTarget runs
+// after this stage, because a cluster's kit has to exist before a backup may).
+// The control plane's Helm release is one apply: the checkpoint CronJob and the
+// backend it runs in are rendered together, and the fleet recipient the
+// checkpoint is sealed to is only in hand here.
+//
+// NOTHING IS ENABLED UNLESS THE PRINCIPAL IS PROVEN. The checkpoints land in
+// the same bucket as the clusters' backups, so the credential that writes them
+// must be REFUSED on every cluster prefix this install knows about — read
+// access to a cluster's backups is cluster-admin on that cluster, and one
+// credential that reaches both is one leak away from the fleet's recovery
+// history. VerifyScope is that proof: a refusal there fails the install rather
+// than leaving a CronJob that will upload the fleet's database with the wrong
+// key.
+//
+// AND THIS IS WHY IT MAY RUN BEFORE THE KIT STAGE. A cluster's backup may not
+// be configured until its recovery kit exists, because the kit carries the
+// repository password that makes those backups readable. A control-plane
+// checkpoint does not depend on the kit at all: its two keys are the fleet
+// recipient (this install holds it) and the control plane's own object-store
+// principal (verified above), and its content is the control plane's database.
+// The control-plane kit is written later in the same install, and nothing about
+// the checkpoint waits for it.
+func (s *Session) checkpointTarget(ctx context.Context, server k3s.Runner, inst controlplane.Instance) (*controlplane.CheckpointTarget, error) {
+	if s.Opts.BackupTarget == "" {
+		// Said out loud rather than left out of the values document: the
+		// chart's checkpoint CronJob is the control plane's only supported
+		// recovery path, and an install that omits it has to report that
+		// plainly. It is reported where it matters too — the management
+		// cluster's `backup` verdict says the control plane is unprotected
+		// until a target exists.
+		s.Logf("  the control-plane checkpoint CronJob is NOT installed: this install was given no --backup-target, so there is nowhere to upload a checkpoint, and the management cluster will report the control plane as unprotected until there is")
+		return nil, nil
+	}
+	if inst.FleetRecipient == "" {
+		return nil, errors.New("this control plane has no fleet recovery recipient, so no checkpoint could be sealed to a key the fleet holds. A first --control-plane install records one; a later one is handed it with --fleet-recipient (and --instance-id) from the machine that installed the control plane")
+	}
+	target, err := parseBackupTarget(s.Opts.BackupTarget)
+	if err != nil {
+		return nil, err
+	}
+	// The CONTROL PLANE's principal, from its own variables. The cluster's
+	// KUBENEST_BACKUP_* pair is deliberately not consulted: it is the
+	// credential the check below exists to refuse, and reading it here would
+	// make "the checkpoints have their own principal" a claim rather than a
+	// fact. AWS_* is the conventional fallback, as it is for the target.
+	checkpoint := controlplane.NewCheckpointTarget(
+		target,
+		inst.FleetRecipient,
+		envFirst(controlplane.EnvCheckpointAccessKeyID, "AWS_ACCESS_KEY_ID"),
+		envFirst(controlplane.EnvCheckpointSecretAccessKey, "AWS_SECRET_ACCESS_KEY"),
+	)
+	if err := checkpoint.Validate(); err != nil {
+		return nil, err
+	}
+	probe, err := checkpoint.S3Client()
+	if err != nil {
+		return nil, err
+	}
+	if err := checkpoint.VerifyScope(ctx, probe, []string{target.Prefix}); err != nil {
+		return nil, fmt.Errorf("refusing to enable the control-plane checkpoint: %w", err)
+	}
+	if err := controlplane.EnsureCredentials(ctx, server, checkpoint); err != nil {
+		return nil, err
+	}
+	s.Logf("  control-plane checkpoints: %s, sealed to the fleet recipient and uploaded to s3://%s/%s by the control plane's own principal (secret %s/%s)",
+		"nightly pg_dump -Fc", checkpoint.Bucket, checkpoint.Prefix, controlplane.Namespace, checkpoint.CredentialsSecret)
+	return &checkpoint, nil
 }
 
 // showAdminPasswordOnce prints the administrator password the first time this

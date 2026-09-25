@@ -182,16 +182,16 @@ func TestValuesCarriesExactlyTheInstallInputs(t *testing.T) {
 	if got := gatewayCA["privateKey"]; got != sec.GatewayCAPrivateKey {
 		t.Errorf("gatewayCA.privateKey = %v, want %q", got, sec.GatewayCAPrivateKey)
 	}
-	// The checkpoint CronJob is explicitly OFF. The chart turns it on by
-	// default and refuses to render without a tools image pinned by digest —
-	// a value no source on this path records — and a value helm cannot render
-	// fails the WHOLE release, so an install would not happen at all.
+	// The checkpoint CronJob is OFF when the install was given no recovery
+	// target: the chart's own default turns it on, so an install that left the
+	// group out would render a CronJob whose required recipient and bucket are
+	// empty, and helm refuses the WHOLE release over a value it cannot render.
 	checkpoint := section(t, doc, "checkpoint")
 	if got := sortedKeys(checkpoint); !equalStrings(got, []string{"enabled"}) {
 		t.Errorf("checkpoint keys = %v, want exactly enabled", got)
 	}
 	if checkpoint["enabled"] != false {
-		t.Errorf("checkpoint.enabled = %v, want false: the chart cannot render its checkpoint CronJob without pins this installer does not have", checkpoint["enabled"])
+		t.Errorf("checkpoint.enabled = %v, want false: this install was given no backup target, so there is nowhere to upload a checkpoint", checkpoint["enabled"])
 	}
 	postgres := section(t, doc, "postgresql")
 	if got := sortedKeys(postgres); !equalStrings(got, []string{"auth"}) {

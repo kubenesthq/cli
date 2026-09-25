@@ -64,11 +64,17 @@ const (
 )
 
 // Settings is what the operator decided: the domain the control plane's
-// hostnames hang off, and the administrator the backend creates on first
-// boot. Everything else the chart defaults.
+// hostnames hang off, the administrator the backend creates on first boot, and
+// — when this install was given a backup target — the control plane's own
+// recovery target (kn-t47). Everything else the chart defaults.
 type Settings struct {
 	Domain     string
 	AdminEmail string
+	// Checkpoint is where the control plane's own checkpoints are written, and
+	// the principal that writes them. NIL MEANS THE CHART RENDERS NO CHECKPOINT
+	// JOB, and the install says so out loud: an installation with no recovery
+	// point is a state to report, never one to leave as an empty values field.
+	Checkpoint *CheckpointTarget
 }
 
 // Secrets is what this install generated once and must keep: the random
@@ -435,6 +441,14 @@ func Values(s Settings, sec Secrets) (string, error) {
 	if s.AdminEmail == "" {
 		return "", fmt.Errorf("the control plane needs an administrator email: the backend creates that user on first boot")
 	}
+	// A recovery target that cannot be rendered is a release that does not
+	// install: the chart refuses the WHOLE release over a missing recipient or
+	// bucket, so this checks the same three things here, before the apply.
+	if s.Checkpoint != nil {
+		if err := s.Checkpoint.Validate(); err != nil {
+			return "", err
+		}
+	}
 	// Marshalled, never concatenated: the generated passwords are random and
 	// may hold any character YAML gives meaning to, and one that did would
 	// otherwise silently change the chart's values instead of failing.
@@ -453,28 +467,21 @@ func Values(s Settings, sec Secrets) (string, error) {
 		"postgresql": map[string]any{
 			"auth": map[string]any{"password": sec.PostgresPassword},
 		},
-		// THE CHECKPOINT CRONJOB IS RENDERED OFF, and this is a limitation of
-		// the installer rather than a decision about recovery (kn-t47).
+		// THE CONTROL PLANE'S OWN RECOVERY PATH (kn-t47).
 		//
-		// The chart turns it on by default and refuses to render without two
-		// values: the checkpoint tools image PINNED BY DIGEST
-		// (checkpoint.tools.image.digest) and the fleet recipient
-		// (checkpoint.recipient). The recipient is known here — it is the
-		// public half of the fleet recovery key this install generated — but
-		// the digest has NO source on this path: no constant, bundle manifest
-		// or catalog entry in this wave carries the digest of
-		// ghcr.io/kubenesthq/checkpoint-tools, and a digest invented here
-		// would name an image nobody built. Helm refuses the whole release
-		// over a value it cannot render, so leaving the group on would mean
-		// the control plane does not install at all.
+		// ON WHEN THIS INSTALL WAS GIVEN A BACKUP TARGET, and off — visibly, by
+		// the caller's log line — when it was not. The chart renders its
+		// checkpoint CronJob from `enabled` and refuses to render without a
+		// recipient and a bucket, so all three travel together; the job itself
+		// runs the BACKEND image, which is already pinned by digest in this
+		// chart and now carries `pg_dump` and `age`, so there is no second
+		// image for anyone to pin.
 		//
-		// Off, the install works and the omission is visible where it matters:
-		// the management cluster's `backup` verdict reports that the control
-		// plane has no checkpoint. Turning it on needs the digest to be
-		// recorded somewhere the installer reads (the bundle catalog is the
-		// natural home) and the checkpoint bucket and its separate principal
-		// to be configured, which is the rest of the checkpoint wiring.
-		"checkpoint": map[string]any{"enabled": false},
+		// The credentials Secret is named rather than written: its contents are
+		// a credential, and they reach the cluster through kubectl (see
+		// EnsureCredentials), not through a values document that a helm
+		// release's history would keep.
+		"checkpoint": checkpointValues(s.Checkpoint),
 		"backend": map[string]any{
 			"admin": map[string]any{
 				"email":    s.AdminEmail,
@@ -487,6 +494,27 @@ func Values(s Settings, sec Secrets) (string, error) {
 		return "", fmt.Errorf("rendering the control-plane values: %w", err)
 	}
 	return string(out), nil
+}
+
+// checkpointValues renders the chart's `checkpoint` group.
+//
+// NIL IS AN EXPLICIT `enabled: false`, not an omitted value. The chart's own
+// default turns the checkpoint CronJob ON, so an install with no backup target
+// that simply left the group out would render a CronJob whose required values
+// are empty — and helm refuses the WHOLE release over a value it cannot render,
+// which is how a missing recovery target would turn into a control plane that
+// does not install at all.
+func checkpointValues(target *CheckpointTarget) map[string]any {
+	if target == nil {
+		return map[string]any{"enabled": false}
+	}
+	return map[string]any{
+		"enabled":           true,
+		"recipient":         target.Recipient,
+		"bucket":            target.Bucket,
+		"prefix":            target.Prefix,
+		"credentialsSecret": target.CredentialsSecret,
+	}
 }
 
 // generateSecrets draws one fresh set from the system CSPRNG. Each format is
