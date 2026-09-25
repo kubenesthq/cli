@@ -50,11 +50,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -381,25 +383,6 @@ func cpInstallPreviousCandidate(t *testing.T, ctx context.Context, env cpUpgrade
 	return revision
 }
 
-// cpForceMigrationFailure makes the migration Job fail while the fence is up,
-// by taking the database away from it — the same failure hardware observed
-// ("connection refused" against a restarting PostgreSQL), produced on purpose.
-func cpForceMigrationFailure(t *testing.T, ctx context.Context, server k3s.Runner, down bool) {
-	t.Helper()
-	replicas := "1"
-	verb := "stopping"
-	if !down {
-		replicas, verb = "1", "restarting"
-	} else {
-		replicas = "0"
-	}
-	t.Logf("%s PostgreSQL so the migration Job cannot connect", verb)
-	if _, err := k3s.Kubectl(ctx, server, "scale statefulset "+controlplane.ReleaseName+"-postgresql"+
-		" -n "+controlplane.Namespace+" --replicas="+replicas); err != nil {
-		t.Fatalf("scaling PostgreSQL: %v", err)
-	}
-}
-
 // cpPostgresImage rewrites the running PostgreSQL StatefulSet's image, so the
 // refusal's terms can be exercised by moving the RUNNING side — which is a
 // read-only change to a StatefulSet that needs no second chart.
@@ -487,10 +470,10 @@ func TestControlPlaneUpgradeGate(t *testing.T) {
 	// A migration Job that cannot reach its database fails, and what is left
 	// is the PREVIOUS chart with the fence still up — never a half-migrated
 	// control plane serving customers.
-	cpAssertMigrationFailureKeepsTheFenceUp(t, ctx, env, server, name, home)
+	cpAssertMigrationFailureKeepsTheFenceUp(t, ctx, env, server, name, home, values)
 
 	// ----------------------------------------------------------- (c) and (d)
-	cpAssertResumeFromASecondLaptop(t, ctx, env, server, name)
+	cpAssertResumeFromASecondLaptop(t, ctx, env, server, name, home, values)
 }
 
 // cpPrepareControlPlane performs step (a) and returns the values the control
@@ -641,8 +624,16 @@ func cpAssertPostgresRefusal(t *testing.T, ctx context.Context, env cpUpgradeEnv
 			if err == nil {
 				t.Fatalf("an upgrade onto %s was accepted; the control plane's database must not change without its own tested procedure\n%s", tc.what, out.String())
 			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("the refusal does not name the %s:\n%v", tc.want, err)
+			// THE REFUSAL'S TERMS ARE IN THE OUTPUT, NOT IN THE ERROR. The
+			// gate line — "PostgreSQL unchanged: ... a different major ..."
+			// plus its Fix — is printed by the gates stage, and the command's
+			// error is only the summary ("this control-plane upgrade is
+			// refused before anything is changed: PostgreSQL unchanged"). A
+			// test that read the error alone therefore asserted nothing about
+			// which difference was named.
+			both := err.Error() + "\n" + out.String()
+			if !strings.Contains(both, tc.want) {
+				t.Errorf("neither the error nor the run's output names the %s:\n%v", tc.want, both)
 			}
 		})
 	}
@@ -658,32 +649,71 @@ func cpRunningImage(t *testing.T, ctx context.Context, server k3s.Runner) string
 	return strings.TrimSpace(out)
 }
 
-// cpAssertMigrationFailureKeepsTheFenceUp forces the migration Job's database
-// away, runs the upgrade, and asserts what is left: the PREVIOUS chart still
-// running, the fence still up, and the checkpoint still eligible.
+// cpAssertMigrationFailureKeepsTheFenceUp is (e): force the migration Job's
+// database away WHILE THE RUN IS AT THE MIGRATION, and assert what is left —
+// the PREVIOUS chart still running, the fence still up, the checkpoint still
+// eligible — and then that a clean upgrade succeeds, so the arm after this one
+// starts from a known state.
+//
+// FOUR THINGS THIS ARM HAS TO GET RIGHT, and each was wrong before:
+//
+//	it runs from a HOME THAT CAN REACH THE CONTROL PLANE (cpLaptopHome): a bare
+//	t.TempDir() cannot log in, so the run never got as far as the migration;
+//
+//	it starts from a chart that is NOT the one being applied
+//	(cpResetToThePreviousCandidate): the run that (b) completed already left
+//	the current candidate running, so there was nothing to migrate and the
+//	upgrade was a no-op;
+//
+//	PostgreSQL goes away only ONCE THE CHECKPOINT IS ELIGIBLE, which is what
+//	the run's own output says — the checkpoint stage needs the database, so
+//	stopping it beforehand failed the checkpoint instead of the migration;
+//
+//	a FRESH journal, so the fence stage raises a fence instead of reporting the
+//	completed first run's stage as skipped.
 //
 // The automatic return TO the checkpoint is T4.7's recovery path (the plan's
 // "rolling back to the checkpoint is automatic only while the fence has held
 // continuously"); what this gate proves is the state the failure leaves, which
 // is the one a customer's requests are answered from.
-func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name, home string) {
+func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name, installingHome, values string) {
 	t.Helper()
+	cpResetToThePreviousCandidate(t, ctx, env, server, values)
 	before := cpBackendImage(t, ctx, server)
 	eligibleBefore := cpEligibleAt(t, ctx, server)
+	home := cpLaptopHome(t, installingHome)
 
-	cpForceMigrationFailure(t, ctx, server, true)
-	defer cpForceMigrationFailure(t, ctx, server, false)
+	var (
+		varOut   strings.Builder
+		scaleErr error
+		fired    = make(chan struct{})
+	)
+	// THE MARKER IS THE RUN'S OWN TRANSITION, not a poll from outside: the
+	// checkpoint is eligible when the run says its stage completed, and only
+	// then does taking the database away hit the MIGRATION rather than the
+	// checkpoint.
+	watcher := newCPWatchWriter(&varOut, controlplane.StageCheckpoint+" ok", func() {
+		defer close(fired)
+		t.Log("the checkpoint is eligible; taking PostgreSQL away from the migration")
+		scaleErr = cpScalePostgres(ctx, server, 0)
+	})
+	err := cpRunCLI(t, watcher, home, cpUpgradeArgs(env, name)...)
+	select {
+	case <-fired:
+	default:
+		t.Errorf("the run never reached the checkpoint, so the migration was never denied its database:\n%s", varOut.String())
+	}
+	if scaleErr != nil {
+		t.Fatalf("taking PostgreSQL away at the migration: %v", scaleErr)
+	}
+	t.Log(varOut.String())
 
-	var out strings.Builder
-	err := cpRunCLI(t, &out, home, cpUpgradeArgs(env, name)...)
-	t.Log(out.String())
 	if err == nil {
 		t.Fatal("a migration Job that could not reach its database did not fail the upgrade")
 	}
 	if !strings.Contains(err.Error(), controlplane.MigrationJobName) {
 		t.Errorf("the failure does not name the migration Job:\n%v", err)
 	}
-
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceUp {
 		t.Errorf("the failed migration left the fence %q: a customer request could reach a control plane whose schema was not brought forward", report.State)
 	}
@@ -693,37 +723,76 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if eligibleAfter := cpEligibleAt(t, ctx, server); eligibleAfter != eligibleBefore {
 		t.Errorf("the failed migration changed the eligible checkpoint from %s to %s", eligibleBefore, eligibleAfter)
 	}
+
+	// AND BACK TO A KNOWN STATE, which is also the recovery an operator
+	// performs: the database returns, and the same command then succeeds —
+	// the failed Job is removed and a new one runs for the same revision.
+	if err := cpScalePostgres(ctx, server, 1); err != nil {
+		t.Fatalf("restoring PostgreSQL: %v", err)
+	}
+	if err := cpWaitForPostgres(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	clean := cpLaptopHome(t, installingHome)
+	var cleanOut strings.Builder
+	if err := cpRunCLI(t, &cleanOut, clean, cpUpgradeArgs(env, name)...); err != nil {
+		t.Fatalf("the upgrade after a failed migration did not succeed; an operator whose fix worked must be able to run the identical command again: %v\n%s", err, cleanOut.String())
+	}
+	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
+		t.Errorf("the clean upgrade finished with the fence %q", report.State)
+	}
 }
 
-// cpAssertResumeFromASecondLaptop is (c) and (d): interrupt the run, then
-// finish it from a genuinely fresh process state.
-//
-// THE SECOND LAPTOP IS A SECOND HOME. `--resume` reads the operation record
-// from the CLUSTER and takes it over; a journal on this machine would be this
-// machine's memory, and the point of the assertion is that a laptop that has
-// none can finish the operation.
-func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name string) {
-	t.Helper()
-	first := t.TempDir()
-	second := t.TempDir()
+// cpWaitForPostgres waits until the PostgreSQL StatefulSet is ready again,
+// because the migration Job it is about to be given has backoffLimit 0: a Job
+// created before the database accepts connections fails permanently.
+func cpWaitForPostgres(ctx context.Context, server k3s.Runner) error {
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		out, err := k3s.Kubectl(ctx, server, "get statefulset "+controlplane.ReleaseName+"-postgresql"+
+			" -n "+controlplane.Namespace+" -o jsonpath={.status.readyReplicas}")
+		if err == nil && strings.TrimSpace(out) == "1" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the PostgreSQL StatefulSet did not become ready again (%s, last error %v)", strings.TrimSpace(out), err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
 
-	// (c) Interrupt after the checkpoint: cancel the run once the eligible
-	// checkpoint has moved, which is the recorded step the plan names.
+// cpAssertResumeFromASecondLaptop is (c) and (d): interrupt the run at a
+// recorded step, then finish it from a genuinely fresh process state.
+//
+// THE SECOND LAPTOP IS A SECOND HOME, and a home is not a directory: it is the
+// config, the credential and the cluster journal the installing laptop left
+// behind. A bare t.TempDir() has none of them, cannot reach the control plane,
+// and so waited ten minutes for a checkpoint that was never going to be taken.
+//
+// EACH ARM STARTS FROM THE PREVIOUS CANDIDATE, so there is an upgrade to
+// interrupt: without that reset the run's stages are all skipped and nothing
+// happens at the moment it is cancelled.
+func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name, installingHome, values string) {
+	t.Helper()
+
+	// (c) Interrupt once the checkpoint has been published — the recorded step
+	// the plan names — and finish from the second laptop.
+	cpResetToThePreviousCandidate(t, ctx, env, server, values)
+	first := cpLaptopHome(t, installingHome)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var firstOut strings.Builder
+	stopAtCheckpoint := newCPWatchWriter(&firstOut, controlplane.StageCheckpoint+" ok", func() {
+		t.Log("the checkpoint is eligible; interrupting the run there")
+		cancel()
+	})
 	interrupted := make(chan struct{})
 	go func() {
 		defer close(interrupted)
-		var out strings.Builder
-		_ = cpRunCLIWithContext(t, runCtx, &out, first, cpUpgradeArgs(env, name)...)
+		_ = cpRunCLIWithContext(t, runCtx, stopAtCheckpoint, first, cpUpgradeArgs(env, name)...)
 	}()
-	before := cpEligibleAt(t, ctx, server)
-	cpWaitFor(t, 10*time.Minute, 5*time.Second, "the checkpoint the interrupted run publishes", func() (bool, string) {
-		now := cpEligibleAt(t, ctx, server)
-		return now != "" && now != before, "eligible checkpoint is " + now
-	})
-	cancel()
 	<-interrupted
+	t.Log(firstOut.String())
 
 	opID := cpOperationID(t, ctx, server)
 	if opID == "" {
@@ -731,50 +800,47 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 	}
 	t.Logf("interrupted after the checkpoint; operation %s", opID)
 
-	// The second laptop: a fresh HOME, so no journal of the first run's.
+	second := cpLaptopHome(t, installingHome)
 	var out strings.Builder
-	err := cpRunCLI(t, &out, second, cpUpgradeArgs(env, name, "--resume", opID)...)
-	t.Log(out.String())
-	if err != nil {
-		t.Fatalf("the second laptop could not finish the interrupted upgrade: %v", err)
+	if err := cpRunCLI(t, &out, second, cpUpgradeArgs(env, name, "--resume", opID)...); err != nil {
+		t.Fatalf("the second laptop could not finish the interrupted upgrade: %v\n%s", err, out.String())
 	}
+	t.Log(out.String())
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
 		t.Errorf("the resumed run finished with the fence %q", report.State)
 	}
 
-	// (d) Interrupt DURING THE MIGRATION and finish from the third laptop. The
+	// (d) Interrupt DURING THE MIGRATION and finish from a third laptop. The
 	// migration is the step that must not be half-done and unwatched: the fence
 	// is up, the backend is stopped, and the Job's outcome is the one thing a
 	// successor has to establish rather than guess.
-	third := t.TempDir()
-	_, revisionBefore, _ := cpMigrationJob(t, ctx, server)
-	runCtx, cancel2 := context.WithCancel(ctx)
+	cpResetToThePreviousCandidate(t, ctx, env, server, values)
+	third := cpLaptopHome(t, installingHome)
+	runCtx2, cancel2 := context.WithCancel(ctx)
 	defer cancel2()
+	var thirdOut strings.Builder
+	stopAtMigration := newCPWatchWriter(&thirdOut, controlplane.StageMigration, func() {
+		t.Log("the migration stage has started; interrupting the run inside it")
+		cancel2()
+	})
 	interrupted2 := make(chan struct{})
 	go func() {
 		defer close(interrupted2)
-		var out strings.Builder
-		_ = cpRunCLIWithContext(t, runCtx, &out, third, cpUpgradeArgs(env, name)...)
+		_ = cpRunCLIWithContext(t, runCtx2, stopAtMigration, third, cpUpgradeArgs(env, name)...)
 	}()
-	cpWaitFor(t, 15*time.Minute, 5*time.Second, "the migration Job the interrupted run creates", func() (bool, string) {
-		_, revision, found := cpMigrationJob(t, ctx, server)
-		if !found {
-			return false, "no migration Job yet"
-		}
-		return revision != "" && revision != revisionBefore, "migration Job at revision " + revision
-	})
-	cancel2()
 	<-interrupted2
+	t.Log(thirdOut.String())
 
 	opID2 := cpOperationID(t, ctx, server)
 	if opID2 == "" {
 		t.Fatal("an upgrade interrupted during the migration left no operation record")
 	}
-	fourth := t.TempDir()
+	fourth := cpLaptopHome(t, installingHome)
 	var out2 strings.Builder
 	if err := cpRunCLI(t, &out2, fourth, cpUpgradeArgs(env, name, "--resume", opID2)...); err != nil {
 		t.Fatalf("the second laptop could not finish the upgrade interrupted during the migration: %v\n%s", err, out2.String())
 	}
+	t.Log(out2.String())
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
 		t.Errorf("the run resumed during the migration finished with the fence %q", report.State)
 	}
@@ -855,4 +921,120 @@ func convergeReporter(t *testing.T) converge.Reporter {
 	return converge.ReporterFunc(func(e converge.Event) {
 		t.Logf("  %s %s %s", e.Check, e.Outcome, e.State.Status)
 	})
+}
+
+// cpLaptopHome returns a fresh HOME carrying the INSTALLING laptop's state.
+//
+// A BARE t.TempDir() IS NOT A LAPTOP. The CLI finds its control plane in
+// ~/.kubenest/config.json, its token in credentials.json, and the cluster's
+// journal under ~/.kubenest/journals/; a home with none of those cannot reach
+// the control plane at all, which is why the resume arms waited ten minutes for
+// a checkpoint that never came and why the forced-failure arm re-ran a
+// COMPLETED stage off the first run's journal instead of doing anything.
+//
+// The token and the CA are copied, not re-derived: the gate is about resuming
+// on a second laptop, and a second laptop is a machine that has the operator's
+// credential and no memory of the first run's process.
+func cpLaptopHome(t *testing.T, from string) string {
+	t.Helper()
+	home := t.TempDir()
+	dst := filepath.Join(home, ".kubenest")
+	if err := os.MkdirAll(dst, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"config.json", "credentials.json"} {
+		src := filepath.Join(from, ".kubenest", name)
+		body, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("reading the installing laptop's %s: %v", src, err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, name), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The CLUSTER JOURNAL too: the command resolves the management cluster (and
+	// its node list) through the install journal this machine holds.
+	src := filepath.Join(from, ".kubenest", "journals")
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		t.Fatalf("reading the installing laptop's journals in %s: %v", src, err)
+	}
+	if err := os.MkdirAll(filepath.Join(dst, "journals"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(src, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dst, "journals", entry.Name()), body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return home
+}
+
+// cpWatchWriter passes a run's output through and fires ONCE, when the stream
+// contains marker.
+//
+// IT IS HOW AN ARM INTERRUPTS THE RUN AT THE STEP IT MEANS TO. Deciding from
+// outside — polling the checkpoint, or the migration Job — means polling state
+// the run has not reached yet and guessing when it has; the run's own stage
+// transitions are the only ordered account of what it is doing.
+type cpWatchWriter struct {
+	mu     sync.Mutex
+	buf    strings.Builder
+	out    io.Writer
+	marker string
+	fired  bool
+	fire   func()
+}
+
+func newCPWatchWriter(out io.Writer, marker string, fire func()) *cpWatchWriter {
+	return &cpWatchWriter{out: out, marker: marker, fire: fire}
+}
+
+func (w *cpWatchWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.buf.Write(p)
+	fire := false
+	if !w.fired && strings.Contains(w.buf.String(), w.marker) {
+		w.fired = true
+		fire = true
+	}
+	w.mu.Unlock()
+	// The callback runs OUTSIDE the lock: it may write output of its own, and
+	// firing under the lock would deadlock the run it is watching.
+	if fire {
+		w.fire()
+	}
+	return w.out.Write(p)
+}
+
+// cpResetToThePreviousCandidate puts the control plane back on the PINNED
+// previous candidate, so an arm that follows really has a chart to move.
+//
+// Without it, (c), (d) and (e) all start from a control plane that already runs
+// the current candidate: (e) has nothing to migrate and the upgrade is a no-op,
+// and the resume arms interrupt a run whose stages are all skipped.
+func cpResetToThePreviousCandidate(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, values string) string {
+	t.Helper()
+	revision := cpInstallPreviousCandidate(t, ctx, env, server, values)
+	if err := controlplane.WaitReady(ctx, server, revision, envBundle(t, ctx, env), convergeReporter(t)); err != nil {
+		t.Fatalf("the previous candidate did not become ready again: %v", err)
+	}
+	t.Logf("control plane put back on the previous candidate at install revision %s", revision)
+	return revision
+}
+
+// cpScalePostgres returns the error rather than failing the test, because the
+// forced-failure arm scales the StatefulSet FROM A CALLBACK that runs on the
+// run's own goroutine — and t.Fatalf outside the test goroutine is not allowed.
+func cpScalePostgres(ctx context.Context, server k3s.Runner, replicas int) error {
+	_, err := k3s.Kubectl(ctx, server, "scale statefulset "+controlplane.ReleaseName+"-postgresql"+
+		" -n "+controlplane.Namespace+" --replicas="+strconv.Itoa(replicas))
+	return err
 }
