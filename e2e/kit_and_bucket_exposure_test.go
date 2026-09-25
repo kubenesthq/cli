@@ -230,8 +230,14 @@ func TestKitAndBucketExposure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The second laptop talks to the control plane phase 1 INSTALLED, with the
+	// URL, token and CA the first install stored — never to the harness's own
+	// control plane. The first real run registered this cluster with the
+	// harness's control plane while pinning the new one's CA, and the agent
+	// could never connect ("x509: certificate signed by unknown authority").
+	fleet := configuredControlPlane(t, cfgTwo)
 	var secondOut bytes.Buffer
-	sessionTwo := kitSession(t, controlPlane, bundle, journalTwo, install.Options{
+	sessionTwo := kitSession(t, fleet, bundle, journalTwo, install.Options{
 		Bundle: env.bundle, Name: clusterTwo, Servers: []string{kit.secondServer}, HATier: "single-server",
 		SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevice: kit.secondStorage,
 		ControlPlaneCA: []byte(cfgTwo.ControlPlaneCA),
@@ -574,6 +580,33 @@ func seedSecondLaptop(t *testing.T, from, to string) {
 	if _, err := os.Stat(filepath.Join(dst, "config.json")); err != nil {
 		t.Fatalf("the second laptop has no config to install with: %v", err)
 	}
+}
+
+// configuredControlPlane is the client a laptop builds from its stored CLI
+// state (pkg/cmd's controlPlaneClient): the logged-in URL, its token, and the
+// control plane's own CA.
+func configuredControlPlane(t *testing.T, cfg *config.Config) *api.Client {
+	t.Helper()
+	if cfg.ControlPlaneURL == "" {
+		t.Fatal("the seeded laptop is logged in to no control plane: the first install must have logged it in")
+	}
+	creds, err := config.LoadCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := creds.TokenFor(cfg.ControlPlaneURL)
+	if token == "" {
+		t.Fatalf("the seeded laptop holds no token for %s", cfg.ControlPlaneURL)
+	}
+	opts := []api.Option{api.WithToken(token)}
+	if cfg.ControlPlaneCA != "" {
+		opts = append(opts, api.WithCACert([]byte(cfg.ControlPlaneCA)))
+	}
+	client, err := api.New(cfg.ControlPlaneURL, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
 
 // plantWorkload creates a namespace with a Secret whose value is ALSO mounted
