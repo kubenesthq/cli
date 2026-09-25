@@ -234,37 +234,28 @@ func installedVersion(ctx context.Context, r Runner, binary string) (bool, strin
 	return true, out, nil
 }
 
-// GenerateToken mints a cluster token in k3s's own shape:
+// GenerateToken mints the cluster token's password: 64 lowercase hex
+// characters from crypto/rand, which k3s accepts as the short `<PASSWORD>`
+// form of --token.
 //
-//	K10<40 lowercase hex>::server:<40 lowercase hex>
+// It is deliberately NOT the full `K10<CA-HASH>::server:<PASSWORD>` form. The
+// CA hash in that form is the SHA-256 of the cluster CA, which does not exist
+// until the first server starts, so any value minted beforehand fails k3s's
+// normalisation ("failed to normalize server token") and the first server
+// never starts. Found on real hardware 2026-09-25. The install reads the full
+// token back from the first server once it is up (NodeToken) and uses that for
+// every join and for the recovery kit, so joins still pin the cluster CA.
 //
-// The two halves are independent random draws, so two servers installed from
-// one plan cannot collide and a token read off one node is not a prefix of
-// another's.
-//
-// This is why the install path mints a token instead of reading one back
-// (NodeToken): the first server's token is created by k3s only while it
-// starts, so a cluster whose first node has no token staged has no
-// credential to join with until that node is up — and the joining servers
-// need it before their own k3s starts. Generating it up front, from
-// crypto/rand, is what makes the very first server's --token-file possible
-// and the whole cluster's token a single value the install plan derives
-// every join from.
+// Generating the password up front, from crypto/rand, is what makes the very
+// first server's --token-file possible and the cluster's secret a value the
+// install chose rather than one that exists only on the node.
 //
 // crypto/rand, not math/rand: this value is a credential. It must never be
 // predictable from a sequence of other tokens, and it must never be zero —
 // on a rand failure the caller gets an error, because a server started with
 // an empty or guessed token is a cluster anyone can join.
 func GenerateToken() (string, error) {
-	lower, err := tokenHex(20)
-	if err != nil {
-		return "", err
-	}
-	upper, err := tokenHex(20)
-	if err != nil {
-		return "", err
-	}
-	return "K10" + lower + "::server:" + upper, nil
+	return tokenHex(32)
 }
 
 // tokenHex returns n random bytes as 2n lowercase hex characters.

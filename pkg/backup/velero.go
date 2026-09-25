@@ -220,6 +220,16 @@ func EnsureRepositoryPassword(ctx context.Context, r k3s.Runner) (password strin
 	if err != nil {
 		return "", false, err
 	}
+	// The namespace must exist before the Secret, and this runs before the
+	// Velero chart creates it. Found on real hardware 2026-09-25:
+	// `namespaces "velero" not found`. Create-if-absent is idempotent and
+	// carries nothing secret, so apply is fine here.
+	nsDoc := []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + Namespace + "\n")
+	if res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(nsDoc)); err != nil {
+		return "", false, fmt.Errorf("creating namespace %s: %w", Namespace, err)
+	} else if res.ExitCode != 0 {
+		return "", false, fmt.Errorf("creating namespace %s: exit %d: %s", Namespace, res.ExitCode, firstLine(res.Stderr))
+	}
 	doc, err := RepositoryPasswordSecret(generated)
 	if err != nil {
 		return "", false, fmt.Errorf("rendering secret %s/%s: %w", Namespace, RepositorySecretName, err)

@@ -227,7 +227,9 @@ func TestJoinTokenNeverAppearsOnACommandLine(t *testing.T) {
 // against until that node is up — and because k3s bakes --token-file into
 // the systemd unit, the file is read at every start, not only at first boot.
 func TestFirstServerGetsTheGeneratedTokenFile(t *testing.T) {
-	tokenShape := regexp.MustCompile(`^K10[0-9a-f]{40}::server:[0-9a-f]{40}$`)
+	// The short <PASSWORD> form: a pre-minted K10<CA-HASH>:: token cannot be
+	// valid, because the CA it hashes does not exist until k3s starts.
+	tokenShape := regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 	fresh := func() *componenttest.FakeRunner {
 		return &componenttest.FakeRunner{Respond: func(cmd string) (sshx.Result, error) {
@@ -277,7 +279,7 @@ func TestFirstServerGetsTheGeneratedTokenFile(t *testing.T) {
 	}
 	token := string(staged)
 	if !tokenShape.MatchString(token) {
-		t.Errorf("the generated token is not k3s-shaped (want K10<40 hex>::server:<40 hex>): %q", token)
+		t.Errorf("the generated token is not a 64-hex k3s password (a K10 form fails k3s's normalisation before the CA exists): %q", token)
 	}
 	// And it must never appear in a command string: command lines are visible
 	// in the target host's process list, and an encoding is not a concealment

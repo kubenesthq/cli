@@ -552,23 +552,29 @@ func stageK3sServer(ctx context.Context, s *Session) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no server node")
 	}
-	// The CLI generates the cluster token itself and hands the first server
-	// the file to read it from, exactly as it already does for every join.
-	// That makes ONE value behind every join, chosen here, which is what the
-	// recovery kit needs: a token the server minted and the CLI read back
-	// afterwards is a token that exists only on the node until someone asks.
+	// The CLI generates the cluster token's password itself and hands the
+	// first server the file to read it from. Once that server is up, the full
+	// K10<CA-HASH>::server:<password> token is read back from it: every join
+	// and the recovery kit use that form, so joins pin the cluster CA. A full
+	// token cannot be minted beforehand, because the CA it hashes does not
+	// exist until k3s starts (k3s refuses it: "failed to normalize server
+	// token"; found on real hardware 2026-09-25).
 	//
 	// It is held in this process's memory and nowhere else: not in the
 	// session's journal, not in a log line, not in the install Record.
-	token, err := k3s.GenerateToken()
+	password, err := k3s.GenerateToken()
 	if err != nil {
 		return err
 	}
-	s.joinToken = token
 
-	if err := stages.NewComponentError("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{Token: token}, s.Reporter)); err != nil {
+	if err := stages.NewComponentError("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{Token: password}, s.Reporter)); err != nil {
 		return err
 	}
+	token, err := k3s.NodeToken(ctx, servers[0].Runner)
+	if err != nil {
+		return fmt.Errorf("reading the cluster token back from %s: %w", servers[0].Address, err)
+	}
+	s.joinToken = token
 	if len(servers) == 1 {
 		return nil
 	}

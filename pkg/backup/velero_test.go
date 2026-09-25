@@ -578,6 +578,7 @@ func TestChartCarriesThePerClusterRepositoryPassword(t *testing.T) {
 	// first-install path.
 	var generated string
 	var createdDoc []byte
+	namespaceApplied := false
 	r = &fakeRunner{
 		Respond: func(cmd string) (sshx.Result, error) {
 			if generated == "" {
@@ -586,6 +587,16 @@ func TestChartCarriesThePerClusterRepositoryPassword(t *testing.T) {
 			return sshx.Result{Stdout: `{"data":{"` + RepositoryPasswordKey + `":"` + base64.StdEncoding.EncodeToString([]byte(generated)) + `"}}`}, nil
 		},
 		RespondInput: func(cmd string, stdin []byte) (sshx.Result, error) {
+			// The API refuses a Secret in a namespace that does not exist yet,
+			// which is the state before the Velero chart runs (found on real
+			// hardware 2026-09-25).
+			if strings.Contains(string(stdin), "kind: Namespace") {
+				namespaceApplied = true
+				return sshx.Result{}, nil
+			}
+			if !namespaceApplied {
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): error when creating "STDIN": namespaces "` + Namespace + `" not found`}, nil
+			}
 			createdDoc = append([]byte(nil), stdin...)
 			var doc struct {
 				StringData map[string]string `yaml:"stringData"`
@@ -624,7 +635,7 @@ func TestChartCarriesThePerClusterRepositoryPassword(t *testing.T) {
 				t.Errorf("the Secret must be created from stdin, never from a command string: %s", c)
 			}
 		}
-		if strings.Contains(c, "kubectl apply") {
+		if strings.Contains(c, "kubectl apply") && !namespaceApplied {
 			t.Errorf("creation must be kubectl create, never apply: %s", c)
 		}
 		if generated != "" && leakscan.RecoverableFrom(c, generated) {
