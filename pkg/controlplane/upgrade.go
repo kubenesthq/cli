@@ -439,6 +439,18 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 		s.Logf("  the fence is already up: %s/<release>-api points at %s, so no customer request reaches the backend", Namespace, status.BackendRef)
 		s.Fence = status
 		s.FenceState = FenceUp
+		// The count the backend ran at before the fence went up. A re-run that
+		// adopts the fence has not read it, and by now the Deployment may be at
+		// zero (a failed migration's stop apply), so the fence's own record is
+		// the source; without it the chart stage would bring back no backend.
+		replicas, err := adoptedBackendReplicas(ctx, r, s.Record.BackendReplicas)
+		if err != nil {
+			return err
+		}
+		if replicas != s.Record.BackendReplicas {
+			s.Record.BackendReplicas = replicas
+			return s.saveRecord()
+		}
 		return nil
 	}
 	replicas, err := Replicas(ctx, r)
@@ -970,4 +982,21 @@ func (s *UpgradeSession) componentReady() (time.Duration, error) {
 		return 0, fmt.Errorf("no target bundle manifest, so this upgrade has no deadlines to obey")
 	}
 	return s.Opts.Bundle.Limits.Timeouts.For("component-ready")
+}
+
+// adoptedBackendReplicas is the backend's replica count for a run that adopts a
+// fence it did not raise: the count this run recorded if it has one, else the
+// count the fence recorded when it went up.
+func adoptedBackendReplicas(ctx context.Context, r k3s.Runner, recorded int32) (int32, error) {
+	if recorded > 0 {
+		return recorded, nil
+	}
+	facts, ok, err := FenceDeploymentFacts(ctx, r)
+	if err != nil {
+		return 0, fmt.Errorf("reading the replica count the fence recorded: %w", err)
+	}
+	if !ok || facts.Replicas <= 0 {
+		return 0, nil
+	}
+	return facts.Replicas, nil
 }

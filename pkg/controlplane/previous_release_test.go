@@ -285,3 +285,29 @@ func TestARestoreWithoutARecordedImageRefuses(t *testing.T) {
 // fenceRevisionOnly is an annotation map with something in it, so the fence is
 // present but carries no image.
 const fenceRevisionOnly = fenceRaiseAnnotation
+
+// A RE-RUN THAT ADOPTS THE FENCE BRINGS THE BACKEND BACK AT THE COUNT THE FENCE
+// RECORDED. On hardware (2026-09-26) the identical command after a failed
+// migration adopted the fence without reading a replica count, its migration
+// stage stopped the backend, and its chart stage then read the Deployment's
+// CURRENT count — zero — and applied the new chart with no backend, so the
+// validation waited out its deadline against nothing.
+func TestAnAdoptedFenceSuppliesTheBackendReplicaCount(t *testing.T) {
+	ctx := context.Background()
+	kube := newPreviousKube(t)
+	kube.fenceFacts = map[string]string{
+		fencePreviousImageAnnotation:    "ghcr.io/kubenesthq/kubenest-backend@sha256:abc",
+		fencePreviousReplicasAnnotation: "2",
+	}
+	got, err := adoptedBackendReplicas(ctx, kube, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Errorf("a re-run adopting the fence would run the backend at %d replica(s), want the 2 the fence recorded", got)
+	}
+	// A count this run already recorded is kept.
+	if got, _ := adoptedBackendReplicas(ctx, kube, 3); got != 3 {
+		t.Errorf("a recorded count of 3 was replaced by %d", got)
+	}
+}
