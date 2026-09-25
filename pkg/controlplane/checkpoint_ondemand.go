@@ -45,9 +45,13 @@ const (
 	CheckpointCronJobName = ReleaseName + "-checkpoint"
 
 	// CheckpointStatusConfigMap is where the runner publishes what is eligible,
-	// and the drill's result. It is created at install so that "no eligible
-	// checkpoint yet" is distinguishable from "the CronJob was deleted": an
-	// absent ConfigMap reads as unknown, this one as unprotected-with-an-age.
+	// and the drill's result. The chart creates it at install so that "no
+	// eligible checkpoint yet" is distinguishable from "the CronJob was
+	// deleted": an absent ConfigMap reads as unknown, this one as
+	// unprotected-with-no-checkpoint. The chart renders it with metadata and
+	// labels only — `data.status` is the runner's to patch, and a chart that
+	// owned that key failed every upgrade after the first checkpoint
+	// (TestTheChartDoesNotOwnTheCheckpointStatus).
 	CheckpointStatusConfigMap = "control-plane-checkpoint-status"
 	checkpointStatusKey       = "status"
 
@@ -92,10 +96,13 @@ type CheckpointRun struct {
 //
 // An ABSENT ConfigMap IS "NONE YET", not an error: the chart creates it at
 // install and the runner creates it if it is missing, so a namespace without one
-// is a namespace where nothing has ever been published. A ConfigMap that is
-// there and unreadable IS an error — a status we cannot parse is not "no
-// checkpoint", and reporting it as one would turn a broken publish into an
-// on-demand run that silently waits out its deadline.
+// is a namespace where nothing has ever been published. A ConfigMap WITH NO
+// `status` KEY is the same answer, and it is the shape every install starts in:
+// the chart renders metadata and labels only, because `data.status` belongs to
+// the runner that patches it. A ConfigMap that is there and unreadable IS an
+// error — a status we cannot parse is not "no checkpoint", and reporting it as
+// one would turn a broken publish into an on-demand run that silently waits out
+// its deadline.
 func ReadEligibleCheckpoint(ctx context.Context, r k3s.Runner) (*EligibleCheckpoint, error) {
 	out, err := k3s.Kubectl(ctx, r, "get configmap "+CheckpointStatusConfigMap+" -n "+Namespace+" -o json")
 	if err != nil {
@@ -110,8 +117,12 @@ func ReadEligibleCheckpoint(ctx context.Context, r k3s.Runner) (*EligibleCheckpo
 	if err := json.Unmarshal([]byte(out), &configMap); err != nil {
 		return nil, fmt.Errorf("the checkpoint status ConfigMap %s/%s is not valid JSON: %w", Namespace, CheckpointStatusConfigMap, err)
 	}
-	raw := strings.TrimSpace(configMap.Data[checkpointStatusKey])
-	if raw == "" {
+	// Not published yet: the chart's ConfigMap carries no `data` until the first
+	// run writes one, so "no checkpoint has ever been recorded here" is the
+	// honest baseline — `backup now --control-plane` waits for the first one
+	// rather than refusing to start.
+	raw, published := configMap.Data[checkpointStatusKey]
+	if !published || strings.TrimSpace(raw) == "" {
 		return nil, nil
 	}
 	var document struct {

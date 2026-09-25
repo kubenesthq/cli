@@ -36,10 +36,12 @@ var (
 	checkpointJobGetPrefix = "sudo -n k3s kubectl get job "
 )
 
-// checkpointMarkerJSON answers `kubectl get configmap ... -o json` with the
-// document the chart creates and the runner merges into. A nil marker is the
-// install-time document: the field is null, which is "no checkpoint has been
-// published yet" and not "an unreadable status".
+// checkpointMarkerJSON answers `kubectl get configmap ... -o json` with a
+// document the runner has published into. A nil marker is a document with no
+// `latest_eligible` — the drill publishes one before the first checkpoint does
+// — which is "no checkpoint has been published yet" and not "an unreadable
+// status". The install-time shape is different and has its own test: the chart
+// renders the ConfigMap with no `data` at all.
 func checkpointMarkerJSON(t *testing.T, marker map[string]any) string {
 	t.Helper()
 	status, err := json.Marshal(map[string]any{
@@ -100,6 +102,42 @@ func checkpointJobJSON(t *testing.T, name, condition, message string) string {
 		t.Fatal(err)
 	}
 	return string(body)
+}
+
+// A ConfigMap the chart created but nothing has published into is "no eligible
+// checkpoint yet", not an unreadable status (kn-t47).
+//
+// The chart must NOT render a `status` document: the runner merge-patches
+// `data.status` and a server-side apply of the chart then conflicts with the
+// runner's field manager — on hardware (2026-09-25) that failed every
+// control-plane upgrade after the first checkpoint (see
+// TestTheChartDoesNotOwnTheCheckpointStatus). So the first read after an
+// install is a ConfigMap with no `data` at all, and the baseline
+// `backup now --control-plane` takes has to be "none yet" rather than a failure.
+func TestReadEligibleCheckpointOnAConfigMapWithoutTheStatusKey(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata":   map[string]any{"name": CheckpointStatusConfigMap, "namespace": Namespace},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if command != checkpointStatusCmd {
+			t.Fatalf("unscripted command: %q", command)
+		}
+		return sshx.Result{Stdout: string(body)}, nil
+	}}
+
+	checkpoint, err := ReadEligibleCheckpoint(context.Background(), r)
+	if err != nil {
+		t.Fatalf("a ConfigMap the chart created with nothing published into it read as a failure: %v", err)
+	}
+	if checkpoint != nil {
+		t.Fatalf("read checkpoint %+v out of a ConfigMap that carries no status document", checkpoint)
+	}
 }
 
 // jobNameOf reads the Job name back out of the create command the run issued.

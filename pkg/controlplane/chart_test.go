@@ -587,6 +587,43 @@ func TestBackendMayReadTheCheckpointCronJob(t *testing.T) {
 	t.Errorf("the backend's Role grants no get on CronJob %v: a security-triggered checkpoint cannot read the template it is created from", name)
 }
 
+// The chart must not own a field a runtime writer changes (kn-t47).
+//
+// The checkpoint runner merge-patches `data.status` into this ConfigMap
+// (kubenest-backend app/services/checkpoint_runner.py::_write_status), which
+// moves that field to another field manager. k3s' helm-controller applies the
+// chart server-side with `--force-conflicts=false`, so the chart's ownership of
+// that field made the NEXT upgrade of the control plane fail on hardware
+// (2026-09-25): `Apply failed with 1 conflict: conflict with "kubectl-patch"
+// using v1: .data.status` — every upgrade after the first checkpoint, not just
+// a failed one.
+//
+// The object still exists at install, with the release's metadata and labels:
+// its PRESENCE is what tells "nothing has been published yet" from "the CronJob
+// was deleted", and the runner creates it if it is missing anyway.
+func TestTheChartDoesNotOwnTheCheckpointStatus(t *testing.T) {
+	objects := chartObjects(t, siblingChartRoot(t), "checkpoint-cronjob.yaml")
+
+	var status map[string]any
+	for _, object := range objects {
+		if object["kind"] == "ConfigMap" && dig(t, object, "metadata", "name") == CheckpointStatusConfigMap {
+			status = object
+		}
+	}
+	if status == nil {
+		t.Fatalf("the chart creates no ConfigMap named %s: nothing then tells \"no checkpoint has been published yet\" from \"the CronJob was deleted\"", CheckpointStatusConfigMap)
+	}
+
+	for _, key := range []string{"data", "binaryData"} {
+		if owned, ok := status[key]; ok {
+			t.Errorf(
+				"the chart's %s ConfigMap owns %s (%v): the checkpoint runner patches that key, and the next server-side upgrade fails with a field-manager conflict",
+				CheckpointStatusConfigMap, key, owned,
+			)
+		}
+	}
+}
+
 func listHas(list any, want any) bool {
 	items, _ := list.([]any)
 	for _, item := range items {
