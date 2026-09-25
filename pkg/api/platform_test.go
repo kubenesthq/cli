@@ -121,7 +121,7 @@ func TestMaintenanceWindowPutRefusesAStaleRevision(t *testing.T) {
 func TestMaintenanceWindowWithoutAWindowIsNotPermission(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"window": null, "revision": null, "state": "stored", "applied_revision": null, "reject_reason": null, "warning": null}`)
+		io.WriteString(w, `{"window": null, "revision": null, "state": "none", "applied_revision": null, "reject_reason": null, "warning": null}`)
 	}))
 	defer srv.Close()
 
@@ -132,6 +132,10 @@ func TestMaintenanceWindowWithoutAWindowIsNotPermission(t *testing.T) {
 	}
 	if record.Window != nil {
 		t.Errorf("window = %+v, want nil: this cluster has no window", record.Window)
+	}
+	if record.State != WindowStateNone {
+		t.Errorf("state = %q, want %q: a cluster with no window is not `stored` (kn-nqj.1)",
+			record.State, WindowStateNone)
 	}
 	if record.Revision != nil {
 		t.Errorf("revision = %v, want nil", *record.Revision)
@@ -172,6 +176,12 @@ func TestMaintenanceWindowReadsStateAndBackupWarning(t *testing.T) {
 		state   string
 		warning func(*testing.T, *string)
 	}{
+		{
+			name:    "none, no window",
+			body:    `{"window": null, "revision": null, "state": "none", "applied_revision": null, "reject_reason": null, "warning": null}`,
+			state:   WindowStateNone,
+			warning: func(t *testing.T, w *string) {},
+		},
 		{
 			name:  "stored, warning unknown",
 			body:  `{"window": {"days": ["sat"], "start": "02:00", "end": "06:00", "timezone": "UTC"}, "revision": 1, "state": "stored", "applied_revision": null, "reject_reason": null, "warning": "unknown"}`,
