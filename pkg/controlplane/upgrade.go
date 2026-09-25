@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -461,7 +462,10 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	// control-plane upgrade failed at the fence). The operation id is stable
 	// across a resume — the same raise retried is the same raise — and the run
 	// id covers a run that holds no record.
-	fenced, err := Raise(ctx, r, s.Opts.Values, RaiseOptions{Stamp: s.fenceStamp()})
+	fenced, err := Raise(ctx, r, s.Opts.Values, RaiseOptions{
+		Stamp: s.fenceStamp(),
+		Facts: s.fenceFacts(),
+	})
 	if err != nil {
 		return err
 	}
@@ -767,6 +771,19 @@ func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) er
 		return err
 	}
 	return WaitForFenceAvailable(ctx, s.runner(stage), deadline, s.PollInterval, s.Opts.Reporter)
+}
+
+// fenceFacts is what this raise records on the fence about the control plane
+// behind it, so a re-run whose backend is gone can still establish which control
+// plane it is upgrading and inside which window.
+func (s *UpgradeSession) fenceFacts() FenceFacts {
+	facts := FenceFacts{Contract: s.Opts.Before.Contract, Build: s.Opts.Before.Build}
+	if s.Opts.Window != nil {
+		if spec, err := json.Marshal(s.Opts.Window.Spec()); err == nil {
+			facts.Window = string(spec)
+		}
+	}
+	return facts
 }
 
 // fenceStamp identifies one raise. The operation id when this run holds the

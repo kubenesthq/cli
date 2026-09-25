@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/controlplane"
+	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/version"
 )
 
@@ -162,5 +166,66 @@ func TestAPlain503IsNotReadAsTheFence(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "503") {
 		t.Errorf("the failure does not carry the status the caller needs:\n%v", err)
+	}
+}
+
+// A NEW RUN AFTER A FAILED MIGRATION MUST FIND THE FACTS THE FAILED RUN LEFT.
+//
+// The failure text says "fix what the error names, then run the identical
+// command again" — and that is a NEW operation, not a `--resume`. A failed run
+// ends its record as TERMINAL, so by the time the new run asks, the operation
+// record has been replaced and holds nothing of the failed run's
+// (hardware, 2026-09-25/26: `this operation recorded no version when it began`).
+//
+// The fence's own Deployment carries them, and it is the right carrier: it is
+// written by the stage that raised the fence and deleted by the stage that
+// lowered it, so the state and the facts that describe it travel together. It is
+// read over the node, so no backend is involved.
+func TestARerunAfterAFailedMigrationUsesTheFactsTheFailedRunRecorded(t *testing.T) {
+	ctx := context.Background()
+	fenced := fenceStub(t)
+	windowSpec := `{"days":["sat","sun"],"start":"02:00","end":"06:00","timezone":"Asia/Kolkata"}`
+
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "get deployment/"+controlplane.FenceService) {
+			return sshx.Result{Stdout: `{"metadata":{"annotations":{` +
+				`"kubenest.io/fence-contract":"3",` +
+				`"kubenest.io/fence-build":"c121ed887750b1d3196d54fe9fd8368791a1bf03",` +
+				`"kubenest.io/fence-window":` + strconv.Quote(windowSpec) + `}}}`}, nil
+		}
+		return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+	}}
+
+	// NO OPERATION ID: this is the "run the identical command again" path.
+	recorded, window := recordedOperationFacts(ctx, runner, "")
+	if recorded.Build != "c121ed887750b1d3196d54fe9fd8368791a1bf03" || recorded.Contract != 3 {
+		t.Fatalf("the new run read %+v from the fence, want the facts the failed run recorded", recorded)
+	}
+	if window != windowSpec {
+		t.Errorf("the recorded window is %q, want the fence's %q: the window gate refuses a window it cannot read", window, windowSpec)
+	}
+	if _, ok := parseRecordedWindow(window); !ok {
+		t.Error("the recorded window does not parse back into a Window")
+	}
+
+	// AND IT IS ENOUGH: with the public route fenced and the backend silent, the
+	// version those facts carry is the answer, so the re-run gets past the check
+	// the last hardware run died on.
+	source := fencedVersionSource{
+		Public: clientFor(t, fenced.URL),
+		Node: func(context.Context) (*api.Client, error) {
+			return nil, fmt.Errorf("the backend Service has no ClusterIP: the migration left it at zero replicas")
+		},
+		Recorded: recorded,
+	}
+	got, known, err := source.version(ctx)
+	if err != nil || !known {
+		t.Fatalf("the re-run could not establish the version (known=%v): %v", known, err)
+	}
+	if got != recorded {
+		t.Errorf("the version is %+v, want the recorded %+v", got, recorded)
+	}
+	if err := requireControlPlaneForUpgrade(got, known); err != nil {
+		t.Errorf("the re-run was refused at the floor check: %v", err)
 	}
 }

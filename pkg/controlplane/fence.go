@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,6 +72,19 @@ const (
 	// applied whatever a cluster's RBAC allows.
 	fenceRaiseAnnotation = "kubenest.io/fence-raise"
 
+	// THE FENCE CARRIES THE FACTS ABOUT THE CONTROL PLANE BEHIND IT, and that
+	// is deliberate: a failed migration leaves the backend at zero replicas and
+	// the public route fenced, and the CLI's advice for that state is "fix what
+	// the error names, then run the identical command again" — which is a NEW
+	// operation, so the record it would have read the facts from has been
+	// replaced (kn-t70-control-plane-version-identity-4xso.1). The fence's own
+	// Deployment exists exactly while the fence is up, and it is written by the
+	// same stage that raised the fence, so the state and the facts that describe
+	// it travel together and are deleted together.
+	fenceContractAnnotation = "kubenest.io/fence-contract"
+	fenceBuildAnnotation    = "kubenest.io/fence-build"
+	fenceWindowAnnotation   = "kubenest.io/fence-window"
+
 	// addonName is the k3s Addon object for the fence's manifest: the file's
 	// base name, in kube-system. It is the object whose checksum decides
 	// whether the file is applied.
@@ -98,6 +112,21 @@ type RaiseOptions struct {
 	// ServiceWait bounds the wait for the fence's Service to exist. Zero uses
 	// the production bound.
 	ServiceWait time.Duration
+	// Facts is what the fence records about the control plane behind it. They
+	// are annotations on the fence's objects, so a re-run whose backend is gone
+	// can still establish which control plane it is upgrading.
+	Facts FenceFacts
+}
+
+// FenceFacts is what the fence knows about the control plane behind it.
+type FenceFacts struct {
+	// Contract and Build are the version the control plane reported when this
+	// fence was raised.
+	Contract int
+	Build    string
+	// Window is the maintenance window spec as JSON, which the upgrade's window
+	// gate needs and cannot read while the backend is gone.
+	Window string
 }
 
 // fenceStamp is the identity this raise stamps, never empty.
@@ -109,6 +138,22 @@ func (o RaiseOptions) fenceStamp() string {
 }
 
 // fenceWait is how long to wait for the fence's objects to appear.
+// annotationsFor is the fence's annotations: the raise's identity, and the
+// facts about the control plane behind it.
+func (o RaiseOptions) annotationsFor(stamp string) map[string]any {
+	out := map[string]any{fenceRaiseAnnotation: stamp}
+	if o.Facts.Contract != 0 {
+		out[fenceContractAnnotation] = fmt.Sprint(o.Facts.Contract)
+	}
+	if o.Facts.Build != "" {
+		out[fenceBuildAnnotation] = o.Facts.Build
+	}
+	if o.Facts.Window != "" {
+		out[fenceWindowAnnotation] = o.Facts.Window
+	}
+	return out
+}
+
 func (o RaiseOptions) fenceWait() time.Duration {
 	if o.ServiceWait > 0 {
 		return o.ServiceWait
@@ -299,7 +344,7 @@ func FenceValues(valuesYAML string, o FenceOptions) (string, error) {
 // manifest is applied; the fence's pod only decides whether the body comes
 // from the fence or from the data plane's own no-endpoints 503.
 func Raise(ctx context.Context, r k3s.Runner, valuesYAML string, o RaiseOptions) (string, error) {
-	manifest, err := fenceObjects(ctx, r, o.fenceStamp())
+	manifest, err := fenceObjects(ctx, r, o.fenceStamp(), o.annotationsFor(o.fenceStamp()))
 	if err != nil {
 		return "", err
 	}
@@ -559,7 +604,7 @@ func Replicas(ctx context.Context, r k3s.Runner) (int32, error) {
 
 // fenceObjects renders the ConfigMap, Deployment and Service the fence is made
 // of, using the image the backend Deployment already runs.
-func fenceObjects(ctx context.Context, r k3s.Runner, stamp string) ([]byte, error) {
+func fenceObjects(ctx context.Context, r k3s.Runner, stamp string, extra map[string]any) ([]byte, error) {
 	image, err := k3s.Kubectl(ctx, r, backendDeploymentImageCmd)
 	if err != nil {
 		return nil, fmt.Errorf("the fence needs the backend's image, which could not be read: %w", err)
@@ -575,10 +620,13 @@ func fenceObjects(ctx context.Context, r k3s.Runner, stamp string) ([]byte, erro
 		"app.kubernetes.io/component": "fence",
 		"app.kubernetes.io/part-of":   "kubenest",
 	}
-	// One annotation, on the object's metadata rather than on the Deployment's
-	// pod template: what has to differ is the DOCUMENT's checksum, and a pod
-	// template that changed would roll the fence for no reason.
+	// One annotation plus the facts, on the object's metadata rather than on the
+	// Deployment's pod template: what has to differ is the DOCUMENT's checksum,
+	// and a pod template that changed would roll the fence for no reason.
 	annotations := map[string]any{fenceRaiseAnnotation: stamp}
+	for key, value := range extra {
+		annotations[key] = value
+	}
 	objectMeta := func(name string) map[string]any {
 		return map[string]any{"name": name, "namespace": Namespace, "labels": labels, "annotations": annotations}
 	}
@@ -753,4 +801,40 @@ func NodeClient(ctx context.Context, server k3s.Runner, open ClientOpener) (*api
 	return open(func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return tunnel.DialTCP(ctx, addr)
 	})
+}
+
+// FenceDeploymentFacts reads the facts the fence carries about the control plane
+// behind it, and whether the fence exists at all.
+//
+// IT IS A KUBECTL READ OVER THE NODE, so it needs no backend: that is the point.
+// The fence exists exactly while the fence is up, and this is what a NEW run
+// (after a failed migration, whose record is terminal and replaced) reads to
+// learn which control plane it is upgrading and inside which window.
+func FenceDeploymentFacts(ctx context.Context, r k3s.Runner) (FenceFacts, bool, error) {
+	var deployment struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	out, err := k3s.Kubectl(ctx, r, "get deployment/"+fenceName+" -n "+Namespace+" -o json")
+	if err != nil {
+		// No fence is not an error: it is the ordinary state of a cluster whose
+		// control plane is not mid-upgrade.
+		return FenceFacts{}, false, nil
+	}
+	if err := json.Unmarshal([]byte(out), &deployment); err != nil {
+		return FenceFacts{}, false, fmt.Errorf("reading the fence Deployment %s/%s: %w", Namespace, fenceName, err)
+	}
+	facts := FenceFacts{
+		Build:  deployment.Metadata.Annotations[fenceBuildAnnotation],
+		Window: deployment.Metadata.Annotations[fenceWindowAnnotation],
+	}
+	if contract := deployment.Metadata.Annotations[fenceContractAnnotation]; contract != "" {
+		n, err := strconv.Atoi(contract)
+		if err != nil {
+			return FenceFacts{}, false, fmt.Errorf("the fence records contract %q, which is not a number", contract)
+		}
+		facts.Contract = n
+	}
+	return facts, true, nil
 }

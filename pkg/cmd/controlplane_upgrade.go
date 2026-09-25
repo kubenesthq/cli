@@ -520,16 +520,37 @@ func controlPlaneNodeRunner(ctx context.Context, f UpgradeFlags) (k3s.Runner, er
 // and the record is the only thing left that knows which control plane is being
 // upgraded and inside which window.
 func recordedOperationFacts(ctx context.Context, runner k3s.Runner, operationID string) (api.ControlPlaneVersion, string) {
-	if operationID == "" {
-		return api.ControlPlaneVersion{}, ""
+	var recorded api.ControlPlaneVersion
+	window := ""
+	if operationID != "" {
+		if stored, err := (&operation.Store{Runner: runner}).Find(ctx, operationID); err == nil && stored != nil && stored.Record != nil {
+			versions := stored.Record.Request.Versions
+			contract, _ := strconv.Atoi(versions[recordedContractKey])
+			recorded = api.ControlPlaneVersion{Contract: contract, Build: versions[recordedBuildKey]}
+			window = versions[recordedWindowKey]
+		}
 	}
-	stored, err := (&operation.Store{Runner: runner}).Find(ctx, operationID)
-	if err != nil || stored == nil || stored.Record == nil {
-		return api.ControlPlaneVersion{}, ""
+	// AND FROM THE FENCE ITSELF, which is where a NEW run has to look.
+	//
+	// A FAILED run ends its record as terminal, and the advice for that state is
+	// "fix what the error names, then run the identical command again" — a new
+	// operation whose record replaces the failed one's. So by the time the new
+	// run asks, the operation record no longer holds the facts it needs
+	// (hardware, 2026-09-25/26). The fence's own Deployment does: it is written
+	// by the stage that raised the fence and deleted by the stage that lowered
+	// it, so it exists exactly while the fence is up, and it is readable over the
+	// node with no backend at all.
+	if recorded == (api.ControlPlaneVersion{}) || window == "" {
+		if facts, ok, err := controlplane.FenceDeploymentFacts(ctx, runner); ok && err == nil {
+			if recorded == (api.ControlPlaneVersion{}) && (facts.Contract != 0 || facts.Build != "") {
+				recorded = api.ControlPlaneVersion{Contract: facts.Contract, Build: facts.Build}
+			}
+			if window == "" {
+				window = facts.Window
+			}
+		}
 	}
-	versions := stored.Record.Request.Versions
-	contract, _ := strconv.Atoi(versions[recordedContractKey])
-	return api.ControlPlaneVersion{Contract: contract, Build: versions[recordedBuildKey]}, versions[recordedWindowKey]
+	return recorded, window
 }
 
 // The keys the operation record carries the control plane's own identity and
