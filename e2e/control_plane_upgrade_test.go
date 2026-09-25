@@ -940,23 +940,45 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 }
 
 // cpOperationID reads the live operation record's id.
+//
+// IT READS THE CONFIGMAP AS JSON. The first version used a jsonpath on the key
+// `record.json` — a key with a DOT in it — and the arm reported "an interrupted
+// control-plane upgrade left no operation record" while the record was on the
+// cluster: `kubectl get … -o jsonpath={.data.record\.json}` is one more thing
+// that can silently answer nothing, and it did. A whole-object read cannot.
+//
+// THE CALLER'S CONTEXT MUST NOT BE A CANCELLED RUN'S. Every read taken after an
+// interrupt uses the gate's own context; passing the run's would fail here the
+// same way the CLI's own record write did.
 func cpOperationID(t *testing.T, ctx context.Context, server k3s.Runner) string {
 	t.Helper()
-	out, err := k3s.Kubectl(ctx, server, "get configmap kubenest-operation -n kube-system -o jsonpath={.data.record\\.json}")
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("cpOperationID was given a cancelled context (%v): every read after an interrupt must use the test's own context", err)
+	}
+	out, err := k3s.Kubectl(ctx, server, "get configmap kubenest-operation -n kube-system -o json")
 	if err != nil {
+		t.Logf("reading the operation record: %v", err)
 		return ""
 	}
-	const key = `"operation_id":"`
-	i := strings.Index(out, key)
-	if i < 0 {
+	var object struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &object); err != nil {
+		t.Logf("the operation record is not readable JSON: %v", err)
 		return ""
 	}
-	rest := out[i+len(key):]
-	j := strings.Index(rest, `"`)
-	if j < 0 {
+	var record struct {
+		OperationID string `json:"operation_id"`
+		Stage       string `json:"stage"`
+	}
+	if err := json.Unmarshal([]byte(object.Data["record.json"]), &record); err != nil {
+		t.Logf("the record document is not readable JSON: %v", err)
 		return ""
 	}
-	return rest[:j]
+	if record.OperationID == "" {
+		t.Logf("the operation record carries no operation_id: %s", object.Data["record.json"])
+	}
+	return record.OperationID
 }
 
 // cpWaitFor retries until check holds, naming what ran out.

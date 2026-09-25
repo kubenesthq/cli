@@ -221,6 +221,17 @@ func endControlPlaneOperation(ctx context.Context, out io.Writer, store *operati
 	if store == nil || handle == nil {
 		return
 	}
+	// THE RECORD IS CLOSED WITH A CONTEXT OF ITS OWN, and it has to be: an
+	// interrupt is a CANCELLED CONTEXT, and closing the record must not be
+	// cancelled with it. Hardware (2026-09-25) printed
+	// `the operation record … could not be closed: reading the operation record
+	// kube-system/kubenest-operation: context canceled`, left the record at
+	// `executor.state: running`, and the second laptop's take-over — which
+	// requires the previous executor STOPPED — was refused. The operator was
+	// left with an operation nobody could continue.
+	ctx, cancel := recordCloseContext(ctx)
+	defer cancel()
+
 	var err error
 	switch {
 	case runErr == nil:
@@ -236,6 +247,20 @@ func endControlPlaneOperation(ctx context.Context, out io.Writer, store *operati
 	if err != nil {
 		fmt.Fprintf(out, "warning: the operation record %s could not be closed: %v\n", handle.OperationID(), err)
 	}
+}
+
+// recordCloseTimeout bounds how long closing the record may take. It is short
+// because it is one ConfigMap write on the way out of a command whose run has
+// already stopped.
+const recordCloseTimeout = 30 * time.Second
+
+// recordCloseContext detaches the record's closing from the run's cancellation
+// and bounds it.
+//
+// The VALUES still travel: a caller that put something in the context (a
+// request id, a logger) must not lose it just because the run was interrupted.
+func recordCloseContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), recordCloseTimeout)
 }
 
 // clusterOf names the cluster a record is about, for the resume line.
