@@ -57,6 +57,11 @@ type gateEnv struct {
 	// volume and no kubenest-vg, which is install.mdx's Option 2 — the
 	// installer creates the volume group, and uninstall may remove it.
 	storageDevice string
+	// controlPlaneCA is the control plane's own CA (PEM), from the file
+	// KUBENEST_CONTROL_PLANE_CA names. A self-hosted control plane issues its
+	// own CA, and an agent that does not pin it cannot reach the hub: a gate
+	// run against one without it installs a cluster that never reports in.
+	controlPlaneCA []byte
 }
 
 func gateEnvironment(t *testing.T) gateEnv {
@@ -77,6 +82,13 @@ func gateEnvironment(t *testing.T) gateEnv {
 	}
 	if env.controlPlane == "" || env.token == "" {
 		t.Skip("KUBENEST_CONTROL_PLANE and KUBENEST_CLI_TOKEN not set: the install registers the cluster and will not run without a control plane")
+	}
+	if path := os.Getenv("KUBENEST_CONTROL_PLANE_CA"); path != "" {
+		ca, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading KUBENEST_CONTROL_PLANE_CA: %v", err)
+		}
+		env.controlPlaneCA = ca
 	}
 	return env
 }
@@ -99,6 +111,9 @@ func session(t *testing.T, env gateEnv, journalPath string, bundle *manifest.Man
 	journal, err := install.OpenJournal(journalPath, opts.Identity())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(opts.ControlPlaneCA) == 0 {
+		opts.ControlPlaneCA = env.controlPlaneCA
 	}
 	s := &install.Session{
 		ID:       install.NewRunID(),
