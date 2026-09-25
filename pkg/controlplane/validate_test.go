@@ -2,8 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/componenttest"
@@ -155,5 +159,39 @@ func TestTheGatesStageEstablishesWhatTheValidationMustSee(t *testing.T) {
 	}
 	if s.Validation.WantBuild != recordedPinTag {
 		t.Errorf("WantBuild = %q, want the chart's backend tag %q", s.Validation.WantBuild, recordedPinTag)
+	}
+}
+
+// The new backend's pod can be rolled out and not yet listening when the
+// validation first dials it: on hardware (2026-09-26) a re-run's chart stage
+// passed in 3 s and the validation's single attempt was refused with
+// "connection refused". A backend that is not answering YET is waited for,
+// within the deadline; a backend that answers with the wrong build is refused
+// at once.
+func TestValidationWaitsForABackendThatIsNotListeningYet(t *testing.T) {
+	refusals := 2
+	calls := 0
+	check := func() error {
+		calls++
+		if calls <= refusals {
+			return fmt.Errorf("reading the upgraded backend's version through 10.43.0.1:8000: %w",
+				&url.Error{Op: "Get", URL: "http://kubenest-backend/api/v1/version", Err: errors.New("connect failed (\"Connection refused\")")})
+		}
+		return nil
+	}
+	if err := retryUnreachable(context.Background(), time.Second, time.Millisecond, check); err != nil {
+		t.Fatalf("a backend that answered on the third dial was refused: %v", err)
+	}
+	if calls != refusals+1 {
+		t.Errorf("the validation dialled %d time(s), want %d", calls, refusals+1)
+	}
+
+	calls = 0
+	wrong := func() error {
+		calls++
+		return errors.New("the backend behind 10.43.0.1:8000 still reports the build that was serving before this upgrade")
+	}
+	if err := retryUnreachable(context.Background(), time.Second, time.Millisecond, wrong); err == nil || calls != 1 {
+		t.Errorf("a wrong build was retried (%d call(s), err %v): only an unreachable backend is waited for", calls, err)
 	}
 }

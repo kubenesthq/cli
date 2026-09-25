@@ -673,7 +673,17 @@ func stageChart(ctx context.Context, s *UpgradeSession) error {
 // alone: see stageGates.
 func stageValidate(ctx context.Context, s *UpgradeSession) error {
 	r := s.runner(StageValidate)
-	return ValidationReporter(ctx, r, s.Opts.Open, s.Validation, s.Opts.Reporter)
+	deadline, err := s.componentReady()
+	if err != nil {
+		return err
+	}
+	every := s.PollInterval
+	if every <= 0 {
+		every = 5 * time.Second
+	}
+	return retryUnreachable(ctx, deadline, every, func() error {
+		return ValidationReporter(ctx, r, s.Opts.Open, s.Validation, s.Opts.Reporter)
+	})
 }
 
 // stageUnfence restores the route and dismantles the fence.

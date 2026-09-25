@@ -2,9 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -276,4 +279,28 @@ func sameImage(a, b postgresImage) bool {
 		return a.digest == b.digest
 	}
 	return a.distribution() == b.distribution() && a.tag == b.tag
+}
+
+// retryUnreachable runs check until it passes, returns an error that is not a
+// transport failure, or the deadline passes.
+//
+// ONLY AN UNREACHABLE BACKEND IS WAITED FOR. The new backend's pod can be rolled
+// out and not yet listening when the validation first dials it (hardware,
+// 2026-09-26: a re-run's chart stage passed in 3 s and the single attempt was
+// refused with "connection refused"). A backend that answers with the wrong
+// build or era is a verdict, not a delay, and is returned at once.
+func retryUnreachable(ctx context.Context, within, every time.Duration, check func() error) error {
+	deadline := time.Now().Add(within)
+	for {
+		err := check()
+		var transport *url.Error
+		if err == nil || !errors.As(err, &transport) || !time.Now().Before(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(every):
+		}
+	}
 }
