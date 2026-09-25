@@ -204,15 +204,25 @@ func ValidationExpectations(ctx context.Context, r k3s.Runner, before api.Contro
 	return out, nil
 }
 
-// RunningBackendImage reads the image the backend Deployment runs now.
-func RunningBackendImage(ctx context.Context, r k3s.Runner) (postgresImage, error) {
+// RunningBackendImageRef reads the image reference the backend Deployment runs,
+// verbatim.
+func RunningBackendImageRef(ctx context.Context, r k3s.Runner) (string, error) {
 	out, err := k3s.Kubectl(ctx, r, backendDeploymentImageCmd)
 	if err != nil {
-		return postgresImage{}, fmt.Errorf("reading the backend Deployment %s/%s: %w", Namespace, backendService, err)
+		return "", fmt.Errorf("reading the backend Deployment %s/%s: %w", Namespace, backendService, err)
 	}
 	ref := strings.TrimSpace(out)
 	if ref == "" {
-		return postgresImage{}, fmt.Errorf("the backend Deployment %s/%s names no image, so which build is serving cannot be established", Namespace, backendService)
+		return "", fmt.Errorf("the backend Deployment %s/%s names no image, so which build is serving cannot be established", Namespace, backendService)
+	}
+	return ref, nil
+}
+
+// RunningBackendImage reads the image the backend Deployment runs now.
+func RunningBackendImage(ctx context.Context, r k3s.Runner) (postgresImage, error) {
+	ref, err := RunningBackendImageRef(ctx, r)
+	if err != nil {
+		return postgresImage{}, err
 	}
 	return parsePostgresImage(ref), nil
 }

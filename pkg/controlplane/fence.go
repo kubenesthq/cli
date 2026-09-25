@@ -3,7 +3,6 @@ package controlplane
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -86,6 +85,18 @@ const (
 	fenceContractAnnotation = "kubenest.io/fence-contract"
 	fenceBuildAnnotation    = "kubenest.io/fence-build"
 	fenceWindowAnnotation   = "kubenest.io/fence-window"
+	// fencePreviousImageAnnotation is the image the BACKEND ran before this
+	// upgrade. It is what a failed migration puts back: the previous chart has
+	// no fence template (a real 1.1 control plane predates the fence entirely),
+	// so re-applying it with `fence.enabled: true` renders the api route back
+	// onto the backend and the fence comes DOWN instead of covering the old code
+	// (hardware, 2026-09-26). The chart that can express a fence is the NEW one,
+	// so the restore re-applies the new archive with the OLD image pinned.
+	fencePreviousImageAnnotation = "kubenest.io/fence-previous-image"
+	// fencePreviousReplicasAnnotation is how many replicas the backend ran at
+	// before the fence stopped it, so a restore in a NEW process (which has no
+	// journal) brings the backend back at the size it had.
+	fencePreviousReplicasAnnotation = "kubenest.io/fence-previous-replicas"
 
 	// addonName is the k3s Addon object for the fence's manifest: the file's
 	// base name, in kube-system. It is the object whose checksum decides
@@ -126,6 +137,12 @@ type FenceFacts struct {
 	// fence was raised.
 	Contract int
 	Build    string
+	// PreviousImage is the backend image the release being upgraded ran. It is
+	// the one thing a restore cannot derive afterwards: by then the chart is the
+	// new one.
+	PreviousImage string
+	// Replicas is how many replicas its backend ran at.
+	Replicas int32
 	// Window is the maintenance window spec as JSON, which the upgrade's window
 	// gate needs and cannot read while the backend is gone.
 	Window string
@@ -152,6 +169,12 @@ func (o RaiseOptions) annotationsFor(stamp string) map[string]any {
 	}
 	if o.Facts.Window != "" {
 		out[fenceWindowAnnotation] = o.Facts.Window
+	}
+	if o.Facts.PreviousImage != "" {
+		out[fencePreviousImageAnnotation] = o.Facts.PreviousImage
+	}
+	if o.Facts.Replicas != 0 {
+		out[fencePreviousReplicasAnnotation] = fmt.Sprint(o.Facts.Replicas)
 	}
 	return out
 }
@@ -579,13 +602,12 @@ func DeleteFenceObjects(ctx context.Context, r k3s.Runner) error {
 	if _, err := k3s.Kubectl(ctx, r, "delete addon "+addonName+" -n "+addonNamespace+" --ignore-not-found"); err != nil {
 		return fmt.Errorf("removing the fence's k3s Addon %s/%s: %w", addonNamespace, addonName, err)
 	}
-	// AND THE PREVIOUS RELEASE GOES WITH IT. It exists to serve a FAILED
-	// migration while the fence is up; once the fence is down the release it
-	// records is either what runs (after a restore) or older than what runs, and
-	// keeping the generated secrets of a superseded release on the cluster is
-	// the kind of residue a recovery kit is supposed to make unnecessary.
-	if _, err := k3s.Kubectl(ctx, r, "delete secret "+PreviousReleaseSecret+" -n "+Namespace+" --ignore-not-found"); err != nil {
-		return fmt.Errorf("removing the previous release Secret %s/%s: %w", Namespace, PreviousReleaseSecret, err)
+	// AND THE LEGACY PREVIOUS-RELEASE SECRET GOES WITH IT, for clusters a
+	// previous build upgraded: it carried a whole superseded release INCLUDING
+	// the install's generated secrets, and nothing reads it any more. Deleting it
+	// with the fence is what stops it outliving its purpose.
+	if _, err := k3s.Kubectl(ctx, r, "delete secret "+LegacyPreviousReleaseSecret+" -n "+Namespace+" --ignore-not-found"); err != nil {
+		return fmt.Errorf("removing the legacy previous-release Secret %s/%s: %w", Namespace, LegacyPreviousReleaseSecret, err)
 	}
 	res, err := r.Run(ctx, "sudo -n rm -f "+k3s.ManifestDir+"/"+fenceName+".yaml")
 	if err != nil {
@@ -836,8 +858,16 @@ func FenceDeploymentFacts(ctx context.Context, r k3s.Runner) (FenceFacts, bool, 
 		return FenceFacts{}, false, fmt.Errorf("reading the fence Deployment %s/%s: %w", Namespace, fenceName, err)
 	}
 	facts := FenceFacts{
-		Build:  deployment.Metadata.Annotations[fenceBuildAnnotation],
-		Window: deployment.Metadata.Annotations[fenceWindowAnnotation],
+		Build:         deployment.Metadata.Annotations[fenceBuildAnnotation],
+		Window:        deployment.Metadata.Annotations[fenceWindowAnnotation],
+		PreviousImage: deployment.Metadata.Annotations[fencePreviousImageAnnotation],
+	}
+	if replicas := deployment.Metadata.Annotations[fencePreviousReplicasAnnotation]; replicas != "" {
+		n, err := strconv.Atoi(replicas)
+		if err != nil {
+			return FenceFacts{}, false, fmt.Errorf("the fence records %q replicas, which is not a number", replicas)
+		}
+		facts.Replicas = int32(n)
 	}
 	if contract := deployment.Metadata.Annotations[fenceContractAnnotation]; contract != "" {
 		n, err := strconv.Atoi(contract)
@@ -849,148 +879,12 @@ func FenceDeploymentFacts(ctx context.Context, r k3s.Runner) (FenceFacts, bool, 
 	return facts, true, nil
 }
 
-// PreviousReleaseSecret is where the release the control plane ran BEFORE this
-// upgrade is kept while the fence is up (kn-t70-control-plane-version-identity-4xso.2).
-//
-// WHY A SECRET AND NOT AN ANNOTATION. `valuesContent` carries the generated
-// secrets — the JWT key, the agent signing key, the encryption key, the
-// administrator's password — so it cannot go in a ConfigMap or on an object
-// that anything may read. It is next to the fence in the sense that matters:
-// written by `CapturePreviousRelease` at the fence stage, read by the migration
-// stage when its Job fails, and deleted by `Lower` with the fence's own objects.
-//
-// It is durable because the process that raised the fence may be gone: the CLI's
-// advice after a failed migration is "fix what the error names, then run the
-// identical command again", and that command may be a second laptop.
-//
-// SIZE: the control-plane chart archive is ~209 KB and base64-encoded inside the
-// Secret (the HelmChart's chartContent already is), so the object is ~280 KB
-// against the API server's 1 MiB limit. TestTheCapturedPreviousReleaseFitsInASecret
-// asserts it from the embedded archive rather than trusting this sentence.
-const PreviousReleaseSecret = ReleaseName + "-fence-previous"
-
-// Keys of the Secret.
-const (
-	previousChartContentKey = "chartContent"
-	previousValuesKey       = "valuesContent"
-	previousReplicasKey     = "replicas"
-)
-
-// PreviousRelease is the release the control plane ran before this upgrade: the
-// chart archive the HelmChart carried, the values it was applied with, and how
-// many replicas its backend ran.
-type PreviousRelease struct {
-	// ChartContent is the chart ARCHIVE's bytes, decoded. The HelmChart carries
-	// them base64-encoded and the Secret carries them base64-encoded again, so
-	// this type holds them once, decoded, and nothing has to remember which
-	// layer encoded what.
-	ChartContent string
-	// ValuesContent is spec.valuesContent verbatim.
-	ValuesContent string
-	// Replicas is the backend's replica count before the fence stopped it, so a
-	// restore in a NEW process (which has no journal) brings the backend back at
-	// the size it had rather than at a number this binary guessed.
-	Replicas int32
-}
-
-// CapturePreviousRelease reads the release the control plane runs now, from the
-// live HelmChart, BEFORE the upgrade's first apply.
-//
-// AFTER the first apply there is nothing to read: the HelmChart is the upgrade's,
-// and the release it replaced exists nowhere else.
-func CapturePreviousRelease(ctx context.Context, r k3s.Runner, replicas int32) (PreviousRelease, error) {
-	content, err := k3s.Kubectl(ctx, r, "get helmchart "+ReleaseName+" -n kube-system -o jsonpath={.spec.chartContent}")
-	if err != nil {
-		return PreviousRelease{}, fmt.Errorf("reading the control plane's chart from HelmChart %s in kube-system: %w (an upgrade with no previous release to go back to must not start)", ReleaseName, err)
-	}
-	values, err := k3s.Kubectl(ctx, r, "get helmchart "+ReleaseName+" -n kube-system -o jsonpath={.spec.valuesContent}")
-	if err != nil {
-		return PreviousRelease{}, fmt.Errorf("reading the control plane's values from HelmChart %s in kube-system: %w", ReleaseName, err)
-	}
-	archive, err := base64.StdEncoding.DecodeString(strings.TrimSpace(content))
-	if err != nil {
-		return PreviousRelease{}, fmt.Errorf("the chart HelmChart %s in kube-system carries is not base64: %w", ReleaseName, err)
-	}
-	previous := PreviousRelease{
-		ChartContent:  string(archive),
-		ValuesContent: values,
-		Replicas:      replicas,
-	}
-	if previous.ChartContent == "" || strings.TrimSpace(previous.ValuesContent) == "" {
-		return PreviousRelease{}, fmt.Errorf("HelmChart %s in kube-system carries no chart content or no values, so the release this upgrade would replace cannot be captured: a failed migration would leave the control plane running nothing", ReleaseName)
-	}
-	return previous, nil
-}
-
-// StorePreviousRelease writes the capture into the fence's Secret.
-func StorePreviousRelease(ctx context.Context, r k3s.Runner, previous PreviousRelease) error {
-	doc := map[string]any{
-		"apiVersion": "v1",
-		"kind":       "Secret",
-		"metadata": map[string]any{
-			"name":      PreviousReleaseSecret,
-			"namespace": Namespace,
-			"labels":    map[string]any{"app.kubernetes.io/component": "fence", "kubenest.io/purpose": "previous-release"},
-		},
-		"type": "Opaque",
-		// data, not stringData: the API server base64-decodes data, so this is
-		// the one place the archive's bytes and the values' text are encoded,
-		// and a read gives them back decoded.
-		"data": map[string]any{
-			previousChartContentKey: base64.StdEncoding.EncodeToString([]byte(previous.ChartContent)),
-			previousValuesKey:       base64.StdEncoding.EncodeToString([]byte(previous.ValuesContent)),
-			previousReplicasKey:     base64.StdEncoding.EncodeToString([]byte(fmt.Sprint(previous.Replicas))),
-		},
-	}
-	body, err := yaml.Marshal(doc)
-	if err != nil {
-		return fmt.Errorf("rendering the previous release Secret: %w", err)
-	}
-	return kubectlApply(ctx, r, body)
-}
-
-// ReadPreviousRelease reads the capture. Not found is (zero, false, nil): no
-// fence means no previous release to go back to, which is the ordinary state.
-func ReadPreviousRelease(ctx context.Context, r k3s.Runner) (PreviousRelease, bool, error) {
-	var secret struct {
-		Data map[string]string `json:"data"`
-	}
-	out, err := k3s.Kubectl(ctx, r, "get secret "+PreviousReleaseSecret+" -n "+Namespace+" -o json")
-	if err != nil {
-		return PreviousRelease{}, false, nil
-	}
-	if err := json.Unmarshal([]byte(out), &secret); err != nil {
-		return PreviousRelease{}, false, fmt.Errorf("reading the previous release Secret %s/%s: %w", Namespace, PreviousReleaseSecret, err)
-	}
-	decode := func(key string) (string, error) {
-		raw, ok := secret.Data[key]
-		if !ok {
-			return "", fmt.Errorf("the previous release Secret %s/%s has no %s", Namespace, PreviousReleaseSecret, key)
-		}
-		decoded, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil {
-			return "", fmt.Errorf("the previous release Secret %s/%s has an unreadable %s: %w", Namespace, PreviousReleaseSecret, key, err)
-		}
-		return string(decoded), nil
-	}
-	content, err := decode(previousChartContentKey)
-	if err != nil {
-		return PreviousRelease{}, false, err
-	}
-	values, err := decode(previousValuesKey)
-	if err != nil {
-		return PreviousRelease{}, false, err
-	}
-	replicas, err := decode(previousReplicasKey)
-	if err != nil {
-		return PreviousRelease{}, false, err
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(replicas))
-	if err != nil {
-		return PreviousRelease{}, false, fmt.Errorf("the previous release Secret %s/%s records replicas %q, which is not a number", Namespace, PreviousReleaseSecret, replicas)
-	}
-	return PreviousRelease{ChartContent: content, ValuesContent: values, Replicas: int32(n)}, true, nil
-}
+// LegacyPreviousReleaseSecret is the Secret an earlier build of this CLI wrote
+// the previous release into. Nothing reads it any more — the restore re-applies
+// the NEW chart with the previous IMAGE pinned (see FenceFacts.PreviousImage) —
+// and DeleteFenceObjects removes it so a cluster upgraded by that build does not
+// keep a superseded release's generated secrets.
+const LegacyPreviousReleaseSecret = ReleaseName + "-fence-previous"
 
 // kubectlApply applies one document over stdin.
 //

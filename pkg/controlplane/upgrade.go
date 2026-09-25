@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"gopkg.in/yaml.v3"
+
 	"strings"
 	"time"
 
@@ -460,17 +463,6 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	if err := s.saveRecord(); err != nil {
 		return err
 	}
-	// THE RELEASE THIS UPGRADE REPLACES IS CAPTURED FIRST, and it has to be
-	// first: after the apply below, the HelmChart IS this upgrade's and the
-	// release it replaced exists nowhere (kn-t70-control-plane-version-identity-4xso.2).
-	previous, err := CapturePreviousRelease(ctx, r, replicas)
-	if err != nil {
-		return err
-	}
-	if err := StorePreviousRelease(ctx, r, previous); err != nil {
-		return err
-	}
-
 	// THE STAMP IS THIS RAISE'S IDENTITY. k3s's deploy controller records the
 	// fence manifest as an Addon carrying its checksum and skips an apply whose
 	// content matches, so two raises of identical values are ONE raise as far as
@@ -478,9 +470,13 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	// control-plane upgrade failed at the fence). The operation id is stable
 	// across a resume — the same raise retried is the same raise — and the run
 	// id covers a run that holds no record.
+	facts, err := s.fenceFacts(ctx, r, replicas)
+	if err != nil {
+		return err
+	}
 	fenced, err := Raise(ctx, r, s.Opts.Values, RaiseOptions{
 		Stamp: s.fenceStamp(),
-		Facts: s.fenceFacts(),
+		Facts: facts,
 	})
 	if err != nil {
 		return err
@@ -811,26 +807,52 @@ func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) er
 	return WaitForFenceAvailable(ctx, s.runner(stage), deadline, s.PollInterval, s.Opts.Reporter)
 }
 
-// restorePreviousRelease re-applies the release the control plane ran before
-// this upgrade, with the fence still up and the migration off, and waits for its
-// backend to serve again.
+// restorePreviousRelease puts the PREVIOUS CODE back behind the fence after a
+// failed migration.
 //
-// THE VALUES ARE THE ONES IT RAN WITH, plus two changes and only two: the fence
-// stays up, and the migration Job is off. The chart has ONE backend image for
-// the Job and the Deployment and the Job's pod template is immutable, so an
-// apply that re-enabled the Job would be patched onto the failed attempt's Job
-// and refused.
+// IT RE-APPLIES THE NEW CHART, NOT THE PREVIOUS ONE, and that is the whole
+// subtlety (hardware, 2026-09-26): the previous chart has no fence template — a
+// real 1.1 control plane predates the fence entirely — so re-applying it with
+// `fence.enabled: true` renders the api route back onto the backend and the
+// fence comes DOWN, exposing an unvalidated backend. Only the NEW chart can
+// express "the old code, fenced", so the restore applies the new archive with:
+//
+//	the run's values, unchanged;
+//	fence.enabled          TRUE  — the fence stays up, which is the point;
+//	migration.enabled      FALSE — the chart has ONE backend image for the Job
+//	                               and the Deployment and the Job's pod template
+//	                               is immutable;
+//	backend.image                the image the backend ran BEFORE the upgrade,
+//	                               recorded on the fence at the fence stage;
+//	backend.replicas             the count recorded before the fence stopped it.
+//
+// That is the state from just before the migration, and it is the state to
+// return to while the checkpoint is the operator's recovery point.
 func (s *UpgradeSession) restorePreviousRelease(ctx context.Context) error {
 	r := s.runner(StageMigration)
-	previous, ok, err := ReadPreviousRelease(ctx, r)
+	facts, ok, err := FenceDeploymentFacts(ctx, r)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no previous release is recorded in Secret %s/%s, so the chart this upgrade replaced cannot be put back: nothing was captured at the fence stage", Namespace, PreviousReleaseSecret)
+		return fmt.Errorf("the fence's own Deployment is gone, so the image the previous release ran cannot be established")
 	}
-	replicas := previous.Replicas
-	values, err := FenceValues(previous.ValuesContent, FenceOptions{Up: true, BackendReplicas: &replicas})
+	if facts.PreviousImage == "" {
+		return fmt.Errorf("the fence records no %s, so the image the previous release ran cannot be established: nothing was recorded at the fence stage", fencePreviousImageAnnotation)
+	}
+	replicas := s.Record.BackendReplicas
+	if replicas == 0 {
+		// A NEW process has no journal, so the count comes from the fence.
+		replicas = facts.Replicas
+	}
+	if replicas == 0 {
+		replicas = 1
+	}
+	values, err := withBackendImage(s.Opts.Values, facts.PreviousImage)
+	if err != nil {
+		return err
+	}
+	values, err = FenceValues(values, FenceOptions{Up: true, BackendReplicas: &replicas})
 	if err != nil {
 		return err
 	}
@@ -838,7 +860,7 @@ func (s *UpgradeSession) restorePreviousRelease(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	revision, err := ApplyArchive(ctx, r, []byte(previous.ChartContent), values)
+	revision, err := Apply(ctx, r, values)
 	if err != nil {
 		return err
 	}
@@ -846,33 +868,74 @@ func (s *UpgradeSession) restorePreviousRelease(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// ONLY THE ROLLOUT IS WAITED FOR, NOT READINESS, and that is not a
-	// weakening: the migration failed because PostgreSQL went away, so the
-	// previous backend's pods start and sit NotReady until the database answers.
-	// Demanding readiness here would time out and report "the control plane is
-	// running nothing" about a control plane whose previous chart IS what runs
-	// (hardware, 2026-09-26; kn-t70-control-plane-version-identity-4xso.2).
+	// ONLY THE ROLLOUT IS WAITED FOR, NOT READINESS: the migration failed because
+	// PostgreSQL went away, so the previous backend's pods start and sit NotReady
+	// until the database answers.
 	rollout, err := WaitRolledOut(ctx, r, revision, deadline, s.PollInterval, s.Opts.Reporter)
 	if err != nil {
 		return err
 	}
-	s.Logf("  the previous release is back behind the fence at install revision %s (%d/%d backend replicas ready), with the fence up and the migration off",
-		revision, rollout.Ready, rollout.Want)
+	s.Logf("  the previous code is back behind the fence at install revision %s (%s, %d/%d backend replicas ready), with the fence up and the migration off",
+		revision, facts.PreviousImage, rollout.Ready, rollout.Want)
 	s.Restored = &rollout
 	return nil
+}
+
+// withBackendImage pins the chart's backend image.
+//
+// A failed migration must put back the image the backend RAN, and the values a
+// run carries name whatever the chart pins now, so the pin is written here
+// explicitly — repository, tag and digest separately, which is what the chart's
+// image helper reads.
+func withBackendImage(valuesYAML, ref string) (string, error) {
+	image := parsePostgresImage(ref)
+	if image.repository == "" {
+		return "", fmt.Errorf("the recorded previous backend image %q names no repository", ref)
+	}
+	doc := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		return "", fmt.Errorf("reading the control-plane values: %w", err)
+	}
+	pin := map[string]any{"repository": image.repository, "pullPolicy": "IfNotPresent"}
+	if image.tag != "" {
+		pin["tag"] = image.tag
+	}
+	if image.digest != "" {
+		pin["digest"] = image.digest
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	if backend == nil {
+		backend = map[string]any{}
+	}
+	backend["image"] = pin
+	doc["backend"] = backend
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("rendering the control-plane values: %w", err)
+	}
+	return string(out), nil
 }
 
 // fenceFacts is what this raise records on the fence about the control plane
 // behind it, so a re-run whose backend is gone can still establish which control
 // plane it is upgrading and inside which window.
-func (s *UpgradeSession) fenceFacts() FenceFacts {
-	facts := FenceFacts{Contract: s.Opts.Before.Contract, Build: s.Opts.Before.Build}
+func (s *UpgradeSession) fenceFacts(ctx context.Context, r k3s.Runner, replicas int32) (FenceFacts, error) {
+	facts := FenceFacts{Contract: s.Opts.Before.Contract, Build: s.Opts.Before.Build, Replicas: replicas}
+	// THE IMAGE THE BACKEND RUNS NOW is the one a failed migration puts back, and
+	// it is only knowable HERE: after the first apply the chart is the new one and
+	// the released image exists nowhere the CLI can read
+	// (kn-t70-control-plane-version-identity-4xso.2).
+	running, err := RunningBackendImageRef(ctx, r)
+	if err != nil {
+		return facts, err
+	}
+	facts.PreviousImage = running
 	if s.Opts.Window != nil {
 		if spec, err := json.Marshal(s.Opts.Window.Spec()); err == nil {
 			facts.Window = string(spec)
 		}
 	}
-	return facts
+	return facts, nil
 }
 
 // fenceStamp identifies one raise. The operation id when this run holds the
