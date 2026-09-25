@@ -997,8 +997,13 @@ func ReadPreviousRelease(ctx context.Context, r k3s.Runner) (PreviousRelease, bo
 // STDIN, NEVER A COMMAND STRING: the document is the previous release's values,
 // which carry the install's generated secrets — the same rule k3s.WriteManifest
 // keeps for the agent's values.
+//
+// SERVER-SIDE, because a client-side apply copies the whole object into the
+// last-applied-configuration annotation, annotations are limited to 256 KiB,
+// and the real release does not fit (hardware, 2026-09-26: "metadata.annotations:
+// Too long: may not be more than 262144 bytes").
 func kubectlApply(ctx context.Context, r k3s.Runner, doc []byte) error {
-	res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(doc))
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply --server-side --force-conflicts --field-manager=kubenest-cli -f -", bytes.NewReader(doc))
 	if err != nil {
 		return fmt.Errorf("applying the previous release Secret: %w", err)
 	}

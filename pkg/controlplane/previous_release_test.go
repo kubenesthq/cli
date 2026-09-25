@@ -82,8 +82,15 @@ func newPreviousKube(t *testing.T, chartContent, valuesContent string) *previous
 				return sshx.Result{}, err
 			}
 			return sshx.Result{Stdout: string(body)}, nil
-		case strings.HasPrefix(command, "sudo -n k3s kubectl apply -f -"):
+		case strings.HasPrefix(command, "sudo -n k3s kubectl apply ") && strings.HasSuffix(command, " -f -"):
 			stdin := k.lastInput(t)
+			// The API server's rule, measured on hardware (2026-09-26): a
+			// client-side apply copies the whole object into the
+			// last-applied-configuration annotation, and annotations are limited
+			// to 256 KiB in total — the real chart's release does not fit.
+			if !strings.Contains(command, "--server-side") && len(stdin) > 262144 {
+				return sshx.Result{ExitCode: 1, Stderr: `The Secret "` + PreviousReleaseSecret + `" is invalid: metadata.annotations: Too long: may not be more than 262144 bytes`}, nil
+			}
 			var object map[string]any
 			if err := yaml.Unmarshal(stdin, &object); err != nil {
 				return sshx.Result{}, err
