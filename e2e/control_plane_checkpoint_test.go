@@ -282,6 +282,15 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 		if err != nil || res.ExitCode != 0 {
 			t.Fatalf("creating the drill Job from its CronJob: %v / exit %d: %s", err, res.ExitCode, res.Stderr)
 		}
+		t.Cleanup(func() {
+			_, _ = runner.Run(context.Background(), "sudo -n k3s kubectl delete job "+job+" -n "+controlplane.Namespace+" --wait=false")
+		})
+		// The drill decrypts the checkpoint with the identity Secret the chart
+		// mounts; without it the pod can never start, which is a finding to
+		// name at once rather than fifteen minutes of "Pending".
+		if _, err := k3s.Kubectl(ctx, runner, "get secret kubenest-cp-checkpoint-identity -n "+controlplane.Namespace+" -o name"); err != nil {
+			t.Fatalf("the drill's identity Secret kubenest-cp-checkpoint-identity does not exist, so its pod cannot mount it and never starts (kn-drill-identity-u6il): %v", err)
+		}
 		started := time.Now()
 		t47WaitFor(t, 15*time.Minute, 10*time.Second, "the drill Job to finish", func() (bool, string) {
 			out, err := k3s.Kubectl(ctx, runner, "get job "+job+" -n "+controlplane.Namespace+" -o jsonpath={.status.conditions[*].type}")
@@ -314,16 +323,30 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t47RewindCheckpoint(t, document, 49*time.Hour)
+		// The original is kept apart from the rewound copy: the first version
+		// of this gate rewound the document in place, never wrote it, and then
+		// "restored" the rewound copy in its cleanup, so the wait watched an
+		// unchanged status and the fixture was left 49 hours in the past.
+		original, err := json.Marshal(document)
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Cleanup(func() {
 			// Leave the fixture as it was found: the timestamp back, the CronJob
 			// resumed. A gate that left a rewound status behind would leave the
 			// next reader with a lie.
-			if err := t47WriteStatus(context.Background(), runner, document); err != nil {
-				t.Logf("restoring the checkpoint status: %v", err)
+			var restore map[string]any
+			if err := json.Unmarshal(original, &restore); err == nil {
+				if err := t47WriteStatus(context.Background(), runner, restore); err != nil {
+					t.Logf("restoring the checkpoint status: %v", err)
+				}
 			}
 			t47Suspend(context.Background(), t, runner, false)
 		})
+		t47RewindCheckpoint(t, document, 49*time.Hour)
+		if err := t47WriteStatus(ctx, runner, document); err != nil {
+			t.Fatalf("publishing the rewound status: %v", err)
+		}
 
 		// The group is a warning either way (the weekly drill has not run on a
 		// fresh fixture), so the assertion is the REASON: with a checkpoint
