@@ -1,4 +1,4 @@
-// Package install is the thirteen-stage platform installer (kn-7k8).
+// Package install is the platform installer (kn-7k8).
 //
 // The sequencing machinery — the ordered stages, the journal, resume, and
 // what a failure says — lives in pkg/stages and is shared with the bundle
@@ -8,8 +8,8 @@
 //
 // What lives HERE is what is specific to building a cluster from nothing:
 // the stage names, what each one does, the eleven preflight checks, the five
-// acceptance checks, and uninstall. A registered install runs the thirteen
-// stages install.mdx names; a --control-plane install runs fourteen, adding
+// acceptance checks, and uninstall. A registered install runs the fifteen
+// stages install.mdx names; a --control-plane install runs sixteen, adding
 // the stage that installs the KubeNest control plane into the first cluster
 // so that first cluster is registered through the control plane it hosts.
 package install
@@ -99,7 +99,25 @@ const (
 	StageCerts      = "platform-certs"
 	StageStorage    = "platform-storage"
 	StageBackup     = "platform-backup"
-	StageDay2       = "platform-day2"
+	// StageRecoveryKit writes and verifies this cluster's recovery kit before
+	// anything can produce a backup.
+	//
+	// It runs AFTER the stage that installs Velero (which is what creates the
+	// per-cluster repository password) and AFTER the stage that records the
+	// immutable ids, and BEFORE StageBackupTarget, which is the stage that
+	// first allows an upload to exist. That ordering is the whole point: a
+	// bucket whose only copy of a cluster's repository password is on a laptop
+	// that no longer exists is the failure this stage removes, so no backup or
+	// checkpoint may be configurable until the kit is written, uploaded and
+	// verified.
+	StageRecoveryKit = "recovery-kit"
+	// StageBackupTarget configures the target, the default schedule and the
+	// datastore snapshots — everything that can produce an upload — and is
+	// therefore ordered after StageRecoveryKit. Installed-unconfigured Velero
+	// produces nothing, which is why StageBackup (Velero only) may stay where
+	// it is.
+	StageBackupTarget = "platform-backup-target"
+	StageDay2         = "platform-day2"
 	// StageControlPlane installs the KubeNest control plane into this
 	// cluster. It is the one stage a registered install does not run; in a
 	// --control-plane install it sits between platform-day2 and register, so
@@ -111,9 +129,17 @@ const (
 	StageVerify       = "verify"
 )
 
-// StageNames is the order a REGISTERED install runs, which is also the
-// bundle's thirteen. It is not arbitrary — every stage depends on the ones
-// above it. Plan adds StageControlPlane for --control-plane.
+// StageNames is the order a REGISTERED install runs. It is not arbitrary —
+// every stage depends on the ones above it, and two of those dependencies are
+// load-bearing:
+//
+//   - platform-backup installs Velero UNCONFIGURED, which produces nothing;
+//     platform-backup-target is what first lets an upload exist, so it is
+//     ordered after recovery-kit.
+//   - recovery-kit needs the immutable ids (register) and the cluster's
+//     repository password (platform-backup), so it is ordered after both.
+//
+// Plan adds StageControlPlane for --control-plane.
 var StageNames = []string{
 	StagePreflight,
 	StageRegister,
@@ -124,6 +150,8 @@ var StageNames = []string{
 	StageStorage,
 	StageBackup,
 	StageDay2,
+	StageRecoveryKit,
+	StageBackupTarget,
 	StageAgent,
 	StageProfiles,
 	StageRecord,

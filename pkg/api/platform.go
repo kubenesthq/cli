@@ -88,6 +88,41 @@ func (c *Client) ReportInstallStage(ctx context.Context, clusterID string, entry
 	return c.do(req, nil)
 }
 
+// HostRecord is one host in a cluster's inventory (kn-t50): the contract's
+// HostEntry.
+//
+// This is what makes a node verb possible from a second laptop. The install
+// journal lives on the machine that ran the install; this record lives in the
+// control plane, and every node verb reads its targets from here.
+type HostRecord struct {
+	HostID string `json:"host_id"`
+	// NodeUID is the Kubernetes Node's metadata.uid, and it is empty until
+	// the node exists — a host can be in the inventory before it is a node.
+	NodeUID string `json:"node_uid"`
+	// SSHAddress, SSHPort and SSHUser are where and as whom the CLI reaches
+	// the host over SSH.
+	SSHAddress string `json:"ssh_address"`
+	SSHPort    int    `json:"ssh_port"`
+	SSHUser    string `json:"ssh_user"`
+	// HostKeyFingerprint is the SHA-256 of the host key seen when the host
+	// joined, in OpenSSH's SHA256:<base64> form. Recorded, not independently
+	// verified: SSH trust-on-first-use is unchanged. Not a secret.
+	HostKeyFingerprint string `json:"host_key_fingerprint"`
+	// JoinAddress is the address the host joined the cluster through, which
+	// may be a private address different from SSHAddress.
+	JoinAddress string `json:"join_address"`
+	// Role is "server" (a k3s control-plane node) or "agent" (a worker).
+	Role string `json:"role"`
+	// StorageDevice is the stable /dev/disk/by-id/... path, or empty for a
+	// cluster installed without one. A bare device name is never accepted.
+	StorageDevice string `json:"storage_device"`
+	// VolumeGroupOwnership is "customer-created" or "installer-created":
+	// what an uninstall or a node removal may destroy on THIS host.
+	VolumeGroupOwnership string `json:"volume_group_ownership"`
+	// LifecycleState is "joining", "active", "removing" or "removed".
+	LifecycleState string `json:"lifecycle_state"`
+}
+
 // BundleRecord is stage 12's write: what was installed, which profiles, which
 // tier, and who owns the volume group.
 //
@@ -95,12 +130,24 @@ func (c *Client) ReportInstallStage(ctx context.Context, clusterID string, entry
 // reads to decide whether it may remove a volume group, and a wrong value
 // there is the difference between a clean teardown and destroying a
 // customer's data.
+//
+// Revision is the compare-and-swap this write is based on: it is the revision
+// the caller READ, and the control plane refuses a write that is not at the
+// current one (409) rather than applying it. Two operators editing one
+// cluster from two laptops is the ordinary case.
 type BundleRecord struct {
 	BundleVersion        string                `json:"bundle_version"`
 	Profiles             []string              `json:"profiles"`
 	HATier               string                `json:"ha_tier"`
 	VolumeGroupOwnership string                `json:"volume_group_ownership"`
 	InstallJournal       []InstallJournalEntry `json:"install_journal,omitempty"`
+	// Hosts is the inventory this write asserts. Omitted means "leave the
+	// stored inventory alone": an upgrade rewrites this record and carries no
+	// host list, and must not erase one.
+	Hosts []HostRecord `json:"hosts,omitempty"`
+	// Revision is the revision the write is based on. Required by the
+	// contract: a body that does not carry one is refused.
+	Revision int `json:"revision"`
 }
 
 // PutBundleRecord writes the cluster's bundle record. Scope: install:report.
@@ -181,7 +228,8 @@ func (c *Client) InstallJournal(ctx context.Context, clusterID string) ([]Instal
 }
 
 // ClusterBundle is the cluster's recorded bundle: what is installed on it,
-// which profiles, which tier, and who owns the volume group.
+// which profiles, which tier, who owns the volume group, and which machines
+// it is.
 //
 // An upgrade reads it rather than being told: the record is the authority on
 // what the cluster IS, and an upgrade that took its starting point from a
@@ -192,6 +240,12 @@ type ClusterBundle struct {
 	HATier               string                `json:"ha_tier"`
 	VolumeGroupOwnership string                `json:"volume_group_ownership"`
 	InstallJournal       []InstallJournalEntry `json:"install_journal"`
+	// Hosts is the cluster's host inventory. Null in the record means no
+	// inventory has ever been recorded — NOT an empty cluster — and a node
+	// verb must refuse that rather than guess the machines from flags.
+	Hosts []HostRecord `json:"hosts"`
+	// Revision is what a write must carry back (see BundleRecord.Revision).
+	Revision int `json:"revision"`
 }
 
 // BundleRecord reads the cluster's recorded bundle.

@@ -60,6 +60,13 @@ type InstallFlags struct {
 	// AdminEmail is the control plane's administrator account, which is
 	// created during the install. Defaults to admin@<domain>.
 	AdminEmail string
+	// FleetRecipient and InstanceID are the fleet's identity. A
+	// --control-plane install generates the key and records both; a cluster
+	// added to a fleet normally reads them from this machine's config, which
+	// that install wrote, and only needs the flags when it is installed from a
+	// machine that never ran it.
+	FleetRecipient string
+	InstanceID     string
 }
 
 // controlPlaneDomain is the domain this install serves the control plane
@@ -207,6 +214,8 @@ this machine is logged in to; it needs no control plane of its own.`,
 	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	fs.StringVar(&f.StorageDevice, "storage-device", "", "blank device for the installer to create kubenest-vg on (omit if you created the volume group yourself)")
 	fs.StringVar(&f.BackupTarget, "backup-target", "", "S3-compatible backup target for Velero (optional; unset reports backup: unconfigured)")
+	fs.StringVar(&f.FleetRecipient, "fleet-recipient", "", "the fleet recovery key's PUBLIC recipient (age1...); normally read from this machine's config after a --control-plane install")
+	fs.StringVar(&f.InstanceID, "instance-id", "", "the instance id every recovery kit is bound to; normally read from this machine's config after a --control-plane install")
 	return cmd
 }
 

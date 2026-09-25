@@ -314,6 +314,51 @@ func startSSHServer(t *testing.T, authorized ssh.PublicKey) (addr string, hostKe
 	return ln.Addr().String(), hostSigner.PublicKey()
 }
 
+func TestDialCapturesTheNegotiatedHostKeyFingerprint(t *testing.T) {
+	// The fingerprint goes into the cluster's host inventory (kn-t50) and a
+	// later node operation refuses a host that presents a different key. So it
+	// has to be the key THIS handshake agreed on — not a re-read of
+	// known_hosts, which accept-new has just written, and not anything the
+	// caller supplied.
+	pemBytes, pub := genKey(t)
+	keyPath := writeKey(t, pemBytes)
+	addr, hostKey := startSSHServer(t, pub)
+
+	host, portStr, _ := net.SplitHostPort(addr)
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+
+	opts := Options{
+		User: "test", KeyPath: keyPath, Port: port,
+		ConfigPath:     filepath.Join(t.TempDir(), "config"),
+		KnownHostsPath: filepath.Join(t.TempDir(), "known_hosts"),
+		AgentSocket:    noAgent,
+	}
+	ep, err := Resolve(host, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := Dial(context.Background(), ep, opts)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	want := ssh.FingerprintSHA256(hostKey)
+	got := client.HostKeyFingerprint()
+	if got != want {
+		t.Errorf("fingerprint = %q, want %q — the key the server presented", got, want)
+	}
+	if !strings.HasPrefix(got, "SHA256:") {
+		t.Errorf("fingerprint %q is not in OpenSSH's SHA256:<base64> form", got)
+	}
+	// A fresh, never-dialled client has no negotiated key and must say so
+	// rather than invent one.
+	if empty := new(Client).HostKeyFingerprint(); empty != "" {
+		t.Errorf("a client with no connection reports fingerprint %q, want empty", empty)
+	}
+}
+
 func TestDialAndRunAgainstRealServer(t *testing.T) {
 	pemBytes, pub := genKey(t)
 	keyPath := writeKey(t, pemBytes)

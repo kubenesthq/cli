@@ -40,6 +40,10 @@ type reconnectingRunner struct {
 
 	mu   sync.Mutex
 	conn runConn
+	// endpoint is the resolved endpoint of the live connection: the address,
+	// user and port actually in use, which the inventory records (kn-t50).
+	// Set under mu, whenever a connection is established.
+	endpoint *sshx.Endpoint
 }
 
 // runConn is the part of *sshx.Client this needs: run a command, stream one,
@@ -53,7 +57,7 @@ type runConn interface {
 // newReconnectingRunner takes ownership of an already-dialled client and
 // knows how to replace it.
 func newReconnectingRunner(address string, opts sshx.Options, client *sshx.Client) *reconnectingRunner {
-	r := &reconnectingRunner{address: address, opts: opts, conn: client}
+	r := &reconnectingRunner{address: address, opts: opts, conn: client, endpoint: client.Endpoint}
 	r.dial = func(ctx context.Context) (runConn, error) {
 		endpoint, err := sshx.Resolve(r.address, r.opts)
 		if err != nil {
@@ -144,8 +148,36 @@ func (r *reconnectingRunner) connection(ctx context.Context) (runConn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Adopt the endpoint of the connection that is now live. It is what the
+	// inventory records as this host's SSH user and port (kn-t50), and a
+	// redial — ssh_config may have moved the port — is a new endpoint.
+	if c, ok := conn.(*sshx.Client); ok {
+		r.endpoint = c.Endpoint
+	}
 	r.conn = conn
 	return conn, nil
+}
+
+// Endpoint is the resolved endpoint of the live connection: the SSH user and
+// port actually in use, which may come from ssh_config rather than from a
+// flag. Nil when there is no live connection.
+func (r *reconnectingRunner) Endpoint() *sshx.Endpoint {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.endpoint
+}
+
+// HostKeyFingerprint is the SHA-256 fingerprint of the host key the live
+// connection negotiated, in OpenSSH's SHA256:<base64> form. Empty when there
+// is no live connection, or when the connection is not an sshx.Client (a test
+// fake): the inventory records what was observed and says nothing otherwise.
+func (r *reconnectingRunner) HostKeyFingerprint() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.conn.(*sshx.Client); ok {
+		return c.HostKeyFingerprint()
+	}
+	return ""
 }
 
 // discard drops a connection observed dead, unless someone else already

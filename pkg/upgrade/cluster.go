@@ -17,6 +17,11 @@ import (
 // argument could move a cluster it had misidentified.
 
 // Recorded is the cluster's bundle record, read once at the start of a run.
+//
+// It carries the host inventory and the inventory revision (kn-t50) as well
+// as the bundle: the record is the one place a second laptop can learn which
+// machines this cluster is (see ResolveHosts), and the revision is what a
+// write has to carry back.
 type Recorded struct {
 	api.ClusterBundle
 }
@@ -61,6 +66,38 @@ func (r ControlPlaneRecords) Save(ctx context.Context, record api.BundleRecord) 
 		return fmt.Errorf("no registered cluster to record against")
 	}
 	return r.Client.PutBundleRecord(ctx, r.ClusterID, record)
+}
+
+// HostInventory is a cluster's host inventory as its record carries it: the
+// hosts, and the revision the record is at.
+type HostInventory struct {
+	Hosts    []api.HostRecord
+	Revision int
+}
+
+// ResolveHosts resolves the hosts of a cluster FROM ITS RECORD, for a laptop
+// that has no local install journal — the second operator, or the same one
+// after the laptop that ran the install is gone (kn-t50).
+//
+// It refuses an empty or missing inventory rather than falling back to
+// --server/--agent flags. Those flags describe what an operator THINKS the
+// cluster is; the record is what it is, and a node operation that destroys
+// data on the wrong machine because a flag was mistyped is precisely the
+// failure the inventory exists to prevent. An empty inventory means "read it
+// again, or re-run the install's record stage", never "assume".
+func ResolveHosts(ctx context.Context, store RecordStore) (HostInventory, error) {
+	recorded, err := store.Load(ctx)
+	if err != nil {
+		return HostInventory{}, err
+	}
+	if len(recorded.Hosts) == 0 {
+		return HostInventory{}, fmt.Errorf(
+			"the cluster record carries no host inventory, so there is no host to act on: this cluster's record " +
+				"was written before the inventory existed, or its record stage has not run since. Re-run the " +
+				"install's record stage, or run `kubenest node add` to adopt the host explicitly — the hosts are " +
+				"never inferred from --server/--agent flags")
+	}
+	return HostInventory{Hosts: recorded.Hosts, Revision: recorded.Revision}, nil
 }
 
 // installedProfiles is the profile set the cluster has, which does not change

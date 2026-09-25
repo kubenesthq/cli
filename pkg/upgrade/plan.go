@@ -360,6 +360,13 @@ func stageRecord(ctx context.Context, s *Session) error {
 		HATier:               s.haTier(),
 		VolumeGroupOwnership: s.volumeGroupOwnership(),
 		InstallJournal:       terminalEntries(s.Jnl),
+		// The revision this run READ. The write is a compare-and-swap (kn-t50)
+		// and an upgrade carries no host list, so the record keeps the
+		// inventory it has (see BundleRecord.Hosts) while this run's bundle
+		// version and revision land. A cluster whose inventory moved during
+		// the run is refused rather than overwritten — the operator re-reads
+		// and re-applies.
+		Revision: s.Cluster.Revision,
 	})
 }
 

@@ -206,6 +206,167 @@ func secretManifest(sec Secrets) ([]byte, error) {
 	return out, nil
 }
 
+// InstanceName is the Secret holding the INSTANCE's own identity: its
+// immutable id, and the PUBLIC recipient of the fleet recovery key.
+//
+// It is separate from SecretName on purpose. SecretName holds credentials the
+// chart renders (a JWT secret, an encryption key, a password); this holds what
+// the instance IS. It is not a chart value, it is never rendered into
+// anything, and it must outlive a control-plane upgrade and travel inside a
+// datastore snapshot, because it is what every kit and every recovery set is
+// bound to.
+const InstanceName = "kubenest-cp-instance"
+
+// Keys of InstanceName.
+const (
+	keyInstanceID     = "instance-id"
+	keyFleetRecipient = "fleet-recipient"
+)
+
+// Instance is the instance's own identity: the immutable id kits and recovery
+// sets are bound to, and the fleet recipient every later install encrypts to.
+type Instance struct {
+	// ID is the instance's immutable id. It is minted once, at the first
+	// control-plane install, and never changes: a kit or a recovery set that
+	// named an id the instance no longer has would be refused by the very
+	// check that exists to tell right from wrong.
+	ID string
+	// FleetRecipient is the public age recipient of the fleet recovery key.
+	// It is not a secret — it can only encrypt.
+	FleetRecipient string
+}
+
+// ErrNoInstance reports that the instance identity is not on this cluster
+// yet. It is exported because the caller that has just generated a fleet key
+// must be able to tell "nothing recorded yet" (generate one) from "recorded
+// and unreadable" (stop).
+var ErrNoInstance = errors.New("this instance has no recorded identity yet")
+
+// EnsureInstance returns the instance's identity, recording it on the first
+// control-plane install.
+//
+// recipient is the public half of the fleet key THIS install generated. It is
+// required to create the record and is never replaced once stored: kits are
+// sealed to the recorded recipient, so accepting a different one would leave
+// every kit ever written unopenable by the key the operator holds. A later run
+// that presents a different recipient is refused, which is the only honest
+// answer — the alternative is silently re-pointing the fleet at a key whose
+// private half may not exist.
+//
+// On a later run recipient may be empty: the CLI holds only the recipient it
+// read back (from this cluster or from its own config), and there is nothing
+// to create.
+func EnsureInstance(ctx context.Context, r k3s.Runner, recipient string) (inst Instance, created bool, err error) {
+	stored, err := readInstance(ctx, r)
+	switch {
+	case err == nil:
+		if recipient != "" && recipient != stored.FleetRecipient {
+			return Instance{}, false, fmt.Errorf(
+				"this instance already has a fleet recovery recipient (%s); the recipient offered (%s) is a different key, and every kit in the fleet is sealed to the recorded one. Refusing: overwriting it would leave those kits openable by nothing",
+				stored.FleetRecipient, recipient)
+		}
+		return stored, false, nil
+	case !errors.Is(err, ErrNoInstance):
+		return Instance{}, false, err
+	}
+	if recipient == "" {
+		return Instance{}, false, fmt.Errorf("%w: a first control-plane install must record the fleet recovery recipient it just generated; without one no kit could ever be written, and an instance that has never had a fleet key cannot be given one retroactively (F19: 1.1 clusters are not backfilled)", ErrNoInstance)
+	}
+	id, err := randomHex(16)
+	if err != nil {
+		return Instance{}, false, err
+	}
+	manifest, err := instanceManifest(Instance{ID: id, FleetRecipient: recipient})
+	if err != nil {
+		return Instance{}, false, err
+	}
+	// create, not apply, for the same reason EnsureSecrets uses create: two
+	// concurrent first installs must not both mint an instance id, and the
+	// loser must fail rather than overwrite the winner's.
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl create -f -", bytes.NewReader(manifest))
+	if err != nil {
+		return Instance{}, false, fmt.Errorf("recording the instance identity: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return Instance{}, false, fmt.Errorf("recording the instance identity: exit %d: %s (an instance already recorded on this cluster keeps its own id)",
+			res.ExitCode, firstLine(res.Stderr))
+	}
+	stored, err = readInstance(ctx, r)
+	if err != nil {
+		return Instance{}, false, err
+	}
+	return stored, true, nil
+}
+
+// ReadInstance reads the instance identity, and reports a clear error when
+// this cluster has none.
+func ReadInstance(ctx context.Context, r k3s.Runner) (Instance, error) { return readInstance(ctx, r) }
+
+func readInstance(ctx context.Context, r k3s.Runner) (Instance, error) {
+	out, err := k3s.Kubectl(ctx, r, "get secret "+InstanceName+" -n "+Namespace+" -o json")
+	if err != nil {
+		// A read failure cannot be told from an absent Secret here, and it
+		// does not need to be: the create that follows one fails on an object
+		// that already exists.
+		return Instance{}, fmt.Errorf("%w: %v", ErrNoInstance, err)
+	}
+	var stored struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &stored); err != nil {
+		return Instance{}, fmt.Errorf("secret %s/%s is unparsable: %w", Namespace, InstanceName, err)
+	}
+	inst := Instance{}
+	for _, key := range []struct {
+		name string
+		into *string
+	}{
+		{keyInstanceID, &inst.ID},
+		{keyFleetRecipient, &inst.FleetRecipient},
+	} {
+		encoded, ok := stored.Data[key.name]
+		if !ok {
+			return Instance{}, fmt.Errorf("secret %s/%s has no %q key: this instance's identity is incomplete, and an id or recipient invented to fill the gap would be a different instance",
+				Namespace, InstanceName, key.name)
+		}
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return Instance{}, fmt.Errorf("secret %s/%s key %q is not base64: %w", Namespace, InstanceName, key.name, err)
+		}
+		if len(raw) == 0 {
+			return Instance{}, fmt.Errorf("secret %s/%s has an empty %q key", Namespace, InstanceName, key.name)
+		}
+		*key.into = string(raw)
+	}
+	return inst, nil
+}
+
+// instanceManifest renders the instance identity Secret. stringData keeps the
+// values out of the document as base64 noise.
+func instanceManifest(inst Instance) ([]byte, error) {
+	doc := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      InstanceName,
+			"namespace": Namespace,
+			"labels": map[string]any{
+				"app.kubernetes.io/managed-by": "kubenest-cli",
+			},
+		},
+		"type": "Opaque",
+		"stringData": map[string]any{
+			keyInstanceID:     inst.ID,
+			keyFleetRecipient: inst.FleetRecipient,
+		},
+	}
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("rendering secret %s/%s: %w", Namespace, InstanceName, err)
+	}
+	return out, nil
+}
+
 // Values renders the helm values document the control plane is installed
 // with: the operator's settings and this install's generated secrets, and
 // nothing else. The Gateway, the hub's public URL (wss://hub.<domain>) and

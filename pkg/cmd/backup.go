@@ -1,15 +1,22 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/recoverykit"
+	"kubenest.io/cli/pkg/s3"
 	"kubenest.io/cli/pkg/sshx"
 )
 
@@ -155,16 +162,36 @@ unconfigured — loud, but never blocking.`,
 			if err := target.Validate(); err != nil {
 				return err
 			}
-			bundle, client, err := conn.dial(cmd)
+			// The client the scope check and the pre-flight read use. Without
+			// it, Configure would skip the scope check entirely — and the
+			// check is the thing that keeps one cluster's credential from
+			// being read access to every cluster's backups and to the control
+			// plane's recovery material.
+			client, err := target.S3Client()
 			if err != nil {
 				return err
 			}
-			defer client.Close()
-			rep := converge.NewTextReporter(cmd.OutOrStdout())
-			if err := backup.Configure(cmd.Context(), client, bundle, target, rep); err != nil {
+			target.Client = client
+
+			out := cmd.OutOrStdout()
+			bundle, ssh, err := conn.dial(cmd)
+			if err != nil {
 				return err
 			}
-			if err := backup.ConfigureDatastoreSnapshots(cmd.Context(), client, bundle, target, rep); err != nil {
+			defer ssh.Close()
+			rep := converge.NewTextReporter(out)
+
+			// What the bucket does and does not protect, before anything
+			// depends on it. Warnings, never refusals: an unknown storage
+			// choice must not block an operator.
+			for _, warning := range target.Preflight(cmd.Context(), target.Client) {
+				fmt.Fprintf(out, "warning: %s\n", warning)
+			}
+
+			if err := backup.Configure(cmd.Context(), ssh, bundle, target, rep); err != nil {
+				return err
+			}
+			if err := backup.ConfigureDatastoreSnapshots(cmd.Context(), ssh, bundle, target, rep); err != nil {
 				return fmt.Errorf("configure datastore snapshots on %s: %w", conn.Servers[0], err)
 			}
 			for _, address := range conn.Servers[1:] {
@@ -185,7 +212,7 @@ unconfigured — loud, but never blocking.`,
 					return fmt.Errorf("close SSH connection to %s: %w", address, closeErr)
 				}
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "backup target for %s configured and verified: bucket %s via %s\n", conn.Cluster, target.Bucket, target.Endpoint)
+			fmt.Fprintf(out, "backup target for %s configured and verified: bucket %s via %s\n", conn.Cluster, target.Bucket, target.Endpoint)
 			return nil
 		},
 	}
@@ -217,11 +244,18 @@ not a silent log line.`,
 			}
 			defer client.Close()
 			name := "manual-" + time.Now().UTC().Format("20060102-150405")
-			rep := converge.NewTextReporter(cmd.OutOrStdout())
+			out := cmd.OutOrStdout()
+			rep := converge.NewTextReporter(out)
 			if err := backup.TakeBackup(cmd.Context(), client, bundle, name, rep); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "backup %s completed on %s\n", name, conn.Cluster)
+			// The backup is in the bucket; now it has to be FINDABLE. A
+			// completed backup that no recovery set names is a backup nobody
+			// can select on the day it matters.
+			if err := recordRecoverySet(cmd.Context(), out, conn.Cluster, name); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "backup %s completed on %s\n", name, conn.Cluster)
 			return nil
 		},
 	}
@@ -254,4 +288,101 @@ func envFirst(names ...string) string {
 		}
 	}
 	return ""
+}
+
+// recordRecoverySet adds one completed backup to the cluster's recovery set,
+// and writes the set back.
+//
+// It needs no new flags. The install journal names the cluster's immutable id,
+// and the local recovery kit carries the artifact id, the S3 location and the
+// scope — so the CLI can write a set for a backup it just took without being
+// told any of it again.
+//
+// When there is no journal or no local kit it says so and continues rather
+// than failing: the backup itself succeeded, and the honest report is that
+// nothing will be able to find it. That report is loud, because a bucket full
+// of unselectable backups is the failure this is meant to prevent.
+func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupName string) error {
+	journalPath, err := install.JournalPath(clusterName)
+	if err != nil {
+		return err
+	}
+	journal, err := install.ReadJournal(journalPath)
+	if err != nil || journal == nil || journal.ClusterID == "" {
+		fmt.Fprintf(out, "warning: no install journal for %q on this machine, so no recovery set was written for %s. Run `kubenest recovery-kit check` and record it from wherever the journal is\n", clusterName, backupName)
+		return nil
+	}
+	kit, err := recoverykit.NewestLocal(journal.ClusterID, recoverykit.KindCluster)
+	if err != nil {
+		fmt.Fprintf(out, "warning: %v; no recovery set was written for %s, so nothing will be able to select it\n", err, backupName)
+		return nil
+	}
+	doc, err := kit.Document()
+	if err != nil {
+		return err
+	}
+	scope := strings.Trim(kit.S3Location.Prefix, "/")
+	accessKeyID := envFirst("KUBENEST_BACKUP_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+	secretAccessKey := envFirst("KUBENEST_BACKUP_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
+	if accessKeyID == "" || secretAccessKey == "" {
+		// The backup itself succeeded. Failing here would turn a good backup
+		// into a failed command over a set nobody asked for, so this is a
+		// warning that names exactly what will not be findable.
+		fmt.Fprintf(out, "warning: no bucket credentials in the environment (KUBENEST_BACKUP_ACCESS_KEY_ID / KUBENEST_BACKUP_SECRET_ACCESS_KEY), so no recovery set was written for %s and nothing will be able to select it\n", backupName)
+		return nil
+	}
+	client, err := s3.New(s3.Config{
+		Endpoint:        kit.S3Location.Endpoint,
+		Bucket:          kit.S3Location.Bucket,
+		Region:          kit.S3Location.Region,
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+	})
+	if err != nil {
+		fmt.Fprintf(out, "warning: %v; no recovery set was written for %s, so nothing will be able to select it\n", err, backupName)
+		return nil
+	}
+
+	key := recoverykit.SetKey(scope, journal.ClusterID, recoverykit.KindCluster, kit.ArtifactID)
+	var set *recoverykit.Set
+	switch raw, err := client.Get(ctx, key); {
+	case err == nil:
+		set, err = recoverykit.LoadSet(raw)
+		if err != nil {
+			return err
+		}
+	case errors.Is(err, s3.ErrNotFound):
+		set, err = recoverykit.NewSet(kit, versionsOf(journal), recoverykit.Digest(doc), time.Now().UTC())
+		if err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("reading the recovery set at %s: %w", key, err)
+	}
+	set, err = set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	set.Complete = true
+	body, err := set.Document()
+	if err != nil {
+		return err
+	}
+	if err := client.Put(ctx, key, body); err != nil {
+		return fmt.Errorf("writing the recovery set at %s: %w", key, err)
+	}
+	fmt.Fprintf(out, "recovery set updated: %s now names %d completed backup(s)\n", key, len(set.Backups))
+	return nil
+}
+
+// versionsOf reads the versions a recovery needs out of the install journal's
+// identity, and nothing else: a version is not a credential.
+func versionsOf(journal *install.Journal) map[string]string {
+	versions := map[string]string{}
+	for _, key := range []string{"bundle"} {
+		if v := journal.Identity.Fields[key]; v != "" {
+			versions[key] = v
+		}
+	}
+	return versions
 }

@@ -131,6 +131,11 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 		SSHKey:        f.SSHKey,
 		StorageDevice: f.StorageDevice,
 		BackupTarget:  f.BackupTarget,
+		// The fleet's identity: normally from this machine's config (written
+		// by the install that created the control plane), overridable by flag
+		// for a machine that never ran one.
+		FleetRecipient: f.FleetRecipient,
+		InstanceID:     f.InstanceID,
 	}
 
 	// The two install shapes differ in where the cluster's record lives and in

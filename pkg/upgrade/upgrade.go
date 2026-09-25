@@ -382,6 +382,10 @@ func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
 			HATier:               s.Cluster.HATier,
 			VolumeGroupOwnership: s.Cluster.VolumeGroupOwnership,
 			InstallJournal:       terminalEntries(s.Jnl),
+			// Same compare-and-swap as the forward record write: the revision
+			// this run read, and no host list, so the inventory is left alone
+			// (kn-t50).
+			Revision: s.Cluster.Revision,
 		}); err != nil {
 			return fmt.Errorf("the cluster was rolled back but its record could not be updated: %w", err)
 		}

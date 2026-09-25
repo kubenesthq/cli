@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,8 +23,11 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/node"
 	"kubenest.io/cli/pkg/preflight"
+	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/register"
+	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/storage"
 )
@@ -57,6 +62,17 @@ type Options struct {
 	// trusts the API it reports to; a --control-plane install learns it from
 	// the cluster it just installed.
 	ControlPlaneCA []byte
+	// FleetRecipient is the PUBLIC age recipient of the instance's fleet
+	// recovery key, and InstanceID is the instance's immutable id. A
+	// --control-plane install generates the key and records both on the
+	// cluster; every later install reads them from this machine's config
+	// (written by that install) or is handed them with the matching flags.
+	//
+	// They are not secrets — a recipient can only encrypt — but they must not
+	// change: a kit sealed to a different recipient is a kit the fleet key
+	// cannot open.
+	FleetRecipient string
+	InstanceID     string
 }
 
 // Identity is the part of the request a resume must match exactly. The install
@@ -149,7 +165,61 @@ type Session struct {
 	// Record is the journalled non-secret record.
 	Record Record
 
+	// joinToken is the cluster token this install minted for its first server.
+	// In memory only, for the life of this process: it is a credential, and
+	// the journal has no field a credential fits into. It is empty on a resume
+	// whose k3s stage already completed, which is why the kit stage falls back
+	// to reading the token file back off the server.
+	joinToken string
+	// orgID and instanceID are the immutable ids a recovery kit is bound to,
+	// filled by the register and control-plane stages.
+	orgID      string
+	instanceID string
+	// cpMaterial is the control plane's own key material (ENCRYPTION_KEY,
+	// AGENT_JWT_SECRET, the platform CA), held in memory by the stage that
+	// installed the control plane so the kit stage can seal it. It is not
+	// journalled and not logged: Record has no field a credential fits into.
+	cpMaterial map[string]string
+	// kit is the kit this run wrote, held so the stage that first allows an
+	// upload can refuse to configure anything without it.
+	kit *recoverykit.Kit
+	// fleetKey is the fleet recovery identity, present ONLY on the process
+	// that generated it (the first control-plane install). Every other install
+	// is handed the public recipient and has no private half to hold.
+	fleetKey *recoverykit.FleetKey
+
 	closers []io.Closer
+}
+
+// fleetRecipient is the public recipient this install is handed: the one it
+// generated, the one recorded on the cluster it is installing, or the one in
+// this machine's config.
+func (s *Session) fleetRecipient() string {
+	if s.fleetKey != nil {
+		return s.fleetKey.Recipient()
+	}
+	if s.Opts.FleetRecipient != "" {
+		return s.Opts.FleetRecipient
+	}
+	if cfg, err := config.Load(); err == nil {
+		return cfg.FleetRecipient
+	}
+	return ""
+}
+
+// instanceIdentity is the immutable instance id kits are bound to: the one
+// this install recorded, or the one in this machine's config.
+func (s *Session) instanceIdentity() string {
+	if s.instanceID != "" {
+		return s.instanceID
+	}
+	if s.Opts.InstanceID != "" {
+		return s.Opts.InstanceID
+	}
+	if cfg, err := config.Load(); err == nil {
+		return cfg.InstanceID
+	}
+	return ""
 }
 
 // The engine's Controller, implemented by this session.
@@ -260,6 +330,8 @@ func Plan(s *Session) []Stage {
 			{Name: StageNetworking, Component: "traefik", Run: bind(stageNetworking)},
 			{Name: StageCerts, Component: "cert-manager", Run: bind(stageCerts)},
 			{Name: StageStorage, Component: "openebs-lvm-localpv", Run: bind(stageStorage)},
+			// Velero only, unconfigured: it creates the repository password and
+			// can upload nothing, so it is safe before the kit.
 			{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
 			{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
 			// AlwaysRun: a resume has to re-establish API access before the
@@ -267,6 +339,12 @@ func Plan(s *Session) []Stage {
 			// idempotent.
 			{Name: StageControlPlane, AlwaysRun: true, Run: bind(stageControlPlane)},
 			{Name: StageRegister, AlwaysRun: true, Run: bind(stageRegister)},
+			// The kit is written and verified here, before anything can
+			// produce a backup (StageBackupTarget), and after both the
+			// control-plane material (StageControlPlane) and the immutable
+			// ids (StageRegister) exist.
+			{Name: StageRecoveryKit, Run: bind(stageRecoveryKit)},
+			{Name: StageBackupTarget, Component: "velero", Run: bind(stageBackupTarget)},
 			{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
 			{Name: StageProfiles, Run: bind(stageProfiles)},
 			{Name: StageRecord, Run: bind(stageRecord)},
@@ -283,6 +361,8 @@ func Plan(s *Session) []Stage {
 		{Name: StageStorage, Component: "openebs-lvm-localpv", Run: bind(stageStorage)},
 		{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
 		{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
+		{Name: StageRecoveryKit, Run: bind(stageRecoveryKit)},
+		{Name: StageBackupTarget, Component: "velero", Run: bind(stageBackupTarget)},
 		{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
 		{Name: StageProfiles, Run: bind(stageProfiles)},
 		{Name: StageRecord, Run: bind(stageRecord)},
@@ -426,6 +506,10 @@ func stageRegister(ctx context.Context, s *Session) error {
 		return err
 	}
 	s.Jnl.ClusterID = cluster.ID
+	// The organisation the cluster belongs to is part of every recovery kit's
+	// immutable binding, so it is kept for the duration of the run. It is an
+	// id, not a credential.
+	s.orgID = org.ID
 	s.Record.Adopted = adopted
 
 	if _, agentInstalled := s.Jnl.Completed(StageAgent); agentInstalled {
@@ -455,19 +539,27 @@ func stageK3sServer(ctx context.Context, s *Session) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no server node")
 	}
-	if err := stages.NewComponentError("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{}, s.Reporter)); err != nil {
+	// The CLI generates the cluster token itself and hands the first server
+	// the file to read it from, exactly as it already does for every join.
+	// That makes ONE value behind every join, chosen here, which is what the
+	// recovery kit needs: a token the server minted and the CLI read back
+	// afterwards is a token that exists only on the node until someone asks.
+	//
+	// It is held in this process's memory and nowhere else: not in the
+	// session's journal, not in a log line, not in the install Record.
+	token, err := k3s.GenerateToken()
+	if err != nil {
+		return err
+	}
+	s.joinToken = token
+
+	if err := stages.NewComponentError("k3s", k3s.InstallServer(ctx, servers[0].Runner, s.Bundle, k3s.ServerOptions{Token: token}, s.Reporter)); err != nil {
 		return err
 	}
 	if len(servers) == 1 {
 		return nil
 	}
 
-	// The token is read for immediate use and never stored: not in the
-	// session, not in the journal, not in a log line.
-	token, err := k3s.NodeToken(ctx, servers[0].Runner)
-	if err != nil {
-		return err
-	}
 	joinURL := serverURL(servers[0].Address)
 	for _, server := range servers[1:] {
 		if err := k3s.InstallServer(ctx, server.Runner, s.Bundle,
@@ -488,9 +580,17 @@ func stageK3sAgents(ctx context.Context, s *Session) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no server node to join")
 	}
-	token, err := k3s.NodeToken(ctx, servers[0].Runner)
-	if err != nil {
-		return err
+	// The token this install minted for its first server, so every agent joins
+	// with the same value the kit will carry. A resume skips the k3s stage, so
+	// fall back to the read path rather than minting a second token that no
+	// node would accept.
+	token := s.joinToken
+	if token == "" {
+		var err error
+		token, err = k3s.NodeToken(ctx, servers[0].Runner)
+		if err != nil {
+			return err
+		}
 	}
 	joinURL := serverURL(servers[0].Address)
 	for _, node := range agents {
@@ -571,27 +671,58 @@ func stageStorage(ctx context.Context, s *Session) error {
 	return stages.NewComponentError(storage.ComponentKey, storage.Verify(ctx, server, s.Bundle, s.Reporter))
 }
 
-// stageBackup installs Velero, configured if a target was supplied.
+// stageBackup installs Velero and nothing else.
 //
 // A backup target is optional and its absence is VISIBLE, not silent: the
 // cluster reports backup: unconfigured in every heartbeat until one is set,
 // because a cluster that has never taken a backup is exactly the quiet
 // failure this product exists to prevent.
+//
+// It is deliberately no longer where the target, the schedule and the
+// datastore snapshots are configured. Per the backup-restore page an
+// installed-but-unconfigured Velero is a legitimate, VISIBLE state, and it can
+// produce no upload, which is exactly why it may run before the recovery kit
+// exists. Everything that CAN produce an upload moved to stageBackupTarget,
+// which is ordered after the kit.
 func stageBackup(ctx context.Context, s *Session) error {
 	server, err := s.Server()
 	if err != nil {
 		return err
 	}
-	if err := stages.NewComponentError("velero", backup.Install(ctx, server, s.Bundle, s.Reporter)); err != nil {
+	return stages.NewComponentError("velero", backup.Install(ctx, server, s.Bundle, s.Reporter))
+}
+
+// stageBackupTarget points the cluster at the backup target and proves it
+// works: the scope of its credential, the bucket's protection, the credentials
+// Secret, the BackupStorageLocation, convergence until Velero validates the
+// location Available, the default workload Schedule, and the datastore
+// snapshots on every control-plane server.
+//
+// This is the stage that first allows a backup to exist, so it refuses to do
+// any of it unless the recovery kit is in place. The guard is not decorative:
+// it is checked at run time, against the kit this run wrote or the one written
+// locally by an earlier run, because a resume skips the kit stage.
+func stageBackupTarget(ctx context.Context, s *Session) error {
+	server, err := s.Server()
+	if err != nil {
 		return err
 	}
 	if s.Opts.BackupTarget == "" {
-		s.Logf("  no --backup-target given: Velero is installed unconfigured and this cluster will report backup: unconfigured in every heartbeat until one is set")
+		s.Logf("  no --backup-target given: Velero is installed unconfigured and this cluster will report backup: unconfigured in every heartbeat until one is set. No backup can exist, so no kit is needed yet either")
 		return nil
+	}
+	if _, err := s.recoveryKitInPlace(); err != nil {
+		return fmt.Errorf("refusing to configure a backup target: %w. The %s stage writes and verifies the kit first, and a backup whose repository password exists only on a host that may be gone is the state that ordering removes", err, StageRecoveryKit)
 	}
 	target, err := parseBackupTarget(s.Opts.BackupTarget)
 	if err != nil {
 		return err
+	}
+	// Before anything depends on the target: what the bucket does and does not
+	// protect. Warns, never refuses — an unknown Crest storage choice must not
+	// block an install.
+	for _, warning := range target.Preflight(ctx, target.Client) {
+		s.Logf("  warning: %s", warning)
 	}
 	if err := stages.NewComponentError("velero", backup.Configure(ctx, server, s.Bundle, target, s.Reporter)); err != nil {
 		return err
@@ -609,6 +740,242 @@ func stageBackup(ctx context.Context, s *Session) error {
 		}
 	}
 	return nil
+}
+
+// stageRecoveryKit writes, uploads and verifies this cluster's recovery kit —
+// and, on a control-plane install, the instance's own kit — before any backup
+// can exist.
+//
+// What the bucket exposes, stated once, in the open:
+//
+//   - with --secrets-encryption (every server, every tier), the Secret VALUES
+//     in a datastore snapshot are sealed by k3s's bootstrap data under the
+//     cluster token — which is in this kit;
+//   - volume data (kopia repositories) is encrypted by the per-cluster
+//     repository password — which is in this kit;
+//   - Velero's RESOURCE archives hold workload Secrets in PLAINTEXT and are
+//     protected by the credential's prefix scope alone, which is why
+//     `backup set-target` refuses a credential that reaches another prefix.
+//
+// The verification is honest about what it can do. The first control-plane
+// install still holds the freshly generated fleet identity, so it decrypts
+// both the local copy and the uploaded copy and only then continues. Every
+// later install holds only the public recipient: it uploads, fetches the
+// uploaded ciphertext back and compares its digest with the local file. It
+// does not claim to have decrypted anything, and it never asks for the private
+// key. Only `kubenest recovery-kit check`, run with the fleet key, can say the
+// kit opens.
+func stageRecoveryKit(ctx context.Context, s *Session) error {
+	if s.Opts.BackupTarget == "" {
+		s.Logf("  no --backup-target given: there is no S3 location for a recovery kit, and no backup can exist for one to open. Pass --backup-target (or `kubenest backup set-target`) and the kit is written and verified before anything is uploaded")
+		return nil
+	}
+	server, err := s.Server()
+	if err != nil {
+		return err
+	}
+	target, err := parseBackupTarget(s.Opts.BackupTarget)
+	if err != nil {
+		return err
+	}
+	recipient := s.fleetRecipient()
+	if recipient == "" {
+		return errors.New("this install was not handed a fleet recovery recipient, so it cannot seal a kit that the fleet key would open. A --control-plane install records one; a cluster added to a fleet reads it from this machine's config, or takes --fleet-recipient (and --instance-id) from the machine that installed the control plane")
+	}
+	instanceID := s.instanceIdentity()
+	if instanceID == "" {
+		return errors.New("this install does not know its instance id, which every kit and recovery set is bound to. A --control-plane install records one; a cluster added to a fleet reads it from this machine's config, or takes --instance-id from the machine that installed the control plane")
+	}
+	if s.Jnl.ClusterID == "" || s.orgID == "" {
+		return errors.New("this install has no recorded cluster or organisation id, so a kit written now could not be bound to anything: stage 2 (register) fills both")
+	}
+
+	token := s.joinToken
+	if token == "" {
+		// A resume skips the k3s stage, so the token it minted is not in this
+		// process. The read path is the same one `node add` uses against a
+		// cluster installed before the CLI minted tokens.
+		token, err = k3s.NodeToken(ctx, server)
+		if err != nil {
+			return fmt.Errorf("reading back the cluster token the kit must carry: %w", err)
+		}
+	}
+	repoPassword, err := backup.RepositoryPassword(ctx, server)
+	if err != nil {
+		return fmt.Errorf("reading the cluster's Velero repository password, which the kit must carry: %w", err)
+	}
+
+	now := time.Now().UTC()
+	location := recoverykit.Location{Endpoint: target.Endpoint, Bucket: target.Bucket, Region: target.Region, Prefix: target.Prefix}
+	scope := strings.Trim(target.Prefix, "/")
+	client := target.Client
+
+	binding := recoverykit.Binding{Kind: recoverykit.KindCluster, InstanceID: instanceID, OrganisationID: s.orgID, ClusterID: s.Jnl.ClusterID}
+	// The bucket's own credentials are NOT in here: the operator keeps them
+	// separately, offline, with the fleet key. A kit that carried them would
+	// put the key to the bucket inside the bucket. What the kit records is the
+	// non-secret S3 location above.
+	secrets := map[string]string{
+		recoverykit.KeyVeleroRepoPassword: repoPassword,
+		recoverykit.KeyK3sJoinToken:       token,
+	}
+	kit, err := s.sealAndUpload(ctx, client, scope, binding, recoverykit.KindCluster, s.Jnl.ClusterID,
+		location, veleroRepositoryID(), secrets, now)
+	if err != nil {
+		return err
+	}
+	s.kit = kit
+
+	// The instance's own kit, on a control-plane install only: the control
+	// plane's key material, which no cluster kit may carry. Only the instance
+	// administrator may export it, which the control plane enforces; here it
+	// simply must exist before the control plane's own backup can.
+	if s.Opts.ControlPlaneInstall {
+		if len(s.cpMaterial) == 0 {
+			return errors.New("this is a --control-plane install but the control plane's key material is not in hand, so the instance kit cannot be written: stage 9 (control-plane) fills it")
+		}
+		// It is stored under the MANAGEMENT cluster's id — the cluster this
+		// control plane runs in — so the instance's own artifacts sit beside
+		// that cluster's and the control plane's separate copy of the set
+		// lands at the same relative path.
+		cpBinding := recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: instanceID, ClusterID: s.Jnl.ClusterID}
+		if _, err := s.sealAndUpload(ctx, client, scope, cpBinding, recoverykit.KindControlPlane, s.Jnl.ClusterID,
+			location, "", s.cpMaterial, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// veleroRepositoryID is the Velero backup repository identity this cluster's
+// volumes are written to. It is derived from the managed storage location and
+// the repository type, not read from a live repository: the kit has to exist
+// BEFORE the first repository does.
+func veleroRepositoryID() string {
+	return "velero-" + backup.StorageLocationName + "-kopia"
+}
+
+// sealAndUpload is the whole write-verify path for one kit: seal, write
+// locally, upload, fetch back, verify. Nothing else in the install path writes
+// a kit, so the ordering guarantee has one implementation.
+func (s *Session) sealAndUpload(ctx context.Context, client backup.Bucket, scope string, binding recoverykit.Binding, kind recoverykit.Kind, pathSegment string, location recoverykit.Location, repoID string, secrets map[string]string, now time.Time) (*recoverykit.Kit, error) {
+	artifactID, err := recoverykit.ArtifactID(now)
+	if err != nil {
+		return nil, err
+	}
+	kit, err := recoverykit.New(binding, artifactID, location, repoID, secrets, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := kit.SealTo(s.fleetRecipient()); err != nil {
+		return nil, err
+	}
+	doc, err := kit.Document()
+	if err != nil {
+		return nil, err
+	}
+	local, err := recoverykit.LocalPath(pathSegment, kind, artifactID)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeLocalKit(local, doc); err != nil {
+		return nil, err
+	}
+
+	key := recoverykit.KitKey(scope, pathSegment, kind, artifactID)
+	if err := client.Put(ctx, key, doc); err != nil {
+		return nil, fmt.Errorf("uploading the %s recovery kit to %s: %w. Nothing else may be created until the kit is in the bucket: a cluster whose repository password exists only on this laptop is the state this stage removes", kind, key, err)
+	}
+
+	// Verify. What can be verified depends on which half of the fleet key this
+	// process holds, and the report says which it did.
+	uploaded, err := client.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("fetching the uploaded %s recovery kit back from %s to verify it: %w", kind, key, err)
+	}
+	switch {
+	case s.fleetKey != nil:
+		// The first control-plane install: the freshly generated identity is
+		// in hand, so both copies are opened, not merely digested.
+		for _, copyOf := range []struct {
+			what string
+			doc  []byte
+		}{{"local", doc}, {"uploaded", uploaded}} {
+			back, err := recoverykit.Load(copyOf.doc)
+			if err != nil {
+				return nil, fmt.Errorf("the %s copy of the %s recovery kit is unreadable: %w", copyOf.what, kind, err)
+			}
+			opened, err := back.Secrets(s.fleetKey.SecretKeyString())
+			if err != nil {
+				return nil, fmt.Errorf("the %s copy of the %s recovery kit did not open with the fleet key this install generated: %w", copyOf.what, kind, err)
+			}
+			if err := back.FingerprintsMatch(opened); err != nil {
+				return nil, fmt.Errorf("the %s copy of the %s recovery kit: %w", copyOf.what, kind, err)
+			}
+		}
+		s.Logf("  %s recovery kit %s: decrypted from both the local and the uploaded copy", kind, artifactID)
+	default:
+		if got, want := recoverykit.Digest(uploaded), recoverykit.Digest(doc); got != want {
+			return nil, fmt.Errorf("the uploaded %s recovery kit at %s is not the one written (uploaded %s, local %s). This install holds only the public recipient, so it cannot open the kit; it can only prove the upload is intact", kind, key, got, want)
+		}
+		s.Logf("  %s recovery kit %s: uploaded and digest-verified against the local copy (this install holds only the public recipient, so it did not — and must not claim to — decrypt it)", kind, artifactID)
+	}
+
+	// The recovery set: the plaintext manifest a recovery selects a kit and a
+	// backup by. Only a completed upload is eligible, so it is written after
+	// the verification above.
+	set, err := recoverykit.NewSet(kit, s.versions(), recoverykit.Digest(doc), now)
+	if err != nil {
+		return nil, err
+	}
+	set.Complete = true
+	setDoc, err := set.Document()
+	if err != nil {
+		return nil, err
+	}
+	if err := client.Put(ctx, recoverykit.SetKey(scope, pathSegment, kind, artifactID), setDoc); err != nil {
+		return nil, fmt.Errorf("writing the %s recovery set: %w", kind, err)
+	}
+	return kit, nil
+}
+
+func writeLocalKit(path string, doc []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("creating the recovery-kit directory: %w", err)
+	}
+	if err := os.WriteFile(path, doc, 0o600); err != nil {
+		return fmt.Errorf("writing the recovery kit to %s: %w", path, err)
+	}
+	return nil
+}
+
+// recoveryKitInPlace returns the kit this cluster's backups must be opened by:
+// the one this run wrote, or — on a resume, which skips the kit stage — the
+// newest one written locally for this cluster.
+func (s *Session) recoveryKitInPlace() (*recoverykit.Kit, error) {
+	if s.kit != nil {
+		return s.kit, nil
+	}
+	if s.Jnl.ClusterID == "" {
+		return nil, errors.New("no cluster id is recorded")
+	}
+	kit, err := recoverykit.NewestLocal(s.Jnl.ClusterID, recoverykit.KindCluster)
+	if err != nil {
+		return nil, err
+	}
+	return kit, nil
+}
+
+// versions is the exact set of versions a recovery of this cluster needs, from
+// the manifest that installed it.
+func (s *Session) versions() map[string]string {
+	versions := map[string]string{"bundle": s.Bundle.Bundle}
+	for _, key := range []string{"velero", "k3s"} {
+		if v, err := s.Bundle.Core.Version(key); err == nil {
+			versions[key] = v
+		}
+	}
+	return versions
 }
 
 // stageDay2 places system-upgrade-controller and kured.
@@ -637,6 +1004,45 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
+	// The instance's identity comes first, because everything the fleet keeps
+	// off a host is bound to it: the immutable instance id, and the PUBLIC
+	// recipient of the fleet recovery key.
+	//
+	// On the first install there is nothing recorded, so this process mints
+	// the fleet recovery identity. Its private half NEVER leaves this process:
+	// it is not written to the host, not to the journal, not to a log line and
+	// not to the install Record, which deliberately has no field one fits
+	// into. It is printed once, after the recipient is durably recorded, so a
+	// run that fails before that leaves no stale key in an operator's notes.
+	//
+	// Every later install holds only the recipient it reads back here.
+	inst, _, err := controlplane.EnsureInstance(ctx, server, s.Opts.FleetRecipient)
+	if errors.Is(err, controlplane.ErrNoInstance) {
+		key, keyErr := recoverykit.GenerateFleetKey()
+		if keyErr != nil {
+			return keyErr
+		}
+		var created bool
+		inst, created, err = controlplane.EnsureInstance(ctx, server, key.Recipient())
+		if err != nil {
+			return err
+		}
+		s.fleetKey = key
+		if created {
+			s.Logf(""+
+				"  fleet recovery key — the only copy that will ever exist:\n"+
+				"\n"+
+				"    %s\n"+
+				"\n"+
+				"  Write it down and keep at least two offline copies apart from each other. It is not\n"+
+				"  stored on this machine, on any host, or in the control plane: losing every copy means\n"+
+				"  no recovery kit ever opens, and nothing can recreate it. Every kit and every\n"+
+				"  checkpoint is encrypted to this key's public half.", key.SecretKeyString())
+		}
+	} else if err != nil {
+		return err
+	}
+	s.instanceID = inst.ID
 	sec, _, err := controlplane.EnsureSecrets(ctx, server)
 	if err != nil {
 		return err
@@ -658,6 +1064,15 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	ca, err := controlplane.PlatformCA(ctx, server)
 	if err != nil {
 		return err
+	}
+	// The control plane's own key material, held in this process only until
+	// the kit stage can seal it. A CLUSTER kit must never carry any of it, so
+	// it is kept apart from everything else the session holds and is never
+	// journalled.
+	s.cpMaterial = map[string]string{
+		recoverykit.KeyEncryptionKey:  sec.EncryptionKey,
+		recoverykit.KeyAgentJWTSecret: sec.JWTSecret,
+		recoverykit.KeyControlPlaneCA: string(ca),
 	}
 
 	// The backend is a ClusterIP that only the node can route to, so the CLI
@@ -706,6 +1121,12 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	cfg.ControlPlaneCA = string(ca)
 	cfg.UserEmail = s.Opts.AdminEmail
 	cfg.Token = "" // no legacy password JWT lives in config.json any more
+	// This instance's identity, stored exactly as the control-plane URL and CA
+	// are, so every later install on this machine encrypts each kit to the
+	// fleet's recipient without being told it — and without ever being asked
+	// for the private key, which this machine does not have.
+	cfg.InstanceID = inst.ID
+	cfg.FleetRecipient = inst.FleetRecipient
 	if err := config.Save(cfg); err != nil {
 		return err
 	}
@@ -846,6 +1267,99 @@ func stageProfiles(ctx context.Context, s *Session) error {
 // The ownership value is not bookkeeping — it is what uninstall reads to
 // decide whether it may remove a volume group, which is the difference
 // between a clean teardown and destroying a customer's data.
+//
+// sshNodeInfo is the part of a node's connection the record stage reads: the
+// resolved endpoint (the SSH user and port actually in use, which may come
+// from ssh_config rather than a flag) and the SHA-256 of the host key the
+// handshake negotiated. It is declared before stageRecord only because Go
+// reads top to bottom; the stage is below.
+//
+// An interface rather than a concrete type because the runner is what a test
+// fakes: a fake has neither, and the entry then records what was observed —
+// which is nothing — instead of inventing a port.
+type sshNodeInfo interface {
+	Endpoint() *sshx.Endpoint
+	HostKeyFingerprint() string
+}
+
+// hostInventory is the record's host list: one entry per node this install
+// opened a connection to.
+//
+// The host ID is minted here, at the one moment a host enters the cluster's
+// inventory. The Node UID is read back from the CLUSTER rather than derived
+// from the address: the node object knows itself by its hostname and internal
+// IP, and a UID that is guessed is worse than one that is absent, because a
+// later operation uses it to tell a rebuilt node from the node it recorded.
+func (s *Session) hostInventory(ctx context.Context, ownership storage.Ownership) ([]api.HostRecord, error) {
+	servers := s.NodesWithRole(RoleServer)
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no server node, so the address the cluster's nodes joined through is unknown")
+	}
+	joinAddress := serverURL(servers[0].Address)
+
+	uids := map[string]string{}
+	if byAddress, err := k3s.NodeUIDsByAddress(ctx, servers[0].Runner); err != nil {
+		// The install has already succeeded on the machines; a kubectl read
+		// that fails here must not fail the install, the same way a failed
+		// install-stage report must not (see ReportInstallStage). An entry
+		// with no Node UID is the honest "not read", and the first node
+		// operation that needs one reads it from the cluster it is about to
+		// act on anyway.
+		s.Logf("  warning: the cluster's Node UIDs could not be read (%v); the inventory records the hosts without them", err)
+	} else {
+		uids = byAddress
+	}
+
+	// The storage stage records the device in the journal and this stage runs
+	// after it; the flag is the same value for a run that has not reached that
+	// stage yet.
+	device := s.Record.Device
+	if device == "" {
+		device = s.Opts.StorageDevice
+	}
+
+	hosts := make([]api.HostRecord, 0, len(s.Nodes))
+	for _, n := range s.Nodes {
+		port, user, fingerprint := 22, s.Opts.SSHUser, ""
+		if info, ok := n.Runner.(sshNodeInfo); ok {
+			fingerprint = info.HostKeyFingerprint()
+			if ep := info.Endpoint(); ep != nil {
+				if ep.Port != 0 {
+					port = ep.Port
+				}
+				if user == "" {
+					user = ep.User
+				}
+			}
+		}
+		entry, err := node.Entry{
+			Role:                 node.Role(n.Role),
+			SSHAddress:           n.Address,
+			SSHPort:              port,
+			SSHUser:              user,
+			HostKeyFingerprint:   fingerprint,
+			JoinAddress:          joinAddress,
+			NodeUID:              uids[n.Address],
+			StorageDevice:        device,
+			VolumeGroupOwnership: string(ownership),
+			LifecycleState:       node.StateActive,
+		}.Record()
+		if err != nil {
+			return nil, fmt.Errorf("recording host %s: %w", n.Address, err)
+		}
+		hosts = append(hosts, entry)
+	}
+	return hosts, nil
+}
+
+// stageRecord writes the cluster's record: what was installed, which
+// profiles, which tier, who owns the volume groups — and, since kn-t50,
+// WHICH MACHINES this cluster is.
+//
+// The host list is what makes a node verb possible from a laptop other than
+// the one that ran the install, so it is written by the stage that already
+// knows every host it just touched rather than by a later command that would
+// have to be told.
 func stageRecord(ctx context.Context, s *Session) error {
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to record against")
@@ -858,12 +1372,27 @@ func stageRecord(ctx context.Context, s *Session) error {
 	if profiles == nil {
 		profiles = []string{}
 	}
+	// The revision this write carries is the one the record is at NOW, read
+	// here rather than assumed to be 0. The write is a compare-and-swap: a
+	// body carrying a stale revision is refused (409) by design, and an
+	// install that failed at its last stage over a number nobody typed would
+	// be the wrong way to learn that someone else has moved the inventory.
+	current, err := s.API.BundleRecord(ctx, s.Jnl.ClusterID)
+	if err != nil {
+		return fmt.Errorf("reading the cluster's record, which this stage's write is based on: %w", err)
+	}
+	hosts, err := s.hostInventory(ctx, ownership)
+	if err != nil {
+		return err
+	}
 	return s.API.PutBundleRecord(ctx, s.Jnl.ClusterID, api.BundleRecord{
 		BundleVersion:        s.Opts.Bundle,
 		Profiles:             profiles,
 		HATier:               s.Opts.HATier,
 		VolumeGroupOwnership: string(ownership),
 		InstallJournal:       terminalEntries(s.Jnl),
+		Hosts:                hosts,
+		Revision:             current.Revision,
 	})
 }
 

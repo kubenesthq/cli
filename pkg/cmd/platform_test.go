@@ -101,7 +101,8 @@ func TestPlatformInstallHelpListsExactlyItsFlagSurface(t *testing.T) {
 
 	want := map[string]bool{
 		"admin-email": true, "agent": true, "backup-target": true, "bundle": true,
-		"control-plane": true, "domain": true, "ha": true, "help": true, "name": true,
+		"control-plane": true, "domain": true, "fleet-recipient": true, "ha": true,
+		"help": true, "instance-id": true, "name": true,
 		"org": true, "profile": true, "server": true, "ssh-key": true, "ssh-user": true,
 		"storage-device": true,
 	}

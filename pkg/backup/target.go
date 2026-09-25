@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/s3"
 )
 
 // TargetSecretName is the Secret holding the target's credentials, in the
@@ -59,6 +62,16 @@ type Target struct {
 
 	AccessKeyID     string
 	SecretAccessKey string
+
+	// Client is the S3 client the scope check and the pre-flight read use. It
+	// is built from this same struct's coordinates and credentials (S3Client),
+	// and it is nil in the code paths that only render the cluster's own
+	// configuration, where no bucket is reachable.
+	//
+	// It is a field rather than a parameter because Configure is the point at
+	// which the cluster starts depending on the target, and the scope check
+	// must happen before the first `kubectl apply`, not beside it.
+	Client Bucket
 }
 
 // Validate checks shape only; whether the credentials actually open the
@@ -215,7 +228,224 @@ func storageLocationProbe(r k3s.Runner) converge.Probe {
 	}
 }
 
+// ControlPlanePrefix is the bucket prefix the control plane's OWN scoped
+// principal writes under — a separate principal from every cluster's. Its
+// contents are the fleet recovery material and every cluster's recovery sets,
+// so a cluster credential that can reach it is a fleet-wide compromise rather
+// than one tenant's problem. VerifyScope refuses such a credential, by name,
+// before anything depends on the target.
+const ControlPlanePrefix = "control-plane/"
+
+// ScopeCheckProbe is the object this check writes, inside the cluster's own
+// prefix, to prove the credential can write, read and list there. It is
+// overwritten on every run rather than accumulated.
+const ScopeCheckProbe = "scope-check.json"
+
+// siblingProbe is a directory beside this cluster's own that belongs to no
+// one. It exists only so the check can ask a credential to read OUTSIDE its
+// prefix without needing another cluster's name: a policy scoped to this
+// cluster's prefix refuses it, and a policy scoped to the bucket does not.
+const siblingProbe = "kubenest-scope-check-sibling"
+
+// Bucket is the slice of pkg/s3 the target's scope check and pre-flight read
+// use. *s3.Client satisfies it. It is an interface so these two checks can be
+// driven by an httptest endpoint without dragging in the rest of pkg/s3, and
+// so the k3s-side code paths that render the cluster's own configuration need
+// no bucket at all.
+type Bucket interface {
+	Put(ctx context.Context, key string, body []byte) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	List(ctx context.Context, prefix string) (keys []string, truncated bool, err error)
+	BucketEncryption(ctx context.Context) (s3.Protection, error)
+	BucketVersioning(ctx context.Context) (s3.Versioning, error)
+}
+
+// S3Client builds the SigV4 client this target's coordinates and credentials
+// describe. Endpoint scheme, path-style addressing and the AWS detection are
+// the same ones the BackupStorageLocation is rendered with, so the CLI probes
+// exactly the store Velero will talk to.
+func (t Target) S3Client() (*s3.Client, error) {
+	return s3.New(s3.Config{
+		Endpoint:        t.Endpoint,
+		Bucket:          t.Bucket,
+		Region:          t.Region,
+		AccessKeyID:     t.AccessKeyID,
+		SecretAccessKey: t.SecretAccessKey,
+	})
+}
+
+// ownPrefix is the cluster-level directory this cluster's objects live under,
+// without surrounding slashes.
+func (t Target) ownPrefix() string { return strings.Trim(t.Prefix, "/") }
+
+// foreignPrefixes are the prefixes this cluster's credential must be REFUSED
+// on: the control plane's, and a directory beside this cluster's own that
+// belongs to no one.
+func (t Target) foreignPrefixes() []string {
+	// path.Join cleans away the "." that path.Dir yields for a top-level
+	// prefix, so the sibling is always a clean directory name — the same
+	// string a policy author writes, and the same one the signature covers.
+	sibling := path.Join(path.Dir(t.ownPrefix()), siblingProbe)
+	return []string{ControlPlanePrefix, sibling + "/"}
+}
+
+// VerifyScope proves the credential can do its job inside this cluster's own
+// prefix and CANNOT do it anywhere else.
+//
+// This is the check that stops one leaked backup credential from being
+// fleet-wide read access. Read access to a cluster's backups is cluster-admin
+// on that cluster — the resource archives hold workload Secrets in plaintext —
+// and the control-plane prefix holds the fleet recovery material. So: write,
+// read and list the cluster's own prefix must all succeed, and the same
+// operations outside it must be REFUSED (AccessDenied). "Refused" is the
+// distinction that matters: a credential that reaches another prefix and finds
+// no key there has still reached it, so an absent object is a failure of the
+// check, not a pass.
+//
+// The refusal names the exact operation that succeeded, because that is what
+// the customer has to change in the policy.
+func (t Target) VerifyScope(ctx context.Context, probe Bucket) error {
+	if probe == nil {
+		return errors.New("the credential scope check needs an S3 client")
+	}
+	own := t.ownPrefix()
+	if own == "" {
+		return fmt.Errorf("--prefix is required to scope a backup credential: with none, this cluster's prefix is the bucket root, the control plane's %q prefix is inside it, and no policy can grant one without the other. Set --prefix (for example --prefix clusters/<cluster-name>) and grant the credential write, read and list on <bucket>/%s/* only", ControlPlanePrefix, "clusters/<cluster-name>")
+	}
+
+	probeKey := path.Join(own, ScopeCheckProbe)
+	body := []byte(fmt.Sprintf("{\"written_by\":\"kubenest backup set-target\",\"scope\":%q,\"at\":%q}\n", own, time.Now().UTC().Format(time.RFC3339)))
+	if err := probe.Put(ctx, probeKey, body); err != nil {
+		return fmt.Errorf("the backup credential cannot write its own prefix %q (PutObject %s): grant it write on <bucket>/%s/*: %w", own, probeKey, own, err)
+	}
+	got, err := probe.Get(ctx, probeKey)
+	if err != nil {
+		return fmt.Errorf("the backup credential cannot read back what it just wrote (%s, GetObject %s): Velero must be able to read its own backups: %w", own, probeKey, err)
+	}
+	if !bytes.Equal(got, body) {
+		return fmt.Errorf("the object read back from %s is not the one written: the store or the credential is doing something other than what this check assumes", probeKey)
+	}
+	if _, _, err := probe.List(ctx, own+"/"); err != nil {
+		return fmt.Errorf("the backup credential cannot list its own prefix %q (ListObjectsV2 %s/): Velero must be able to list its own backups: %w", own, own, err)
+	}
+
+	for _, foreign := range t.foreignPrefixes() {
+		if _, _, err := probe.List(ctx, foreign); err == nil {
+			return outsideRefusal(t, "ListObjectsV2", foreign, err)
+		} else if !errors.Is(err, s3.ErrAccessDenied) {
+			return outsideRefusal(t, "ListObjectsV2", foreign, err)
+		}
+		key := path.Join(foreign, ScopeCheckProbe)
+		if _, err := probe.Get(ctx, key); err == nil {
+			return outsideRefusal(t, "GetObject", key, err)
+		} else if !errors.Is(err, s3.ErrAccessDenied) {
+			return outsideRefusal(t, "GetObject", key, err)
+		}
+	}
+	return nil
+}
+
+// outsideRefusal is the refusal a credential outside its prefix gets, naming
+// the operation that succeeded and the policy the customer must apply. The CLI
+// cannot create storage credentials; the policy text is the docs' (T4.10) and
+// this names only what has to change.
+func outsideRefusal(t Target, op, where string, err error) error {
+	reached := "it returned a result"
+	if err != nil {
+		reached = "it returned " + err.Error() + "; a refusal is AccessDenied, and anything else means the credential reached outside its prefix"
+	}
+	return fmt.Errorf(
+		"the backup credential for cluster prefix %q can read outside its own prefix: %s %s succeeded — %s. Refused: a credential that can reach %q or a sibling cluster's prefix is read access to every cluster's backups (and to the fleet's recovery material). Apply a policy granting this credential s3:GetObject, s3:PutObject and s3:ListBucket on <bucket>/%s/* only, and nothing on any other prefix",
+		t.ownPrefix(), op, where, reached, ControlPlanePrefix, t.ownPrefix())
+}
+
+// Preflight reports what an operator should know about the bucket before
+// anything depends on the target: whether it has default server-side
+// encryption, and whether versioning is on.
+//
+// It WARNS and never refuses. An unknown Crest storage choice must not block an
+// install, and a store that does not answer the protection API at all is a
+// fact to state rather than a reason to stop — the same reason
+// Unconfigured is a report and not an error.
+func (t Target) Preflight(ctx context.Context, probe Bucket) []string {
+	if probe == nil {
+		return nil
+	}
+	var warnings []string
+	protection, err := probe.BucketEncryption(ctx)
+	switch {
+	case err != nil:
+		warnings = append(warnings, fmt.Sprintf("could not read the bucket's default-encryption configuration (%v): if the store encrypts at rest by default that is fine, but nothing here has confirmed it", err))
+	case protection.Algorithm == "":
+		warnings = append(warnings, fmt.Sprintf("bucket %q has no default server-side encryption: objects are stored exactly as they were uploaded, so whether the backups are encrypted at rest is the store's global setting and not this bucket's policy. Set a default encryption on bucket %q, or record in writing that the store encrypts at rest", t.Bucket, t.Bucket))
+	}
+
+	versioning, err := probe.BucketVersioning(ctx)
+	switch {
+	case err != nil:
+		warnings = append(warnings, fmt.Sprintf("could not read the bucket's versioning state (%v): nothing here has confirmed that an overwritten or deleted backup is recoverable", err))
+	case versioning.Status != "Enabled":
+		status := versioning.Status
+		if status == "" {
+			status = "never configured"
+		}
+		warnings = append(warnings, fmt.Sprintf("bucket %q versioning is off (%s): a backup that is overwritten or deleted cannot be recovered from the store, and neither can a mistaken bulk delete. Velero's retention relies on the store keeping what it wrote", t.Bucket, status))
+	}
+	return warnings
+}
+
+// ParseTarget reads the s3://<bucket>[/<prefix>]?endpoint=<host>&region=<region>
+// form that `--backup-target` and `--target` use.
+//
+// It carries only non-secret coordinates; the credential is passed in by the
+// caller, from the environment, because a credential on a command line lands in
+// shell history, in `ps`, and in the install transcript someone pastes into a
+// support ticket.
+func ParseTarget(raw, accessKeyID, secretAccessKey string) (Target, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "s3" || u.Host == "" {
+		return Target{}, fmt.Errorf(
+			"%q is not an S3 target: use s3://<bucket>[/<prefix>]?endpoint=<host>&region=<region> (credentials come from KUBENEST_BACKUP_ACCESS_KEY_ID and KUBENEST_BACKUP_SECRET_ACCESS_KEY, never from a flag)", raw)
+	}
+	query := u.Query()
+	target := Target{
+		Bucket:          u.Host,
+		Prefix:          strings.Trim(u.Path, "/"),
+		Endpoint:        query.Get("endpoint"),
+		Region:          query.Get("region"),
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+	}
+	if target.AccessKeyID == "" || target.SecretAccessKey == "" {
+		return Target{}, fmt.Errorf(
+			"an S3 target was given but no credentials are in the environment: set KUBENEST_BACKUP_ACCESS_KEY_ID and KUBENEST_BACKUP_SECRET_ACCESS_KEY (or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)")
+	}
+	if err := target.Validate(); err != nil {
+		return Target{}, err
+	}
+	// The client the scope check and the pre-flight read use. Building it here
+	// means every path that can configure or inspect a target has one, so the
+	// scope check is never silently skipped.
+	client, err := target.S3Client()
+	if err != nil {
+		return Target{}, err
+	}
+	target.Client = client
+	return target, nil
+}
+
+// TargetURL renders a target's coordinates back into the s3:// form, so a
+// command that has one can be told about another without the operator
+// retyping it.
+func TargetURL(t Target) string {
+	query := url.Values{}
+	query.Set("endpoint", t.Endpoint)
+	query.Set("region", t.Region)
+	return "s3://" + t.Bucket + "/" + strings.Trim(t.Prefix, "/") + "?" + query.Encode()
+}
+
 // Configure points the cluster at a backup target and proves it works:
+
 // credentials Secret, BackupStorageLocation, convergence until Velero
 // validates the location Available, then the default workload Schedule from
 // the manifest. Idempotent — re-running with the same or a corrected target
@@ -223,6 +453,20 @@ func storageLocationProbe(r k3s.Runner) converge.Probe {
 func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t Target, rep converge.Reporter) error {
 	if err := t.Validate(); err != nil {
 		return err
+	}
+	// Before anything depends on the target: prove the credential is scoped to
+	// this cluster's own prefix. It is deliberately first — a refusal here
+	// leaves the cluster exactly as it was, whereas discovering it after the
+	// credentials Secret is applied would leave a credential on the host that
+	// reaches the control plane.
+	//
+	// Nil means a caller that only renders the cluster's own configuration
+	// (the k3s-side tests); the installer and `backup set-target` always build
+	// it, which is asserted where they do.
+	if t.Client != nil {
+		if err := t.VerifyScope(ctx, t.Client); err != nil {
+			return err
+		}
 	}
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {

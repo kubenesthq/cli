@@ -29,6 +29,20 @@ type Config struct {
 	// management cluster can reach the API it just installed.
 	ControlPlaneCA string `json:"control_plane_ca,omitempty"`
 
+	// FleetRecipient is the PUBLIC age recipient of this instance's fleet
+	// recovery key, and InstanceID is the instance's immutable id. They are
+	// written by the --control-plane install and read by every later install,
+	// exactly as ControlPlaneURL and ControlPlaneCA are: a later cluster
+	// encrypts its recovery kit to the recipient without ever being asked for
+	// the private key, which lives in the operator's offline copy and nowhere
+	// on this machine.
+	//
+	// Neither is a secret — the recipient is public by design — but they are
+	// not to be regenerated: a kit sealed to a different recipient is a kit
+	// the fleet key cannot open.
+	FleetRecipient string `json:"fleet_recipient,omitempty"`
+	InstanceID     string `json:"instance_id,omitempty"`
+
 	// LegacyAPIURL is read (never written) so a config written by the
 	// pre-platform CLI still logs in against the same control plane.
 	LegacyAPIURL string `json:"api_url,omitempty"`

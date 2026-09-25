@@ -225,14 +225,30 @@ func keyFileAuth(path string, passphrase func() ([]byte, error)) (ssh.AuthMethod
 type Client struct {
 	Endpoint *Endpoint
 	conn     *ssh.Client
+	// hostKey is the key the handshake actually negotiated, captured so the
+	// inventory can record its fingerprint (kn-t50). The callback sees it and
+	// then it is gone; the host key is how a later operation proves it is
+	// talking to the machine it recorded.
+	hostKey ssh.PublicKey
 }
 
 // Dial connects to the resolved endpoint, verifying the host key with
 // accept-new semantics against known_hosts (see hostkey.go).
 func Dial(ctx context.Context, ep *Endpoint, opts Options) (*Client, error) {
-	hostKey, err := hostKeyCallback(opts.KnownHostsPath)
+	check, err := hostKeyCallback(opts.KnownHostsPath)
 	if err != nil {
 		return nil, err
+	}
+	// The verification is unchanged; this only observes the key it approved.
+	// A callback that accepted a key and kept nothing would leave the
+	// inventory unable to record which machine this is.
+	var negotiated ssh.PublicKey
+	hostKey := func(hostport string, remote net.Addr, key ssh.PublicKey) error {
+		if err := check(hostport, remote, key); err != nil {
+			return err
+		}
+		negotiated = key
+		return nil
 	}
 
 	timeout := opts.DialTimeout
@@ -258,7 +274,22 @@ func Dial(ctx context.Context, ep *Endpoint, opts Options) (*Client, error) {
 		raw.Close()
 		return nil, fmt.Errorf("SSH to %s@%s (credentials tried: %v): %w", ep.User, addr, ep.AuthSources, err)
 	}
-	return &Client{Endpoint: ep, conn: ssh.NewClient(c, chans, reqs)}, nil
+	return &Client{Endpoint: ep, conn: ssh.NewClient(c, chans, reqs), hostKey: negotiated}, nil
+}
+
+// HostKeyFingerprint is the SHA-256 fingerprint of the host key this
+// connection negotiated, in OpenSSH's "SHA256:<base64>" form — the same
+// string `ssh-keygen -lf` prints. Empty when the handshake completed without
+// the callback observing a key (which does not happen against a real host).
+//
+// It is NOT a secret: a fingerprint identifies a public key and cannot be
+// used to impersonate one. It is recorded so a later operation can refuse a
+// host that presents a different key.
+func (c *Client) HostKeyFingerprint() string {
+	if c == nil || c.hostKey == nil {
+		return ""
+	}
+	return ssh.FingerprintSHA256(c.hostKey)
 }
 
 // Result is the outcome of one remote command.

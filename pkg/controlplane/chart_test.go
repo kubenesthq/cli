@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -286,5 +287,239 @@ func helmIgnore(t *testing.T, ignoreFile string) func(rel string) bool {
 			}
 		}
 		return false
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What the control-plane chart must say (kn-t47).
+//
+// These read the chart SOURCE (kubenest-helm/kubenest), like the drift test
+// above, and assert on the rendered STRUCTURE — the YAML objects the templates
+// describe — rather than on the template text, so a change that keeps the
+// words and drops the object fails here.
+//
+// The templates are Go templates, not YAML: helper actions become a quoted
+// placeholder and whole-line control-flow actions are dropped before parsing.
+// That is enough to read the objects, and it is why these tests skip when the
+// sibling checkout is absent instead of guessing at an archive.
+// ---------------------------------------------------------------------------
+
+// siblingChartRoot is where kubenest-helm is checked out beside this repo.
+func siblingChartRoot(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join("..", "..", "..", "kubenest-helm", "kubenest")
+	if _, err := os.Stat(filepath.Join(root, "Chart.yaml")); err != nil {
+		t.Skipf("kubenest-helm is not checked out beside this repo, so the chart's objects cannot be read here: %v", err)
+	}
+	return root
+}
+
+// chartObjects parses one template's documents. An action on a line of its own
+// is control flow (an if/with guard) and carries no object, so it is dropped;
+// an action inside a value becomes a placeholder string.
+func chartObjects(t *testing.T, root, name string) []map[string]any {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(root, "templates", name))
+	if err != nil {
+		t.Fatalf("reading templates/%s: %v", name, err)
+	}
+	var kept []string
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "{{") && strings.HasSuffix(trimmed, "}}") && strings.Count(trimmed, "{{") == 1 {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	// A bare scalar, not a quoted one: an action inside quotes (`image: "{{ ... }}"`)
+	// would otherwise end as two adjacent scalars and the document would not parse.
+	rendered := actionPattern.ReplaceAllString(strings.Join(kept, "\n"), "__RENDERED__")
+
+	var objects []map[string]any
+	decoder := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var doc map[string]any
+		err := decoder.Decode(&doc)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("templates/%s does not parse once its template actions are placeholders: %v", name, err)
+		}
+		if len(doc) > 0 {
+			objects = append(objects, doc)
+		}
+	}
+	if len(objects) == 0 {
+		t.Fatalf("templates/%s described no objects at all, so nothing below was checked", name)
+	}
+	return objects
+}
+
+var actionPattern = regexp.MustCompile(`(?s)\{\{-?.*?-?\}\}`)
+
+func objectOfKind(t *testing.T, objects []map[string]any, kind string) map[string]any {
+	t.Helper()
+	for _, object := range objects {
+		if object["kind"] == kind {
+			return object
+		}
+	}
+	t.Fatalf("no %s in the template", kind)
+	return nil
+}
+
+// dig walks a parsed object to a nested key, failing the test when it is absent.
+func dig(t *testing.T, object map[string]any, path ...string) any {
+	t.Helper()
+	var current any = object
+	for _, key := range path {
+		mapping, ok := current.(map[string]any)
+		if !ok {
+			t.Fatalf("%s is not a mapping on the way to %v", key, path)
+		}
+		current, ok = mapping[key]
+		if !ok {
+			t.Fatalf("%v is missing on the way to %v", key, path)
+		}
+	}
+	return current
+}
+
+func containerNamed(t *testing.T, podSpec map[string]any, key, name string) map[string]any {
+	t.Helper()
+	list, ok := podSpec[key].([]any)
+	if !ok {
+		return nil
+	}
+	for _, entry := range list {
+		container, ok := entry.(map[string]any)
+		if ok && container["name"] == name {
+			return container
+		}
+	}
+	return nil
+}
+
+func envOf(t *testing.T, container map[string]any, name string) map[string]any {
+	t.Helper()
+	list, _ := container["env"].([]any)
+	for _, entry := range list {
+		variable, ok := entry.(map[string]any)
+		if ok && variable["name"] == name {
+			return variable
+		}
+	}
+	return nil
+}
+
+// A migration is a step, not a side effect of a pod starting, and two versions
+// must never serve at once.
+func TestBackendDeploymentHasNoMigrateInitContainerAndUsesRecreate(t *testing.T) {
+	objects := chartObjects(t, siblingChartRoot(t), "backend-deployment.yaml")
+	deployment := objectOfKind(t, objects, "Deployment")
+
+	if strategy := dig(t, deployment, "spec", "strategy", "type"); strategy != "Recreate" {
+		t.Errorf("spec.strategy.type = %v, want Recreate: the schema is migrated by a Job, so an old pod must never serve beside a migrated database", strategy)
+	}
+
+	podSpec := dig(t, deployment, "spec", "template", "spec").(map[string]any)
+	if container := containerNamed(t, podSpec, "initContainers", "migrate"); container != nil {
+		t.Errorf("the backend still runs the migrate initContainer: %v", container)
+	}
+	// And nothing else sneaks `alembic upgrade head` into the pod either.
+	for _, key := range []string{"initContainers", "containers"} {
+		list, _ := podSpec[key].([]any)
+		for _, entry := range list {
+			container, _ := entry.(map[string]any)
+			if command, ok := container["command"].([]any); ok {
+				for _, part := range command {
+					if text, ok := part.(string); ok && strings.Contains(text, "alembic") {
+						t.Errorf("container %v runs %q: the migration is a recorded Job, not a container", container["name"], text)
+					}
+				}
+			}
+		}
+	}
+
+	// The pod carries the agent key, and it is a different Secret key from the
+	// one SECRET_KEY comes from.
+	backend := containerNamed(t, podSpec, "containers", "backend")
+	if backend == nil {
+		t.Fatal("no backend container")
+	}
+	agent := envOf(t, backend, "AGENT_JWT_SECRET")
+	if agent == nil {
+		t.Fatal("the backend container has no AGENT_JWT_SECRET env")
+	}
+	ref := dig(t, agent, "valueFrom", "secretKeyRef").(map[string]any)
+	if ref["key"] != "agent-jwt-secret" {
+		t.Errorf("AGENT_JWT_SECRET comes from Secret key %v, want agent-jwt-secret", ref["key"])
+	}
+}
+
+func TestHubReadsAgentJWTSecretAndNoJWTSecret(t *testing.T) {
+	objects := chartObjects(t, siblingChartRoot(t), "hub-deployment.yaml")
+	deployment := objectOfKind(t, objects, "Deployment")
+
+	podSpec := dig(t, deployment, "spec", "template", "spec").(map[string]any)
+	hub := containerNamed(t, podSpec, "containers", "hub")
+	if hub == nil {
+		t.Fatal("no hub container")
+	}
+
+	if stale := envOf(t, hub, "JWT_SECRET"); stale != nil {
+		t.Errorf("the hub still reads JWT_SECRET (%v): it must not be given the key that signs user sessions", stale)
+	}
+	agent := envOf(t, hub, "AGENT_JWT_SECRET")
+	if agent == nil {
+		t.Fatal("the hub has no AGENT_JWT_SECRET env, so it cannot verify an agent token")
+	}
+	ref := dig(t, agent, "valueFrom", "secretKeyRef").(map[string]any)
+	if ref["key"] != "agent-jwt-secret" {
+		t.Errorf("the hub reads AGENT_JWT_SECRET from Secret key %v, want agent-jwt-secret", ref["key"])
+	}
+}
+
+// The control plane's certificate is issued by its OWN CA, and the CA, the
+// Issuer and the Certificate name the same objects.
+func TestGatewayCertificateUsesTheControlPlaneIssuer(t *testing.T) {
+	root := siblingChartRoot(t)
+
+	certificate := objectOfKind(t, chartObjects(t, root, "gateway.yaml"), "Certificate")
+	issuerRef := dig(t, certificate, "spec", "issuerRef").(map[string]any)
+	if issuerRef["kind"] != "Issuer" {
+		t.Errorf("the Certificate is issued by a %v: a ClusterIssuer is the host cluster's identity, and a control plane restored onto another cluster would be distrusted", issuerRef["kind"])
+	}
+	// A template action renders as a placeholder; what matters is that the
+	// issuer is named by the chart and that the Issuer object exists under the
+	// same name. Both come from the same helper-free expression, so compare the
+	// rendered name through the objects themselves.
+	name, _ := issuerRef["name"].(string)
+	if name == "" {
+		t.Fatal("the Certificate names no issuer")
+	}
+
+	objects := chartObjects(t, root, "issuer.yaml")
+	secret := objectOfKind(t, objects, "Secret")
+	issuer := objectOfKind(t, objects, "Issuer")
+
+	if secret["type"] != "kubernetes.io/tls" {
+		t.Errorf("the CA Secret is of type %v, want kubernetes.io/tls", secret["type"])
+	}
+	caSecretName := dig(t, issuer, "spec", "ca", "secretName")
+	if caSecretName != secret["metadata"].(map[string]any)["name"] {
+		t.Errorf("the Issuer signs from Secret %v but the chart creates %v", caSecretName, secret["metadata"].(map[string]any)["name"])
+	}
+	if issuer["metadata"].(map[string]any)["name"] != name {
+		t.Errorf("the Certificate names issuer %v but the chart creates %v", name, issuer["metadata"].(map[string]any)["name"])
+	}
+	// The CA's key is part of the recovery set: a CA without it cannot renew
+	// the control plane's certificate after a restore.
+	data := dig(t, secret, "stringData").(map[string]any)
+	for _, key := range []string{"tls.crt", "tls.key"} {
+		if _, ok := data[key]; !ok {
+			t.Errorf("the CA Secret carries no %s", key)
+		}
 	}
 }

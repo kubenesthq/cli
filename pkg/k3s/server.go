@@ -2,6 +2,8 @@ package k3s
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -29,13 +31,36 @@ import (
 //	                        state either way — observed for real on the
 //	                        2026-08-20 lab host, where k3s went in without
 //	                        the flag.
-var serverFlags = []string{"--cluster-init", "--disable", "traefik", "--disable", "local-storage"}
+//	--secrets-encryption    encrypts Secrets at rest in the embedded etcd
+//	                        datastore, with a key k3s generates and keeps on
+//	                        first start. A datastore snapshot is a copy of
+//	                        that datastore, and every snapshot this platform
+//	                        ships lands in the customer's own bucket —
+//	                        without the flag it carries every Kubernetes
+//	                        Secret in plaintext, the bucket credentials it was
+//	                        uploaded with among them. That is exactly the
+//	                        state bundle 1.2 removes, and unlike the other
+//	                        three the flag is cluster-wide: it is set by the
+//	                        etcd members, so an agent must never carry it and
+//	                        the upgrade path must never backfill it (F19 —
+//	                        see ServerFlags).
+var serverFlags = []string{"--cluster-init", "--disable", "traefik", "--disable", "local-storage", "--secrets-encryption"}
 
 // ServerFlags returns the canonical flag set. Exported so a test can assert on
 // it rather than on a string literal it copied.
+//
+// --secrets-encryption is deliberately NOT part of InstallAgent: an agent is
+// not a server, and the flag is cluster-wide from the etcd members, so a
+// worker has nothing to encrypt and nothing to configure. It must also never
+// be introduced into the upgrade path: 1.1 clusters are not backfilled (F19),
+// and enabling it on an existing datastore without a recovery kit produces
+// exactly the unprotected-snapshot state this bundle removes — a flag that
+// appears to protect data while the old snapshots in the bucket stay
+// readable.
 func ServerFlags() []string { return append([]string(nil), serverFlags...) }
 
-// tokenFile is where a joining node's cluster token lives. Root-only, and
+// tokenFile is where a node's cluster token lives — staged by every server
+// install, the first included, not only by a joiner. Root-only, and
 // PERMANENT — see below.
 //
 // The token never travels on a command line, because a command line is
@@ -67,19 +92,39 @@ type ServerOptions struct {
 	// JoinURL is empty for the first server, which initialises the etcd
 	// cluster, and https://<first-server>:6443 for the second and third.
 	JoinURL string
-	// Token is the cluster token, required when joining. It is written to a
-	// root-only file on the target and passed as --token-file.
+	// Token is the cluster token. It is written to a root-only file on the
+	// target and passed as --token-file.
+	//
+	// Required when joining. On the FIRST server it is what the install plan
+	// generates once and derives every join from; left empty, InstallServer
+	// generates one with GenerateToken, because a server that is the cluster's
+	// token source must have a token before k3s starts — reading it back
+	// afterwards (NodeToken) is a read path, not a way to create one.
 	Token string
 }
 
 // InstallServer installs k3s at the bundle's pinned version on a control-plane
 // node and waits for it to be Ready.
 //
+// The cluster token is staged on EVERY server, the first included. The first
+// server is where the token is born — k3s writes one to
+// /var/lib/rancher/k3s/server/node-token only once it has started — so
+// without a token up front the credential exists nowhere until the first
+// server is up, and the node that owns the datastore has nothing to
+// authenticate the rest of the cluster with. Minting it here (GenerateToken
+// when the caller has none; the install plan's one token otherwise) and
+// passing --token-file gives the first server the same shape as a joining
+// one, and the file persists because k3s bakes the flag into the systemd
+// unit.
+//
 // Idempotent: a node already running the pinned version is left alone, which
-// is what makes a resumed install converge rather than reinstall. A node
-// running a DIFFERENT version is an error, not an upgrade — moving between
-// k3s versions is bundle upgrade orchestration (kn-fuo), and doing it
-// silently inside an install would be the least safe possible way to do it.
+// is what makes a resumed install converge rather than reinstall. That early
+// return is also why no token is generated or written for it — a resumed
+// install must not rotate a cluster's credential, and a node already at the
+// pinned version is already a member. A node running a DIFFERENT version is
+// an error, not an upgrade — moving between k3s versions is bundle upgrade
+// orchestration (kn-fuo), and doing it silently inside an install would be
+// the least safe possible way to do it.
 func InstallServer(ctx context.Context, r Runner, bundle *manifest.Manifest, opts ServerOptions, rep converge.Reporter) error {
 	version, err := bundle.Core.Version("k3s")
 	if err != nil {
@@ -99,15 +144,26 @@ func InstallServer(ctx context.Context, r Runner, bundle *manifest.Manifest, opt
 	}
 
 	args := append([]string{"server"}, serverFlags...)
+	token := opts.Token
 	if opts.JoinURL != "" {
-		if opts.Token == "" {
+		if token == "" {
 			return fmt.Errorf("joining %s needs the cluster token", opts.JoinURL)
 		}
-		if err := writeTokenFile(ctx, r, opts.Token); err != nil {
+		args = append(args, "--server", opts.JoinURL)
+	} else if token == "" {
+		generated, err := GenerateToken()
+		if err != nil {
 			return err
 		}
-		args = append(args, "--server", opts.JoinURL, "--token-file", tokenFile)
+		token = generated
 	}
+	// Same staging and same flag for the first server and for a joiner: the
+	// token travels over STDIN, never in the command string, and the file is
+	// PERMANENT (k3s re-reads it on every start of the service).
+	if err := writeTokenFile(ctx, r, token); err != nil {
+		return err
+	}
+	args = append(args, "--token-file", tokenFile)
 
 	if err := runInstaller(ctx, r, version, args); err != nil {
 		return err
@@ -178,9 +234,53 @@ func installedVersion(ctx context.Context, r Runner, binary string) (bool, strin
 	return true, out, nil
 }
 
+// GenerateToken mints a cluster token in k3s's own shape:
+//
+//	K10<40 lowercase hex>::server:<40 lowercase hex>
+//
+// The two halves are independent random draws, so two servers installed from
+// one plan cannot collide and a token read off one node is not a prefix of
+// another's.
+//
+// This is why the install path mints a token instead of reading one back
+// (NodeToken): the first server's token is created by k3s only while it
+// starts, so a cluster whose first node has no token staged has no
+// credential to join with until that node is up — and the joining servers
+// need it before their own k3s starts. Generating it up front, from
+// crypto/rand, is what makes the very first server's --token-file possible
+// and the whole cluster's token a single value the install plan derives
+// every join from.
+//
+// crypto/rand, not math/rand: this value is a credential. It must never be
+// predictable from a sequence of other tokens, and it must never be zero —
+// on a rand failure the caller gets an error, because a server started with
+// an empty or guessed token is a cluster anyone can join.
+func GenerateToken() (string, error) {
+	lower, err := tokenHex(20)
+	if err != nil {
+		return "", err
+	}
+	upper, err := tokenHex(20)
+	if err != nil {
+		return "", err
+	}
+	return "K10" + lower + "::server:" + upper, nil
+}
+
+// tokenHex returns n random bytes as 2n lowercase hex characters.
+func tokenHex(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("minting the cluster token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 // NodeToken reads the cluster token from an installed server. It is a
 // credential: it is returned for immediate use joining other nodes and must
-// not be journalled, logged or printed.
+// not be journalled, logged or printed. It is now the READ path only — for
+// clusters installed before this change and for `node add` against them; the
+// install path generates the token with GenerateToken.
 func NodeToken(ctx context.Context, r Runner) (string, error) {
 	res, err := r.Run(ctx, "sudo -n cat /var/lib/rancher/k3s/server/node-token")
 	if err != nil {
@@ -264,6 +364,62 @@ type nodeList struct {
 			} `json:"conditions"`
 		} `json:"status"`
 	} `json:"items"`
+}
+
+// nodeInventory is the slice of `kubectl get nodes -o json` the inventory
+// read needs: the Node's UID and every address the cluster knows it by.
+type nodeInventory struct {
+	Items []struct {
+		Metadata struct {
+			Name string `json:"name"`
+			UID  string `json:"uid"`
+		} `json:"metadata"`
+		Status struct {
+			Addresses []struct {
+				Type    string `json:"type"`
+				Address string `json:"address"`
+			} `json:"addresses"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+// NodeUIDsByAddress maps every address the cluster knows a node by to that
+// node's metadata.uid (kn-t50).
+//
+// By ADDRESS, and by all of them, because the two sides name a machine
+// differently: the installer has the address the operator typed (or the one
+// its ssh connection resolved to), and the Node object has its hostname plus
+// whatever InternalIP/ExternalIP the kubelet registered. Matching on one name
+// would leave the other hosts' UIDs empty, which reads as "the node does not
+// exist yet" about a node that does.
+//
+// The UID, not the name, is what an inventory entry records: a rebuilt host
+// can come back with the same hostname and is a different Node object, and a
+// node operation has to be able to tell that apart.
+func NodeUIDsByAddress(ctx context.Context, r Runner) (map[string]string, error) {
+	out, err := Kubectl(ctx, r, "get nodes -o json")
+	if err != nil {
+		return nil, err
+	}
+	var nodes nodeInventory
+	if err := json.Unmarshal([]byte(out), &nodes); err != nil {
+		return nil, fmt.Errorf("parsing `kubectl get nodes -o json`: %w", err)
+	}
+	byAddress := make(map[string]string, len(nodes.Items))
+	for _, n := range nodes.Items {
+		if n.Metadata.UID == "" {
+			continue
+		}
+		if n.Metadata.Name != "" {
+			byAddress[n.Metadata.Name] = n.Metadata.UID
+		}
+		for _, a := range n.Status.Addresses {
+			if a.Address != "" {
+				byAddress[a.Address] = n.Metadata.UID
+			}
+		}
+	}
+	return byAddress, nil
 }
 
 // nodesReadyProbe observes how many nodes are Ready, naming the first that is
