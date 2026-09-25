@@ -277,13 +277,16 @@ type MaintenanceWindow struct {
 	Timezone string   `json:"timezone"`
 }
 
-// The three states a stored window is in, as the control plane reports them,
+// The four states a stored window is in, as the control plane reports them,
 // and as the command surface prints them. They are distinct values and are
-// never collapsed (kn-t31): `stored` is written to the control plane,
-// `applying` has been handed to the cluster and not yet acknowledged, and
-// `active` has been acknowledged at the current revision. A window that is
-// stored but not yet active is NOT in force.
+// never collapsed (kn-t31): `none` means no window has ever been written,
+// `stored` is written to the control plane, `applying` has been handed to the
+// cluster and not yet acknowledged, and `active` has been acknowledged at the
+// current revision. A window that is stored but not yet active is NOT in force,
+// and `none` is not `stored` — a cluster with no window must not have to be
+// recognised by its null field (kn-nqj.1).
 const (
+	WindowStateNone     = "none"
 	WindowStateStored   = "stored"
 	WindowStateApplying = "applying"
 	WindowStateActive   = "active"
@@ -368,10 +371,10 @@ func (c *Client) PutMaintenanceWindow(ctx context.Context, clusterID string, w M
 // Scope: clusters:read.
 //
 // A cluster with no window answers 200 with a nil Window, a nil Revision and
-// state "stored". A control plane too old to serve the route answers 404,
-// which is an ERROR and not a nil record: an unroutable read is a failed read,
-// and a failed read that looked like "no window" would also be a failed read
-// that looked like permission.
+// state "none". A control plane too old to serve the route answers 404, which
+// is an ERROR and not a nil record: an unroutable read is a failed read, and a
+// failed read that looked like "no window" would also be a failed read that
+// looked like permission.
 func (c *Client) MaintenanceWindow(ctx context.Context, clusterID string) (MaintenanceWindowRecord, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/maintenance-window"), nil)

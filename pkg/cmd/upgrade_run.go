@@ -371,6 +371,14 @@ func printWindowStates(out io.Writer, cluster string, record api.MaintenanceWind
 		fmt.Fprintf(out, "  stored:   %s written to the control plane\n", window)
 	}
 
+	// `none` is its own state (kn-nqj.1), printed rather than inferred: the
+	// control plane used to report a cluster with no window as `stored`, which
+	// is the same word it uses for a window that IS written, so the only way to
+	// tell them apart was the null field.
+	if record.State == api.WindowStateNone {
+		fmt.Fprintf(out, "  none:     no window has ever been written for this cluster; set one with `kubenest cluster set-window`\n")
+	}
+
 	if record.State == api.WindowStateApplying {
 		fmt.Fprintf(out, "  applying: revision %s has been handed to the cluster and not acknowledged yet\n", revision)
 	} else {
