@@ -2,14 +2,18 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -298,7 +302,9 @@ func TestConfigureFailsWithTheStoresReason(t *testing.T) {
 
 func TestTakeBackupReportsATerminalFailureImmediately(t *testing.T) {
 	r := &fakeRunner{Respond: scripted(map[string]string{
-		"get backup": `{"status":{"phase":"Failed","failureReason":"bucket vanished"}}`,
+		"get backup":                 `{"metadata":{"uid":"uid-manual-x"},"status":{"phase":"Failed","failureReason":"bucket vanished"}}`,
+		"get namespaces":             `{"items":[]}`,
+		"get persistentvolumeclaims": `{"items":[]}`,
 	})}
 	err := TakeBackup(context.Background(), r, testManifest(), "manual-x", nil)
 	if err == nil {
@@ -311,11 +317,242 @@ func TestTakeBackupReportsATerminalFailureImmediately(t *testing.T) {
 
 func TestTakeBackupPassesOnCompleted(t *testing.T) {
 	r := &fakeRunner{Respond: scripted(map[string]string{
-		"get backup": `{"status":{"phase":"Completed"}}`,
+		"get backup":                 `{"metadata":{"uid":"uid-manual-x"},"status":{"phase":"Completed"}}`,
+		"get namespaces":             `{"items":[]}`,
+		"get persistentvolumeclaims": `{"items":[]}`,
 	})}
 	if err := TakeBackup(context.Background(), r, testManifest(), "manual-x", nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// coverageFixture is the cluster state the coverage record is read from: two
+// workload namespaces, one of them with a claim, one claim in an excluded
+// namespace, and one claim created after the capture started.
+func coverageFixture() map[string]string {
+	return map[string]string{
+		"get backup": `{"metadata":{"uid":"uid-manual-x"},` +
+			`"status":{"phase":"Completed","startTimestamp":"2026-09-25T02:00:05Z"}}`,
+		"get namespaces": `{"items":[` +
+			`{"metadata":{"name":"payments","uid":"ns-payments"}},` +
+			`{"metadata":{"name":"storefront","uid":"ns-storefront"}},` +
+			`{"metadata":{"name":"velero","uid":"ns-velero"}},` +
+			`{"metadata":{"name":"kube-system","uid":"ns-kube-system"}}]}`,
+		"get persistentvolumeclaims": `{"items":[` +
+			`{"metadata":{"namespace":"payments","name":"data","uid":"pvc-data","creationTimestamp":"2026-09-25T01:00:00Z"}},` +
+			`{"metadata":{"namespace":"velero","name":"scratch","uid":"pvc-scratch","creationTimestamp":"2026-09-25T01:00:00Z"}},` +
+			`{"metadata":{"namespace":"payments","name":"late","uid":"pvc-late","creationTimestamp":"2026-09-25T02:30:00Z"}}]}`,
+	}
+}
+
+// recordedCoverage runs one TakeBackup against the fixture answers and returns
+// the runner it drove plus the decoded coverage.json the CLI wrote.
+func recordedCoverage(t *testing.T, name string, answers map[string]string) (*fakeRunner, []appliedDoc, map[string]any) {
+	t.Helper()
+	r := &fakeRunner{Respond: scripted(answers)}
+	if err := TakeBackup(context.Background(), r, testManifest(), name, nil); err != nil {
+		t.Fatalf("TakeBackup: %v", err)
+	}
+	created := createdDocs(r)
+	if len(created) != 1 {
+		t.Fatalf("documents created = %d, want exactly the one coverage record", len(created))
+	}
+	var cm struct {
+		Metadata struct {
+			Name            string            `yaml:"name"`
+			Namespace       string            `yaml:"namespace"`
+			Labels          map[string]string `yaml:"labels"`
+			OwnerReferences []struct {
+				APIVersion string `yaml:"apiVersion"`
+				Kind       string `yaml:"kind"`
+				Name       string `yaml:"name"`
+				UID        string `yaml:"uid"`
+			} `yaml:"ownerReferences"`
+		} `yaml:"metadata"`
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal([]byte(created[0].Doc), &cm); err != nil {
+		t.Fatalf("the coverage record is not a readable document: %v", err)
+	}
+	if cm.Metadata.Name != CoverageRecordName(name) || cm.Metadata.Namespace != Namespace {
+		t.Errorf("record object = %s/%s, want %s/%s",
+			cm.Metadata.Namespace, cm.Metadata.Name, Namespace, CoverageRecordName(name))
+	}
+	if cm.Metadata.Labels[coverageLabelKey] != coverageLabel ||
+		cm.Metadata.Labels["app.kubernetes.io/managed-by"] != coverageManagedBy {
+		t.Errorf("record labels = %v, want the KubeNest coverage record labels", cm.Metadata.Labels)
+	}
+	if len(cm.Metadata.OwnerReferences) != 1 {
+		t.Fatalf("ownerReferences = %v, want exactly the Backup that owns the record", cm.Metadata.OwnerReferences)
+	}
+	owner := cm.Metadata.OwnerReferences[0]
+	if owner.APIVersion != "velero.io/v1" || owner.Kind != "Backup" || owner.Name != name || owner.UID != "uid-"+name {
+		t.Errorf("ownerReference = %+v, want velero.io/v1 Backup %s uid-%s: Velero's TTL must collect the record with the backup",
+			owner, name, name)
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(cm.Data[coverageRecordKey]), &record); err != nil {
+		t.Fatalf("coverage.json is not JSON: %v (%q)", err, cm.Data[coverageRecordKey])
+	}
+	return r, created, record
+}
+
+// The record is the expected set, written while the backup is starting: the set
+// of namespaces and claims the backup must cover, with the UIDs the cluster
+// gave them.
+func TestTakeBackupRecordsTheExpectedSetBeforeTheBackupSettles(t *testing.T) {
+	r, created, record := recordedCoverage(t, "manual-x", coverageFixture())
+
+	if record["backup"] != "manual-x" || record["recorded_by"] != "cli" {
+		t.Errorf("record backup/recorded_by = %v/%v, want manual-x/cli", record["backup"], record["recorded_by"])
+	}
+	if _, err := time.Parse(time.RFC3339, record["recorded_at"].(string)); err != nil {
+		t.Errorf("recorded_at = %v, want RFC3339: %v", record["recorded_at"], err)
+	}
+	if record["capture_started_at"] != "2026-09-25T02:00:05Z" {
+		t.Errorf("capture_started_at = %v, want the Backup's own status.startTimestamp", record["capture_started_at"])
+	}
+
+	namespaces, ok := record["namespaces"].([]any)
+	if !ok {
+		t.Fatalf("namespaces = %#v, want a list", record["namespaces"])
+	}
+	if len(namespaces) != 2 {
+		t.Fatalf("namespaces = %#v, want payments and storefront only: velero and kube-system are excluded from the backup", namespaces)
+	}
+	payments := namespaces[0].(map[string]any)
+	if payments["name"] != "payments" || payments["uid"] != "ns-payments" {
+		t.Errorf("namespace entry = %v, want the cluster's name and UID", payments)
+	}
+	volumes, ok := payments["volumes"].([]any)
+	if !ok || len(volumes) != 1 {
+		t.Fatalf("payments volumes = %#v, want only data: velero is excluded and `late` was created after the capture started", payments["volumes"])
+	}
+	volume := volumes[0].(map[string]any)
+	if volume["namespace"] != "payments" || volume["name"] != "data" || volume["uid"] != "pvc-data" {
+		t.Errorf("volume entry = %v, want payments/data with the claim's own UID", volume)
+	}
+	storefront := namespaces[1].(map[string]any)
+	if storefront["name"] != "storefront" || storefront["uid"] != "ns-storefront" {
+		t.Errorf("namespace entry = %v, want storefront's name and UID", storefront)
+	}
+	if vols, ok := storefront["volumes"].([]any); !ok || len(vols) != 0 {
+		t.Errorf("storefront volumes = %#v, want an empty list: a claimed namespace with nothing in it is a fact, not a silence",
+			storefront["volumes"])
+	}
+
+	// Before the settle probe can see the backup, never after it: the set is
+	// the one that existed when the capture started.
+	commands := r.Commands()
+	observedAt := -1
+	for i := len(commands) - 1; i >= 0; i-- {
+		if strings.Contains(commands[i], "get backup ") {
+			observedAt = i
+			break
+		}
+	}
+	if observedAt < 0 {
+		t.Fatal("the backup was never observed, so nothing settled")
+	}
+	if created[0].At > observedAt {
+		t.Errorf("the coverage record was created at command %d, after the settle probe observed the backup at %d",
+			created[0].At, observedAt)
+	}
+}
+
+// The record is a cross-repo contract: the operator reads and writes the same
+// JSON with its own struct, so the shape is pinned in kubenest-contracts and
+// compared here field for field, in both directions.
+func TestTheCoverageRecordMatchesTheContractsExample(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "kubenest-contracts", "testdata", "backup-coverage-record.json")
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("kubenest-contracts is not checked out beside this repo, so the record's shape cannot be checked here: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var example map[string]any
+	if err := json.Unmarshal(raw, &example); err != nil {
+		t.Fatalf("%s is not JSON: %v", path, err)
+	}
+
+	_, _, written := recordedCoverage(t, "manual-x", coverageFixture())
+	assertSameShape(t, "coverage", example, written)
+}
+
+// createdDocs returns every document streamed to `kubectl create` and where in
+// the command sequence it happened. The coverage record is created rather than
+// applied so that a second writer fails instead of replacing the set recorded
+// at the start.
+func createdDocs(r *fakeRunner) []appliedDoc {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []appliedDoc
+	for i, c := range r.commands {
+		if strings.Contains(c, "kubectl create") {
+			out = append(out, appliedDoc{At: i, Doc: string(r.inputs[i])})
+		}
+	}
+	return out
+}
+
+// assertSameShape requires the same key set at every path of two decoded JSON
+// documents, recursing through objects and comparing the first element of each
+// list. It fails in both directions: a field the writer stopped emitting and a
+// field the example gained without the writer are both drift.
+func assertSameShape(t *testing.T, path string, want, got any) {
+	t.Helper()
+	switch w := want.(type) {
+	case map[string]any:
+		g, ok := got.(map[string]any)
+		if !ok {
+			t.Errorf("%s: %T in the example, %T in the record", path, want, got)
+			return
+		}
+		if keys := mismatchedKeys(w, g); keys != "" {
+			t.Errorf("%s: %s", path, keys)
+		}
+		for key, value := range w {
+			if other, ok := g[key]; ok {
+				assertSameShape(t, path+"."+key, value, other)
+			}
+		}
+	case []any:
+		g, ok := got.([]any)
+		if !ok {
+			t.Errorf("%s: %T in the example, %T in the record", path, want, got)
+			return
+		}
+		if len(w) == 0 || len(g) == 0 {
+			return
+		}
+		assertSameShape(t, path+"[]", w[0], g[0])
+	default:
+		if (want == nil) != (got == nil) {
+			t.Errorf("%s: null in one and %v in the other", path, got)
+		}
+	}
+}
+
+func mismatchedKeys(want, got map[string]any) string {
+	var missing, extra []string
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	for key := range got {
+		if _, ok := want[key]; !ok {
+			extra = append(extra, key)
+		}
+	}
+	if len(missing) == 0 && len(extra) == 0 {
+		return ""
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return fmt.Sprintf("keys missing from the record %v, keys the example does not carry %v", missing, extra)
 }
 
 // testBucketName is the bucket every fake endpoint serves.

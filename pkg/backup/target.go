@@ -686,6 +686,12 @@ func TakeBackup(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, na
 	if err := apply(ctx, r, "backup "+name, doc); err != nil {
 		return err
 	}
+	// The expected coverage set is recorded BEFORE the backup settles: it is
+	// enumerated when the backup starts, and a set enumerated after the fact
+	// could add a claim the backup never claimed or drop one it did (kn-t210).
+	if err := recordExpectedCoverage(ctx, r, name); err != nil {
+		return err
+	}
 
 	res, err := converge.Wait(ctx, backupSettledProbe(r, name), converge.Options{
 		Name:     "backup-" + name + "-settled",
