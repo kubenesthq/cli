@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 )
 
@@ -265,6 +266,7 @@ func Lower(
 	valuesYAML string,
 	replicas *int32,
 	apply func(valuesYAML string) error,
+	confirm func() error,
 ) error {
 	values, err := FenceValues(valuesYAML, FenceOptions{Up: false, BackendReplicas: replicas})
 	if err != nil {
@@ -272,6 +274,16 @@ func Lower(
 	}
 	if err := apply(values); err != nil {
 		return fmt.Errorf("restoring the API route: %w", err)
+	}
+	// THE CONFIRMATION IS NOT OPTIONAL IN PRODUCTION, and it is why Lower takes
+	// it: the apply only writes the HelmChart, so the route still names the
+	// fence until helm-controller re-renders it. Deleting the fence before that
+	// leaves api.<domain> pointing at a Service that is gone (hardware,
+	// 2026-09-25). A nil confirm is for a caller with no route to observe.
+	if confirm != nil {
+		if err := confirm(); err != nil {
+			return err
+		}
 	}
 	return DeleteFenceObjects(ctx, r)
 }
@@ -285,6 +297,34 @@ func Lower(
 func Status(ctx context.Context, r k3s.Runner) (FenceReport, error) {
 	report := FenceReport{State: FenceUnknown}
 
+	ref, err := apiRouteBackendRef(ctx, r)
+	if err != nil {
+		return report, err
+	}
+	report.BackendRef = ref
+	switch ref {
+	case FenceService:
+		report.State = FenceUp
+	case backendService:
+		report.State = FenceDown
+	}
+	exists, err := serviceExists(ctx, r, FenceService)
+	if err != nil {
+		return report, err
+	}
+	report.FenceExists = exists
+	return report, nil
+}
+
+// apiRouteBackendRef reads which Service the api.<domain> route points at.
+//
+// IT IS A SEPARATE READ FROM Status because the fence's stages have to WAIT on
+// it: Apply writes the HelmChart, and helm-controller re-renders the route
+// afterwards, so the route is a fact about a different object than the one the
+// apply wrote. A stage that assumed it had switched once the apply returned
+// reported "the fence is up" while api.<domain> still reached the backend
+// (hardware, 2026-09-25).
+func apiRouteBackendRef(ctx context.Context, r k3s.Runner) (string, error) {
 	var route struct {
 		Spec struct {
 			Rules []struct {
@@ -296,29 +336,118 @@ func Status(ctx context.Context, r k3s.Runner) (FenceReport, error) {
 	}
 	out, err := k3s.Kubectl(ctx, r, "get httproute "+apiRouteName+" -n "+Namespace+" -o json")
 	if err != nil {
-		return report, fmt.Errorf("reading the API route %s/%s: %w", Namespace, apiRouteName, err)
+		return "", fmt.Errorf("reading the API route %s/%s: %w", Namespace, apiRouteName, err)
 	}
 	if err := json.Unmarshal([]byte(out), &route); err != nil {
-		return report, fmt.Errorf("reading the API route %s/%s: %w", Namespace, apiRouteName, err)
+		return "", fmt.Errorf("reading the API route %s/%s: %w", Namespace, apiRouteName, err)
 	}
+	ref := ""
 	for _, rule := range route.Spec.Rules {
-		for _, ref := range rule.BackendRefs {
-			report.BackendRef = ref.Name
-			switch ref.Name {
-			case FenceService:
-				report.State = FenceUp
-			case backendService:
-				report.State = FenceDown
-			}
+		for _, backend := range rule.BackendRefs {
+			ref = backend.Name
 		}
 	}
-	exists, err := serviceExists(ctx, r, FenceService)
-	if err != nil {
-		return report, err
-	}
-	report.FenceExists = exists
-	return report, nil
+	return ref, nil
 }
+
+// WaitForRouteBackend converges until the api.<domain> route points at want.
+//
+// THE CALLER MUST WAIT, in both directions: on the way in so the fence is real
+// before anything changes, and on the way out BEFORE the fence's objects are
+// deleted — a route naming a Service that no longer exists is not a 503, it is
+// a hostname that answers nothing.
+func WaitForRouteBackend(ctx context.Context, r k3s.Runner, want string, deadline, interval time.Duration, rep converge.Reporter) error {
+	object := "httproute/" + apiRouteName + " in " + Namespace
+	probe := func(ctx context.Context) (bool, converge.State, error) {
+		ref, err := apiRouteBackendRef(ctx, r)
+		if err != nil {
+			return false, converge.State{Object: object, Status: "unreadable"}, err
+		}
+		if ref == want {
+			return true, converge.State{Object: object, Status: "points at " + want}, nil
+		}
+		return false, converge.State{
+			Object: object,
+			Status: "points at " + ref + ", not " + want,
+			Detail: "the chart was applied; helm-controller re-renders this route afterwards, and until it does the public API is served by whatever the route names now",
+		}, nil
+	}
+	res, err := converge.Wait(ctx, probe, converge.Options{
+		Name:     fenceRouteCheckName,
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: rep,
+	})
+	if err != nil {
+		return err
+	}
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("%s: the API route did not start pointing at %s: %w", fenceRouteCheckName, want, err)
+	}
+	return nil
+}
+
+// fenceRouteCheckName is what the route wait reports itself as.
+const fenceRouteCheckName = "kubenest-control-plane-fence-route"
+
+// WaitForFenceAvailable converges until the fence's own Deployment serves, so
+// the maintenance answer comes from the fence rather than incidentally from a
+// Service with no endpoints.
+func WaitForFenceAvailable(ctx context.Context, r k3s.Runner, deadline, interval time.Duration, rep converge.Reporter) error {
+	object := "deployment/" + fenceName + " in " + Namespace
+	probe := func(ctx context.Context) (bool, converge.State, error) {
+		var d struct {
+			Metadata struct {
+				Generation int64 `json:"generation"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+			Status struct {
+				ObservedGeneration int64 `json:"observedGeneration"`
+				AvailableReplicas  int32 `json:"availableReplicas"`
+			} `json:"status"`
+		}
+		out, err := k3s.Kubectl(ctx, r, "get deployment/"+fenceName+" -n "+Namespace+" -o json")
+		if err != nil {
+			return false, converge.State{Object: object, Status: "not found yet"}, err
+		}
+		if err := json.Unmarshal([]byte(out), &d); err != nil {
+			return false, converge.State{Object: object, Status: "unparsable"}, err
+		}
+		want := int32(1)
+		if d.Spec.Replicas != nil {
+			want = *d.Spec.Replicas
+		}
+		if d.Metadata.Generation > d.Status.ObservedGeneration {
+			return false, converge.State{Object: object, Status: "the fence pod template is not observed yet"}, nil
+		}
+		if d.Status.AvailableReplicas < want {
+			return false, converge.State{
+				Object: object,
+				Status: fmt.Sprintf("%d/%d available", d.Status.AvailableReplicas, want),
+				Detail: "the fence must answer 503 itself, rather than the route resting on a Service with no endpoints",
+			}, nil
+		}
+		return true, converge.State{Object: object, Status: fmt.Sprintf("%d/%d available", d.Status.AvailableReplicas, want)}, nil
+	}
+	res, err := converge.Wait(ctx, probe, converge.Options{
+		Name:     fenceAvailableCheckName,
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: rep,
+	})
+	if err != nil {
+		return err
+	}
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("%s: the fence never started answering: %w", fenceAvailableCheckName, err)
+	}
+	return nil
+}
+
+// fenceAvailableCheckName is what the fence-readiness wait reports itself as.
+const fenceAvailableCheckName = "kubenest-control-plane-fence-ready"
 
 // DeleteFenceObjects removes the fence's objects after the route has been
 // restored, and its durable manifest with them.

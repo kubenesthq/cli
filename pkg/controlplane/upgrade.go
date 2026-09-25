@@ -157,6 +157,21 @@ type UpgradeOptions struct {
 
 	// Now overrides the clock, for tests.
 	Now func() time.Time
+
+	// PollInterval overrides how often a converge wait re-reads the cluster.
+	// Zero uses converge's own cadence; a test sets a millisecond so a wait is
+	// EXERCISED rather than endured.
+	PollInterval time.Duration
+
+	// WaitDeadline overrides the bundle's `component-ready` timeout for this
+	// procedure's waits. Zero — the only value production ever sets — uses the
+	// manifest's number, which is where every deadline comes from.
+	//
+	// IT EXISTS FOR THE ARM THAT ASSERTS A WAIT FAILS. A test that proves "a
+	// fence whose route never switches is refused" has to let a wait run out,
+	// and doing that against the manifest's real minute makes the whole package
+	// three minutes slower for everyone who runs `go test ./...`.
+	WaitDeadline time.Duration
 }
 
 // UpgradeRecord is what an upgrade must remember across a resume beyond its
@@ -185,13 +200,18 @@ type UpgradeRecord struct {
 
 // UpgradeSession is one control-plane upgrade run.
 type UpgradeSession struct {
-	ID         string
-	Opts       UpgradeOptions
-	Jnl        *stages.Journal
-	Emit       stages.Emitter
-	Fence      FenceReport
-	Record     UpgradeRecord
-	FenceState FenceState
+	ID   string
+	Opts UpgradeOptions
+	// PollInterval is Opts.PollInterval, carried here because every wait reads
+	// it and none of them should have to reach through the options.
+	PollInterval time.Duration
+	// WaitDeadline is Opts.WaitDeadline, for the same reason.
+	WaitDeadline time.Duration
+	Jnl          *stages.Journal
+	Emit         stages.Emitter
+	Fence        FenceReport
+	Record       UpgradeRecord
+	FenceState   FenceState
 
 	// handle and skip come from the operation record — the lock — when the
 	// command took it. Without them every remote action still happens; with
@@ -440,6 +460,17 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	if err := s.apply(ctx, StageFence, values); err != nil {
 		return err
 	}
+	// THE ROUTE IS OBSERVED, NOT ASSUMED. The apply writes the HelmChart and
+	// helm-controller re-renders the route afterwards, so a stage that returned
+	// here reported "the fence is up" while api.<domain> still reached the
+	// backend (hardware, 2026-09-25). The checkpoint and the migration must not
+	// start until the switch has actually happened.
+	if err := s.waitForRoute(ctx, StageFence, FenceService); err != nil {
+		return err
+	}
+	if err := s.waitForFenceReady(ctx, StageFence); err != nil {
+		return err
+	}
 	s.FenceState = FenceUp
 	s.Logf("  the fence is up: %s/%s-api answers 503 and the backend stays up behind the node's tunnel, so the checkpoint can still be taken", Namespace, ReleaseName)
 	return nil
@@ -554,6 +585,18 @@ func stageChart(ctx context.Context, s *UpgradeSession) error {
 	if err != nil {
 		return err
 	}
+	// THE MIGRATION JOB STAYS ENABLED FROM HERE ON. A chart apply that rendered
+	// it off makes helm DELETE the Job the migration stage created: the
+	// operator-visible record of the schema step would be gone after the
+	// upgrade and `kubectl logs job/kubenest-cp-migrate` would have nothing to
+	// read (hardware, 2026-09-25). The Job's pod template depends only on the
+	// backend image, the pull secrets and the PostgreSQL host, user and
+	// database — none of which the later applies change — so keeping it on
+	// cannot hit the immutable-field rule.
+	running, err = MigrationValues(running)
+	if err != nil {
+		return err
+	}
 	revision, err := Apply(ctx, r, running)
 	if err != nil {
 		return err
@@ -580,9 +623,27 @@ func stageValidate(ctx context.Context, s *UpgradeSession) error {
 func stageUnfence(ctx context.Context, s *UpgradeSession) error {
 	r := s.runner(StageUnfence)
 	replicas := s.Record.BackendReplicas
-	if err := Lower(ctx, r, s.Opts.Values, int32Ptr(replicas), func(values string) error {
-		return s.apply(ctx, StageUnfence, values)
-	}); err != nil {
+	if err := Lower(ctx, r, s.Opts.Values, int32Ptr(replicas),
+		func(values string) error {
+			// The migration Job stays enabled here too: see stageChart. This is
+			// the LAST apply of the run, so a Job rendered off here is a Job
+			// helm deletes.
+			withMigration, err := MigrationValues(values)
+			if err != nil {
+				return err
+			}
+			return s.apply(ctx, StageUnfence, withMigration)
+		},
+		func() error {
+			// AND THE FENCE'S OBJECTS OUTLIVE THE APPLY. The route is still the
+			// fence until helm-controller re-renders it; deleting the Service
+			// first leaves api.<domain> naming something that is gone.
+			deadline, err := s.componentReady()
+			if err != nil {
+				return err
+			}
+			return WaitForRouteBackend(ctx, s.runner(StageUnfence), backendService, deadline, s.PollInterval, s.Opts.Reporter)
+		}); err != nil {
 		return err
 	}
 	s.Record.FenceRaised = false
@@ -665,4 +726,39 @@ func actionSpecs(stage, command string) (operation.Spec, bool) {
 		}, true
 	}
 	return operation.Spec{}, false
+}
+
+// waitForRoute converges until the public API route names want.
+//
+// BOTH DIRECTIONS ARE WAITED ON. On the way in, so the fence is real before the
+// checkpoint and the migration start; on the way out (through Lower's confirm),
+// so the fence's objects are not deleted while api.<domain> still names them.
+func (s *UpgradeSession) waitForRoute(ctx context.Context, stage, want string) error {
+	deadline, err := s.componentReady()
+	if err != nil {
+		return err
+	}
+	return WaitForRouteBackend(ctx, s.runner(stage), want, deadline, s.PollInterval, s.Opts.Reporter)
+}
+
+// waitForFenceReady converges until the fence answers 503 itself.
+func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) error {
+	deadline, err := s.componentReady()
+	if err != nil {
+		return err
+	}
+	return WaitForFenceAvailable(ctx, s.runner(stage), deadline, s.PollInterval, s.Opts.Reporter)
+}
+
+// componentReady is the bundle's component-ready deadline. Every wait in this
+// procedure is bounded by something real, and the number comes from the
+// manifest rather than from a default in this binary.
+func (s *UpgradeSession) componentReady() (time.Duration, error) {
+	if s.WaitDeadline > 0 {
+		return s.WaitDeadline, nil
+	}
+	if s.Opts.Bundle == nil {
+		return 0, fmt.Errorf("no target bundle manifest, so this upgrade has no deadlines to obey")
+	}
+	return s.Opts.Bundle.Limits.Timeouts.For("component-ready")
 }

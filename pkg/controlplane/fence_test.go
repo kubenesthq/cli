@@ -168,10 +168,17 @@ func TestLowerRestoresTheBackendRefAndDeletesTheFence(t *testing.T) {
 	replicas := int32(1)
 
 	var applied string
+	var confirmed bool
 	err := Lower(ctx, r, fenceTestValues, &replicas, func(values string) error {
 		applied = values
 		return nil
+	}, func() error {
+		confirmed = true
+		return nil
 	})
+	if !confirmed {
+		t.Fatal("Lower deleted the fence without confirming the route had been restored, so api.<domain> named a Service that was gone")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

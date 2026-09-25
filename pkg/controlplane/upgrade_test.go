@@ -9,6 +9,7 @@ import (
 
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/window"
@@ -40,6 +41,9 @@ type appliedValues struct {
 	imageRepository string
 	imageTag        string
 	imageDigest     string
+	// raw is the applied values document verbatim, for the assertions about the
+	// parts NOT decoded above — the migration Job's pod-template inputs.
+	raw string
 }
 
 // stageRunner is a FakeRunner that answers the reads the fence, checkpoint and
@@ -103,6 +107,15 @@ func newStageRunner(t *testing.T, values string) *stageRunner {
 				return sshx.Result{Stdout: FenceService}, nil
 			}
 			return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+		case strings.Contains(command, "get deployment/"+fenceName):
+			// THE FENCE STAGE WAITS FOR THE FENCE TO SERVE, because the route
+			// switch is only real once helm-controller has re-rendered it and a
+			// fence whose pod never starts is one the data plane answers for
+			// incidentally. A stage now observes it, so the fake must answer.
+			if !s.fenceUp {
+				return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return sshx.Result{Stdout: `{"metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"availableReplicas":1}}`}, nil
 		case strings.Contains(command, backendReplicasCmd):
 			return sshx.Result{Stdout: "1"}, nil
 		case strings.Contains(command, backendDeploymentImageCmd):
@@ -172,7 +185,7 @@ func decodeApplied(t *testing.T, manifest []byte) appliedValues {
 	if err := yaml.Unmarshal([]byte(raw), &values); err != nil {
 		t.Fatalf("the applied values are not valid YAML: %v", err)
 	}
-	out := appliedValues{}
+	out := appliedValues{raw: raw}
 	out.installRevision, _ = values["installRevision"].(string)
 	if fence, ok := values["fence"].(map[string]any); ok {
 		out.fence, _ = fence["enabled"].(bool)
@@ -191,7 +204,7 @@ func decodeApplied(t *testing.T, manifest []byte) appliedValues {
 	return out
 }
 
-func testUpgradeSession(t *testing.T, runner *stageRunner, values string) *UpgradeSession {
+func testUpgradeSession(t *testing.T, runner k3s.Runner, values string) *UpgradeSession {
 	t.Helper()
 	bundle := installBundle(t)
 	s := &UpgradeSession{
@@ -206,6 +219,8 @@ func testUpgradeSession(t *testing.T, runner *stageRunner, values string) *Upgra
 			Reporter: converge.ReporterFunc(func(converge.Event) {}),
 		},
 	}
+	s.PollInterval = s.Opts.PollInterval
+	s.WaitDeadline = s.Opts.WaitDeadline
 	journal, err := openTestJournal(t, s.Opts)
 	if err != nil {
 		t.Fatal(err)
