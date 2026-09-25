@@ -47,14 +47,17 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/controlplane"
@@ -140,6 +143,13 @@ func cpInstallArgs(env cpUpgradeEnv, name string) []string {
 	}
 	if env.storageDevice != "" {
 		args = append(args, "--storage-device", env.storageDevice)
+	}
+	// The upgrade's recovery-point gate refuses a control plane with no
+	// checkpoint, and the checkpoint needs a backup target. The credentials
+	// come from the environment the install already reads
+	// (KUBENEST_BACKUP_* and KUBENEST_CHECKPOINT_*).
+	if target := os.Getenv("KUBENEST_GATE_BACKUP_TARGET"); target != "" {
+		args = append(args, "--backup-target", target)
 	}
 	return args
 }
@@ -296,6 +306,17 @@ func cpInstallPreviousCandidate(t *testing.T, ctx context.Context, env cpUpgrade
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The install that just ran left ITS migration Job, rendered from the chart
+	// this binary embeds. Job.spec.template is immutable, so the previous
+	// candidate's apply would fail trying to patch it to the previous image.
+	// Removing it lets the previous candidate create its own Job at its own
+	// revision, which is the state a real installation of that candidate is in
+	// when an upgrade reaches it: an old revision's Job, and values that still
+	// enable the migration.
+	if _, err := k3s.Kubectl(ctx, server, "delete job "+controlplane.MigrationJobName+" -n "+controlplane.Namespace+
+		" --ignore-not-found --wait=true"); err != nil {
+		t.Fatalf("removing the install's migration Job before the previous candidate is applied: %v", err)
+	}
 	applied, err := controlplane.ApplyArchive(ctx, server, archive, values)
 	if err != nil {
 		t.Fatalf("installing the control plane from the previous candidate %s: %v", env.previousCandidate, err)
@@ -444,7 +465,65 @@ func cpPrepareControlPlane(t *testing.T, ctx context.Context, env cpUpgradeEnv, 
 	if err := controlplane.WaitReady(ctx, server, revision, envBundle(t, ctx, env), convergeReporter(t)); err != nil {
 		t.Fatalf("the previous candidate did not become ready: %v", err)
 	}
+	cpOpenWindowAllWeek(t, ctx, home, name)
 	return values, revision
+}
+
+// cpOpenWindowAllWeek gives the management cluster a window that is open at
+// every minute and waits until it is ACTIVE. The upgrade is a disruptive
+// operation and refuses to start without a window in force (T3.1); this gate
+// is about the upgrade, so its window must never be the reason it cannot run.
+// The client is built from the install's own laptop state in home.
+func cpOpenWindowAllWeek(t *testing.T, ctx context.Context, home, name string) {
+	t.Helper()
+	var config struct {
+		URL string `json:"control_plane_url"`
+		CA  string `json:"control_plane_ca"`
+	}
+	var creds struct {
+		Tokens map[string]struct {
+			Token string `json:"token"`
+		} `json:"tokens"`
+	}
+	var journal struct {
+		ClusterID string `json:"cluster_id"`
+	}
+	for path, into := range map[string]any{
+		filepath.Join(home, ".kubenest", "config.json"):            &config,
+		filepath.Join(home, ".kubenest", "credentials.json"):       &creds,
+		filepath.Join(home, ".kubenest", "journals", name+".json"): &journal,
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading the install's laptop state: %v", err)
+		}
+		if err := json.Unmarshal(raw, into); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+	client, err := api.New(config.URL, api.WithToken(creds.Tokens[config.URL].Token), api.WithCACert([]byte(config.CA)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := client.MaintenanceWindow(ctx, journal.ClusterID)
+	if err != nil {
+		t.Fatalf("reading the management cluster's window: %v", err)
+	}
+	if _, err := client.PutMaintenanceWindow(ctx, journal.ClusterID, api.MaintenanceWindow{
+		Days:     []string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"},
+		Start:    "00:00",
+		End:      "23:59",
+		Timezone: "UTC",
+	}, current.CurrentRevision()); err != nil {
+		t.Fatalf("storing an all-week window: %v", err)
+	}
+	cpWaitFor(t, 5*time.Minute, 5*time.Second, "the all-week window is active", func() (bool, string) {
+		record, err := client.MaintenanceWindow(ctx, journal.ClusterID)
+		if err != nil {
+			return false, err.Error()
+		}
+		return record.State == api.WindowStateActive, record.State
+	})
 }
 
 // cpAssertVersionThroughTheNode reads the deployed backend's identity through
