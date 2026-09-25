@@ -232,6 +232,60 @@ func TestCheckpointCredentialsManifestCarriesThePrincipalsKeys(t *testing.T) {
 	}
 }
 
+// The endpoint the checkpoint containers read MUST be a URL, not the bare
+// host:port the customer typed on the command line.
+//
+// WHAT THIS FOUND ON HARDWARE: the lab control plane's checkpoint Job died with
+// `ValueError: Invalid endpoint: 23.88.125.22.sslip.io` raised by botocore,
+// because this Secret carried the raw `--backup-target` endpoint while
+// pkg/backup treats "no scheme" as https and botocore requires the scheme to be
+// spelled out. The rule is stated once — backup.EndpointURL, which the cluster's
+// own Velero configuration already uses — and this is its second reader, so the
+// two cannot come to different answers about the same store.
+func TestCheckpointCredentialsCarryAnEndpointURLWithAScheme(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		want     string
+	}{
+		{"no scheme means https", "store.example:9000", "https://store.example:9000"},
+		{"a plain https host gets a scheme", "s3.ap-south-1.amazonaws.com", "https://s3.ap-south-1.amazonaws.com"},
+		{"an explicit http endpoint is left alone", "http://minio.velero-e2e.svc:9000", "http://minio.velero-e2e.svc:9000"},
+		{"an explicit https endpoint is left alone", "https://s3.example.com", "https://s3.example.com"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			target := testCheckpointTarget()
+			target.Endpoint = c.endpoint
+			doc, err := target.CredentialsManifest()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parsed struct {
+				StringData map[string]string `yaml:"stringData"`
+			}
+			if err := yaml.Unmarshal(doc, &parsed); err != nil {
+				t.Fatalf("the credentials manifest is not valid YAML: %v", err)
+			}
+			if got := parsed.StringData[keyCheckpointEndpoint]; got != c.want {
+				t.Errorf("AWS_ENDPOINT_URL = %q, want %q — botocore refuses an endpoint without a scheme and the Job dies before it dumps anything", got, c.want)
+			}
+		})
+	}
+
+	// An AWS target has no endpoint at all: the key stays omitted, so the
+	// container's client uses AWS's own default rather than an empty URL.
+	bare := testCheckpointTarget()
+	bare.Endpoint = ""
+	doc, err := bare.CredentialsManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(doc), keyCheckpointEndpoint) {
+		t.Errorf("an AWS target (no endpoint) wrote an AWS_ENDPOINT_URL:\n%s", doc)
+	}
+}
+
 // The install-side half of the same fact: the values document that enables the
 // CronJob carries the four values the chart requires, under the chart's own
 // key names. A rename here is a chart that renders nothing and an install that

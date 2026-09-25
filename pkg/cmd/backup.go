@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"kubenest.io/cli/pkg/backup"
+	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
@@ -55,6 +56,31 @@ func (c *backupConn) validate() error {
 	}
 	if c.BundlePath == "" {
 		return fmt.Errorf("--bundle-manifest is required: schedules, retention and deadlines all come from the bundle manifest, never from defaults in this binary")
+	}
+	return nil
+}
+
+// validateControlPlane is the control-plane run's own required set, and it is
+// deliberately not validate() with a case relaxed.
+//
+// --cluster is REFUSED rather than optional, because the subject of
+// `backup now --control-plane` is not a workload cluster at all: the control
+// plane runs in the management cluster that --server already addresses, and a
+// cluster name would only ever be used to select a workload cluster's backups
+// (and its recovery set). Accepting one and ignoring it would leave an operator
+// believing the command had been scoped to a cluster the run never looked at.
+//
+// What remains is what the run needs: the host to reach and the bundle manifest
+// to bound the wait with.
+func (c *backupConn) validateControlPlane() error {
+	if c.Cluster != "" {
+		return fmt.Errorf("--cluster does not apply to --control-plane: the control plane runs in the management cluster that --server addresses, and this command backs up the control plane rather than a workload cluster's backups. Drop --cluster")
+	}
+	if len(c.Servers) == 0 {
+		return fmt.Errorf("at least one --server is required: it addresses the management cluster the control plane runs in (the cluster record that will resolve it is not built yet)")
+	}
+	if c.BundlePath == "" {
+		return fmt.Errorf("--bundle-manifest is required: the wait for the checkpoint is bounded by the bundle's component-ready timeout, and deadlines come from the bundle manifest, never from defaults in this binary")
 	}
 	return nil
 }
@@ -226,15 +252,30 @@ unconfigured — loud, but never blocking.`,
 }
 
 func newBackupNowCommand() *cobra.Command {
-	var conn backupConn
+	var (
+		conn         backupConn
+		controlPlane bool
+	)
 	cmd := &cobra.Command{
 		Use:   "now",
 		Short: "Take a backup immediately",
 		Long: `Take one workload backup right now, outside the schedule, and wait for it
 to complete — within the bundle manifest's limits.timeouts.backup. A backup
 that settles as anything but Completed is an error naming Velero's reason,
-not a silent log line.`,
+not a silent log line.
+
+With --control-plane the subject is the control plane's OWN recovery point.
+A Job is created from the checkpoint CronJob the control-plane chart installs,
+and the command waits until the checkpoint it produced is ELIGIBLE: the runner
+uploads the sealed dump and its manifest, reads both back, and only then
+publishes the marker, so a Job that finished without a new eligible checkpoint
+is reported as the interrupted run it is rather than as a backup. The wait is
+bounded by the bundle's component-ready timeout, and --cluster does not apply —
+the control plane runs in the management cluster that --server addresses.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if controlPlane {
+				return runControlPlaneNow(cmd, conn)
+			}
 			if err := conn.validate(); err != nil {
 				return err
 			}
@@ -260,7 +301,38 @@ not a silent log line.`,
 		},
 	}
 	conn.register(cmd)
+	cmd.Flags().BoolVar(&controlPlane, "control-plane", false, "back up the control plane itself: create a Job from the chart's checkpoint CronJob and wait until the checkpoint is eligible (no --cluster)")
 	return cmd
+}
+
+// runControlPlaneNow takes one control-plane checkpoint on demand.
+//
+// THE SAME TRANSPORT AS EVERY OTHER BACKUP COMMAND: the Job is created on the
+// management cluster over SSH through the same `k3s kubectl` the install uses,
+// so no kubeconfig and no cluster-admin credential has to exist on the
+// operator's machine.
+//
+// The Job is derived from the chart's CronJob rather than rendered here — see
+// pkg/controlplane.OnDemandCheckpoint — so the image digest, the scratch volume
+// and the fleet recipient are the chart's, and an on-demand checkpoint cannot
+// differ from a scheduled one.
+func runControlPlaneNow(cmd *cobra.Command, conn backupConn) error {
+	if err := conn.validateControlPlane(); err != nil {
+		return err
+	}
+	bundle, client, err := conn.dial(cmd)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	out := cmd.OutOrStdout()
+	run, err := controlplane.OnDemandCheckpoint(cmd.Context(), client, bundle, converge.NewTextReporter(out))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "control-plane checkpoint %s is eligible: job %s, %d bytes sealed at %s\n",
+		run.Checkpoint.Key, run.Job, run.Checkpoint.SizeBytes, run.Checkpoint.At)
+	return nil
 }
 
 // newBackupSkeletonCommand marks the wave-3 half of kn-mzn: the scheduled

@@ -100,13 +100,25 @@ func (t Target) Validate() error {
 	return nil
 }
 
-// s3URL is the endpoint with an explicit scheme (https unless given).
-func (t Target) s3URL() string {
-	if strings.Contains(t.Endpoint, "://") {
-		return t.Endpoint
+// EndpointURL is an S3 endpoint with an explicit scheme: https unless the
+// caller gave one.
+//
+// THE RULE IS STATED ONCE, here, because two consumers act on it and a
+// disagreement between them is a store one of them cannot reach. The cluster's
+// Velero configuration (Target.s3URL) and the control-plane checkpoint
+// Secrets/values (pkg/controlplane) both render the customer's `--endpoint`
+// for a client that may require a URL: botocore raises
+// `ValueError: Invalid endpoint: <host>` for a bare host:port, which on a real
+// host surfaced as a checkpoint Job that died before dumping anything.
+func EndpointURL(endpoint string) string {
+	if strings.Contains(endpoint, "://") {
+		return endpoint
 	}
-	return "https://" + t.Endpoint
+	return "https://" + endpoint
 }
+
+// s3URL is the endpoint with an explicit scheme (https unless given).
+func (t Target) s3URL() string { return EndpointURL(t.Endpoint) }
 
 func (t Target) backupPrefix(kind string) string {
 	return path.Join(strings.Trim(t.Prefix, "/"), kind)

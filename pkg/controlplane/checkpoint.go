@@ -232,11 +232,17 @@ func (t CheckpointTarget) CredentialsManifest() ([]byte, error) {
 	// Omitted when unset, never written empty: the chart marks both optional,
 	// and an empty AWS_ENDPOINT_URL would send the upload at AWS instead of the
 	// store it came from.
+	//
+	// The endpoint travels with its SCHEME. The customer types a host:port on
+	// the command line and this Secret is read by botocore, which refuses an
+	// endpoint without one; the rule (no scheme means https) is
+	// backup.EndpointURL, the same one the cluster's own Velero configuration
+	// uses, so the two readers cannot disagree about where the store is.
 	if t.Region != "" {
 		stringData[keyCheckpointRegion] = t.Region
 	}
 	if t.Endpoint != "" {
-		stringData[keyCheckpointEndpoint] = t.Endpoint
+		stringData[keyCheckpointEndpoint] = backup.EndpointURL(t.Endpoint)
 	}
 	doc := map[string]any{
 		"apiVersion": "v1",
