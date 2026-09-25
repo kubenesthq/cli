@@ -140,6 +140,11 @@ type HelmChart struct {
 	// travels in the HelmChart itself and carries its own version, so
 	// ChartContent excludes Repo, Chart and Version.
 	ChartContent string
+	// FailurePolicy is spec.failurePolicy: what helm-controller does when the
+	// release's install or upgrade fails. Empty leaves the key out, and
+	// helm-controller's default, reinstall, answers a failed upgrade with
+	// `helm uninstall` of the whole release followed by a fresh install.
+	FailurePolicy string
 }
 
 // Manifest renders the HelmChart custom resource. There are two mutually
@@ -180,6 +185,11 @@ func (h HelmChart) Manifest() ([]byte, error) {
 	}
 	if h.ValuesYAML != "" {
 		spec["valuesContent"] = h.ValuesYAML
+	}
+	// Only when set: an unset policy must keep every existing chart's manifest
+	// byte-identical, and helm-controller's own default applies instead.
+	if h.FailurePolicy != "" {
+		spec["failurePolicy"] = h.FailurePolicy
 	}
 	doc := map[string]any{
 		"apiVersion": "helm.cattle.io/v1",

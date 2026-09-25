@@ -172,7 +172,7 @@ func TestInstallAppliesTheEmbeddedChartAndWaitsForTheControlPlane(t *testing.T) 
 		t.Errorf("applied to %v/%v, want kube-system/%s", metadata["namespace"], metadata["name"], ReleaseName)
 	}
 	spec := section(t, doc, "spec")
-	want := []string{"chartContent", "createNamespace", "targetNamespace", "valuesContent"}
+	want := []string{"chartContent", "createNamespace", "failurePolicy", "targetNamespace", "valuesContent"}
 	if got := sortedKeys(spec); !equalStrings(got, want) {
 		t.Errorf("spec keys = %v, want exactly %v: chartContent excludes repo, chart and version", got, want)
 	}
@@ -274,3 +274,46 @@ func TestBackendAddrIsTheServiceClusterIPAndPort(t *testing.T) {
 // Config.ControlPlaneCA — so there is no host-cluster CA to read, and
 // TestEnsureSecretsMintsTheControlPlaneCAOnceAndKeepsIt is where that CA is
 // checked.
+
+// A failed control-plane upgrade must leave the running control plane in
+// place. k3s's helm-controller defaults failurePolicy to reinstall: when the
+// release is failed the next helm-install pod runs `helm uninstall
+// kubenest-cp` and then `helm install`, deleting and recreating every
+// Deployment, Service, ConfigMap, chart-owned Secret, checkpoint CronJob and
+// the Postgres and Redis StatefulSets — with only the PVCs surviving. It
+// happened twice on hardware 2026-09-25, both times after a chart upgrade
+// changed the backend image. With abort the failed release stays in place and
+// the control-plane wait reports the failure.
+func TestControlPlaneHelmChartAbortsOnFailure(t *testing.T) {
+	ctx := context.Background()
+	settings := Settings{Domain: "kn.example.com", AdminEmail: "admin@kn.example.com"}
+	sec := Secrets{JWTSecret: "jwt", EncryptionKey: "enc", PostgresPassword: "pg", AdminPassword: "adm"}
+	values, err := Values(settings, sec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.HasPrefix(command, "sudo -n install -m 0600 ") {
+			return sshx.Result{}, nil
+		}
+		t.Fatalf("unscripted command: %q", command)
+		return sshx.Result{}, nil
+	}}
+	if _, err := Apply(ctx, r, values); err != nil {
+		t.Fatal(err)
+	}
+
+	inputs := r.Inputs()
+	if len(inputs) != 1 {
+		t.Fatalf("streamed %d documents to the host, want the one HelmChart", len(inputs))
+	}
+	var doc struct {
+		Spec map[string]any `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(inputs[0], &doc); err != nil {
+		t.Fatalf("the applied manifest is not valid YAML: %v", err)
+	}
+	if doc.Spec["failurePolicy"] != "abort" {
+		t.Errorf("spec.failurePolicy = %v, want abort: leaving it unset makes helm-controller uninstall and reinstall the whole control plane on a failed upgrade", doc.Spec["failurePolicy"])
+	}
+}

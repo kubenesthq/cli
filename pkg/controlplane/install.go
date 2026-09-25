@@ -60,6 +60,14 @@ func Apply(ctx context.Context, r k3s.Runner, valuesYAML string) (string, error)
 		ChartContent:    base64.StdEncoding.EncodeToString(ChartArchive()),
 		// valuesContent carries the generated secrets, so it is readable by anyone who can read HelmCharts in kube-system — the same cluster-admin audience as the Secret they came from.
 		ValuesYAML: values,
+		// helm-controller's default, reinstall, answers a failed upgrade of
+		// this release with `helm uninstall kubenest-cp` followed by a fresh
+		// install: every Deployment, Service, ConfigMap, chart-owned Secret,
+		// checkpoint CronJob and the Postgres and Redis StatefulSets are
+		// deleted and recreated, with only the PVCs surviving (observed twice
+		// on hardware 2026-09-25). abort leaves the failed release in place so
+		// the control-plane wait reports the failure instead.
+		FailurePolicy: "abort",
 	}
 	doc, err := chart.Manifest()
 	if err != nil {
