@@ -112,6 +112,11 @@ func TestTheRunningPostgresComesFromTheCluster(t *testing.T) {
 		switch {
 		case strings.Contains(command, postgresStatefulSetImageCmd):
 			return sshx.Result{Stdout: "docker.io/bitnami/postgresql@sha256:bbbb"}, nil
+		case strings.Contains(command, postgresVersionCmd):
+			// The server cannot be asked, so the FALLBACK is what this test is
+			// about. When it can be asked, the server's own answer wins — see
+			// TestTheRunningMajorIsReadFromTheRunningServerWhenTheImageIsPinnedByDigest.
+			return sshx.Result{ExitCode: 1, Stderr: "error: unable to upgrade connection"}, nil
 		case strings.Contains(command, "get configmap "+CheckpointStatusConfigMap):
 			return sshx.Result{Stdout: checkpointMarkerJSON(t, checkpointMarker("cp/x.dump", 1))}, nil
 		default:
@@ -143,4 +148,121 @@ func TestTheChartAndTheClusterAgreeingPasses(t *testing.T) {
 	if err := comparePostgres(running, chart); err != nil {
 		t.Errorf("a control plane already running the chart's PostgreSQL was refused: %v", err)
 	}
+}
+
+// THE FIRST UPGRADE OF A FRESHLY INSTALLED CONTROL PLANE MUST NOT BE REFUSED.
+//
+// The chart pins PostgreSQL by DIGEST, so the StatefulSet's reference carries no
+// tag; and the eligible checkpoint does not exist before the first upgrade,
+// because the checkpoint stage runs after the gates. A gate whose only two
+// sources were "the image tag" and "the checkpoint" therefore refused every
+// first upgrade — observed on a fresh host on 2026-09-25.
+//
+// The running SERVER is the third source, and it is the authoritative one: it
+// is asked directly with `postgres --version` inside the running pod.
+func TestTheRunningMajorIsReadFromTheRunningServerWhenTheImageIsPinnedByDigest(t *testing.T) {
+	t.Run("the server answers", func(t *testing.T) {
+		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, postgresStatefulSetImageCmd):
+				return sshx.Result{Stdout: "registry-1.docker.io/bitnami/postgresql@sha256:7d77a46bbf200709237318c27dec0eaeae2520e403dd18fdebde2be7a6b04993"}, nil
+			case strings.Contains(command, postgresVersionCmd):
+				return sshx.Result{Stdout: "postgres (PostgreSQL) 17.6"}, nil
+			case strings.Contains(command, "get configmap "+CheckpointStatusConfigMap):
+				// NO ELIGIBLE CHECKPOINT YET: this is the first upgrade, so the
+				// fallback has nothing to offer and the server has to answer.
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): configmaps "control-plane-checkpoint-status" not found`}, nil
+			default:
+				t.Fatalf("unscripted command: %q", command)
+			}
+			return sshx.Result{}, nil
+		}}
+
+		image, err := RunningPostgresImage(context.Background(), r)
+		if err != nil {
+			t.Fatalf("the running PostgreSQL could not be established from the server itself: %v", err)
+		}
+		if image.major != "17" {
+			t.Fatalf("the running major is %q, want 17 from `postgres --version`", image.major)
+		}
+		if image.repository != "registry-1.docker.io/bitnami/postgresql" {
+			t.Errorf("the distribution is %q, want the running image's repository", image.repository)
+		}
+
+		// And the gate itself: the same chart passes, a different major refuses.
+		same := parsePostgresImage("bitnami/postgresql:17.2.0-debian-12-r0")
+		if err := comparePostgres(image, same); err != nil {
+			t.Errorf("an upgrade onto the PostgreSQL the server already runs was refused: %v", err)
+		}
+		other := parsePostgresImage("bitnami/postgresql:18.1.0-debian-12-r0")
+		if err := comparePostgres(image, other); err == nil {
+			t.Error("an upgrade that would change the PostgreSQL major was accepted once the major came from the server")
+		}
+	})
+
+	t.Run("the server cannot be asked", func(t *testing.T) {
+		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, postgresStatefulSetImageCmd):
+				return sshx.Result{Stdout: "registry-1.docker.io/bitnami/postgresql@sha256:7d77a46b"}, nil
+			case strings.Contains(command, postgresVersionCmd):
+				return sshx.Result{ExitCode: 1, Stderr: "error: unable to upgrade connection"}, nil
+			case strings.Contains(command, "get configmap "+CheckpointStatusConfigMap):
+				return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+			default:
+				t.Fatalf("unscripted command: %q", command)
+			}
+			return sshx.Result{}, nil
+		}}
+		if _, err := RunningPostgresImage(context.Background(), r); err == nil {
+			t.Fatal("a database whose major could not be established from ANY source was accepted: this gate fails closed")
+		}
+	})
+
+	t.Run("the tag still wins when the image carries one", func(t *testing.T) {
+		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, postgresStatefulSetImageCmd):
+				return sshx.Result{Stdout: "docker.io/bitnami/postgresql:17.2.0-debian-12-r0"}, nil
+			default:
+				// The running server is NOT asked when the reference already
+				// names its major: one read, not two.
+				t.Fatalf("the running server was asked although the image carries a tag: %q", command)
+			}
+			return sshx.Result{}, nil
+		}}
+		image, err := RunningPostgresImage(context.Background(), r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if image.major != "17" {
+			t.Errorf("the running major is %q, want 17 from the image tag", image.major)
+		}
+	})
+
+	t.Run("the checkpoint is the last resort", func(t *testing.T) {
+		// The server cannot be asked AND the image carries no tag, but a
+		// checkpoint records the server's own major: that answer is better than
+		// a refusal, and it is what the runner derived from `server_version_num`.
+		r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, postgresStatefulSetImageCmd):
+				return sshx.Result{Stdout: "registry-1.docker.io/bitnami/postgresql@sha256:7d77a46b"}, nil
+			case strings.Contains(command, postgresVersionCmd):
+				return sshx.Result{ExitCode: 1, Stderr: "error: unable to upgrade connection"}, nil
+			case strings.Contains(command, "get configmap "+CheckpointStatusConfigMap):
+				return sshx.Result{Stdout: checkpointMarkerJSON(t, checkpointMarker("cp/x.dump", 1))}, nil
+			default:
+				t.Fatalf("unscripted command: %q", command)
+			}
+			return sshx.Result{}, nil
+		}}
+		image, err := RunningPostgresImage(context.Background(), r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if image.major != "16" {
+			t.Errorf("the running major is %q, want 16 from the checkpoint's postgres_major", image.major)
+		}
+	})
 }

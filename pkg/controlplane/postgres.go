@@ -31,7 +31,19 @@ const (
 	// StatefulSet uses.
 	postgresStatefulSetImageCmd = "get statefulset " + postgresStatefulSet + " -n " + Namespace +
 		" -o jsonpath={.spec.template.spec.containers[0].image}"
+
+	// postgresVersionCmd asks the RUNNING SERVER what it is, inside the pod the
+	// chart created. The container name is the Bitnami subchart's ("postgresql",
+	// kubenest/charts/postgresql/templates/primary/statefulset.yaml) and is
+	// named explicitly, because a StatefulSet with any other container would
+	// otherwise have this read pick the wrong one.
+	postgresVersionCmd = "exec -n " + Namespace + " statefulset/" + postgresStatefulSet +
+		" -c postgresql -- postgres --version"
 )
+
+// postgresVersionLine matches the version `postgres --version` prints:
+// "postgres (PostgreSQL) 17.6" (and "17.6 (Debian ...)" on some builds).
+var postgresVersionLine = regexp.MustCompile(`\((?:PostgreSQL|Debian)[^)]*\)\s*(\d+)`)
 
 // postgresImage is one PostgreSQL image reference, split into the two facts
 // that must not change.
@@ -52,6 +64,30 @@ type postgresImage struct {
 // tagMajor matches the leading major of a Bitnami PostgreSQL tag, which is the
 // PostgreSQL version: "17.2.0-debian-12-r0", "18.1.0".
 var tagMajor = regexp.MustCompile(`^(\d+)`)
+
+// distribution is the part of a repository that names WHICH PostgreSQL this is:
+// the path inside its registry, with the registry host normalised away.
+//
+// THE REFERENCE IS NOT COMPARABLE RAW. The chart declares `bitnami/postgresql`
+// unqualified — deliberately, because the Bitnami subchart prepends its own
+// registry, and qualifying it produced an unpullable
+// registry-1.docker.io/docker.io/... (found on real hardware 2026-09-25) —
+// while the StatefulSet renders `registry-1.docker.io/bitnami/postgresql`.
+// Comparing the two strings would report a change of distribution on every
+// upgrade, which is the same gate never passing from the other direction.
+func (p postgresImage) distribution() string {
+	parts := strings.Split(p.repository, "/")
+	if len(parts) > 1 && (strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") {
+		parts = parts[1:]
+	}
+	repo := strings.Join(parts, "/")
+	// Docker Hub's own aliases, so "docker.io/library/postgres" and
+	// "library/postgres" are the same distribution.
+	for _, alias := range []string{"docker.io/", "index.docker.io/", "registry-1.docker.io/"} {
+		repo = strings.TrimPrefix(repo, alias)
+	}
+	return repo
+}
 
 // parsePostgresImage splits a container image reference.
 //
@@ -190,12 +226,22 @@ func postgresImageFromValues(valuesYAML string) (postgresImage, bool, error) {
 
 // RunningPostgresImage reads the PostgreSQL the control plane runs now.
 //
-// The reference comes from the StatefulSet, and the MAJOR comes from the
-// StatefulSet's tag when it has one and otherwise from the checkpoint the
-// runner published, which derives it from the live server's own
-// `server_version_num`. A digest-pinned reference carries no version, and
-// refusing every control plane because its image is pinned the way this chart
-// pins it would be a gate that never passes.
+// THE MAJOR COMES FROM THE RUNNING SERVER BEFORE ANY FALLBACK, and the order
+// below is the fix for a refusal that hit every FIRST upgrade: this chart pins
+// PostgreSQL by DIGEST, so the StatefulSet's reference carries no tag, and the
+// eligible checkpoint does not exist before the first upgrade because the
+// checkpoint stage runs after the gates (observed on a fresh host, 2026-09-25).
+//
+//	tag         when the reference carries one, which is free and exact;
+//	the SERVER  `postgres --version` in the running pod: the authoritative
+//	            answer, and the only one that is right for a database whose
+//	            image is pinned by digest;
+//	checkpoint  the eligible checkpoint's `postgres_major`, which the runner
+//	            derives from the live server's own `server_version_num`.
+//
+// Still FAILS CLOSED when none of the three answers, because "I could not tell"
+// is not "they are the same" for the gate that stands between an upgrade and
+// the installation's database.
 func RunningPostgresImage(ctx context.Context, r k3s.Runner) (postgresImage, error) {
 	out, err := k3s.Kubectl(ctx, r, postgresStatefulSetImageCmd)
 	if err != nil {
@@ -206,17 +252,39 @@ func RunningPostgresImage(ctx context.Context, r k3s.Runner) (postgresImage, err
 		return postgresImage{}, fmt.Errorf("the PostgreSQL StatefulSet %s/%s names no image, so what this control plane runs cannot be established", Namespace, postgresStatefulSet)
 	}
 	image := parsePostgresImage(ref)
-	if image.major == "" {
-		checkpoint, err := ReadEligibleCheckpoint(ctx, r)
-		if err != nil {
-			return postgresImage{}, err
-		}
-		if checkpoint == nil || checkpoint.PostgresMajor == 0 {
-			return postgresImage{}, fmt.Errorf("the running PostgreSQL image %s is pinned by digest, and no eligible checkpoint records the server's major version, so the database this control plane runs cannot be established — and an upgrade must not proceed without knowing whether it would change the database", ref)
-		}
-		image.major = fmt.Sprintf("%d", checkpoint.PostgresMajor)
+	if image.major != "" {
+		return image, nil
 	}
+	if major := runningPostgresMajorFromServer(ctx, r); major != "" {
+		image.major = major
+		return image, nil
+	}
+	checkpoint, err := ReadEligibleCheckpoint(ctx, r)
+	if err != nil {
+		return postgresImage{}, err
+	}
+	if checkpoint == nil || checkpoint.PostgresMajor == 0 {
+		return postgresImage{}, fmt.Errorf("the running PostgreSQL image %s is pinned by digest, the running server did not report its version (%s), and no eligible checkpoint records it, so the database this control plane runs cannot be established — and an upgrade must not proceed without knowing whether it would change the database", ref, postgresVersionCmd)
+	}
+	image.major = fmt.Sprintf("%d", checkpoint.PostgresMajor)
 	return image, nil
+}
+
+// runningPostgresMajorFromServer asks the running server what it is.
+//
+// A read that cannot answer is NOT an error here: it is the reason the caller
+// has two more sources to try, and the last of them refuses. The failure is
+// reported by whatever the caller does when every source is silent.
+func runningPostgresMajorFromServer(ctx context.Context, r k3s.Runner) string {
+	out, err := k3s.Kubectl(ctx, r, postgresVersionCmd)
+	if err != nil {
+		return ""
+	}
+	match := postgresVersionLine.FindStringSubmatch(out)
+	if match == nil {
+		return ""
+	}
+	return match[1]
 }
 
 // PostgresRefusal is the difference between the two images.
@@ -257,7 +325,7 @@ func CheckPostgresUnchanged(ctx context.Context, r k3s.Runner, valuesYAML string
 func comparePostgres(running, declared postgresImage) error {
 	// The DISTRIBUTION first: the same major from a different builder is a
 	// different database, and a tag would not tell anyone that.
-	if running.repository != declared.repository {
+	if running.distribution() != declared.distribution() {
 		return &PostgresRefusal{
 			Running: running.repository, Declared: declared.repository,
 			Reason: fmt.Sprintf("the chart's PostgreSQL comes from %s and the running one from %s, so this is a change of distribution rather than of version",
