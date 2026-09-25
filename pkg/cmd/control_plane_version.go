@@ -67,6 +67,7 @@ var commandsNeedingTheControlPlane = []string{
 	"login",
 	"platform install",
 	"platform upgrade",
+	"node reboot",
 	"backup",
 }
 

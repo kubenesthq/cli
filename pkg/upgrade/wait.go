@@ -127,7 +127,7 @@ func (s *Session) LockOperation(ctx context.Context) (*operation.Store, *operati
 	}
 	store := &operation.Store{
 		Runner:   server,
-		Operator: operatorName(),
+		Operator: OperatorName(),
 		// The control plane's copy is display and check_upgrade: the record in
 		// the cluster is the lock, and it works while the control plane does
 		// not. A mirror that fails is reported on the handle rather than
@@ -163,10 +163,14 @@ func (s *Session) journalClusterID() string {
 	return s.Jnl.ClusterID
 }
 
-// operatorName names whoever holds a new record, e.g. "ana@laptop". It is what
+// OperatorName names whoever holds a new record, e.g. "ana@laptop". It is what
 // a refused second laptop is told, so it identifies a person and a machine and
 // never a credential.
-func operatorName() string {
+//
+// It is exported because every disruptive verb names its executor in one place:
+// an operator refused by `node reboot` and an operator refused by `platform
+// upgrade` must read the same shape, and two functions would drift.
+func OperatorName() string {
 	user := os.Getenv("USER")
 	if user == "" {
 		user = os.Getenv("USERNAME")
