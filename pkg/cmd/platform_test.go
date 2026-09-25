@@ -482,6 +482,11 @@ func TestSetWindowRefusesAWindowTheCLICannotRepresent(t *testing.T) {
 		{"a day that is not a day", window.Spec{Days: []string{"notaday"}, Start: "02:00", End: "06:00", Timezone: "UTC"}},
 		{"no day at all", window.Spec{Start: "02:00", End: "06:00", Timezone: "UTC"}},
 		{"a time that is not a time", window.Spec{Days: []string{"sat"}, Start: "25:00", End: "06:00", Timezone: "UTC"}},
+		// A crossing window naming fewer than all seven days is read
+		// differently by kured than by this CLI (pkg/window/kured_oracle_test.go),
+		// so set-window must refuse it rather than store a window that means
+		// something else on the cluster than it does here.
+		{"a crossing window that does not name all seven days", window.Spec{Days: []string{"sat"}, Start: "22:00", End: "04:00", Timezone: "UTC"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var out bytes.Buffer

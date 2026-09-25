@@ -41,6 +41,20 @@ leaves the cluster in a worse state than the overrun does.
 The timezone is an IANA name, never an offset: offsets move twice a year, and
 a window that silently shifts by an hour is worse than no window at all.
 
+A window that crosses midnight — an end earlier than its start, the common
+02:00 shape written the other way round — is accepted only when it names all
+seven days. kured opens such a window on every day it lists, while the platform
+opens it on the day it opened, and those two rules agree only for the whole
+week: with fewer days the cluster would reboot outside the window you set.
+set-window refuses any other crossing window and names both ways to write one
+that works (all seven days, or do not cross midnight).
+
+A start or end that falls in the hour your zone skips or repeats when it
+changes its clock (02:00-02:59 in Berlin, for instance) is refused too: such a
+local time does not name one instant, so kured and the platform would disagree
+about when the window is open for an hour twice a year. Set the boundaries
+outside that hour, or use UTC or a zone without daylight saving.
+
 The window has three states and they are reported separately: STORED in the
 control plane, APPLYING to the cluster, and ACTIVE once the operator has
 acknowledged this revision. Only an active window is in force — until then the
@@ -64,7 +78,7 @@ opening; kubenest platform upgrade --wait holds for it.`,
 	fs.StringVar(&cluster, "cluster", "", "cluster to configure (required)")
 	fs.StringSliceVar(&spec.Days, "days", nil, "days the window opens: mon,tue,wed,thu,fri,sat,sun (required)")
 	fs.StringVar(&spec.Start, "start", "", "window start, HH:MM 24-hour (required)")
-	fs.StringVar(&spec.End, "end", "", "window end, HH:MM 24-hour; earlier than start means it crosses midnight (required)")
+	fs.StringVar(&spec.End, "end", "", "window end, HH:MM 24-hour; earlier than start means it crosses midnight, which must name all seven days (required)")
 	fs.StringVar(&spec.Timezone, "timezone", "", "IANA timezone name, e.g. Asia/Kolkata or UTC (required)")
 	return cmd
 }

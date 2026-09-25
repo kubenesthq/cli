@@ -15,7 +15,13 @@
 //	the customer set 02:00-06:00 local, and local is what they meant.
 //
 //	A window whose end is before its start CROSSES MIDNIGHT. 22:00-04:00 is
-//	the common maintenance shape, not an input error.
+//	the common maintenance shape, not an input error — but it is accepted
+//	only when it names ALL SEVEN DAYS. kured opens such a window on every
+//	day it lists, while this package belongs it to the day it OPENED, and
+//	the two answer identically only for the whole week; with fewer days the
+//	cluster would reboot four hours outside the window the operator set. See
+//	crossingRefusal, and pkg/window/kured_oracle_test.go, which puts every
+//	minute of a week to kured's own code.
 package window
 
 import (
@@ -90,6 +96,9 @@ func Parse(spec Spec) (Window, error) {
 	if start == end {
 		return Window{}, fmt.Errorf("a maintenance window that starts and ends at %s is zero minutes long", spec.Start)
 	}
+	if end < start && len(days) != 7 {
+		return Window{}, crossingRefusal(spec.Start, spec.End)
+	}
 
 	if strings.TrimSpace(spec.Timezone) == "" {
 		return Window{}, fmt.Errorf("a maintenance window needs a timezone: an IANA name such as Asia/Kolkata or UTC, never an offset — offsets move twice a year and the window would silently shift with them")
@@ -98,8 +107,133 @@ func Parse(spec Spec) (Window, error) {
 	if err != nil {
 		return Window{}, fmt.Errorf("timezone %q is not an IANA name (Asia/Kolkata, Europe/Berlin, UTC): %w", spec.Timezone, err)
 	}
+	if err := changeoverRefusal(loc, start, end); err != nil {
+		return Window{}, err
+	}
 
 	return Window{Days: days, Start: start, End: end, Location: loc}, nil
+}
+
+// The horizon the clock-change refusal below is asked over, and why it is a
+// CONSTANT rather than time.Now.
+//
+// A local time is not skipped or repeated by itself — it is skipped or repeated
+// on a date, because the zone's changeover falls on one. So "can this window be
+// read on every day of the year" is a question about a horizon of days, and the
+// horizon starts at a fixed date so that Parse is deterministic: the same spec
+// is accepted or refused on every machine, on every run, whatever the wall clock
+// says. That is also what lets the backend's Python apply the same rule to the
+// same days (maintenance_window.DST_SCAN_START_YEAR) and be compared with this
+// one at all.
+//
+// Five years is longer than the horizon any install plans over. WHEN IT STOPS
+// COVERING THE FUTURE, move these two numbers in BOTH languages in one commit,
+// the way internal/kuredoracle's digests move with the bundle's kured pin.
+const (
+	dstScanStartYear = 2026
+	dstScanYears     = 5
+)
+
+// changeoverRefusal refuses a window whose start or end falls in a local hour
+// the zone skips or repeats when it changes its clock.
+//
+// WHY REFUSE RATHER THAN PICK ONE ANSWER. Such a wall clock does not name one
+// instant. This package reads a window as wall-clock minutes, and kured builds
+// the day's boundaries with time.Date, which normalises a skipped time forward
+// and chooses one of the two instants a repeated time names (a choice Go
+// documents as unspecified). Measured against kured 1.23.0 for
+// Europe/Berlin `sun 02:30-05:00`: on 2026-03-29 kured closes the window at
+// 03:00-03:29 CEST while this package keeps it open, and on 2026-10-25 kured is
+// shut at the CEST occurrence of 02:30-02:59 while this package is open — an
+// hour of disagreement twice a year, for a window the operator set in good
+// faith. The same shape the other way round (`sun 01:00-02:30`, end in the
+// skipped hour) has kured OPEN for 03:00-03:29 CEST while this package is shut.
+// So set-window refuses the shape and NAMES BOTH FIXES.
+//
+// NARROW ON PURPOSE: only the window's own two boundaries are asked about. A
+// window that merely CONTAINS the changeover — `sun 01:00-05:00` in Berlin, or
+// the all-seven-days 22:00-04:00 crossing — is accepted, because there the two
+// readings produce the same instants (both boundaries name one instant each and
+// the clock change happens between them).
+func changeoverRefusal(loc *time.Location, start, end int) error {
+	for _, boundary := range []struct {
+		field   string
+		minutes int
+	}{{"start", start}, {"end", end}} {
+		if _, skipped := changeoverDay(loc, boundary.minutes); skipped {
+			return fmt.Errorf(
+				"a maintenance window whose %s %s falls in the hour %s skips or repeats when it changes its clock is refused: that local time does not name one instant, so kured and this platform would disagree about when the window is open, for one hour twice a year. Either choose a start and end outside the zone's changeover hour, or use UTC or a zone without daylight saving",
+				boundary.field, clock(boundary.minutes), loc)
+		}
+	}
+	return nil
+}
+
+// changeoverDay returns the first day in the horizon on which this wall clock is
+// skipped or repeated.
+//
+// Only days on which the zone's offset actually changes are examined in detail:
+// the scan walks one probe a day and looks at the pair of days around each change
+// of offset, which is the only place a wall clock can be skipped or repeated.
+// That keeps Parse's cost at a walk over the horizon rather than a walk over the
+// horizon times two boundaries.
+func changeoverDay(loc *time.Location, minutes int) (time.Time, bool) {
+	from := time.Date(dstScanStartYear, time.January, 1, 12, 0, 0, 0, loc)
+	until := from.AddDate(dstScanYears, 0, 0)
+	previous := from
+	_, previousOffset := previous.Zone()
+
+	for day := from.AddDate(0, 0, 1); day.Before(until); day = day.AddDate(0, 0, 1) {
+		_, offset := day.Zone()
+		if offset != previousOffset {
+			for _, candidate := range [2]time.Time{previous, day} {
+				if localTimeIsSkippedOrRepeated(loc, candidate, minutes) {
+					return candidate, true
+				}
+			}
+			previousOffset = offset
+		}
+		previous = day
+	}
+	return time.Time{}, false
+}
+
+// localTimeIsSkippedOrRepeated reports whether hh:mm on this day in this zone
+// names zero instants (the hour was skipped) or two (it was repeated).
+//
+// It asks every instant that COULD display that wall clock — one per offset the
+// zone uses on that day — which instants those are, and counts how many really
+// do. Zero means the hour is skipped; two means it is repeated; one means the
+// wall clock is ordinary and the two implementations cannot disagree about it.
+func localTimeIsSkippedOrRepeated(loc *time.Location, day time.Time, minutes int) bool {
+	year, month, date := day.Date()
+	hours, mins := minutes/60, minutes%60
+
+	// The offsets in play around this day. A zone moves its clock one transition
+	// at a time, so the days either side of it bracket both offsets.
+	noon := time.Date(year, month, date, 12, 0, 0, 0, loc)
+	offsets := map[int]bool{}
+	for _, probe := range [3]time.Time{noon.Add(-24 * time.Hour), noon, noon.Add(24 * time.Hour)} {
+		_, offset := probe.Zone()
+		offsets[offset] = true
+	}
+
+	// The wall clock as a UTC coordinate, so the instant that displays it under
+	// an offset o is that coordinate minus o.
+	naive := time.Date(year, month, date, hours, mins, 0, 0, time.UTC)
+	instants := map[int64]bool{}
+	for offset := range offsets {
+		instant := naive.Add(-time.Duration(offset) * time.Second)
+		local := instant.In(loc)
+		if local.Year() != year || local.Month() != month || local.Day() != date {
+			continue
+		}
+		if local.Hour()*60+local.Minute() != minutes {
+			continue
+		}
+		instants[instant.Unix()] = true
+	}
+	return len(instants) != 1
 }
 
 // parseClock reads "HH:MM" into minutes since midnight.
@@ -125,9 +259,20 @@ func (w Window) CrossesMidnight() bool { return w.End < w.Start }
 
 // Contains reports whether an instant falls inside the window.
 //
-// A window that crosses midnight belongs to the day it OPENED: a Saturday
-// 22:00-04:00 window is open at 02:00 on Sunday morning, and is not open at
-// 02:00 on Saturday morning.
+// A window that crosses midnight belongs to the day it OPENED: a window that
+// names all seven days and runs 22:00-04:00 is open at 02:00 because the
+// previous day's opening is still running, and it is open at 23:00 because
+// that day's has begun. (A window that crosses midnight and names FEWER than
+// seven days is refused by Parse, because here it would belong to the day it
+// opened while kured opens it on every listed day — see crossingRefusal.)
+//
+// THE END MINUTE IS INSIDE, which is kured's own rule: it builds the day's end
+// as HH:MM:00.999999999 and tests `loctime.Before(end)`, so on the whole-minute
+// instants a window is made of, a window is [start, end] — both ends included.
+// A half-open test here (minutes < w.End) would refuse an operator at 09:00
+// while kured reboots at 09:00: one window, two answers, and the disagreement
+// is silent. pkg/window/kured_oracle_test.go samples every minute of a week and
+// of two DST change days against kured's code to keep that from happening.
 func (w Window) Contains(t time.Time) bool {
 	if w.Location == nil || len(w.Days) == 0 {
 		return false
@@ -137,20 +282,40 @@ func (w Window) Contains(t time.Time) bool {
 
 	for _, day := range w.Days {
 		if !w.CrossesMidnight() {
-			if local.Weekday() == day && minutes >= w.Start && minutes < w.End {
+			if local.Weekday() == day && minutes >= w.Start && minutes <= w.End {
 				return true
 			}
 			continue
 		}
-		// Opened yesterday and still running, or opening today.
+		// Opened today and still running, or opened yesterday and not yet
+		// closed: the end minute of the morning part is inside too.
 		if local.Weekday() == day && minutes >= w.Start {
 			return true
 		}
-		if local.Weekday() == (day+1)%7 && minutes < w.End {
+		if local.Weekday() == (day+1)%7 && minutes <= w.End {
 			return true
 		}
 	}
 	return false
+}
+
+// crossingRefusal is the one refusal for a window that crosses midnight and
+// does not name all seven days.
+//
+// The window is interpreted in three places — this package, the control
+// plane's validator and kured — and the two weekday rules only meet when the
+// day list is the whole week: kured tests the weekday of the INSTANT, so
+// `sat 22:00-04:00` is open Saturday 00:00-04:00 ("it opened Friday") and
+// Saturday 22:00-24:00, while this package's rule is that a crossing window
+// belongs to the day it OPENED. The instant sets differ by four hours a week,
+// and the operator who set Saturday night gets a reboot on Saturday MORNING.
+//
+// So set-window refuses the shape instead of picking one of the two answers —
+// and NAMES BOTH FIXES, rather than widening the window silently.
+func crossingRefusal(start, end string) error {
+	return fmt.Errorf(
+		"a maintenance window that crosses midnight (%s-%s) is refused unless it names all seven days: kured opens such a window on every day it lists, at 00:00, because it tests the day of the instant, while this window belongs to the day it opened — so with fewer than seven days the two disagree for four hours of every day listed. Either list all seven days, or do not cross midnight (make the end later than the start)",
+		start, end)
 }
 
 // NextOpen returns when the window next opens at or after t, so a refusal can

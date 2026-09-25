@@ -35,8 +35,15 @@ func TestWindowInItsOwnTimezone(t *testing.T) {
 	if !w.Contains(at(t, w.Location, "2026-08-22 03:30")) {
 		t.Error("03:30 on Saturday must be inside a Saturday 02:00-06:00 window")
 	}
-	if w.Contains(at(t, w.Location, "2026-08-22 06:00")) {
-		t.Error("the window is half-open: 06:00 is the end, not inside")
+	// The END MINUTE IS INSIDE — kured's own rule, pinned against kured's code
+	// by kured_oracle_test.go: it builds the day's end as HH:MM:00.999999999 and
+	// tests Before(end). A half-open test here would refuse an operator at 06:00
+	// while kured reboots at 06:00.
+	if !w.Contains(at(t, w.Location, "2026-08-22 06:00")) {
+		t.Error("the end minute is inside the window: kured's own code answers true at 06:00")
+	}
+	if w.Contains(at(t, w.Location, "2026-08-22 06:01")) {
+		t.Error("the minute after the end is outside")
 	}
 	if w.Contains(at(t, w.Location, "2026-08-21 03:30")) {
 		t.Error("Friday is not in a sat,sun window")
@@ -49,26 +56,39 @@ func TestWindowInItsOwnTimezone(t *testing.T) {
 	}
 }
 
-// 22:00-04:00 is the common maintenance shape, not an input error. A window
-// that crosses midnight belongs to the day it OPENED.
+// 22:00-04:00 is the common maintenance shape, not an input error — but only
+// when it names all seven days, which is the one shape kured's weekday rule and
+// this package's agree on (kured_oracle_test.go refuses the rest). The
+// attribution below is this package's: a crossing window belongs to the day it
+// OPENED, so Friday's opening is what is still running on Saturday morning.
 func TestAWindowThatCrossesMidnight(t *testing.T) {
 	w := mustParse(t, window.Spec{
-		Days: []string{"sat"}, Start: "22:00", End: "04:00", Timezone: "UTC",
+		Days: []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}, Start: "22:00", End: "04:00", Timezone: "UTC",
 	})
 	if !w.CrossesMidnight() {
 		t.Fatal("22:00-04:00 crosses midnight")
 	}
 	cases := map[string]bool{
-		"2026-08-22 22:30": true,  // Saturday night, just opened
-		"2026-08-23 01:00": true,  // Sunday morning, still the Saturday window
-		"2026-08-23 04:00": false, // closed
-		"2026-08-22 01:00": false, // Saturday morning is NOT the Saturday window
-		"2026-08-23 23:00": false, // Sunday night is not a Saturday window
+		"2026-08-22 22:30": true, // Saturday night, just opened
+		"2026-08-23 01:00": true, // Sunday morning, still the Saturday window
+		"2026-08-23 04:00": true, // the end minute is inside
+		"2026-08-23 04:01": false,
+		"2026-08-22 01:00": true, // Saturday morning: Friday's window opened and is still running
+		"2026-08-23 23:00": true, // Sunday night: Sunday's own opening
+		"2026-08-23 13:00": false,
 	}
 	for value, want := range cases {
 		if got := w.Contains(at(t, w.Location, value)); got != want {
 			t.Errorf("Contains(%s) = %v, want %v", value, got, want)
 		}
+	}
+
+	// Fewer than seven days is the shape the three interpreters read
+	// differently, so it is refused rather than answered twice.
+	if _, err := window.Parse(window.Spec{
+		Days: []string{"sat"}, Start: "22:00", End: "04:00", Timezone: "UTC",
+	}); err == nil {
+		t.Error("a crossing window that does not name all seven days must be refused")
 	}
 }
 
@@ -86,17 +106,22 @@ func TestATimezoneMustBeAnIANAName(t *testing.T) {
 	}
 }
 
-// A window whose timezone observes DST still means local wall-clock time on
-// both sides of the change. This is the whole reason the name is stored.
+// A window whose zone observes DST still means local wall-clock time on both
+// sides of the change. This is the whole reason the name is stored.
+//
+// The window starts at 03:00 rather than at 02:30 because 02:30 is inside the
+// hour Berlin skips and repeats and is refused outright (see
+// kured_oracle_test.go::TestAWindowStartingOrEndingInADSTChangeoverHourIsRefused):
+// a boundary that names no single instant cannot mean one thing on the cluster.
 func TestTheWindowIsWallClockAcrossADSTChange(t *testing.T) {
 	w := mustParse(t, window.Spec{
-		Days: []string{"sun"}, Start: "02:30", End: "05:00", Timezone: "Europe/Berlin",
+		Days: []string{"sun"}, Start: "03:00", End: "05:00", Timezone: "Europe/Berlin",
 	})
 	// Berlin left DST on 2026-10-25; both these Sundays are 03:00 local.
 	before := at(t, w.Location, "2026-10-18 03:00")
 	after := at(t, w.Location, "2026-11-01 03:00")
 	if !w.Contains(before) || !w.Contains(after) {
-		t.Error("03:00 local is inside a 02:30-05:00 local window on both sides of a DST change")
+		t.Error("03:00 local is inside a 03:00-05:00 local window on both sides of a DST change")
 	}
 }
 

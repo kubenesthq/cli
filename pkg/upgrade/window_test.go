@@ -54,6 +54,16 @@ func TestStagesRunInsideTheWindow(t *testing.T) {
 			t.Errorf("%s must run inside the window: %v", stage, err)
 		}
 	}
+
+	// The END MINUTE is inside — kured's own rule, pinned against kured's code
+	// by pkg/window/kured_oracle_test.go (it builds the day's end as
+	// HH:MM:00.999999999 and tests Before(end)). A stage starting at 06:00 must
+	// therefore run, not pause: the alternative is an upgrade that pauses at the
+	// minute kured would reboot at.
+	boundary := sessionInWindow(t, time.Date(2026, 8, 22, 6, 0, 0, 0, time.UTC))
+	if err := boundary.windowStillOpen(StageComponents); err != nil {
+		t.Errorf("a stage starting at the window's end minute must run: %v", err)
+	}
 }
 
 // Two stages are exempt by design, and one class is exempt in effect.
