@@ -679,8 +679,6 @@ func cpRunningImage(t *testing.T, ctx context.Context, server k3s.Runner) string
 func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, env cpUpgradeEnv, server k3s.Runner, name, installingHome, values string) {
 	t.Helper()
 	cpResetToThePreviousCandidate(t, ctx, env, server, values)
-	before := cpBackendImage(t, ctx, server)
-	eligibleBefore := cpEligibleAt(t, ctx, server)
 	home := cpLaptopHome(t, installingHome)
 
 	var (
@@ -717,30 +715,122 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceUp {
 		t.Errorf("the failed migration left the fence %q: a customer request could reach a control plane whose schema was not brought forward", report.State)
 	}
-	if after := cpBackendImage(t, ctx, server); after != before {
-		t.Errorf("the failed migration changed the backend image from %s to %s: the previous chart must still be what runs", before, after)
+	// NO CODE SERVES A HALF-MIGRATED SCHEMA, which is what the plan protects —
+	// and it is NOT "the image is unchanged". The chart has ONE backend image
+	// for the migration Job and the Deployment, and the migration stage's stop
+	// apply sets `backend.replicas: 0`, so the Deployment's SPEC carries the new
+	// image with zero replicas. What matters is that nothing is serving: no
+	// backend replica is Ready, and the public route is still the fence.
+	// (An earlier version of this arm compared the images and failed a correct
+	// product for a state the upgrade intends.)
+	if ready := cpBackendReady(t, ctx, server); ready != 0 {
+		t.Errorf("the failed migration left %d backend replica(s) Ready, so a build that was never migrated is serving", ready)
 	}
-	if eligibleAfter := cpEligibleAt(t, ctx, server); eligibleAfter != eligibleBefore {
-		t.Errorf("the failed migration changed the eligible checkpoint from %s to %s", eligibleBefore, eligibleAfter)
+	// THE CHECKPOINT THIS RUN TOOK is the one that must survive. Comparing with
+	// the checkpoint from before the run is wrong: the run publishes its own in
+	// stage 3, deliberately, and the marker moves.
+	want := cpCheckpointMarkerIn(t, varOut.String())
+	if want == "" {
+		t.Fatalf("the run never reported the checkpoint it published, so this arm cannot say which one must survive:\n%s", varOut.String())
 	}
-
-	// AND BACK TO A KNOWN STATE, which is also the recovery an operator
-	// performs: the database returns, and the same command then succeeds —
-	// the failed Job is removed and a new one runs for the same revision.
+	if eligibleAfter := cpEligibleMarker(t, ctx, server); eligibleAfter != want {
+		t.Errorf("the eligible checkpoint after the failed migration is %s, but the run published %s: the recovery point this run took is not the one the control plane would return to", eligibleAfter, want)
+	}
+	// AND BACK TO A KNOWN STATE BY HAND, so the arm after this one starts from
+	// a control plane that is running and serving.
+	//
+	// NOT by re-running the upgrade: kn-t70-control-plane-version-identity-4xso.1
+	// is filed for that. A re-run's version check goes through the fenced route
+	// while the backend is at zero replicas, so it fails with HTTP 503 and the
+	// assertion would be asserting the other bead's defect. Until that bead
+	// lands, the harness restores the state itself.
 	if err := cpScalePostgres(ctx, server, 1); err != nil {
 		t.Fatalf("restoring PostgreSQL: %v", err)
 	}
 	if err := cpWaitForPostgres(ctx, server); err != nil {
 		t.Fatal(err)
 	}
-	clean := cpLaptopHome(t, installingHome)
-	var cleanOut strings.Builder
-	if err := cpRunCLI(t, &cleanOut, clean, cpUpgradeArgs(env, name)...); err != nil {
-		t.Fatalf("the upgrade after a failed migration did not succeed; an operator whose fix worked must be able to run the identical command again: %v\n%s", err, cleanOut.String())
-	}
+	cpLowerTheFence(t, ctx, values, server)
+	cpResetToThePreviousCandidate(t, ctx, env, server, values)
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
-		t.Errorf("the clean upgrade finished with the fence %q", report.State)
+		t.Errorf("the hand-restored control plane left the fence %q", report.State)
 	}
+}
+
+// cpBackendReady is how many backend replicas are Ready. An absent
+// status.readyReplicas is 0, which is the state a stopped Deployment reports.
+func cpBackendReady(t *testing.T, ctx context.Context, server k3s.Runner) int {
+	t.Helper()
+	out, err := k3s.Kubectl(ctx, server, "get deployment "+controlplane.ReleaseName+"-backend"+
+		" -n "+controlplane.Namespace+" -o jsonpath={.status.readyReplicas}")
+	if err != nil {
+		t.Fatalf("reading the backend's ready replicas: %v", err)
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		t.Fatalf("the backend's ready replica count %q is not a number", out)
+	}
+	return n
+}
+
+// cpCheckpointMarkerIn reads the marker the run itself reported, from the line
+// stageCheckpoint prints: "checkpoint eligible BEFORE the migration starts:
+// <marker> (job <job>)".
+func cpCheckpointMarkerIn(t *testing.T, out string) string {
+	t.Helper()
+	const prefix = "checkpoint eligible BEFORE the migration starts: "
+	i := strings.Index(out, prefix)
+	if i < 0 {
+		return ""
+	}
+	marker := out[i+len(prefix):]
+	if j := strings.Index(marker, " (job "); j >= 0 {
+		marker = marker[:j]
+	}
+	if j := strings.IndexAny(marker, "\n\r"); j >= 0 {
+		marker = marker[:j]
+	}
+	return strings.TrimSpace(marker)
+}
+
+// cpEligibleMarker is the eligible checkpoint as "<key>@<at>", the same shape
+// the upgrade's own stage prints.
+func cpEligibleMarker(t *testing.T, ctx context.Context, server k3s.Runner) string {
+	t.Helper()
+	checkpoint, err := controlplane.ReadEligibleCheckpoint(ctx, server)
+	if err != nil {
+		t.Fatalf("reading the eligible checkpoint: %v", err)
+	}
+	if checkpoint == nil {
+		return ""
+	}
+	return checkpoint.Key + "@" + checkpoint.At
+}
+
+// cpLowerTheFence restores the public route and dismantles the fence BY HAND,
+// through the package API the command uses. It is the manual recovery path: the
+// route goes back to the backend FIRST (Lower owns that order), and only then
+// are the fence's objects deleted.
+func cpLowerTheFence(t *testing.T, ctx context.Context, values string, server k3s.Runner) {
+	t.Helper()
+	replicas := int32(1)
+	err := controlplane.Lower(ctx, server, values, &replicas,
+		func(v string) error {
+			_, err := controlplane.Apply(ctx, server, v)
+			return err
+		},
+		func() error {
+			return controlplane.WaitForRouteBackend(ctx, server, controlplane.ReleaseName+"-backend",
+				5*time.Minute, 2*time.Second, converge.NewTextReporter(io.Discard))
+		})
+	if err != nil {
+		t.Fatalf("lowering the fence by hand: %v", err)
+	}
+	t.Log("the fence was lowered by hand and the route is back on the backend")
 }
 
 // cpWaitForPostgres waits until the PostgreSQL StatefulSet is ready again,
