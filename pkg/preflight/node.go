@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/storage"
@@ -43,6 +44,16 @@ func checkNode(ctx context.Context, opts Options, node Node, rep *Report) {
 // checkOS refuses anything outside the bundle's tested matrix. Locking the
 // OS is what makes the bundle testable: a known kernel and a deterministic
 // LVM layout are preconditions for storage and OS patching.
+//
+// It also reads the host's EFFECTIVE APT policy and refuses a host whose own
+// configuration would reboot it by itself. That is part of THIS check rather
+// than a twelfth: the eleven checks are a documented contract (install.mdx's
+// table, the Check* constants in preflight.go) and "what will this operating
+// system do on its own" is one question. Ubuntu 24.04 does not reboot by
+// itself, but the operative word is default — a customer image can set
+// Unattended-Upgrade::Automatic-Reboot "true" in /etc/apt/apt.conf.d, and a
+// node that reboots on its own schedule defeats the reboot window entirely
+// (on a single-server cluster, it is an API outage nobody asked for).
 func checkOS(ctx context.Context, opts Options, node Node, rep *Report) {
 	out, err := run(ctx, node.Runner, "cat /etc/os-release")
 	if err != nil {
@@ -54,16 +65,39 @@ func checkOS(ctx context.Context, opts Options, node Node, rep *Report) {
 		return
 	}
 	id, versionID, pretty := parseOSRelease(out)
-	if opts.Bundle.OS.Supports(id, versionID) {
-		rep.add(Result{Check: CheckOS, Node: node.Address, Outcome: Pass, Detail: pretty})
+	if !opts.Bundle.OS.Supports(id, versionID) {
+		rep.add(Result{
+			Check: CheckOS, Node: node.Address, Outcome: Fail,
+			Detail: fmt.Sprintf("this node runs %s", pretty),
+			Fix: fmt.Sprintf("bundle %s is tested on %s only, and the installer refuses anything else rather than half-installing it",
+				opts.Bundle.Bundle, strings.Join(opts.Bundle.OS.Supported, ", ")),
+		})
 		return
 	}
-	rep.add(Result{
-		Check: CheckOS, Node: node.Address, Outcome: Fail,
-		Detail: fmt.Sprintf("this node runs %s", pretty),
-		Fix: fmt.Sprintf("bundle %s is tested on %s only, and the installer refuses anything else rather than half-installing it",
-			opts.Bundle.Bundle, strings.Join(opts.Bundle.OS.Supported, ", ")),
-	})
+
+	// The EFFECTIVE configuration, not our own drop-in: apt reads
+	// /etc/apt/apt.conf.d in order, so a file that sorts after pkg/hostpolicy's
+	// drop-in is what has the last word, and only the effective value can see
+	// that. A configuration that cannot be read is a refusal, not a silent
+	// pass — the installer may not certify a policy it cannot see.
+	effective, err := hostpolicy.ReadEffective(ctx, node.Runner)
+	if err != nil {
+		rep.add(Result{
+			Check: CheckOS, Node: node.Address, Outcome: Fail,
+			Detail: "could not read this node's effective APT configuration: " + err.Error(),
+			Fix:    "`apt-config dump` must work on the host: it is how the installer proves that nothing in /etc/apt/apt.conf.d lets APT reboot this node by itself",
+		})
+		return
+	}
+	if effective.AutomaticReboot {
+		rep.add(Result{
+			Check: CheckOS, Node: node.Address, Outcome: Fail,
+			Detail: fmt.Sprintf(`%s has Unattended-Upgrade::Automatic-Reboot "true" in its effective APT configuration, so an unattended upgrade would reboot it on a schedule nobody chose`, pretty),
+			Fix:    `remove the Automatic-Reboot "true" setting from /etc/apt/apt.conf.d/ (Ubuntu's own default is not to reboot): the reboot decision belongs to this cluster's reboot window, and a node that reboots itself takes the workload down outside it`,
+		})
+		return
+	}
+	rep.add(Result{Check: CheckOS, Node: node.Address, Outcome: Pass, Detail: pretty})
 }
 
 func parseOSRelease(out string) (id, versionID, pretty string) {

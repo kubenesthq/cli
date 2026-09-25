@@ -118,27 +118,30 @@ func outcomeOf(rep preflight.Report, check string) (preflight.Result, bool) {
 	return preflight.Result{}, false
 }
 
+// documentedChecks are the eleven checks install.mdx's table names. Every
+// one must appear in a report, under exactly this name: a check that silently
+// does not run is worse than one that fails, because the operator believes it
+// passed. T3.2's APT-policy finding is part of the operating-system check
+// rather than a twelfth entry, so this list does not grow with it.
+var documentedChecks = []string{
+	preflight.CheckControlPlane, preflight.CheckSSH, preflight.CheckOS,
+	preflight.CheckPrivilege, preflight.CheckExistingK8s, preflight.CheckVolumeGroup,
+	preflight.CheckPorts, preflight.CheckEgress, preflight.CheckResources,
+	preflight.CheckNodeCount, preflight.CheckBundle,
+}
+
 func TestHealthyHostPassesEveryCheck(t *testing.T) {
 	rep, err := preflight.Run(context.Background(), baseOptions(t, healthyHost(nil)))
 	if err != nil {
 		t.Fatalf("a correctly-specified host must pass:\n%v", err)
 	}
-	// All eleven checks from install.mdx's table must be present in the
-	// report — a check that silently does not run is worse than one that
-	// fails, because the operator believes it passed.
-	wantChecks := []string{
-		preflight.CheckControlPlane, preflight.CheckSSH, preflight.CheckOS,
-		preflight.CheckPrivilege, preflight.CheckExistingK8s, preflight.CheckVolumeGroup,
-		preflight.CheckPorts, preflight.CheckEgress, preflight.CheckResources,
-		preflight.CheckNodeCount, preflight.CheckBundle,
-	}
-	for _, want := range wantChecks {
+	for _, want := range documentedChecks {
 		if _, ok := outcomeOf(rep, want); !ok {
 			t.Errorf("check %q did not run", want)
 		}
 	}
-	if got := len(rep.Results); got != len(wantChecks) {
-		t.Errorf("ran %d checks on a single-node install, want %d: %v", got, len(wantChecks), rep.Results)
+	if got := len(rep.Results); got != len(documentedChecks) {
+		t.Errorf("ran %d checks on a single-node install, want %d: %v", got, len(documentedChecks), rep.Results)
 	}
 }
 
@@ -188,6 +191,55 @@ func TestNonUbuntuIsRefused(t *testing.T) {
 	_, err := preflight.Run(context.Background(), opts)
 	if err == nil || !strings.Contains(err.Error(), "Debian") {
 		t.Fatalf("want a refusal naming what the node runs, got %v", err)
+	}
+}
+
+// T3.2's preflight half. Ubuntu 24.04 does not reboot itself, but a host whose
+// own apt.conf.d says otherwise defeats the reboot window — on a
+// single-server cluster that is an API outage nobody asked for — so the host
+// is refused. The fixture is the EFFECTIVE configuration, which is what
+// `apt-config dump` reports: a file that sorts after the installer's own
+// drop-in is what decides, so reading our file would prove nothing.
+func TestCheckOSReportsAHostThatRebootsByItself(t *testing.T) {
+	// This host's /etc/apt/apt.conf.d/20reboot sets Automatic-Reboot "true".
+	// The dump is the value after every file in the directory has been read.
+	rebootsByItself := healthyHost(map[string]sshx.Result{
+		"apt-config dump": {Stdout: `Unattended-Upgrade::Allowed-Origins "";` + "\n" +
+			`Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";` + "\n" +
+			`Unattended-Upgrade::Automatic-Reboot "true";` + "\n"},
+	})
+	rep, err := preflight.Run(context.Background(), baseOptions(t, rebootsByItself))
+	if err == nil {
+		t.Fatal("a host whose APT configuration reboots it by itself must be refused")
+	}
+	res, ok := outcomeOf(rep, preflight.CheckOS)
+	if !ok || res.Outcome != preflight.Fail {
+		t.Fatalf("the operating-system check must fail, got %+v", res)
+	}
+	if !strings.Contains(res.Detail, `Automatic-Reboot "true"`) {
+		t.Errorf("the finding must name the setting it read, got %q", res.Detail)
+	}
+	// Eleven checks, still, under their documented names: the finding is part
+	// of the operating-system check and not a twelfth row in install.mdx's
+	// table.
+	for _, want := range documentedChecks {
+		if _, ok := outcomeOf(rep, want); !ok {
+			t.Errorf("check %q did not run", want)
+		}
+	}
+	if got := len(rep.Results); got != len(documentedChecks) {
+		t.Errorf("ran %d checks, want %d: %v", got, len(documentedChecks), rep.Results)
+	}
+
+	// A host that does not set it — Ubuntu's default, and what the installer's
+	// own drop-in writes — is not refused.
+	rep, err = preflight.Run(context.Background(), baseOptions(t, healthyHost(nil)))
+	if err != nil {
+		t.Fatalf("a host that never reboots itself must not be refused:\n%v", err)
+	}
+	res, _ = outcomeOf(rep, preflight.CheckOS)
+	if res.Outcome != preflight.Pass {
+		t.Errorf("the operating-system check must pass, got %s: %s", res.Outcome, res.Detail)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/node"
@@ -552,6 +553,16 @@ func stageK3sServer(ctx context.Context, s *Session) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no server node")
 	}
+	// The host-level update policy first, on every server: security updates
+	// only, no APT-initiated reboot, k3s out of needrestart's reach
+	// (pkg/hostpolicy). It is written before k3s exists so that nothing an
+	// unattended upgrade does while the cluster is being built can take a
+	// node down outside a reboot window.
+	for _, server := range servers {
+		if err := hostpolicy.Apply(ctx, server.Runner); err != nil {
+			return fmt.Errorf("host policy on %s: %w", server.Address, err)
+		}
+	}
 	// The CLI generates the cluster token's password itself and hands the
 	// first server the file to read it from. Once that server is up, the full
 	// K10<CA-HASH>::server:<password> token is read back from it: every join
@@ -613,6 +624,13 @@ func stageK3sAgents(ctx context.Context, s *Session) error {
 	}
 	joinURL := serverURL(servers[0].Address)
 	for _, node := range agents {
+		// The same host policy as the servers, before k3s lands on the host:
+		// an agent host installs security updates and reboots on the same
+		// terms as a server, and k3s-agent.service must be as unreachable to
+		// needrestart as k3s.service is (pkg/hostpolicy).
+		if err := hostpolicy.Apply(ctx, node.Runner); err != nil {
+			return fmt.Errorf("host policy on %s: %w", node.Address, err)
+		}
 		if err := k3s.InstallAgent(ctx, node.Runner, s.Bundle, joinURL, token, s.Reporter); err != nil {
 			return fmt.Errorf("joining agent %s: %w", node.Address, err)
 		}

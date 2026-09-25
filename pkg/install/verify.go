@@ -15,6 +15,7 @@ import (
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/component/traefik"
 	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/storage"
 )
@@ -78,6 +79,22 @@ func verifyNodesReady(ctx context.Context, s *Session) error {
 	server, err := s.Server()
 	if err != nil {
 		return err
+	}
+	// The host policy the k3s stages wrote, asserted as part of THIS check
+	// rather than as a sixth acceptance check: install.mdx's five stay five.
+	// It is the host's EFFECTIVE APT policy, read back with apt-config, so a
+	// file that sorts after the installer's drop-in cannot hide a host that
+	// would install -updates or reboot itself outside the window. Asserted
+	// before the wait because it is one round trip per host and a policy that
+	// is wrong is worth failing fast.
+	for _, node := range s.Nodes {
+		effective, err := hostpolicy.ReadEffective(ctx, node.Runner)
+		if err != nil {
+			return fmt.Errorf("reading the APT policy on %s: %w", node.Address, err)
+		}
+		if problem := effective.NonCompliance(); problem != "" {
+			return fmt.Errorf("the host policy on %s is not the one the installer wrote: %s", node.Address, problem)
+		}
 	}
 	return k3s.WaitNodesReady(ctx, server, s.Bundle, len(s.Nodes), s.Reporter)
 }
