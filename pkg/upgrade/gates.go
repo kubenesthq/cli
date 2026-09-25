@@ -11,6 +11,7 @@ import (
 	"kubenest.io/cli/pkg/deprecation"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/window"
 )
 
 // The pre-flight gates. Every one runs before anything is touched, and any
@@ -186,24 +187,34 @@ func checkDrill(drill DrillStatus, err error, maxAge time.Duration, now time.Tim
 // Only the START is gated. When the window closes mid-upgrade, no new stage
 // starts but the stage in progress finishes — abandoning a half-completed
 // stage to respect a clock leaves the cluster worse than the overrun does.
+//
+// A MISSING WINDOW IS A REFUSAL, NOT A PASS. This gate used to return
+// Passed: true for a nil window with the detail "no maintenance window is
+// configured for this cluster, so any time is inside it" (kn-nqj), and that
+// made one of seven documented gates approve every cluster, every time, while
+// the operator who had set a window believed upgrades and reboots were
+// confined to it. A window that cannot be READ is refused for the same reason:
+// an unread gate is not a passed gate.
 func checkWindow(s *Session) GateResult {
+	if s.Opts.BypassWindow {
+		return GateResult{Gate: GateWindow, Passed: true,
+			Detail: "--now: the maintenance window is bypassed for this run; every other gate still runs"}
+	}
+	if s.WindowErr != nil {
+		return GateResult{Gate: GateWindow, Passed: false,
+			Detail: "the cluster's maintenance window could not be read, so whether now is inside it is unknown: " + s.WindowErr.Error(),
+			Fix:    "an unread window is not a passed check; " + window.NoWindowFix}
+	}
 	if s.Window == nil {
-		return GateResult{
-			Gate: GateWindow, Passed: true,
-			Detail: "no maintenance window is configured for this cluster, so any time is inside it",
-		}
+		return GateResult{Gate: GateWindow, Passed: false,
+			Detail: window.NoWindow,
+			Fix:    window.NoWindowFix}
 	}
 	now := s.now()
-	if s.Window.Contains(now) {
-		return GateResult{Gate: GateWindow, Passed: true, Detail: "inside " + s.Window.String()}
+	if err := s.Window.Outside(now); err != nil {
+		return GateResult{Gate: GateWindow, Passed: false, Detail: err.Error(), Fix: window.OutsideFix}
 	}
-	detail := fmt.Sprintf("now (%s) is outside %s", now.In(s.Window.Location).Format("Mon 15:04 MST"), s.Window)
-	fix := "wait for the window, or change it with `kubenest cluster set-window`"
-	if next, ok := s.Window.NextOpen(now); ok {
-		fix = fmt.Sprintf("the window next opens %s; wait for it, or change it with `kubenest cluster set-window`",
-			next.Format("Mon 2 Jan 15:04 MST"))
-	}
-	return GateResult{Gate: GateWindow, Passed: false, Detail: detail, Fix: fix}
+	return GateResult{Gate: GateWindow, Passed: true, Detail: "inside " + s.Window.String()}
 }
 
 // checkBundlePath refuses a transition the target bundle does not offer for

@@ -454,6 +454,11 @@ func upgradeSession(t *testing.T, env upgradeEnv, client *api.Client, from, to s
 		Cluster: env.cluster, To: to,
 		Servers: []string{env.server}, Agents: []string{env.agent},
 		SSHUser: env.sshUser, SSHKey: env.sshKey,
+		// --now, as the flag wires it: THIS test is about zero downtime and
+		// rollback, not about the window, and since kn-t31 an upgrade with no
+		// window stored is REFUSED rather than approved with "any time is
+		// inside it". The window's own gate is e2e/window_test.go.
+		BypassWindow: true,
 	}
 	journal, err := stages.OpenJournal(t.TempDir()+"/upgrade.json", opts.Identity(recorded.BundleVersion))
 	if err != nil {

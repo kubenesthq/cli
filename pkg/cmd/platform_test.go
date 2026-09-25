@@ -2,8 +2,16 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/window"
 )
 
 func TestInstallFlagsValidate(t *testing.T) {
@@ -154,6 +162,10 @@ func TestUpgradeRefusesWithoutItsRequiredFlags(t *testing.T) {
 		{[]string{"platform", "rollback"}, "--cluster is required"},
 		{[]string{"platform", "diff", "--from", "1.0"}, "--from and --to"},
 		{[]string{"cluster", "set-window"}, "--cluster is required"},
+		// --now acts regardless of the window and --wait holds for it. Two
+		// instructions that contradict each other are answered by asking, not
+		// by picking one — the same rule --control-plane and --org follow.
+		{[]string{"platform", "upgrade", "--cluster", "prod-1", "--to", "1.1", "--now", "--wait"}, "--now and --wait ask for opposite things"},
 	} {
 		root := NewRootCommand()
 		root.SetArgs(c.args)
@@ -277,5 +289,234 @@ func TestUninstallDemandsConfirm(t *testing.T) {
 	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "--confirm") {
 		t.Errorf("uninstall without --confirm must refuse, got: %v", err)
+	}
+}
+
+// windowServer answers the routes `cluster set-window` uses: the orgs and
+// clusters the cluster NAME is resolved through, and the window it reads and
+// writes. putStatus is what the write answers with, so a test can drive the
+// control plane's own refusals as well as its successes.
+func windowServer(t *testing.T, get string, putStatus int, put string) (*api.Client, *int, *any) {
+	t.Helper()
+	puts := 0
+	var revision any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v1/orgs":
+			io.WriteString(w, `[{"id":"o1","name":"acme","slug":"acme"}]`)
+		case r.URL.Path == "/api/v1/orgs/o1/clusters":
+			io.WriteString(w, `{"data":[{"id":"c1","name":"prod-1","status":"connected","org_id":"o1"}],"has_more":false}`)
+		case r.URL.Path == "/api/v1/clusters/c1/maintenance-window" && r.Method == http.MethodGet:
+			io.WriteString(w, get)
+		case r.URL.Path == "/api/v1/clusters/c1/maintenance-window" && r.Method == http.MethodPut:
+			puts++
+			raw, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			json.Unmarshal(raw, &body)
+			revision = body["revision"]
+			if putStatus >= 400 {
+				w.WriteHeader(putStatus)
+			}
+			io.WriteString(w, put)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.New(srv.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatalf("api.New: %v", err)
+	}
+	return c, &puts, &revision
+}
+
+const (
+	// A cluster already at revision 4: the command reads this and must write
+	// carrying 4.
+	readWindowJSON = `{"window":{"days":["sat","sun"],"start":"02:00","end":"06:00","timezone":"Asia/Kolkata"},"revision":4,"state":"applying","applied_revision":3,"reject_reason":null,"warning":null}`
+	// What the write answers with: the new window at revision 5.
+	writtenWindowJSON = `{"window":{"days":["sat","sun"],"start":"02:00","end":"06:00","timezone":"Asia/Kolkata"},"revision":5,"state":"applying","applied_revision":3,"reject_reason":null,"warning":null}`
+)
+
+func setWindowSpec() window.Spec {
+	return window.Spec{Days: []string{"sat", "sun"}, Start: "02:00", End: "06:00", Timezone: "Asia/Kolkata"}
+}
+
+// THE THREE STATES ARE PRINTED SEPARATELY, AND A WINDOW THAT IS NOT ACTIVE IS
+// NOT REPORTED AS IN FORCE.
+//
+// This is the operator-facing half of kn-nqj: an operator who set a window and
+// is told "the window is set" reads it as "upgrades are confined to it". Stored
+// is not in force, and applying is not in force either — only the operator's
+// acknowledgement of THIS revision makes it so.
+func TestSetWindowPrintsThreeStates(t *testing.T) {
+	t.Run("stored and applying", func(t *testing.T) {
+		client, puts, revision := windowServer(t, readWindowJSON, http.StatusOK, writtenWindowJSON)
+
+		var out bytes.Buffer
+		if err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec()); err != nil {
+			t.Fatal(err)
+		}
+		if *puts != 1 {
+			t.Fatalf("the window was written %d time(s), want 1", *puts)
+		}
+		// The write carries the revision the command READ, or it is a silent
+		// overwrite of whatever another operator stored in between.
+		if got, ok := (*revision).(float64); !ok || int(got) != 4 {
+			t.Errorf("the write carried revision %v, want the 4 that was read", *revision)
+		}
+
+		printed := out.String()
+		if got := stateLineCount(printed); got != 3 {
+			t.Errorf("the three states must be three separate lines, got %d:\n%s", got, printed)
+		}
+		for _, want := range []string{"stored:", "applying:", "active:", "revision 5", "NOT in force"} {
+			if !strings.Contains(printed, want) {
+				t.Errorf("the output is missing %q:\n%s", want, printed)
+			}
+		}
+	})
+
+	t.Run("active", func(t *testing.T) {
+		active := `{"window":{"days":["sat","sun"],"start":"02:00","end":"06:00","timezone":"Asia/Kolkata"},"revision":5,"state":"active","applied_revision":5,"reject_reason":null,"warning":null}`
+		client, _, _ := windowServer(t, readWindowJSON, http.StatusOK, active)
+
+		var out bytes.Buffer
+		if err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec()); err != nil {
+			t.Fatal(err)
+		}
+		printed := out.String()
+		if got := stateLineCount(printed); got != 3 {
+			t.Errorf("the three states must be three separate lines, got %d:\n%s", got, printed)
+		}
+		if !strings.Contains(printed, "in force") || strings.Contains(printed, "NOT in force") {
+			t.Errorf("an acknowledged revision is in force and must be reported as such:\n%s", printed)
+		}
+	})
+}
+
+// stateLineCount counts the lines that open with one of the three state names.
+// A collapsed report — "stored: ... applying: ... active: ..." on one line —
+// counts once, which is the point: three states a reader can point at.
+func stateLineCount(printed string) int {
+	count := 0
+	for _, line := range strings.Split(printed, "\n") {
+		trimmed := strings.TrimSpace(line)
+		for _, state := range []string{"stored:", "applying:", "active:"} {
+			if strings.HasPrefix(trimmed, state) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+// The backup-overlap warning, and the two things it must not be confused with:
+// a warning is NOT a refusal, and "unknown" is not "no overlap".
+func TestSetWindowWarnsOnBackupOverlap(t *testing.T) {
+	overlap := `{"window":{"days":["sat","sun"],"start":"02:30","end":"06:00","timezone":"UTC"},"revision":5,"state":"stored","applied_revision":null,"reject_reason":null,"warning":"this window starts at 02:30 UTC, inside the nightly backup that starts at 02:00 UTC and last took 60 minutes: a reboot during a backup marks that backup ineligible. A later window avoids it; an overlapping one is allowed."}`
+
+	t.Run("an overlapping window warns and is still stored", func(t *testing.T) {
+		client, puts, _ := windowServer(t, readWindowJSON, http.StatusOK, overlap)
+		var out bytes.Buffer
+		if err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec()); err != nil {
+			t.Fatalf("an overlap is a warning, never a refusal: %v", err)
+		}
+		if *puts != 1 {
+			t.Fatalf("the window was not stored")
+		}
+		printed := out.String()
+		if !strings.Contains(printed, "Warning:") || !strings.Contains(printed, "inside the nightly backup") {
+			t.Errorf("the overlap warning was not printed:\n%s", printed)
+		}
+	})
+
+	t.Run("an unmeasured backup reads unknown", func(t *testing.T) {
+		unknown := `{"window":{"days":["sat","sun"],"start":"04:00","end":"06:00","timezone":"UTC"},"revision":5,"state":"stored","applied_revision":null,"reject_reason":null,"warning":"unknown"}`
+		client, _, _ := windowServer(t, readWindowJSON, http.StatusOK, unknown)
+		var out bytes.Buffer
+		if err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec()); err != nil {
+			t.Fatal(err)
+		}
+		printed := out.String()
+		if !strings.Contains(printed, "unknown") || !strings.Contains(printed, "not a passing check") {
+			t.Errorf("an unmeasured backup is not a passing check and must say so:\n%s", printed)
+		}
+	})
+
+	t.Run("no overlap says so", func(t *testing.T) {
+		clear := `{"window":{"days":["sat","sun"],"start":"04:00","end":"06:00","timezone":"UTC"},"revision":5,"state":"active","applied_revision":5,"reject_reason":null,"warning":null}`
+		client, _, _ := windowServer(t, readWindowJSON, http.StatusOK, clear)
+		var out bytes.Buffer
+		if err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec()); err != nil {
+			t.Fatal(err)
+		}
+		printed := out.String()
+		if strings.Contains(printed, "Warning") {
+			t.Errorf("a null warning is the control plane saying it read the evidence and found no overlap:\n%s", printed)
+		}
+		if !strings.Contains(printed, "does not overlap the nightly backup") {
+			t.Errorf("the absence of a warning must still be stated, not left blank:\n%s", printed)
+		}
+	})
+}
+
+// A WINDOW THIS CLI CANNOT REPRESENT IS REFUSED BEFORE ANYTHING IS SENT.
+//
+// The control plane enforces the same rules, and that is the point: the CLI
+// must not accept what it would itself refuse to read back, and must not make
+// the operator learn about it from a stored window that is not what they asked
+// for.
+func TestSetWindowRefusesAWindowTheCLICannotRepresent(t *testing.T) {
+	client, puts, _ := windowServer(t, readWindowJSON, http.StatusOK, writtenWindowJSON)
+
+	for _, c := range []struct {
+		name string
+		spec window.Spec
+	}{
+		{"an offset instead of an IANA name", window.Spec{Days: []string{"sat"}, Start: "02:00", End: "06:00", Timezone: "+05:30"}},
+		{"a zero-length window", window.Spec{Days: []string{"sat"}, Start: "02:00", End: "02:00", Timezone: "UTC"}},
+		{"a day that is not a day", window.Spec{Days: []string{"notaday"}, Start: "02:00", End: "06:00", Timezone: "UTC"}},
+		{"no day at all", window.Spec{Start: "02:00", End: "06:00", Timezone: "UTC"}},
+		{"a time that is not a time", window.Spec{Days: []string{"sat"}, Start: "25:00", End: "06:00", Timezone: "UTC"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := runWindow(context.Background(), &out, client, "prod-1", c.spec); err == nil {
+				t.Fatal("the window must be refused, not stored")
+			}
+			if out.Len() != 0 {
+				t.Errorf("a refused window must not print a stored one:\n%s", out.String())
+			}
+		})
+	}
+	if *puts != 0 {
+		t.Errorf("%d window(s) reached the control plane, want none: the CLI refuses what it cannot represent", *puts)
+	}
+}
+
+// If the CLI's rules and the control plane's ever drift, the drift must reach
+// the operator as a refusal with the reason — never as a success over a window
+// that was not stored.
+func TestSetWindowSurfacesTheControlPlanesRefusal(t *testing.T) {
+	client, puts, _ := windowServer(t, readWindowJSON, http.StatusUnprocessableEntity,
+		`{"detail": "timezone 'Mars/Phobos' is not an IANA name (Asia/Kolkata, Europe/Berlin, UTC)"}`)
+
+	var out bytes.Buffer
+	err := runWindow(context.Background(), &out, client, "prod-1", setWindowSpec())
+	if err == nil {
+		t.Fatal("a 422 from the control plane must refuse")
+	}
+	if !strings.Contains(err.Error(), "Mars/Phobos") {
+		t.Errorf("the refusal must carry the control plane's reason, got: %v", err)
+	}
+	if *puts != 1 {
+		t.Errorf("the write was attempted %d time(s), want 1", *puts)
+	}
+	if out.Len() != 0 {
+		t.Errorf("nothing was stored, so no stored window may be reported:\n%s", out.String())
 	}
 }

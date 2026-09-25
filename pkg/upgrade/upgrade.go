@@ -102,6 +102,14 @@ type Options struct {
 	Acknowledge []string
 	// Now overrides the clock, for tests.
 	Now func() time.Time
+	// Sleep waits for d. Nil means time.Sleep; a test replaces it so that a
+	// wait is measured rather than endured.
+	Sleep func(ctx context.Context, d time.Duration) error
+	// BypassWindow is `--now`: the maintenance window is not consulted for this
+	// run at all — neither the gate nor the mid-run pause. It bypasses THE
+	// WINDOW ONLY: every other gate still runs, because the operator asking to
+	// act now has not asked to act on a degraded cluster.
+	BypassWindow bool
 }
 
 // Identity is the part of the request a resume must match exactly. The
@@ -158,8 +166,16 @@ type Session struct {
 	Out      io.Writer
 	API      *api.Client
 
-	// Window is the cluster's maintenance window, nil if none is set.
+	// Window is the cluster's stored maintenance window. NIL MEANS NONE IS
+	// SET, and the window gate REFUSES that: a missing window is not "any time
+	// is inside it" (kn-nqj). It is loaded from the control plane by the
+	// command that builds the session.
 	Window *window.Window
+	// WindowErr is why the stored window could not be READ or PARSED — an
+	// unreachable control plane, a route a control plane does not serve, a
+	// stored window this CLI cannot represent. The gate refuses on it and says
+	// which, rather than reporting a window that is merely absent.
+	WindowErr error
 	// Cluster is what the cluster's record says it IS: the bundle it is on,
 	// its profile set, its tier. Read once, at the start, from Records.
 	Cluster Recorded
@@ -264,7 +280,7 @@ func windowExempt(stage string) bool {
 // windowStillOpen implements the maintenance-window rule for a stage that has
 // not started yet.
 func (s *Session) windowStillOpen(stage string) error {
-	if s.Window == nil || windowExempt(stage) {
+	if s.Opts.BypassWindow || s.Window == nil || windowExempt(stage) {
 		return nil
 	}
 	if s.Window.Contains(s.now()) {
@@ -272,7 +288,7 @@ func (s *Session) windowStillOpen(stage string) error {
 	}
 	next := "the next window"
 	if at, ok := s.Window.NextOpen(s.now()); ok {
-		next = at.Format("Mon 2 Jan 15:04 MST")
+		next = s.Window.Moment(at)
 	}
 	return stages.Paused(
 		"the maintenance window %s has closed, so no new stage is starting. The stage that was running finished; the cluster is mid-upgrade and reports itself as such. The upgrade resumes at %s",

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/stages"
@@ -134,4 +135,92 @@ func TestARecordWithNoHostInventoryIsRefusedRatherThanGuessed(t *testing.T) {
 			t.Errorf("a refused resolution still returned hosts: %+v", inv.Hosts)
 		}
 	}
+}
+
+// windowServer serves the one read the window loader makes.
+func windowServer(t *testing.T, body map[string]any) *api.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if !strings.HasSuffix(req.URL.Path, "/maintenance-window") {
+			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.New(srv.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// The gate reads the window from the control plane, so the loader has three
+// distinct answers and they must not collapse into two: a stored window, NO
+// window (nil, which the gate refuses), and a window it cannot read or cannot
+// represent (an error, which the gate also refuses, naming why).
+func TestRecordsWindowDistinguishesStoredFromAbsentFromUnreadable(t *testing.T) {
+	t.Run("a stored window is parsed", func(t *testing.T) {
+		records := ControlPlaneRecords{Client: windowServer(t, map[string]any{
+			"window": map[string]any{"days": []string{"sat"}, "start": "02:00", "end": "06:00", "timezone": "Asia/Kolkata"},
+			"revision": 4, "state": "active", "applied_revision": 4,
+		}), ClusterID: "c1"}
+
+		w, err := records.Window(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w == nil {
+			t.Fatal("a stored window must come back parsed")
+		}
+		if w.Location == nil || w.Location.String() != "Asia/Kolkata" {
+			t.Errorf("location = %v, want the stored IANA name", w.Location)
+		}
+		if !w.Contains(time.Date(2026, 8, 21, 21, 0, 0, 0, time.UTC)) {
+			t.Error("Saturday 02:30 IST is inside the stored window")
+		}
+	})
+
+	t.Run("no stored window is nil, not zero", func(t *testing.T) {
+		records := ControlPlaneRecords{Client: windowServer(t, map[string]any{
+			"window": nil, "revision": nil, "state": "stored",
+		}), ClusterID: "c1"}
+
+		w, err := records.Window(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w != nil {
+			t.Fatalf("window = %+v, want nil: this cluster has none stored", w)
+		}
+	})
+
+	t.Run("a window this CLI cannot represent is an error", func(t *testing.T) {
+		// An offset is not an IANA name: the stored window is unreadable, which
+		// is not the same answer as "no window" and must not be reported as one.
+		records := ControlPlaneRecords{Client: windowServer(t, map[string]any{
+			"window": map[string]any{"days": []string{"sat"}, "start": "02:00", "end": "06:00", "timezone": "+05:30"},
+			"revision": 4, "state": "stored",
+		}), ClusterID: "c1"}
+
+		if _, err := records.Window(context.Background()); err == nil {
+			t.Fatal("a stored window this CLI cannot represent must be an error")
+		} else if !strings.Contains(err.Error(), "not one this CLI can represent") {
+			t.Errorf("the error must say which failure it is, got: %v", err)
+		}
+	})
+
+	t.Run("a route the control plane does not serve is an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(srv.Close)
+		c, _ := api.New(srv.URL)
+		records := ControlPlaneRecords{Client: c, ClusterID: "c1"}
+
+		if _, err := records.Window(context.Background()); err == nil {
+			t.Fatal("an unroutable read must be an error, not a cluster without a window")
+		}
+	})
 }

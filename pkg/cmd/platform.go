@@ -290,12 +290,17 @@ actively harmed you.`,
 			if f.To == "" {
 				return fmt.Errorf("--to is required: the bundle version to upgrade to (see `kubenest platform diff`)")
 			}
+			if f.Now && f.Wait {
+				return fmt.Errorf("--now and --wait ask for opposite things: --now acts immediately regardless of the maintenance window, --wait holds until the window opens")
+			}
 			return runUpgrade(cmd.Context(), cmd.OutOrStdout(), f)
 		},
 	}
 	fs := cmd.Flags()
 	fs.StringVar(&f.Cluster, "cluster", "", "cluster to upgrade (required)")
 	fs.StringVar(&f.To, "to", "", "bundle version to upgrade to (required)")
+	fs.BoolVar(&f.Wait, "wait", false, "hold until the maintenance window opens, holding nothing while waiting, then take the operation lock and re-run every gate")
+	fs.BoolVar(&f.Now, "now", false, "act immediately regardless of the maintenance window; --now bypasses the window and nothing else")
 	fs.StringArrayVar(&f.Acknowledge, "acknowledge", nil, "accept one deprecated-API finding by namespace/Kind/name (repeatable; there is deliberately no blanket override)")
 	fs.StringArrayVar(&f.Servers, "server", nil, "control-plane node address (only needed without a local install journal)")
 	fs.StringArrayVar(&f.Agents, "agent", nil, "agent node address (only needed without a local install journal)")

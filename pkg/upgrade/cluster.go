@@ -9,6 +9,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/window"
 )
 
 // The cluster's own record is the authority on what it IS: which bundle,
@@ -169,4 +170,38 @@ func (d InClusterDrills) LastRestoreDrill(ctx context.Context) (DrillStatus, err
 		return DrillStatus{}, fmt.Errorf("the recorded restore-drill result carries no status")
 	}
 	return result, nil
+}
+
+// Window reads the cluster's stored maintenance window — the ONE definition
+// shared by this upgrade and by OS reboots (kn-t31).
+//
+// A nil Window with a nil error means NO WINDOW IS STORED, and the window gate
+// REFUSES that: a cluster with no window has no time an upgrade may start
+// (kn-nqj). An error means the window could not be read, or could not be
+// represented by pkg/window, and the gate refuses on that too — an unread gate
+// is not a passed gate, and neither answer may be read as "any time".
+//
+// It lives here rather than in the command because the gate, the --wait hold
+// and the e2e gate all have to ask the same question of the same route.
+func (r ControlPlaneRecords) Window(ctx context.Context) (*window.Window, error) {
+	if r.Client == nil {
+		return nil, fmt.Errorf("no control plane configured: run `kubenest login` first")
+	}
+	record, err := r.Client.MaintenanceWindow(ctx, r.ClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("reading this cluster's maintenance window: %w", err)
+	}
+	if record.Window == nil {
+		return nil, nil
+	}
+	parsed, err := window.Parse(window.Spec{
+		Days:     record.Window.Days,
+		Start:    record.Window.Start,
+		End:      record.Window.End,
+		Timezone: record.Window.Timezone,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("the window stored for this cluster is not one this CLI can represent: %w", err)
+	}
+	return &parsed, nil
 }

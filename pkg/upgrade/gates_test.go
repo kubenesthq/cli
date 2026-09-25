@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kubenest.io/cli/pkg/window"
 )
 
 func hoursAgo(h int) *time.Time {
@@ -189,5 +191,136 @@ func TestVersionsCompareNumerically(t *testing.T) {
 	}
 	if !back {
 		t.Error("v1.35.10 → v1.35.9 is backward")
+	}
+}
+
+// A CLUSTER WITH NO WINDOW IS REFUSED, NOT PASSED.
+//
+// This gate used to return Passed: true for a nil window with the detail "no
+// maintenance window is configured for this cluster, so any time is inside it"
+// (kn-nqj). One of seven documented gates therefore approved every cluster,
+// every time, while an operator who had set a window believed upgrades and
+// reboots were confined to it. A missing window has no time inside it, and the
+// refusal has to name the command that fixes it.
+//
+// MUTATION THAT MUST FAIL THIS TEST: restore the nil-passes branch in
+// checkWindow. It passes today with that behaviour, which is the whole reason
+// this test exists.
+func TestCheckWindowRefusesWhenNoWindowIsConfigured(t *testing.T) {
+	s := &Session{Opts: Options{Cluster: "prod-1", Now: func() time.Time { return now }}}
+
+	got := checkWindow(s)
+	if got.Passed {
+		t.Fatal("a cluster with no maintenance window has no time an upgrade may start")
+	}
+	if !strings.Contains(got.Fix, "kubenest cluster set-window") {
+		t.Errorf("the refusal must name the fix, got: %s", got.Fix)
+	}
+	lowered := strings.ToLower(got.Detail)
+	if strings.Contains(lowered, "any time") || strings.Contains(lowered, "inside it") {
+		t.Errorf("a missing window must never read as permission: %s", got.Detail)
+	}
+
+	// An unreadable window is refused for the same reason and says WHICH of the
+	// two it is: a read that failed must not arrive as a window that is absent.
+	s.WindowErr = errTest
+	unread := checkWindow(s)
+	if unread.Passed {
+		t.Fatal("a window that could not be read is not a passed check")
+	}
+	if !strings.Contains(unread.Detail, errTest.Error()) {
+		t.Errorf("the refusal must carry the read's own failure: %s", unread.Detail)
+	}
+	if !strings.Contains(unread.Fix, "kubenest cluster set-window") {
+		t.Errorf("the refusal must name the fix, got: %s", unread.Fix)
+	}
+}
+
+// The refusal names the next opening in LOCAL TIME AND UTC.
+//
+// Both, because the operator set the window in their own zone while the log,
+// the journal and the control plane's record are read in UTC. A refusal that
+// names only one of them makes every reader convert in their head, and "the
+// window opens at 02:00" and "it is 02:00 now" then mean different things to
+// two people looking at the same cluster.
+func TestCheckWindowNamesNextOpeningInLocalAndUTC(t *testing.T) {
+	// IST is UTC+05:30, so a Saturday 02:00 opening in Asia/Kolkata is Friday
+	// 20:30 UTC — the window is one thing and the instant is two renderings.
+	w, err := window.Parse(window.Spec{Days: []string{"sat"}, Start: "02:00", End: "06:00", Timezone: "Asia/Kolkata"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{Window: &w, Opts: Options{Cluster: "prod-1", Now: func() time.Time { return now }}}
+
+	got := checkWindow(s)
+	if got.Passed {
+		t.Fatalf("Friday midday UTC is outside a Saturday window: %s", got.Detail)
+	}
+	var report GateReport
+	report.add(got)
+	refusal := report.Err()
+	if refusal == nil {
+		t.Fatal("a failed gate must refuse the upgrade")
+	}
+	for _, want := range []string{"02:00 IST", "20:30 UTC"} {
+		if !strings.Contains(refusal.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, refusal)
+		}
+	}
+	if !strings.Contains(refusal.Error(), "kubenest cluster set-window") && !strings.Contains(refusal.Error(), "--wait") {
+		t.Errorf("the refusal must name what to do about it:\n%s", refusal)
+	}
+
+	// Inside the window the same session passes, so the gate is answering about
+	// the instant and not merely refusing everything.
+	inside := time.Date(2026, 8, 21, 21, 0, 0, 0, time.UTC)
+	s.Opts.Now = func() time.Time { return inside }
+	if got := checkWindow(s); !got.Passed {
+		t.Errorf("02:30 UTC on Saturday is inside a Saturday 02:00-06:00 IST window: %s", got.Detail)
+	}
+}
+
+// --now bypasses the window and nothing else.
+//
+// The operator asking to act now has asked to act now; they have not asked to
+// act on a degraded cluster mid-upgrade, or to make a transition the target
+// bundle does not offer. So the window gate passes and every other gate still
+// decides for itself.
+func TestNowBypassesOnlyTheWindow(t *testing.T) {
+	from := parseManifest(t, `
+bundle: "1.0"
+ha-tiers: [single-server, ha]
+limits: {timeouts: {node-ready: 5m}}
+profiles: {ha: {}}
+`)
+	to := parseManifest(t, `
+bundle: "1.1"
+ha-tiers: [ha]
+limits: {timeouts: {node-ready: 5m}}
+profiles: {ha: {}}
+`)
+	s := &Session{
+		From: from, To: to,
+		Opts: Options{Cluster: "prod-1", Now: func() time.Time { return now }, BypassWindow: true},
+	}
+
+	got := checkWindow(s)
+	if !got.Passed {
+		t.Fatalf("--now must bypass the window even with no window stored: %s / %s", got.Detail, got.Fix)
+	}
+	if !strings.Contains(got.Detail, "--now") {
+		t.Errorf("the pass must say the window was bypassed by --now rather than that it was satisfied: %s", got.Detail)
+	}
+
+	// ONLY the window: the other gates are untouched.
+	if other := checkBundlePath(s.From, s.To, nil, "single-server"); other.Passed {
+		t.Error("--now must not bypass the bundle-path gate: a tier the target does not offer is still refused")
+	}
+
+	// And without --now the same session refuses, so the pass came from the
+	// flag and not from something else about the session.
+	s.Opts.BypassWindow = false
+	if got := checkWindow(s); got.Passed {
+		t.Fatal("without --now a cluster with no window must refuse")
 	}
 }

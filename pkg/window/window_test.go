@@ -1,6 +1,7 @@
 package window_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -144,5 +145,56 @@ func TestStringRoundTripsWhatWasConfigured(t *testing.T) {
 	})
 	if got, want := w.String(), "sat,sun 02:00-06:00 Asia/Kolkata"; got != want {
 		t.Errorf("String() = %q, want %q", got, want)
+	}
+}
+
+// THE ONE REFUSAL EVERY DISRUPTIVE VERB GIVES (plan 7.4 item 3).
+//
+// Outside the window, refuse and name the next opening in LOCAL TIME AND UTC.
+// It lives here, once, because the upgrade's window gate, a node reboot and a
+// restore all print it: two wordings would drift, and the operator would then
+// have to work out which verb is telling them the truth.
+//
+// MUTATION THAT MUST FAIL THIS TEST: render the next opening in one zone only,
+// or drop the opening from the message. The upgrade's gate would then refuse
+// with a sentence that leaves the operator to convert the instant themselves,
+// which is the failure this test is here to prevent.
+func TestOutsideRefusesWithNowAndTheNextOpeningInLocalAndUTC(t *testing.T) {
+	w := mustParse(t, window.Spec{
+		Days: []string{"sat"}, Start: "02:00", End: "06:00", Timezone: "Asia/Kolkata",
+	})
+	// Friday midday UTC is outside a Saturday 02:00 IST window.
+	now := at(t, time.UTC, "2026-08-21 12:00")
+	err := w.Outside(now)
+	if err == nil {
+		t.Fatal("Friday midday is outside a Saturday window")
+	}
+	// The opening is Saturday 02:00 IST, which is Friday 20:30 UTC: the two
+	// renderings name one instant, and both must be in the refusal.
+	for _, want := range []string{"02:00 IST", "20:30 UTC", "12:00 UTC", w.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal is missing %q:\n%v", want, err)
+		}
+	}
+
+	// Inside the window there is nothing to refuse.
+	if err := w.Outside(at(t, w.Location, "2026-08-22 03:00")); err != nil {
+		t.Errorf("inside the window Outside must return nil, got %v", err)
+	}
+
+	// A window that cannot be read is refused too, and says so rather than
+	// reading as "any time": no day list means there is no time the window
+	// covers.
+	if err := (window.Window{}).Outside(now); err == nil {
+		t.Error("a window with no day and no zone cannot be acted inside")
+	}
+
+	// And the fix that goes with a missing window names the command, not a
+	// shrug: this is the sentence a refused operator copies.
+	if !strings.Contains(window.NoWindowFix, "kubenest cluster set-window") {
+		t.Errorf("NoWindowFix = %q, want the command that sets one", window.NoWindowFix)
+	}
+	if !strings.Contains(window.OutsideFix, "--wait") {
+		t.Errorf("OutsideFix = %q, want the flag that holds for the window", window.OutsideFix)
 	}
 }

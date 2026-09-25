@@ -83,13 +83,24 @@ func TestWhichStagesAreExemptFromTheWindow(t *testing.T) {
 	}
 }
 
-// A cluster with no window configured is always inside it.
-func TestNoWindowMeansAnyTime(t *testing.T) {
+// A CLUSTER WITH NO WINDOW IS A REFUSAL, AND THE TWO WINDOW RULES ARE
+// ASSERTED TOGETHER BECAUSE OF IT.
+//
+// This test used to be named for the old rule — no window means any time — and
+// that rule was the kn-nqj defect: the gate approved every cluster while the
+// operator believed their window was in force. The gate now REFUSES a missing
+// window. The stage-level pause stays open without one, deliberately, because
+// the gate is what owns the verdict: pausing every stage of an upgrade that has
+// already been refused would only add a second, contradictory answer.
+func TestAMissingWindowIsRefusedByTheGateNotTreatedAsAnyTime(t *testing.T) {
 	s := &Session{Opts: Options{Cluster: "prod-1"}}
 	for _, stage := range StageNames {
 		if err := s.windowStillOpen(stage); err != nil {
 			t.Errorf("%s: %v", stage, err)
 		}
+	}
+	if got := checkWindow(s); got.Passed {
+		t.Fatal("a missing window must be refused by the gate: an upgrade with no window has no time it may start")
 	}
 }
 

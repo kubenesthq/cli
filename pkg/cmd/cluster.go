@@ -39,14 +39,25 @@ progress finishes — abandoning a half-completed stage to respect a clock
 leaves the cluster in a worse state than the overrun does.
 
 The timezone is an IANA name, never an offset: offsets move twice a year, and
-a window that silently shifts by an hour is worse than no window at all.`,
+a window that silently shifts by an hour is worse than no window at all.
+
+The window has three states and they are reported separately: STORED in the
+control plane, APPLYING to the cluster, and ACTIVE once the operator has
+acknowledged this revision. Only an active window is in force — until then the
+cluster keeps its previous window, which is what a disconnected cluster is
+reported as. An upgrade outside the window is refused and names the next
+opening; kubenest platform upgrade --wait holds for it.`,
 		Example: `  kubenest cluster set-window --cluster prod-1 \
     --days sat,sun --start 02:00 --end 06:00 --timezone Asia/Kolkata`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cluster == "" {
 				return fmt.Errorf("--cluster is required")
 			}
-			return runWindow(cmd.Context(), cmd.OutOrStdout(), cluster, spec)
+			client, err := controlPlaneClient()
+			if err != nil {
+				return err
+			}
+			return runWindow(cmd.Context(), cmd.OutOrStdout(), client, cluster, spec)
 		},
 	}
 	fs := cmd.Flags()

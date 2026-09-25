@@ -277,39 +277,134 @@ type MaintenanceWindow struct {
 	Timezone string   `json:"timezone"`
 }
 
-// PutMaintenanceWindow sets the cluster's window.
-func (c *Client) PutMaintenanceWindow(ctx context.Context, clusterID string, w MaintenanceWindow) error {
-	body, err := json.Marshal(w)
+// The three states a stored window is in, as the control plane reports them,
+// and as the command surface prints them. They are distinct values and are
+// never collapsed (kn-t31): `stored` is written to the control plane,
+// `applying` has been handed to the cluster and not yet acknowledged, and
+// `active` has been acknowledged at the current revision. A window that is
+// stored but not yet active is NOT in force.
+const (
+	WindowStateStored   = "stored"
+	WindowStateApplying = "applying"
+	WindowStateActive   = "active"
+)
+
+// WindowBackupUnknown is what the control plane puts in Warning when the
+// operator's backup duration has never been measured. It is a wire value and
+// not a message: a client must be able to tell "no overlap" (null) from "we
+// could not tell" (this), because an unmeasured backup is not a passing check.
+const WindowBackupUnknown = "unknown"
+
+// MaintenanceWindowRecord is what both maintenance-window routes answer: the
+// stored window, the revision it is at, and which of the three states it is in.
+//
+// A NIL Window IS A REFUSAL, NOT PERMISSION. The cluster's window is unset and
+// no code may read that as "any time is inside it" — that was the kn-nqj
+// defect, where the upgrade's window gate approved every cluster because a
+// missing window was treated as a passing check. A caller with a nil window
+// must refuse and name `kubenest cluster set-window`.
+type MaintenanceWindowRecord struct {
+	Window   *MaintenanceWindow `json:"window"`
+	Revision *int               `json:"revision"`
+	State    string             `json:"state"`
+	// AppliedRevision is the revision the operator last acknowledged. Lower
+	// than Revision — or nil — means the cluster is still running the previous
+	// window (or none), which is how a disconnected cluster is reported rather
+	// than as the new one being in force.
+	AppliedRevision *int    `json:"applied_revision"`
+	RejectReason    *string `json:"reject_reason"`
+	// Warning is the backup-overlap warning, the literal "unknown" when the
+	// operator's backup evidence has never been measured, or nil when the
+	// evidence was read and there is no overlap. An unmeasured backup is not a
+	// passing check, which is why the control plane answers "unknown" rather
+	// than nothing.
+	Warning *string `json:"warning"`
+}
+
+// CurrentRevision is the revision a write must carry: the one this record was
+// read at. A cluster that has never had a window is at revision 0, which is
+// what its first write is based on.
+func (r MaintenanceWindowRecord) CurrentRevision() int {
+	if r.Revision == nil {
+		return 0
+	}
+	return *r.Revision
+}
+
+// PutMaintenanceWindow stores the cluster's window. Scope: install:report.
+//
+// revision is the compare-and-swap: the revision the caller READ, from
+// MaintenanceWindow. A write that is not at the stored window's current
+// revision is refused with 409 and the stored window is left alone — two
+// operators setting one cluster's window from two laptops is the ordinary
+// case, and which window is in force is not something to be ambiguous about.
+//
+// The stored window comes back with its new revision and its state, which is
+// `stored` or `applying`: a freshly written window is NOT active until the
+// operator has acknowledged it, and the caller must not report it as in force.
+func (c *Client) PutMaintenanceWindow(ctx context.Context, clusterID string, w MaintenanceWindow, revision int) (MaintenanceWindowRecord, error) {
+	body, err := json.Marshal(struct {
+		MaintenanceWindow
+		Revision int `json:"revision"`
+	}{MaintenanceWindow: w, Revision: revision})
 	if err != nil {
-		return err
+		return MaintenanceWindowRecord{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
 		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/maintenance-window"), bytes.NewReader(body))
 	if err != nil {
-		return err
+		return MaintenanceWindowRecord{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	return c.do(req, nil)
+	req.Header.Set("Accept", "application/json")
+	var out MaintenanceWindowRecord
+	if err := c.do(req, &out); err != nil {
+		return MaintenanceWindowRecord{}, windowRefusal(err)
+	}
+	return out, nil
 }
 
-// MaintenanceWindow reads the cluster's window. A cluster with none set
-// returns the zero value and no error: no window means any time is inside it.
-func (c *Client) MaintenanceWindow(ctx context.Context, clusterID string) (MaintenanceWindow, error) {
+// MaintenanceWindow reads the cluster's window, its revision and its state.
+// Scope: clusters:read.
+//
+// A cluster with no window answers 200 with a nil Window, a nil Revision and
+// state "stored". A control plane too old to serve the route answers 404,
+// which is an ERROR and not a nil record: an unroutable read is a failed read,
+// and a failed read that looked like "no window" would also be a failed read
+// that looked like permission.
+func (c *Client) MaintenanceWindow(ctx context.Context, clusterID string) (MaintenanceWindowRecord, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/maintenance-window"), nil)
 	if err != nil {
-		return MaintenanceWindow{}, err
+		return MaintenanceWindowRecord{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	var out MaintenanceWindow
+	var out MaintenanceWindowRecord
 	if err := c.do(req, &out); err != nil {
-		var apiErr *Error
-		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
-			return MaintenanceWindow{}, nil
-		}
-		return MaintenanceWindow{}, err
+		return MaintenanceWindowRecord{}, windowRefusal(err)
 	}
 	return out, nil
+}
+
+// windowRefusal turns the two window-route refusals into the operator's next
+// action.
+//
+// 409 is the compare-and-swap: the window moved since this caller read it, so
+// the fix is to re-read and re-apply, never to retry the same body. 404 is a
+// control plane that does not serve the route, which is reported as an
+// inability to read the window rather than as a missing one.
+func windowRefusal(err error) error {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+	switch apiErr.Status {
+	case http.StatusConflict:
+		return fmt.Errorf("someone changed the window; re-run: %w", err)
+	case http.StatusNotFound:
+		return fmt.Errorf("this control plane does not serve the cluster's maintenance-window route, so its window cannot be read — that is not the same as no window being set; upgrade the control plane before acting on the cluster: %w", err)
+	}
+	return err
 }
 
 // AgentTokenRotation is the result of POST /clusters/{id}/rotate-token (kn-i3c).
