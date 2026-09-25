@@ -16,6 +16,8 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/operation"
+	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/s3"
 )
 
@@ -272,6 +274,29 @@ func (t Target) S3Client() (*s3.Client, error) {
 		AccessKeyID:     t.AccessKeyID,
 		SecretAccessKey: t.SecretAccessKey,
 	})
+}
+
+// OperationCopy builds the off-cluster copy of a disruptive operation's record
+// on this target, sealed to the fleet recovery recipient (PLAN 7.2).
+//
+// It is the wiring between the record and the store, and it lives here because
+// this is where a target's coordinates and credentials already are: the copy
+// goes to the SAME bucket under the SAME cluster prefix the backups and the
+// recovery kits use, because that is the credential the CLI holds and the store
+// a recovery reaches when the cluster's API server is gone. The keys sit beside
+// the kits' (<scope>/operations/<operation-id>.json.enc against
+// <scope>/recovery-kits/…), so a recovery that has the kit has the record's
+// directory too.
+//
+// recipient is the PUBLIC half of the fleet key — what a later install holds.
+// NewCopy refuses the private half: this copy is written to a store the
+// customer's cluster does not control.
+func (t Target) OperationCopy(recipient string) (operation.Copy, error) {
+	client, err := t.S3Client()
+	if err != nil {
+		return operation.Copy{}, fmt.Errorf("the operation record's off-cluster copy needs the target's S3 client: %w", err)
+	}
+	return operation.NewCopy(client, recoverykit.Sealer{Recipient: recipient}, t.Prefix)
 }
 
 // ownPrefix is the cluster-level directory this cluster's objects live under,

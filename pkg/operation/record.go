@@ -370,6 +370,50 @@ func (r *Record) State() State {
 	return StateRunning
 }
 
+// ResumeCommand is the command that continues this operation from where it
+// stopped, in the CLI's own words — the command the control plane shows, and
+// the one an operator types.
+//
+// It is empty when there is nothing to resume: a terminal record (the
+// operation ended) and a kind whose verb this CLI does not have yet. Naming a
+// command an operator cannot run would be worse than naming none — the control
+// plane says, in as many words, that the record names no resume command and
+// the cluster's record should be read before repeating any step.
+func (r *Record) ResumeCommand() string {
+	if r.Terminal {
+		return ""
+	}
+	verb := r.Request.Kind.resumeVerb()
+	if verb == "" {
+		return ""
+	}
+	return verb + " --resume " + r.OperationID
+}
+
+// resumeVerb is the verb that resumes an operation of this kind, without the
+// operation id: `--resume <operation-id>` is the flag (PLAN 7.2), and the verbs
+// are the plan's too (7.3 for the node lifecycle). A kind whose verb the plan
+// does not name yet gets no command rather than a guess.
+func (k Kind) resumeVerb() string {
+	switch k {
+	case KindUpgrade:
+		return "kubenest platform upgrade"
+	case KindDatastoreRollback:
+		return "kubenest platform rollback"
+	case KindRestoreNamespace, KindRestoreVolume:
+		return "kubenest platform restore"
+	case KindNodeAdd:
+		return "kubenest node add"
+	case KindNodeRemove:
+		return "kubenest node remove"
+	case KindNodeReplace:
+		return "kubenest node replace"
+	case KindNodeReboot:
+		return "kubenest node reboot"
+	}
+	return ""
+}
+
 // Outstanding returns the writes the operation still owes.
 func (r *Record) Outstanding() []PendingWrite {
 	var out []PendingWrite

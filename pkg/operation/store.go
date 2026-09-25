@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/k3s"
 )
 
@@ -58,6 +59,22 @@ type Store struct {
 	// Now overrides the clock. Tests need it; heartbeats and staleness
 	// readings are the only places the record depends on wall time.
 	Now func() time.Time
+
+	// Mirror is the control plane's copy of the record — the display and
+	// `check_upgrade` path — or nil for a CLI that has none. Every write of the
+	// live record is mirrored when it is set, and a mirror that fails is
+	// reported on the handle and never fails the operation: the record in the
+	// cluster is the lock, and it works while this control plane does not.
+	Mirror *api.Client
+	// MirrorClusterID is the control plane's id for the cluster this record is
+	// about. The mirror route is addressed by it, while the record's own
+	// Request.Cluster is the cluster's NAME. Empty means this CLI does not know
+	// it (an operation before registration), and a configured mirror then
+	// reports that rather than posting a record to the wrong cluster.
+	MirrorClusterID string
+	// MirrorTimeout overrides the bound on one mirror write. Zero uses
+	// defaultMirrorTimeout.
+	MirrorTimeout time.Duration
 }
 
 func (s *Store) now() time.Time {
@@ -83,6 +100,10 @@ type Handle struct {
 	rec   *Record
 	rv    string
 	token string
+	// mirrorErr is the last mirror write's failure, or nil when the last one
+	// succeeded. Guarded by mu, because writes through one handle may come from
+	// more than one place.
+	mirrorErr error
 }
 
 // OperationID is the operation this handle owns.
@@ -204,6 +225,8 @@ func (s *Store) Acquire(ctx context.Context, req Request) (*Handle, error) {
 		return nil, locked(live.Record)
 	}
 	rec.Revision = h.rv
+	// The record now exists and owns the operation; the mirror is display.
+	s.mirror(ctx, h, rec)
 	return h, nil
 }
 
@@ -261,6 +284,7 @@ func (s *Store) update(ctx context.Context, h *Handle, mutate func(*Record) erro
 	}
 	rec.Revision = rv
 	h.rec, h.rv = rec, rv
+	s.mirror(ctx, h, rec)
 	return nil
 }
 

@@ -40,6 +40,10 @@ func (s *Store) Complete(ctx context.Context, h *Handle, result Result) error {
 // copyHistory writes the finished record's copy. A repeated Complete replaces
 // its own copy rather than failing: completion may be retried after a lost
 // connection, and the second attempt is the same operation finishing.
+//
+// It is not mirrored: the terminal write it copies was, at the same revision
+// and with the same content, and the mirror is one row per cluster rather than
+// one per object.
 func (s *Store) copyHistory(ctx context.Context, rec *Record) error {
 	name := HistoryPrefix + rec.OperationID
 	existing, err := s.read(ctx, name)
