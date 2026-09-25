@@ -377,9 +377,16 @@ func clusterGates(ctx context.Context, r k3s.Runner, values string) []Gate {
 
 // stageFence raises the fence: the public API route goes to the 503 page.
 //
+// ITS APPLY CHANGES THE ROUTE AND NOTHING ELSE, and the two things that would
+// otherwise change with it are the backend's image and the migration Job
+// (FenceOptions.BackendImage, FenceOptions.MigrationOff). This is the FIRST
+// apply of the procedure: the checkpoint and the migration both come after it,
+// and both must run against the code and the schema the control plane has now.
+//
 // IT ADOPTS A FENCE THAT IS ALREADY UP. A resume after an interrupted raise
 // finds the route already switched, and re-raising while believing it is
-// switching would be a step whose failure mode is invisible.
+// switching would be a step whose failure mode is invisible. An adopted fence
+// makes no apply: the values it would apply are the ones this run started from.
 func stageFence(ctx context.Context, s *UpgradeSession) error {
 	r := s.runner(StageFence)
 	status, err := Status(ctx, r)
@@ -396,12 +403,37 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	if err != nil {
 		return err
 	}
+	// THE IMAGE THE BACKEND RUNS NOW, read before anything is applied. The
+	// chart this binary carries pins the NEW backend image, so the apply that
+	// raises the fence would otherwise roll the backend Deployment — and the
+	// checkpoint CronJob, which runs the same image — onto code that has never
+	// been migrated. That roll happens BEFORE the checkpoint this procedure
+	// exists to take and before the migration that code needs, which is the
+	// invariant the whole ordered procedure buys (hardware finding, 2026-09-25).
+	// An image that cannot be read is refused, never silently replaced by the
+	// chart's new pin.
+	image, err := runningBackendImage(ctx, r)
+	if err != nil {
+		return err
+	}
 	s.Record.BackendReplicas = replicas
 	s.Record.FenceRaised = true
 	if err := s.saveRecord(); err != nil {
 		return err
 	}
-	values, err := Raise(ctx, r, s.Opts.Values)
+	fenced, err := Raise(ctx, r, s.Opts.Values)
+	if err != nil {
+		return err
+	}
+	// THE MIGRATION JOB GOES OFF WITH it, and that is not a formality either:
+	// the running values still enable it, so an apply that reproduced them
+	// would re-render the release's Job with the new pod template while the
+	// previous revision's Job is still there. Job.spec.template is immutable,
+	// so helm would try to PATCH it and the upgrade would fail outright,
+	// leaving the release failed under failurePolicy: abort (the second half of
+	// the same hardware finding). With it off, helm deletes the Job it had
+	// rendered, and stageMigration creates it again at this run's revision.
+	values, err := FenceValues(fenced, FenceOptions{Up: true, MigrationOff: true, BackendImage: &image})
 	if err != nil {
 		return err
 	}
@@ -457,9 +489,17 @@ func eligibleMarker(c EligibleCheckpoint) string {
 // the Recreate strategy and backoffLimit 0 on the Job, a backend running the
 // old code while the schema moves is the exact state this whole procedure
 // exists to prevent.
+//
+// ITS FIRST APPLY TURNS THE MIGRATION JOB OFF (FenceOptions.MigrationOff), and
+// it is applied BEFORE clearStaleMigrationJob for a reason: the values this run
+// starts from still enable the Job, so an apply that reproduced them would
+// re-render the previous revision's Job with a new pod template and fail helm
+// on an immutable template before the stale Job was ever removed. With the Job
+// off, helm deletes it, and the apply that follows creates it at THIS run's
+// revision and runs the NEW image — the chart's own pin, not the fence's.
 func stageMigration(ctx context.Context, s *UpgradeSession) error {
 	r := s.runner(StageMigration)
-	stopped, err := FenceValues(s.Opts.Values, FenceOptions{Up: true, BackendReplicas: int32Ptr(0)})
+	stopped, err := FenceValues(s.Opts.Values, FenceOptions{Up: true, BackendReplicas: int32Ptr(0), MigrationOff: true})
 	if err != nil {
 		return err
 	}

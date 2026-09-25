@@ -86,6 +86,32 @@ const backendDeploymentImageCmd = "get deployment/" + backendService + " -n " + 
 const backendReplicasCmd = "get deployment/" + backendService + " -n " + Namespace +
 	" -o jsonpath={.spec.replicas}"
 
+// runningBackendImage reads the image the backend Deployment runs and splits it
+// into the fields the chart's values carry, so an apply can be held to exactly
+// the reference that is running.
+//
+// IT IS THE READ THE FENCE ALREADY MAKES, parsed: backendDeploymentImageCmd is
+// what fenceObjects uses to run the 503 page on an image the node has already
+// pulled. One read, two uses, and the same failure rule for both — a backend
+// whose image cannot be read has nothing to serve the maintenance page and
+// nothing to pin, so the stage stops rather than deciding for itself what to
+// run.
+func runningBackendImage(ctx context.Context, r k3s.Runner) (BackendImage, error) {
+	out, err := k3s.Kubectl(ctx, r, backendDeploymentImageCmd)
+	if err != nil {
+		return BackendImage{}, fmt.Errorf("the image the backend Deployment %s/%s runs could not be read, and an apply that does not know it would roll the backend onto the new chart's image: %w", Namespace, backendService, err)
+	}
+	reference := strings.TrimSpace(out)
+	if reference == "" {
+		return BackendImage{}, fmt.Errorf("the backend Deployment %s/%s names no image, so an apply could not be held to what it runs", Namespace, backendService)
+	}
+	image, err := ParseBackendImage(reference)
+	if err != nil {
+		return BackendImage{}, fmt.Errorf("the backend Deployment %s/%s runs %q, which cannot be pinned: %w", Namespace, backendService, reference, err)
+	}
+	return image, nil
+}
+
 // FenceState is what Status found.
 type FenceState string
 
@@ -117,6 +143,27 @@ type FenceOptions struct {
 	// backend down for the migration window; the value read before the fence
 	// went up brings it back afterwards.
 	BackendReplicas *int32
+	// MigrationOff turns the chart's migration Job OFF explicitly.
+	//
+	// IT IS EXPLICIT BECAUSE THE RUNNING VALUES USUALLY ENABLE IT. The values an
+	// upgrade reads off the cluster are the ones the last install or upgrade
+	// applied, and a migration enabled then (migrate.go's MigrationValues,
+	// which nothing turns back off) is still in them. An apply before this
+	// run's migration apply that reproduced them would re-render the release's
+	// Job with a new pod template — and Job.spec.template is immutable, so helm
+	// would try to PATCH it, fail the upgrade outright, and leave the release
+	// failed under failurePolicy: abort (hardware, 2026-09-25). Turning it off
+	// makes helm DELETE the Job instead; the migration stage creates it again.
+	MigrationOff bool
+	// BackendImage, when not nil, pins backend.image to this reference: the
+	// image the backend is RUNNING, read from its Deployment.
+	//
+	// THE APPLY THAT RAISES THE FENCE MUST CHANGE NOTHING BUT THE ROUTE. The
+	// chart a binary carries pins the NEW backend image, so an apply without
+	// this pin rolls the backend Deployment and the checkpoint CronJob onto
+	// code that has never been migrated — before the checkpoint this procedure
+	// exists to take, and before the migration that code needs.
+	BackendImage *BackendImage
 }
 
 // FenceValues returns the values document with the fence applied.
@@ -140,6 +187,37 @@ func FenceValues(valuesYAML string, o FenceOptions) (string, error) {
 			backend = map[string]any{}
 		}
 		backend["replicas"] = *o.BackendReplicas
+		doc["backend"] = backend
+	}
+	if o.MigrationOff {
+		doc["migration"] = map[string]any{"enabled": false}
+	}
+	if o.BackendImage != nil {
+		backend, _ := doc["backend"].(map[string]any)
+		if backend == nil {
+			backend = map[string]any{}
+		}
+		// A REFERENCE WITH NO DIGEST WRITES AN EMPTY ONE, never an absent one.
+		// Helm merges these values over the chart's defaults, the chart's
+		// default backend.image carries the new release's digest, and the
+		// helper renders repository@digest whenever a digest is set. An absent
+		// key leaves that default in force, so the apply would roll the backend
+		// onto the new image after all; so would a digest left over from an
+		// earlier pin. A reference with a digest needs no tag, because the digest
+		// is what renders. Everything else under backend.image (pullPolicy, and
+		// whatever the chart grows there) is left alone.
+		image, _ := backend["image"].(map[string]any)
+		if image == nil {
+			image = map[string]any{}
+		}
+		image["repository"] = o.BackendImage.Repository
+		image["digest"] = o.BackendImage.Digest
+		if o.BackendImage.Tag != "" {
+			image["tag"] = o.BackendImage.Tag
+		} else {
+			delete(image, "tag")
+		}
+		backend["image"] = image
 		doc["backend"] = backend
 	}
 	out, err := yaml.Marshal(doc)

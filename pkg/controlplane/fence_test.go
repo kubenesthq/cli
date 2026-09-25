@@ -2,7 +2,9 @@ package controlplane
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -382,4 +384,66 @@ func renderedAPIBackendRef(t *testing.T, rendered string) struct {
 	}
 	t.Fatalf("the rendered chart carries no HTTPRoute named %s-api", ReleaseName)
 	return out
+}
+
+// The pin the fence applies is the image the CHART RENDERS, not only the value
+// the CLI writes. Helm merges the values over the chart's defaults, and the
+// chart's default backend.image carries the NEW release's digest, which the
+// helper renders whenever it is set. A pin that omits a key leaves the default
+// in force, so this is read from `helm template` rather than from the values.
+// Skipped when helm or the sibling chart is not here.
+func TestThePinnedRunningImageIsWhatTheChartRenders(t *testing.T) {
+	chartRoot := siblingChartRoot(t)
+	if _, err := exec.LookPath("helm"); err != nil {
+		t.Skipf("helm is not installed, so the rendered Deployment cannot be read here: %v", err)
+	}
+	const repo = "ghcr.io/kubenesthq/kubenest-backend"
+	const digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	base := fenceTestValues + "backend:\n  admin:\n    password: p\ngatewayCA:\n  certificate: c\n  privateKey: k\ncheckpoint:\n  enabled: false\n"
+	for _, tc := range []struct{ running, want string }{
+		{repo + "@" + digest, repo + "@" + digest},
+		{repo + ":675ff0e", repo + ":675ff0e"},
+		{repo + ":675ff0e@" + digest, repo + "@" + digest},
+	} {
+		image, err := ParseBackendImage(tc.running)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.running, err)
+		}
+		values, err := FenceValues(base, FenceOptions{Up: true, MigrationOff: true, BackendImage: &image})
+		if err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(t.TempDir(), "values.yaml")
+		if err := os.WriteFile(file, []byte(values), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("helm", "template", ReleaseName, chartRoot, "-f", file).CombinedOutput()
+		if err != nil {
+			t.Fatalf("helm template: %v\n%s", err, out)
+		}
+		if got := renderedBackendImage(t, string(out)); got != tc.want {
+			t.Errorf("running %s: the fence apply renders the backend at %s, want %s — the apply would roll the backend before the checkpoint",
+				tc.running, got, tc.want)
+		}
+	}
+}
+
+// renderedBackendImage reads the backend Deployment's container image out of a
+// rendered chart.
+func renderedBackendImage(t *testing.T, rendered string) string {
+	t.Helper()
+	decoder := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		metadata, _ := doc["metadata"].(map[string]any)
+		if doc["kind"] != "Deployment" || metadata == nil || metadata["name"] != backendService {
+			continue
+		}
+		return fenceDigString(t, doc, "spec", "template", "spec", "containers", "0", "image")
+	}
+	t.Fatalf("the rendered chart carries no Deployment named %s", backendService)
+	return ""
 }
