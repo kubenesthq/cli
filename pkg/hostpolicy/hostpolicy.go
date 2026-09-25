@@ -21,12 +21,17 @@
 //     single-server cluster that restart is an API outage outside the window.
 //
 // Probe P6 (plan 9.1) asks whether needrestart CAN restart k3s after an
-// unattended upgrade. The ignore list ships for both units REGARDLESS of the
-// answer, because that is P6's stated fallback (9.1) and it makes this code
-// independent of the probe's outcome; the controller records the answer P6
-// observed on real hosts alongside this package when it verifies. The e2e gate
-// (e2e/host_policy_test.go, TestHostPolicyGate step 4) is where the observation
-// is made on a host, and it states in its failure message what it saw.
+// unattended upgrade. Observed 2026-09-25 on a k3s server installed by this
+// CLI (Ubuntu 24.04, needrestart 3.6-7ubuntu4.5, default restart mode): no.
+// needrestart selects a service when one of its processes maps a replaced
+// shared object, and every process in k3s.service's cgroup (k3s, its
+// containerd and the runc shims) is a static binary that maps none. A real
+// `unattended-upgrade -d` of 94 packages, libc6 among them, restarted
+// packagekit and deferred dbus and systemd-logind, while `needrestart -b -r l`
+// did not list k3s.service and k3s kept its MainPID. The ignore list ships for
+// both units anyway: it is P6's stated fallback, and it keeps this true if a
+// future k3s links anything dynamically. TestHostPolicyGate step 4 repeats the
+// observation on every gate run.
 //
 // The write discipline is k3s.WriteManifest's, for the same reason: apt reads
 // the whole apt.conf.d directory and needrestart reads the whole file, so a
