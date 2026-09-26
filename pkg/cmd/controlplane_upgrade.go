@@ -19,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
@@ -76,6 +77,22 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	// anything.
 	nodeRunner, err := controlPlaneNodeRunner(ctx, f)
 	if err != nil {
+		return err
+	}
+	// THE BACKEND A STOPPED MIGRATION LEFT BEHIND COMES BACK BEFORE ANY READ.
+	//
+	// The migration stage's first apply stops the backend with the fence up, so
+	// a run interrupted there — or a laptop that died — leaves the control plane
+	// with nothing running and no process left to restore it. Every read this
+	// command makes next (the version, the record, the window, the bundle
+	// manifests) then dies with `control plane kubenest-backend is unreachable:
+	// ... connect failed ("Connection refused")`, and the resume the CLI
+	// advertises is refused for want of the very backend it is resuming
+	// (hardware, 2026-09-26; kn-t70-control-plane-version-identity-4xso.3).
+	//
+	// IT CHANGES NOTHING ON A RUN THAT NEEDS NO RECOVERY: a fence that is not up,
+	// or a backend still running behind one, is left exactly as it is.
+	if err := recoverStoppedBackend(ctx, out, f, nodeRunner); err != nil {
 		return err
 	}
 	nodeClient := func(ctx context.Context) (*api.Client, error) {
@@ -509,6 +526,54 @@ func controlPlaneNodeRunner(ctx context.Context, f UpgradeFlags) (k3s.Runner, er
 		return nil, err
 	}
 	return sshx.Dial(ctx, endpoint, sshx.Options{KeyPath: f.SSHKey})
+}
+
+// recoverStoppedBackend brings a backend back behind the fence when this run
+// finds the migration stage's stop apply and nothing else.
+//
+// IT RUNS BEFORE THE COMMAND'S FIRST READ, and everything it needs is reachable
+// without one: the fence's own Deployment, the backend's replica count, the
+// values the HelmChart carries and the migration Job are all reads through the
+// node, and which code comes back is decided by what the cluster says about the
+// migration (pkg/controlplane's RecoverStoppedBackend, which says why).
+//
+// THE DEADLINE IS THE BUNDLE THIS BINARY CARRIES, and it has to be: this recovery
+// runs before any read of the control plane, so the copy of the manifest the
+// control plane serves is behind the very fence being recovered from, and a
+// number made up here would be a deadline the operator's own bundle does not
+// have. A --to this binary does not carry is therefore refused rather than waited
+// on, and it is only ever refused on a run that actually needs the recovery.
+func recoverStoppedBackend(ctx context.Context, out io.Writer, f UpgradeFlags, node k3s.Runner) error {
+	facts, stopped, err := controlplane.StoppedBackendBehindAFence(ctx, node)
+	if err != nil {
+		return err
+	}
+	if !stopped {
+		// The ordinary run, and the resume whose backend is still up behind the
+		// fence: the reads that follow reach a control plane.
+		return nil
+	}
+	bundle, err := bundles.Manifest(f.To)
+	if err != nil {
+		return fmt.Errorf("the backend is stopped behind a fence and bringing it back is bounded by the target bundle's component-ready deadline, which cannot be read from the control plane because this recovery runs before any read of it: %w", err)
+	}
+	deadline, err := bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return err
+	}
+	values, err := currentControlPlaneValues(ctx, node)
+	if err != nil {
+		return err
+	}
+	return controlplane.RecoverStoppedBackend(ctx, node, controlplane.RecoveryOptions{
+		Values:   values,
+		Facts:    facts,
+		Deadline: deadline,
+		Reporter: converge.NewTextReporter(out),
+		Logf: func(format string, args ...any) {
+			fmt.Fprintf(out, format+"\n", args...)
+		},
+	})
 }
 
 // recordedOperationFacts is what the operation recorded when it began: the

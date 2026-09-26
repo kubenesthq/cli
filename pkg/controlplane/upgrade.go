@@ -47,6 +47,11 @@ import (
 //	this journal; every remote action is recorded before it is submitted, so a
 //	successor can reconcile actual state instead of repeating a step.
 //
+// AND BEFORE ANY STAGE RUNS, a caller that finds the fence up over a backend
+// stopped at zero replicas recovers one first (RecoverStoppedBackend): every
+// read the caller makes before it has a session needs a running control plane,
+// and the run that stopped it is not necessarily still alive to put it back.
+//
 // ROLLING BACK is automatic only while the fence has held continuously: the
 // checkpoint taken at stage 3 is the state to return to, and after the fence
 // lifts, returning to it is an explicit recovery with its data-loss interval
@@ -651,27 +656,20 @@ func stageChart(ctx context.Context, s *UpgradeSession) error {
 			return err
 		}
 	}
-	running, err := FenceValues(s.Opts.Values, FenceOptions{Up: true, BackendReplicas: int32Ptr(replicas)})
+	deadline, err := s.componentReady()
 	if err != nil {
 		return err
 	}
-	// THE MIGRATION JOB STAYS ENABLED FROM HERE ON. A chart apply that rendered
-	// it off makes helm DELETE the Job the migration stage created: the
-	// operator-visible record of the schema step would be gone after the
-	// upgrade and `kubectl logs job/kubenest-cp-migrate` would have nothing to
-	// read (hardware, 2026-09-25). The Job's pod template depends only on the
-	// backend image, the pull secrets and the PostgreSQL host, user and
-	// database — none of which the later applies change — so keeping it on
-	// cannot hit the immutable-field rule.
-	running, err = MigrationValues(running)
+	revision, _, err := applyBehindFence(ctx, r, fencedApply{
+		Code:     backendNew,
+		Values:   s.Opts.Values,
+		Replicas: replicas,
+		Deadline: deadline,
+		Every:    s.PollInterval,
+		Reporter: s.Opts.Reporter,
+		Logf:     s.Logf,
+	})
 	if err != nil {
-		return err
-	}
-	revision, err := Apply(ctx, r, running)
-	if err != nil {
-		return err
-	}
-	if err := WaitReady(ctx, r, revision, s.Opts.Bundle, s.Opts.Reporter); err != nil {
 		return err
 	}
 	s.Record.ChartRevision = revision
@@ -859,48 +857,357 @@ func (s *UpgradeSession) restorePreviousRelease(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("the fence's own Deployment is gone, so the image the previous release ran cannot be established")
 	}
-	if facts.PreviousImage == "" {
-		return fmt.Errorf("the fence records no %s, so the image the previous release ran cannot be established: nothing was recorded at the fence stage", fencePreviousImageAnnotation)
-	}
 	replicas := s.Record.BackendReplicas
 	if replicas == 0 {
 		// A NEW process has no journal, so the count comes from the fence.
 		replicas = facts.Replicas
 	}
-	if replicas == 0 {
-		replicas = 1
-	}
-	values, err := withBackendImage(s.Opts.Values, facts.PreviousImage)
-	if err != nil {
-		return err
-	}
-	values, err = FenceValues(values, FenceOptions{Up: true, BackendReplicas: &replicas})
-	if err != nil {
-		return err
-	}
-	values, err = migrationValues(values, false)
-	if err != nil {
-		return err
-	}
-	revision, err := Apply(ctx, r, values)
-	if err != nil {
-		return err
-	}
 	deadline, err := s.componentReady()
 	if err != nil {
 		return err
 	}
-	// ONLY THE ROLLOUT IS WAITED FOR, NOT READINESS: the migration failed because
-	// PostgreSQL went away, so the previous backend's pods start and sit NotReady
-	// until the database answers.
-	rollout, err := WaitRolledOut(ctx, r, revision, deadline, s.PollInterval, s.Opts.Reporter)
+	_, rollout, err := applyBehindFence(ctx, r, fencedApply{
+		Code:          backendPrevious,
+		Values:        s.Opts.Values,
+		PreviousImage: facts.PreviousImage,
+		Replicas:      replicas,
+		Deadline:      deadline,
+		Every:         s.PollInterval,
+		Reporter:      s.Opts.Reporter,
+		Logf:          s.Logf,
+	})
 	if err != nil {
 		return err
 	}
-	s.Logf("  the previous code is back behind the fence at install revision %s (%s, %d/%d backend replicas ready), with the fence up and the migration off",
-		revision, facts.PreviousImage, rollout.Ready, rollout.Want)
-	s.Restored = &rollout
+	s.Restored = rollout
 	return nil
+}
+
+// backendCode says which code a fenced apply brings back.
+type backendCode int
+
+const (
+	// backendNew is the release this run is moving to: the pin the chart this
+	// binary carries declares, and the schema the migration Job created.
+	backendNew backendCode = iota
+	// backendPrevious is the code the backend ran BEFORE this upgrade. Only the
+	// fence knows its image, because after the first apply the reference is
+	// nowhere on the cluster: the chart this binary carries pins the new one.
+	backendPrevious
+)
+
+// fencedApply is one apply of the control-plane chart while the fence is up,
+// and how to wait for what it brings back.
+type fencedApply struct {
+	// Code is which code this apply puts behind the fence.
+	Code backendCode
+	// Values is the values document the control plane runs with, as the run
+	// read it off the cluster.
+	Values string
+	// PreviousImage is the image the backend ran before the upgrade, recorded
+	// on the fence. It is required for backendPrevious and unused for
+	// backendNew, which takes the chart's own pin.
+	PreviousImage string
+	// Replicas is how many backend replicas the control plane ran before the
+	// fence stopped it.
+	Replicas int32
+	// Deadline bounds the wait that follows the apply.
+	Deadline time.Duration
+	// Every is that wait's poll interval. Zero means the converge default.
+	Every time.Duration
+	// Reporter publishes the wait's progress.
+	Reporter converge.Reporter
+	// Logf writes the line that says what came back. Nil writes nothing.
+	Logf func(format string, args ...any)
+}
+
+// applyBehindFence applies the control-plane chart with the fence up and waits
+// for the backend the apply brings back, returning the install revision it
+// applied and — for the previous code — how far its rollout got.
+//
+// IT IS THE ONE IMPLEMENTATION of every apply a fenced control plane takes: the
+// migration stage's chart roll onto the new code (stageChart), the restore after
+// a failed migration (restorePreviousRelease) and the recovery a resumed run
+// performs before its first read (RecoverStoppedBackend). Three copies of these
+// values would be three chances for the fence, the image and the migration Job
+// to disagree about what is running.
+func applyBehindFence(ctx context.Context, r k3s.Runner, a fencedApply) (string, *Rollout, error) {
+	values := a.Values
+	// ZERO IS NEVER A COUNT TO APPLY. The whole point of this function is that
+	// a backend is running when it returns, and a count nobody recorded — a
+	// fence raised before any run read one, or a Deployment already at zero
+	// because a migration stopped it — starts at the chart's own size of one
+	// rather than leaving the control plane with none and every read refused.
+	replicas := a.Replicas
+	if replicas <= 0 {
+		replicas = 1
+	}
+	if a.Code == backendPrevious {
+		if a.PreviousImage == "" {
+			return "", nil, fmt.Errorf("the fence records no %s, so the image the previous release ran cannot be established: nothing was recorded at the fence stage", fencePreviousImageAnnotation)
+		}
+		pinned, err := withBackendImage(values, a.PreviousImage)
+		if err != nil {
+			return "", nil, err
+		}
+		values = pinned
+	}
+	fenced, err := FenceValues(values, FenceOptions{Up: true, BackendReplicas: &replicas})
+	if err != nil {
+		return "", nil, err
+	}
+	// THE MIGRATION JOB IS ON FOR THE NEW CODE AND OFF FOR THE PREVIOUS ONE.
+	//
+	// On, for the new code, from the chart stage onward: a chart apply that
+	// rendered it off makes helm DELETE the Job the migration stage created, and
+	// the operator-visible record of the schema step would be gone after the
+	// upgrade (hardware, 2026-09-25). Its pod template depends only on the
+	// backend image, the pull secrets and the PostgreSQL host, user and database
+	// — none of which the later applies change — so keeping it on cannot hit the
+	// immutable-field rule.
+	//
+	// Off, for the previous code, because the chart has ONE backend image for
+	// the Job and the Deployment and the Job's pod template is immutable: an
+	// apply that re-enabled it would render the Job with the new pod template
+	// over the Job that already exists, and helm would fail the release.
+	if a.Code == backendPrevious {
+		fenced, err = migrationValues(fenced, false)
+	} else {
+		fenced, err = MigrationValues(fenced)
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	revision, err := Apply(ctx, r, fenced)
+	if err != nil {
+		return "", nil, err
+	}
+	if a.Code == backendPrevious {
+		// ONLY THE ROLLOUT IS WAITED FOR, NOT READINESS: the migration failed
+		// because PostgreSQL went away, so the previous backend's pods start and
+		// sit NotReady until the database answers.
+		rollout, err := WaitRolledOut(ctx, r, revision, a.Deadline, a.Every, a.Reporter)
+		if err != nil {
+			return revision, nil, err
+		}
+		if a.Logf != nil {
+			a.Logf("  the previous code is back behind the fence at install revision %s (%s, %d/%d backend replicas ready), with the fence up and the migration off",
+				revision, a.PreviousImage, rollout.Ready, rollout.Want)
+		}
+		return revision, &rollout, nil
+	}
+	// READINESS IS THE WHOLE WAIT FOR THE NEW CODE: it is the chart this run is
+	// moving to, and a backend that has not become Ready is not one any read can
+	// use.
+	if err := waitReadyWithin(ctx, r, revision, a.Deadline, a.Every, a.Reporter); err != nil {
+		return revision, nil, err
+	}
+	return revision, nil, nil
+}
+
+// A RESUME THAT FINDS THE BACKEND STOPPED MUST PUT ONE BACK BEFORE IT READS
+// (kn-t70-control-plane-version-identity-4xso.3).
+//
+// The migration stage's first apply stops the backend — `backend.replicas: 0`
+// with the fence up — so the schema moves under no running code. A run
+// interrupted after that apply, or a laptop that died, leaves the cluster
+// exactly there: the fence up, the backend stopped, and no process left
+// anywhere to put one back. A second laptop's `--resume` then dies on its FIRST
+// ordinary read — `control plane kubenest-backend is unreachable: ... connect
+// failed ("Connection refused")` (hardware, 2026-09-26) — because the record,
+// the window and the bundle manifests all have to be read from the control
+// plane this procedure has stopped.
+//
+// WHICH CODE TO BRING BACK IS A QUESTION FOR THE CLUSTER, because the second
+// laptop holds no journal: the migration Job is the only witness to how far the
+// schema moved. Three answers:
+//
+//	the Job is running     wait for it, bounded by the bundle's own
+//	                       component-ready deadline, and read its outcome. No
+//	                       backend is started while it runs: a backend against
+//	                       a schema in flight is the state this procedure
+//	                       exists to prevent;
+//	the Job succeeded      the schema is the new one, so the NEW code goes back
+//	                       — fence up, migration on, the replica count the fence
+//	                       recorded — exactly as stageChart would apply it;
+//	the Job failed, or     the schema has not moved, so the PREVIOUS code goes
+//	there is no Job at all back exactly as restorePreviousRelease puts it: the
+//	                       image and the replica count the fence recorded,
+//	                       migration off, waiting only for the rollout.
+//
+// THE FENCE STAYS UP in every case. The code this puts back has not been
+// validated, and the checkpoint that would justify lowering the fence is the one
+// this run has not taken yet; the run that follows continues from the recorded
+// stage, which lowers it once the new backend has been proven.
+//
+// THE JOB IS NOT MATCHED BY ITS INSTALL REVISION, and that is a measurement
+// rather than a preference. A migration apply stamps the Job with a hash of the
+// values it was composed from, and those values carry the installRevision of the
+// apply before it — so the revision a SECOND process computes from the values it
+// reads off the cluster is not the one the interrupted process stamped for the
+// same chart and the same stage (measured 2026-09-26: 38959d1066e00715 against
+// bd33b55a43e0b1e1). What identifies the Job instead is what the chart gives it:
+// there is exactly one Job, MigrationJobName, and the only apply that renders it
+// ON is the migration stage's — every apply before it renders it off
+// (FenceOptions.MigrationOff), which is also what deletes a previous release's
+// Job. So a Job that exists while the fence is up over a stopped backend is this
+// chart's migration, and its state says which code the schema matches.
+//
+// THE RUNNING JOB IS WAITED ON WITH THE REVISION IT CARRIES, which is the
+// revision-only filter migrate.go's wait can honestly apply: it is a fact about
+// this exact Job rather than a value computed at the wrong moment.
+//
+// THE DEADLINE IS THE CALLER'S, because this function must not read the control
+// plane to find one: the bundle's `component-ready` limit, and never a default.
+func RecoverStoppedBackend(ctx context.Context, r k3s.Runner, o RecoveryOptions) error {
+	code, found, err := stoppedBackendCode(ctx, r, o.Deadline, o.Reporter)
+	if err != nil {
+		return err
+	}
+	_, rollout, err := applyBehindFence(ctx, r, fencedApply{
+		Code:          code,
+		Values:        o.Values,
+		PreviousImage: o.Facts.PreviousImage,
+		Replicas:      o.Facts.Replicas,
+		Deadline:      o.Deadline,
+		Every:         o.Every,
+		Reporter:      o.Reporter,
+	})
+	if err != nil {
+		return err
+	}
+	if o.Logf == nil {
+		return nil
+	}
+	// ONE LINE SAYING WHAT WAS FOUND AND WHAT WAS BROUGHT BACK, because the
+	// question a second laptop asks here — is this control plane mid-migration,
+	// and which code does that leave it needing? — is answered by the cluster
+	// and by nothing the operator can read.
+	brought := "the new code the migration moved the schema to"
+	if code == backendPrevious {
+		brought = fmt.Sprintf("the previous code (%s)", o.Facts.PreviousImage)
+		if rollout != nil {
+			brought += fmt.Sprintf(", %d/%d backend replicas ready", rollout.Ready, rollout.Want)
+		}
+	}
+	o.Logf("  the fence is up and the backend is stopped at zero replicas with %s: brought back %s, and the fence stays up", found, brought)
+	return nil
+}
+
+// RecoveryOptions is what a run gives the recovery: the values it read off the
+// cluster, the facts the fence recorded about the code behind it, and the
+// deadline its own bundle manifest names.
+type RecoveryOptions struct {
+	// Values is the values document the control plane runs with. It is carried
+	// onto whichever code comes back rather than re-derived, because the
+	// settings, the generated secrets and the control plane's CA are facts about
+	// this installation.
+	Values string
+	// Facts is what the fence records about the control plane behind it.
+	Facts FenceFacts
+	// Deadline bounds the wait for a running migration and for the backend the
+	// recovery brings back. It is the target bundle's `component-ready` limit.
+	Deadline time.Duration
+	// Every is the poll interval of the wait for the backend this brings back.
+	// Zero means the converge default; the wait for a RUNNING migration is
+	// migrate.go's and keeps its own.
+	Every time.Duration
+	// Reporter publishes the waits' progress.
+	Reporter converge.Reporter
+	// Logf writes the one line that says what was found and what came back.
+	Logf func(format string, args ...any)
+}
+
+// StoppedBackendBehindAFence reports whether the control plane's backend is
+// stopped behind a fence that is still up, and the facts the fence carries about
+// the code it is holding back.
+//
+// TWO READS, BOTH THROUGH THE NODE, and neither needs the control plane's API:
+// the fence's own Deployment exists exactly while the fence is up, and the
+// backend's desired replica count is a field on the Deployment helm rendered.
+// That is what makes this callable BEFORE every read a resume makes.
+//
+// A fence that is not up is not this: nothing has been taken apart, and a
+// backend at the chart's default size is not this either, because the reads the
+// caller is about to make reach it.
+func StoppedBackendBehindAFence(ctx context.Context, r k3s.Runner) (FenceFacts, bool, error) {
+	facts, ok, err := FenceDeploymentFacts(ctx, r)
+	if err != nil || !ok {
+		return FenceFacts{}, false, err
+	}
+	replicas, err := Replicas(ctx, r)
+	if err != nil {
+		return FenceFacts{}, false, err
+	}
+	if replicas > 0 {
+		return FenceFacts{}, false, nil
+	}
+	return facts, true, nil
+}
+
+// stoppedBackendCode decides which code the cluster says a stopped backend
+// should come back as, and describes what it found for the narrative line.
+//
+// THE MIGRATION JOB IS THE ONLY WITNESS. A second laptop's journal says what
+// THIS machine did, not what the cluster is, so the Job's own state — and, while
+// it runs, its own outcome — is what decides between the two codes.
+func stoppedBackendCode(ctx context.Context, r k3s.Runner, deadline time.Duration, rep converge.Reporter) (backendCode, string, error) {
+	job, found, err := readMigrationJob(ctx, r)
+	if err != nil {
+		return backendPrevious, "", err
+	}
+	if !found {
+		// NO JOB: the interrupt came between the stop apply and the Job's
+		// creation, so alembic never ran and the schema is the one the previous
+		// code matches.
+		return backendPrevious, "no migration Job in the cluster, so the schema has not moved", nil
+	}
+	revision := job.Metadata.Annotations[migrationJobRevisionAnnotation]
+	switch {
+	case jobFailed(job):
+		return backendPrevious, fmt.Sprintf("the migration Job %s failed (install revision %s)", MigrationJobName, jobRevision(revision)), nil
+	case jobComplete(job):
+		return backendNew, fmt.Sprintf("the migration Job %s completed (install revision %s)", MigrationJobName, jobRevision(revision)), nil
+	}
+	// RUNNING, OR WITHOUT A VERDICT YET. NOTHING IS STARTED WHILE IT RUNS, so
+	// the wait comes first and the decision second: the Job has backoffLimit 0,
+	// which makes Failed final, and a schema is not something to guess about.
+	if err := WaitForMigration(ctx, r, revision, deadline, rep); err != nil {
+		after, still, readErr := readMigrationJob(ctx, r)
+		if readErr != nil {
+			return backendPrevious, "", readErr
+		}
+		if still && jobFailed(after) {
+			return backendPrevious, fmt.Sprintf("the migration Job %s failed while this run waited for it", MigrationJobName), nil
+		}
+		// STILL RUNNING — or gone, or stamped for another revision: whatever the
+		// reason, the deadline ran out with the schema possibly moving, and a
+		// backend started now would be code against a schema nobody knows. The
+		// wait's own error says which of the three it was.
+		return backendPrevious, "", fmt.Errorf("the migration Job %s has not settled, and no backend is started while the schema may still be moving: %w", MigrationJobName, err)
+	}
+	return backendNew, fmt.Sprintf("the migration Job %s completed while this run waited for it", MigrationJobName), nil
+}
+
+// jobComplete reports whether the Job has ended in success. It is the
+// complement of migrate.go's jobFailed and read the same way: from the Job
+// controller's own condition, never from a pod's exit or a missing failure.
+func jobComplete(job migrationJob) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Status == "True" && condition.Type == "Complete" {
+			return true
+		}
+	}
+	return false
+}
+
+// jobRevision names the install revision a Job carries, for a line an operator
+// reads. A Job that carries none is said rather than printed as nothing.
+func jobRevision(revision string) string {
+	if revision == "" {
+		return "none recorded"
+	}
+	return revision
 }
 
 // withBackendImage pins the chart's backend image.

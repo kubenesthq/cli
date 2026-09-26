@@ -14,6 +14,7 @@ import (
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/sshx"
 )
 
@@ -33,16 +34,44 @@ import (
 // previous image pinned.
 const previousBackendImage = "ghcr.io/kubenesthq/kubenest-backend:1acd82d"
 
-// previousKube is the smallest in-memory kube the restore needs: the fence
-// Deployment's annotations, and the chart applies it observes.
+// previousKube is the smallest in-memory kube the restore and the recovery need:
+// the fence Deployment's annotations, the backend's replica count, the migration
+// Job, and the chart applies it observes.
 type previousKube struct {
 	mu sync.Mutex
 	// fenceFacts is what the fence Deployment records, by annotation name.
 	fenceFacts map[string]string
 	// backendReady is how many replicas the fake reports READY.
 	backendReady int32
-	// applied records every chart apply, in order.
-	applied []appliedRelease
+	// backendReplicas is the backend Deployment's DESIRED replica count. Zero is
+	// the state the migration stage's stop apply leaves behind, and the one the
+	// recovery exists for.
+	backendReplicas int32
+	// migrationCondition is the migration Job's own condition: "Complete",
+	// "Failed", "running" for a Job that has no verdict yet, or "" for no Job in
+	// the cluster at all.
+	migrationCondition string
+	// migrationRevision is the install revision the Job carries. Empty means the
+	// revision the last apply stamped, which is what the migration stage's wait
+	// compares against.
+	migrationRevision string
+	// migrationFailsAfter makes the fake report a RUNNING Job for that many reads
+	// and a Failed one afterwards: an interrupt inside the migration, where the
+	// outcome is only knowable later.
+	migrationFailsAfter int
+	// migrationReads counts the migration Job reads, for that arm, and
+	// migrationRunningSeen records that it answered "running" at least once, so
+	// an arm that never exercised the wait cannot pass silently.
+	migrationReads       int
+	migrationRunningSeen bool
+	// migrationFailedAt is the command index of the read at which the fake first
+	// answered Failed, so a test can assert that nothing was applied before the
+	// verdict was known.
+	migrationFailedAt int
+	// applied records every chart apply, in order, and appliedAt the command
+	// index each one was submitted at.
+	applied   []appliedRelease
+	appliedAt []int
 	// chartRevision is the install revision the last apply stamped.
 	chartRevision string
 	*componenttest.FakeRunner
@@ -55,7 +84,7 @@ type appliedRelease struct {
 
 func newPreviousKube(t *testing.T) *previousKube {
 	t.Helper()
-	k := &previousKube{backendReady: 1}
+	k := &previousKube{backendReady: 1, backendReplicas: 1, migrationCondition: "Failed"}
 	k.FakeRunner = &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		switch {
 		case strings.Contains(command, "get deployment/"+fenceName):
@@ -70,19 +99,45 @@ func newPreviousKube(t *testing.T) *previousKube {
 			}
 			return sshx.Result{Stdout: string(body)}, nil
 		case strings.HasPrefix(command, "sudo -n install -m 0600 ") && strings.Contains(command, ReleaseName+".yaml"):
+			k.appliedAt = append(k.appliedAt, len(k.Commands()))
 			k.recordApply(t, k.lastInput(t))
 			return sshx.Result{}, nil
 		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
 			return sshx.Result{}, nil
+		case strings.Contains(command, backendReplicasCmd):
+			// BEFORE the general Deployment read below, which this command also
+			// matches: the replica count is a bare number and the readiness
+			// probes read whole objects.
+			return sshx.Result{Stdout: fmt.Sprint(k.backendReplicas)}, nil
 		case strings.Contains(command, "get deployment/"):
 			revision := k.chartRevision
 			return sshx.Result{Stdout: fmt.Sprintf(`{"metadata":{"generation":1},"spec":{"replicas":1,"template":{"metadata":{"annotations":{"kubenest.io/install-revision":%q}}}},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"availableReplicas":%d}}`, revision, k.backendReady)}, nil
-		case strings.HasPrefix(command, "get statefulset "):
+		case strings.Contains(command, "get statefulset "):
 			return sshx.Result{Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`}, nil
 		case strings.Contains(command, "get certificate/") || strings.Contains(command, "get gateway/"):
 			return sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"Programmed","status":"True"}]}}`}, nil
 		case command == migrationJobCmd:
-			return sshx.Result{Stdout: jobJSON(t, "Failed", k.chartRevision)}, nil
+			condition := k.migrationCondition
+			if k.migrationFailsAfter > 0 {
+				k.migrationReads++
+				if k.migrationReads <= k.migrationFailsAfter {
+					condition = "running"
+					k.migrationRunningSeen = true
+				} else {
+					if k.migrationFailedAt == 0 {
+						k.migrationFailedAt = len(k.Commands())
+					}
+					condition = "Failed"
+				}
+			}
+			if condition == "" {
+				return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			revision := k.migrationRevision
+			if revision == "" {
+				revision = k.chartRevision
+			}
+			return sshx.Result{Stdout: jobJSON(t, condition, revision)}, nil
 		case strings.HasPrefix(command, "sudo -n k3s kubectl delete job "):
 			return sshx.Result{}, nil
 		default:
@@ -309,5 +364,233 @@ func TestAnAdoptedFenceSuppliesTheBackendReplicaCount(t *testing.T) {
 	// A count this run already recorded is kept.
 	if got, _ := adoptedBackendReplicas(ctx, kube, 3); got != 3 {
 		t.Errorf("a recorded count of 3 was replaced by %d", got)
+	}
+}
+
+// A RESUME THAT FINDS A STOPPED BACKEND PUTS ONE BACK BEFORE IT READS
+// (kn-t70-control-plane-version-identity-4xso.3).
+//
+// The migration stage's first apply stops the backend — `backend.replicas: 0`
+// with the fence up — and an interrupt after that apply, or a laptop that died,
+// leaves the cluster there with no process left to put one back. Every read a
+// resume then makes (the record, the window, the bundle manifests) needs a
+// running control plane, so the resume died on its FIRST read: `control plane
+// kubenest-backend is unreachable: ... connect failed ("Connection refused")`
+// (hardware, 2026-09-26).
+//
+// WHICH CODE COMES BACK IS THE CLUSTER'S ANSWER, because a second laptop holds
+// no journal: the migration Job is the only witness to how far the schema moved.
+const resumeValues = "domain: kn.example.com\njwtSecret: s\nbackend:\n  admin:\n    email: a@b.c\n"
+
+// recoverLikeTheCommand runs the recovery the way runControlPlaneUpgrade does:
+// it asks the cluster whether a backend is stopped behind a fence, and only then
+// spends the values read. Tests go through both steps so the PAIR — the check
+// that decides whether to act, and the act — is what they exercise.
+func recoverLikeTheCommand(ctx context.Context, kube *previousKube, values string) error {
+	facts, stopped, err := StoppedBackendBehindAFence(ctx, kube)
+	if err != nil || !stopped {
+		return err
+	}
+	return RecoverStoppedBackend(ctx, kube, RecoveryOptions{
+		Values:   values,
+		Facts:    facts,
+		Deadline: 2 * time.Second,
+		Every:    time.Millisecond,
+		Reporter: converge.ReporterFunc(func(converge.Event) {}),
+	})
+}
+
+// broughtBack is what one chart apply put behind the fence: which code, whether
+// the fence stays up, whether the migration Job is on, and at what size the
+// backend runs. Decoded once, so each test reads as the question it asks.
+type broughtBack struct {
+	repository string
+	tag        string
+	digest     string
+	fenceUp    bool
+	migration  bool
+	replicas   any
+}
+
+// pinned reports whether the apply named the backend image itself instead of
+// taking the chart's own pin, which is the whole difference between the previous
+// code and the new one.
+func (b broughtBack) pinned() bool {
+	return b.repository != "" || b.tag != "" || b.digest != ""
+}
+
+func decodeBroughtBack(t *testing.T, applied appliedRelease) broughtBack {
+	t.Helper()
+	var out broughtBack
+	if fence, ok := applied.values["fence"].(map[string]any); ok {
+		out.fenceUp, _ = fence["enabled"].(bool)
+	}
+	if migration, ok := applied.values["migration"].(map[string]any); ok {
+		out.migration, _ = migration["enabled"].(bool)
+	}
+	backend, _ := applied.values["backend"].(map[string]any)
+	if backend == nil {
+		t.Fatalf("the applied values carry no backend group: %v", applied.values)
+	}
+	out.replicas = backend["replicas"]
+	if image, ok := backend["image"].(map[string]any); ok {
+		out.repository, _ = image["repository"].(string)
+		out.tag, _ = image["tag"].(string)
+		out.digest, _ = image["digest"].(string)
+	}
+	return out
+}
+
+// NO MIGRATION JOB MEANS THE SCHEMA HAS NOT MOVED, so the code that matches it
+// is the code the control plane ran before this upgrade — and only the fence
+// knows that image, because the chart this binary carries pins the new one.
+func TestAResumeWithTheBackendStoppedAndNoMigrationRestoresThePreviousCode(t *testing.T) {
+	ctx := context.Background()
+	kube := newPreviousKube(t)
+	kube.fenceFacts = map[string]string{
+		fencePreviousImageAnnotation:    previousBackendImage,
+		fencePreviousReplicasAnnotation: "2",
+	}
+	kube.backendReplicas = 0
+	kube.migrationCondition = "" // the Job was never created
+
+	if err := recoverLikeTheCommand(ctx, kube, resumeValues); err != nil {
+		t.Fatal(err)
+	}
+
+	applied := kube.lastApply(t)
+	// THE CHART THIS BINARY CARRIES, because only it has the fence template: the
+	// previous release's chart predates the fence entirely, so re-applying it
+	// with the fence value would render the api route back onto the backend.
+	if applied.chartContent != base64.StdEncoding.EncodeToString(ChartArchive()) {
+		t.Error("the recovery did not apply the chart this binary embeds, which is the only one that can keep the fence up over the old code")
+	}
+	got := decodeBroughtBack(t, applied)
+	want := parsePostgresImage(previousBackendImage)
+	if got.repository != want.repository || got.tag != want.tag {
+		t.Errorf("the recovery pinned backend.image %s:%s, want the previous code the fence recorded (%s)", got.repository, got.tag, previousBackendImage)
+	}
+	if !got.fenceUp {
+		t.Error("the recovery lowered the fence, and the code it put back has not been validated")
+	}
+	if got.migration {
+		t.Error("the recovery re-enabled the migration Job over a schema that has not moved")
+	}
+	if got.replicas != 2 {
+		t.Errorf("the recovery ran the backend at %v replica(s), want the 2 the fence recorded", got.replicas)
+	}
+	// AND NOTHING WAS APPLIED WHILE THE JOB WAS... there was no Job at all, so
+	// the first apply is the recovery's own.
+	if len(kube.appliedAt) != 1 {
+		t.Errorf("the recovery made %d applies, want exactly the one that brought the backend back", len(kube.appliedAt))
+	}
+}
+
+// A MIGRATION THAT SUCCEEDED MEANS THE SCHEMA IS THE NEW ONE, so the NEW code
+// goes back — fence up, the migration Job still enabled so the operator keeps
+// the record of the schema step, and the size the fence recorded.
+func TestAResumeAfterASucceededMigrationBringsBackTheNewCode(t *testing.T) {
+	ctx := context.Background()
+	kube := newPreviousKube(t)
+	kube.fenceFacts = map[string]string{
+		fencePreviousImageAnnotation:    previousBackendImage,
+		fencePreviousReplicasAnnotation: "2",
+	}
+	kube.backendReplicas = 0
+	kube.migrationCondition = "Complete"
+
+	if err := recoverLikeTheCommand(ctx, kube, resumeValues); err != nil {
+		t.Fatal(err)
+	}
+
+	got := decodeBroughtBack(t, kube.lastApply(t))
+	if got.pinned() {
+		t.Errorf("the recovery pinned backend.image %s:%s@%s over a migrated schema, want no override at all: the chart's own pin is the new code the migration moved to",
+			got.repository, got.tag, got.digest)
+	}
+	if !got.fenceUp {
+		t.Error("the recovery lowered the fence, and the code it put back has not been validated")
+	}
+	if !got.migration {
+		t.Error("the recovery turned the migration Job off, so the release would lose the operator-visible record of the schema step")
+	}
+	if got.replicas != 2 {
+		t.Errorf("the recovery ran the backend at %v replica(s), want the 2 the fence recorded", got.replicas)
+	}
+}
+
+// NOTHING IS STARTED WHILE THE MIGRATION RUNS. A backend against a schema in
+// flight is the state this whole procedure exists to prevent, so the recovery
+// waits for the verdict and acts on the outcome — here a failure, which puts the
+// previous code back.
+func TestAResumeWaitsForARunningMigrationBeforeStartingAnyBackend(t *testing.T) {
+	ctx := context.Background()
+	kube := newPreviousKube(t)
+	kube.fenceFacts = map[string]string{
+		fencePreviousImageAnnotation:    previousBackendImage,
+		fencePreviousReplicasAnnotation: "2",
+	}
+	kube.backendReplicas = 0
+	kube.migrationFailsAfter = 1 // running on the first read, failed on every one after
+
+	if err := recoverLikeTheCommand(ctx, kube, resumeValues); err != nil {
+		t.Fatal(err)
+	}
+
+	if !kube.migrationRunningSeen {
+		t.Fatal("the fake never reported a running Job, so this arm never exercised the wait")
+	}
+	if kube.migrationFailedAt == 0 {
+		t.Fatal("the fake never reported the Job's failure, so the recovery never saw the outcome it had to act on")
+	}
+	if len(kube.appliedAt) == 0 {
+		t.Fatal("the recovery applied nothing, so the failed migration was not answered at all")
+	}
+	if kube.appliedAt[0] < kube.migrationFailedAt {
+		t.Errorf("a chart was applied at command %d, before the migration Job's failure was observed at command %d: a backend must never be started while the schema is moving",
+			kube.appliedAt[0], kube.migrationFailedAt)
+	}
+	got := decodeBroughtBack(t, kube.lastApply(t))
+	want := parsePostgresImage(previousBackendImage)
+	if got.repository != want.repository || got.tag != want.tag {
+		t.Errorf("after the failure the recovery pinned backend.image %s:%s, want the previous code (%s)", got.repository, got.tag, previousBackendImage)
+	}
+	if !got.fenceUp {
+		t.Error("the recovery lowered the fence after a failed migration")
+	}
+}
+
+// A RUN THAT NEEDS NO RECOVERY MAKES NONE. A fence that is not up is the
+// ordinary run, and a fence with a backend still running behind it is a resume
+// after an interrupt at the checkpoint: in both, the reads the caller is about
+// to make reach a control plane, and applying a chart here would be an
+// unrecorded change before the gates.
+func TestARunWithTheFenceDownOrABackendRunningNeedsNoRecovery(t *testing.T) {
+	ctx := context.Background()
+	for _, arm := range []struct {
+		name     string
+		fence    map[string]string
+		replicas int32
+	}{
+		{"no fence at all", nil, 0},
+		{"a backend running behind the fence", map[string]string{fencePreviousImageAnnotation: previousBackendImage}, 2},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			kube := newPreviousKube(t)
+			kube.fenceFacts = arm.fence
+			kube.backendReplicas = arm.replicas
+
+			if _, stopped, err := StoppedBackendBehindAFence(ctx, kube); err != nil {
+				t.Fatal(err)
+			} else if stopped {
+				t.Fatalf("%s was read as a stopped backend, and a recovery there would apply a chart over a control plane that is up", arm.name)
+			}
+			if err := recoverLikeTheCommand(ctx, kube, resumeValues); err != nil {
+				t.Fatal(err)
+			}
+			if len(kube.applied) != 0 {
+				t.Errorf("%s: the recovery applied %d chart(s), want none", arm.name, len(kube.applied))
+			}
+		})
 	}
 }

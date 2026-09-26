@@ -1,13 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/componenttest"
@@ -227,5 +231,196 @@ func TestARerunAfterAFailedMigrationUsesTheFactsTheFailedRunRecorded(t *testing.
 	}
 	if err := requireControlPlaneForUpgrade(got, known); err != nil {
 		t.Errorf("the re-run was refused at the floor check: %v", err)
+	}
+}
+
+// A STOPPED BACKEND COMES BACK BEFORE THIS COMMAND READS ANYTHING
+// (kn-t70-control-plane-version-identity-4xso.3).
+//
+// The migration stage's first apply stops the backend with the fence up, so a run
+// interrupted after it — or a laptop that died — leaves the control plane with
+// nothing running, and a `--resume` then dies on its FIRST read: `control plane
+// kubenest-backend is unreachable: ... connect failed ("Connection refused")`
+// (hardware, 2026-09-26).
+//
+// THIS LAYER OWNS THE DEADLINE AND THE PLACE IN THE COMMAND. The recovery runs
+// before controlPlaneForUpgrade, which is the first read, so its deadline cannot
+// come from the control plane — the copy of the bundle manifest it serves is
+// behind the very fence being recovered from. It comes from the bundle this
+// binary carries for --to, and a --to this binary does not carry is REFUSED
+// rather than waited on for a number invented here: deadlines in this CLI come
+// from bundle manifests, never from defaults.
+const recoveryPreviousImage = "ghcr.io/kubenesthq/kubenest-backend:1acd82d"
+
+// resumeKube is the smallest in-memory kube the recovery needs: the fence's
+// facts, the backend's replica count, the values the HelmChart carries, the
+// migration Job (or its absence), and the applies it observes.
+type resumeKube struct {
+	*componenttest.FakeRunner
+	fenceFacts      map[string]string
+	backendReplicas int32
+	migrationFound  bool
+	// chartRevision is the install revision the last apply stamped, which is what
+	// the rollout the recovery waits for reads back.
+	chartRevision string
+	applied       []map[string]any
+}
+
+func newResumeKube(t *testing.T) *resumeKube {
+	t.Helper()
+	k := &resumeKube{}
+	k.FakeRunner = &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.Contains(command, "get deployment/"+controlplane.FenceService):
+			if k.fenceFacts == nil {
+				return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			body, err := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": k.fenceFacts}})
+			if err != nil {
+				return sshx.Result{}, err
+			}
+			return sshx.Result{Stdout: string(body)}, nil
+		case strings.Contains(command, "jsonpath={.spec.replicas}"):
+			return sshx.Result{Stdout: strconv.Itoa(int(k.backendReplicas))}, nil
+		case strings.Contains(command, "get helmchart "):
+			return sshx.Result{Stdout: "domain: kn.example.com\njwtSecret: s\n"}, nil
+		case strings.Contains(command, "get job "+controlplane.MigrationJobName):
+			if !k.migrationFound {
+				return sshx.Result{ExitCode: 1, Stderr: "not found"}, nil
+			}
+			return sshx.Result{Stdout: `{"metadata":{"annotations":{"kubenest.io/install-revision":"x"}},"status":{"succeeded":1,"conditions":[{"type":"Complete","status":"True"}]}}`}, nil
+		case strings.HasPrefix(command, "sudo -n install -m 0600 ") && strings.Contains(command, controlplane.ReleaseName+".yaml"):
+			k.recordApply(t, k.lastInput(t))
+			return sshx.Result{}, nil
+		case strings.HasPrefix(command, "sudo -n install -m 0600 "):
+			return sshx.Result{}, nil
+		case strings.Contains(command, "get deployment/"):
+			return sshx.Result{Stdout: fmt.Sprintf(`{"metadata":{"generation":1},"spec":{"replicas":1,"template":{"metadata":{"annotations":{"kubenest.io/install-revision":%q}}}},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"availableReplicas":1}}`, k.chartRevision)}, nil
+		case strings.Contains(command, "get statefulset "):
+			return sshx.Result{Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`}, nil
+		case strings.Contains(command, "get certificate/") || strings.Contains(command, "get gateway/"):
+			return sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"Programmed","status":"True"}]}}`}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	return k
+}
+
+func (k *resumeKube) lastInput(t *testing.T) []byte {
+	t.Helper()
+	inputs := k.Inputs()
+	if len(inputs) == 0 {
+		t.Fatal("a document was written without streaming one")
+	}
+	return inputs[len(inputs)-1]
+}
+
+func (k *resumeKube) recordApply(t *testing.T, manifest []byte) {
+	t.Helper()
+	var doc map[string]any
+	if err := yaml.Unmarshal(manifest, &doc); err != nil {
+		t.Fatalf("the applied manifest is not valid YAML: %v", err)
+	}
+	spec, _ := doc["spec"].(map[string]any)
+	raw, _ := spec["valuesContent"].(string)
+	var values map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &values); err != nil {
+		t.Fatalf("the applied values are not valid YAML: %v", err)
+	}
+	if revision, ok := values["installRevision"].(string); ok {
+		k.chartRevision = revision
+	}
+	k.applied = append(k.applied, values)
+}
+
+// A backend stopped behind a fence is brought back through the node, at the
+// previous code, with the fence still up — and the deadline that bounds the wait
+// is the one the bundle this binary carries names.
+func TestAStoppedBackendBehindAFenceIsBroughtBackBeforeThisCommandReads(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("the carried bundle's deadline is what the recovery obeys", func(t *testing.T) {
+		kube := newResumeKube(t)
+		kube.fenceFacts = map[string]string{
+			"kubenest.io/fence-previous-image":    recoveryPreviousImage,
+			"kubenest.io/fence-previous-replicas": "2",
+		}
+		kube.backendReplicas = 0
+		kube.migrationFound = false // interrupted before the Job existed
+
+		var out bytes.Buffer
+		// 1.1 is the bundle the lab's gate upgrades to, and one this binary
+		// carries, so the deadline is the manifest's own component-ready limit.
+		if err := recoverStoppedBackend(ctx, &out, UpgradeFlags{Cluster: "prod-1", To: "1.1"}, kube); err != nil {
+			t.Fatal(err)
+		}
+		if len(kube.applied) == 0 {
+			t.Fatalf("the recovery applied no chart, so the resume's next read would still meet a stopped backend:\n%s", out.String())
+		}
+		values := kube.applied[len(kube.applied)-1]
+		backend, _ := values["backend"].(map[string]any)
+		if backend == nil {
+			t.Fatalf("the applied values carry no backend group: %v", values)
+		}
+		image, _ := backend["image"].(map[string]any)
+		if image == nil || image["tag"] != "1acd82d" {
+			t.Errorf("the recovery applied backend.image %v, want the previous code the fence recorded (%s)", image, recoveryPreviousImage)
+		}
+		if fence, _ := values["fence"].(map[string]any); fence == nil || fence["enabled"] != true {
+			t.Errorf("the recovery applied fence = %v, want it still up: the code it put back has not been validated", values["fence"])
+		}
+		if migration, ok := values["migration"].(map[string]any); ok && migration["enabled"] == true {
+			t.Error("the recovery re-enabled the migration Job over a schema that has not moved")
+		}
+		if backend["replicas"] != 2 {
+			t.Errorf("the recovery ran the backend at %v replica(s), want the 2 the fence recorded", backend["replicas"])
+		}
+	})
+
+	t.Run("a bundle this binary does not carry is refused", func(t *testing.T) {
+		kube := newResumeKube(t)
+		kube.fenceFacts = map[string]string{
+			"kubenest.io/fence-previous-image":    recoveryPreviousImage,
+			"kubenest.io/fence-previous-replicas": "2",
+		}
+		kube.backendReplicas = 0
+
+		var out bytes.Buffer
+		err := recoverStoppedBackend(ctx, &out, UpgradeFlags{Cluster: "prod-1", To: "9.9"}, kube)
+		if err == nil {
+			t.Fatal("a recovery with no deadline to obey ran anyway, and a wait without one is a wait nobody can read")
+		}
+		if len(kube.applied) != 0 {
+			t.Errorf("a chart was applied before the deadline could be established: %v", kube.applied)
+		}
+	})
+}
+
+// A RUN THAT NEEDS NO RECOVERY IS NOT TOUCHED BY THIS COMMAND EITHER: a cluster
+// whose fence is down is the ordinary upgrade, and one whose backend is running
+// behind the fence needs no chart applied before its gates.
+func TestTheFenceDownOrABackendRunningIsLeftAloneByTheRecovery(t *testing.T) {
+	ctx := context.Background()
+	for _, arm := range []struct {
+		name     string
+		fence    map[string]string
+		replicas int32
+	}{
+		{"no fence", nil, 0},
+		{"a backend running behind the fence", map[string]string{"kubenest.io/fence-previous-image": recoveryPreviousImage}, 2},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			kube := newResumeKube(t)
+			kube.fenceFacts = arm.fence
+			kube.backendReplicas = arm.replicas
+
+			var out bytes.Buffer
+			if err := recoverStoppedBackend(ctx, &out, UpgradeFlags{Cluster: "prod-1", To: "1.1"}, kube); err != nil {
+				t.Fatal(err)
+			}
+			if len(kube.applied) != 0 {
+				t.Errorf("%s: the recovery applied %d chart(s), want none", arm.name, len(kube.applied))
+			}
+		})
 	}
 }
