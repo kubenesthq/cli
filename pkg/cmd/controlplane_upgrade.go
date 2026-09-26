@@ -115,6 +115,10 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	if err != nil {
 		return err
 	}
+	// WHAT THIS OPERATION STARTED FROM: the record's version on a resume, the
+	// live control plane's otherwise (see resumeStart — the live version has just
+	// been read and its compatibility verdict kept).
+	started := resumeStart(f, before, recorded)
 
 	// AN INTERRUPT IS NOT A FAILURE. SIGINT/SIGTERM cancels the run and leaves
 	// the operation record STOPPED rather than terminal-failed, because the
@@ -170,13 +174,17 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	}
 
 	opts := controlplane.UpgradeOptions{
-		Cluster:      f.Cluster,
-		From:         session.From.Bundle,
-		To:           f.To,
-		Values:       values,
-		Bundle:       session.To,
-		Server:       server,
-		Before:       before,
+		Cluster: f.Cluster,
+		From:    session.From.Bundle,
+		To:      f.To,
+		Values:  values,
+		Bundle:  session.To,
+		Server:  server,
+		// Before is the operation's OWN starting point, not the live control
+		// plane's: on a resume the validation's floor and its "not the build that
+		// was serving" refusal are about the build this operation started from,
+		// and the live control plane may already be running the new one.
+		Before:       started,
 		Open:         controlPlaneOpener(),
 		Out:          out,
 		Reporter:     converge.NewTextReporter(out),
@@ -217,7 +225,7 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 
 	// THE RECORD IS THE LOCK. Taking it is the "no other operation" gate, and
 	// it is what refuses a second laptop while this upgrade is unfinished.
-	store, handle, skip, err := controlPlaneLock(ctx, server, f, session, out, before)
+	store, handle, skip, err := controlPlaneLock(ctx, server, f, session, out, started, recordedWindow)
 	if err != nil {
 		return err
 	}
@@ -331,36 +339,23 @@ func clusterOf(handle *operation.Handle) string {
 }
 
 // controlPlaneLock takes the operation record, or takes over the one named.
+//
+// started IS WHAT THE OPERATION STARTED FROM, which on a resume is the RECORD's
+// version rather than the live control plane's (see resumeStart): the request
+// this builds is compared with the record by pkg/operation, so it has to describe
+// the operation being continued. recordedWindow is the window string the record
+// holds, for the same reason and verbatim — see operationRequest.
 func controlPlaneLock(
 	ctx context.Context,
 	server k3s.Runner,
 	f UpgradeFlags,
 	session *upgrade.Session,
 	out io.Writer,
-	before api.ControlPlaneVersion,
+	started api.ControlPlaneVersion,
+	recordedWindow string,
 ) (*operation.Store, *operation.Handle, map[string]bool, error) {
 	store := &operation.Store{Runner: server}
-	req := operation.Request{
-		Kind:    operation.KindControlPlaneUpgrade,
-		Cluster: f.Cluster,
-		Versions: map[string]string{
-			"bundle":            session.From.Bundle + " -> " + f.To,
-			recordedContractKey: strconv.Itoa(before.Contract),
-			recordedBuildKey:    before.Build,
-		},
-	}
-	// THE WINDOW IS RECORDED WITH THEM, and it has to be: the resume of THIS
-	// operation may find the public route fenced and the backend at zero
-	// replicas, and the window gate refuses a window it cannot read. The record
-	// is in the cluster and needs no backend.
-	if session.Window != nil {
-		if spec, err := json.Marshal(session.Window.Spec()); err == nil {
-			req.Versions[recordedWindowKey] = string(spec)
-		}
-	}
-	for _, node := range session.Nodes {
-		req.Targets = append(req.Targets, operation.Target{HostID: node.Address})
-	}
+	req := operationRequest(f, session, started, recordedWindow)
 	if f.Resume == "" {
 		handle, err := store.Acquire(ctx, req)
 		if err != nil {
@@ -393,6 +388,69 @@ func controlPlaneLock(
 		return nil, nil, nil, err
 	}
 	return store, handle, resumableSkip(plan), nil
+}
+
+// resumeStart is the version the operation this run continues STARTED from.
+//
+// IT IS THE RECORD'S ON A RESUME, NOT THE LIVE CONTROL PLANE'S. A resume can
+// legitimately find the control plane already running the NEW code: the .3
+// recovery has just brought it back, or the interrupt landed in the chart, the
+// validation or the unfence stage. pkg/operation holds a resume to the record's
+// immutable request, so an identity built from the live control plane describes a
+// DIFFERENT request and the resume is refused (hardware, 2026-09-26, run 25:
+// `versions: the record has "... control-plane build=c121ed88...", you passed
+// "... control-plane build=279b285b..."`).
+//
+// THE LIVE VERSION IS STILL READ AND STILL HAS TO PASS THE FLOOR. Compatibility
+// is about the control plane this CLI is talking to NOW, which is why
+// controlPlaneForUpgrade runs before this and its verdict is kept.
+//
+// A RUN WITHOUT --resume STARTS WHERE THE LIVE CONTROL PLANE IS, and so does a
+// resume whose record carries no version facts — an operation recorded by a build
+// that did not write them. Those keep the behaviour they had.
+func resumeStart(f UpgradeFlags, live, recorded api.ControlPlaneVersion) api.ControlPlaneVersion {
+	if f.Resume == "" || recorded == (api.ControlPlaneVersion{}) {
+		return live
+	}
+	return recorded
+}
+
+// operationRequest is the identity of the operation this run creates, or the one
+// it continues: the cluster, the bundles, the version the operation started from
+// and the window it was accepted inside.
+//
+// THE WINDOW COMES FROM THE RECORD VERBATIM ON A RESUME. It is part of the same
+// immutable request — the run that began the operation wrote the window it had
+// stored — so a resume that re-read the cluster's window would be refused as a
+// different request if an operator changed it in between. The window GATE still
+// judges against the cluster's stored window, which is a different question (see
+// windowGate): "was this operation accepted then" is the identity's business,
+// "is now inside the window" is the gate's.
+func operationRequest(f UpgradeFlags, session *upgrade.Session, started api.ControlPlaneVersion, recordedWindow string) operation.Request {
+	req := operation.Request{
+		Kind:    operation.KindControlPlaneUpgrade,
+		Cluster: f.Cluster,
+		Versions: map[string]string{
+			"bundle":            session.From.Bundle + " -> " + f.To,
+			recordedContractKey: strconv.Itoa(started.Contract),
+			recordedBuildKey:    started.Build,
+		},
+	}
+	// THE WINDOW IS RECORDED WITH THEM, and it has to be: the resume of THIS
+	// operation may find the public route fenced and the backend at zero
+	// replicas, and the window gate refuses a window it cannot read. The record
+	// is in the cluster and needs no backend.
+	if f.Resume != "" && recordedWindow != "" {
+		req.Versions[recordedWindowKey] = recordedWindow
+	} else if session.Window != nil {
+		if spec, err := json.Marshal(session.Window.Spec()); err == nil {
+			req.Versions[recordedWindowKey] = string(spec)
+		}
+	}
+	for _, node := range session.Nodes {
+		req.Targets = append(req.Targets, operation.Target{HostID: node.Address})
+	}
+	return req
 }
 
 // resumableSkip is the skip set, with the checkpoint Job's creation removed.

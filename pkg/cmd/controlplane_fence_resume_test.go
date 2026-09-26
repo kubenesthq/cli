@@ -16,8 +16,11 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/controlplane"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/upgrade"
 	"kubenest.io/cli/pkg/version"
+	"kubenest.io/cli/pkg/window"
 )
 
 // A RESUME MUST NOT NEED THE BACKEND THE UPGRADE IT RESUMES HAS FENCED OFF
@@ -509,4 +512,166 @@ func TestARunTakesItsBaseValuesWithoutTheFencesImagePin(t *testing.T) {
 	if backend["replicas"] != 2 {
 		t.Errorf("the base values lost backend.replicas: %v", backend)
 	}
+}
+
+// A RESUME WHOSE CONTROL PLANE ALREADY RUNS THE NEW CODE IS THE SAME REQUEST
+// (kn-t70-control-plane-version-identity-4xso.7).
+//
+// The operation's identity — the "versions" pkg/operation compares a resume's
+// request against — was built from the LIVE control plane. A resume can
+// legitimately find the live control plane already running the NEW code: the .3
+// recovery has just brought it back, or the interrupt landed in the chart, the
+// validation or the unfence stage. The identity then differed from the record's
+// and the resume was refused:
+//
+//	a resume continues the same immutable request, and this one differs:
+//	  versions: the record has "... control-plane build=c121ed88... ", you passed
+//	  "... control-plane build=279b285b..."
+//
+// (hardware, 2026-09-26, run 25).
+//
+// THIS TEST BUILDS BOTH REQUESTS WITH THE CODE THE COMMAND USES — the run that
+// began the operation and the run that resumes it — and compares them the way
+// pkg/operation does.
+func TestAResumeWhoseControlPlaneAlreadyRunsTheNewCodeIsTheSameRequest(t *testing.T) {
+	const (
+		startedBuild = "c121ed887750b1d3196d54fe9fd8368791a1bf03"
+		newBuild     = "279b285b0000000000000000000000000000000a"
+	)
+	stored, err := window.Parse(window.Spec{Days: []string{"sun", "mon"}, Start: "02:00", End: "06:00", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The record holds the window the run that began the operation stored, and it
+	// holds it as that run wrote it.
+	recordedWindow, err := json.Marshal(stored.Spec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &upgrade.Session{
+		From:   &manifest.Manifest{Bundle: "1.0"},
+		Nodes:  []upgrade.Node{{Address: "10.0.0.11", Server: true}},
+		Window: &stored,
+	}
+
+	// THE RUN THAT BEGAN THE OPERATION: no --resume, and the control plane was
+	// running the PREVIOUS build.
+	beginning := UpgradeFlags{Cluster: "prod-1", To: "1.1"}
+	began := operationRequest(beginning, session, resumeStart(beginning, api.ControlPlaneVersion{Contract: 3, Build: startedBuild}, api.ControlPlaneVersion{}), "")
+
+	// THE RESUME: the live control plane now runs the NEW build, and the record
+	// holds the build the operation started from.
+	resuming := UpgradeFlags{Cluster: "prod-1", To: "1.1", Resume: "0b1e5a3f"}
+	live := api.ControlPlaneVersion{Contract: 3, Build: newBuild}
+	recorded := api.ControlPlaneVersion{Contract: 3, Build: startedBuild}
+	again := operationRequest(resuming, session, resumeStart(resuming, live, recorded), string(recordedWindow))
+
+	if diffs := began.Differences(again); len(diffs) != 0 {
+		t.Errorf("the resume is a different request from the one it continues: %v", diffs)
+	}
+
+	// AND THE WINDOW IS THE RECORD'S TOO, verbatim: the operation was accepted
+	// inside the window the run that began it stored, so an operator who changes
+	// the cluster's window between the interrupt and the resume must not turn the
+	// resume into a different request. (The window GATE still judges against the
+	// cluster's stored window, which is a different question.)
+	changed, err := window.Parse(window.Spec{Days: []string{"sat"}, Start: "23:00", End: "23:59", Timezone: "UTC"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := operationRequest(resuming, &upgrade.Session{From: session.From, Nodes: session.Nodes, Window: &changed}, resumeStart(resuming, live, recorded), string(recordedWindow))
+	if diffs := began.Differences(moved); len(diffs) != 0 {
+		t.Errorf("a resume after the cluster's stored window changed is a different request: %v", diffs)
+	}
+
+	// AND AN IDENTITY BUILT FROM THE LIVE BUILD WOULD BE A DIFFERENT REQUEST,
+	// which is the defect this asserts on: this arm also proves the comparison
+	// above can see such a difference.
+	fromLive := operationRequest(resuming, session, live, string(recordedWindow))
+	if diffs := began.Differences(fromLive); len(diffs) == 0 {
+		t.Error("using the live control plane's build produced the record's own request, so this test cannot see the defect it is about")
+	}
+}
+
+// A RESUME VALIDATES AGAINST THE BUILD THE OPERATION STARTED FROM
+// (kn-t70-control-plane-version-identity-4xso.7).
+//
+// The validation's floor ("the counter never goes down") and its refusal of "the
+// build that was serving before this upgrade" are about the operation's OWN
+// starting point, and the build it must refuse is the one THIS OPERATION came
+// from — not whatever the live control plane happens to report now. On a resume
+// whose live control plane already reports the new build while the previous
+// code is still what the Deployment runs (the fence's hold, or the .2 restore's
+// image, with a pod the rollout has not replaced yet), reading "before" from the
+// live control plane would refuse the previous build for answering — and the
+// previous build is exactly what is supposed to serve there.
+func TestAResumeValidatesAgainstTheRecordedStartingBuild(t *testing.T) {
+	const (
+		startedBuild = "c121ed887750b1d3196d54fe9fd8368791a1bf03"
+		newBuild     = "279b285b0000000000000000000000000000000a"
+		// The image the Deployment runs: the PREVIOUS candidate's, pinned by
+		// digest the way the chart renders a pin.
+		previousImage = "ghcr.io/kubenesthq/kubenest-backend@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	)
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "deployment/"+controlplane.ReleaseName+"-backend") && strings.Contains(command, "image") {
+			return sshx.Result{Stdout: previousImage}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	values := "domain: kn.example.com\njwtSecret: s\n"
+	ctx := context.Background()
+
+	// THE RESUME'S STARTING POINT: the record's build, which is what the command
+	// passes as the operation's "before" (see resumeStart).
+	resuming := UpgradeFlags{Cluster: "prod-1", To: "1.1", Resume: "0b1e5a3f"}
+	started := resumeStart(resuming, api.ControlPlaneVersion{Contract: 3, Build: newBuild}, api.ControlPlaneVersion{Contract: 3, Build: startedBuild})
+
+	expectations, err := controlplane.ValidationExpectations(ctx, runner, started, values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expectations.StaleBuild != startedBuild {
+		t.Errorf("StaleBuild = %q, want the build this operation started from (%s): that is the build whose answer means the new image did not roll", expectations.StaleBuild, startedBuild)
+	}
+	wantTag := chartBackendTag(t)
+	if expectations.WantBuild != wantTag {
+		t.Errorf("WantBuild = %q, want the chart's own backend tag %q: the validation must demand the build the chart pins", expectations.WantBuild, wantTag)
+	}
+
+	// AND TODAY'S "before" — the live control plane's build — DEMANDS THE WRONG
+	// REFUSAL: it would refuse the previous build for answering, although the
+	// previous build is what the Deployment runs.
+	todays, err := controlplane.ValidationExpectations(ctx, runner, api.ControlPlaneVersion{Contract: 3, Build: newBuild}, values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if todays.StaleBuild != newBuild {
+		t.Fatalf("the live build did not become the stale-build refusal (%+v), so this test cannot see the defect it is about", todays)
+	}
+}
+
+// chartBackendTag is the tag the chart this binary carries declares for the
+// backend: what the validation demands as the answered build's prefix (the tag
+// is short while APP_VERSION carries the whole commit sha).
+func chartBackendTag(t *testing.T) string {
+	t.Helper()
+	body, err := controlplane.ChartFile("values.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart this binary carries: %v", err)
+	}
+	var doc struct {
+		Backend struct {
+			Image struct {
+				Tag string `yaml:"tag"`
+			} `yaml:"image"`
+		} `yaml:"backend"`
+	}
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("the chart's values are not readable YAML: %v", err)
+	}
+	if doc.Backend.Image.Tag == "" {
+		t.Fatalf("the chart this binary carries pins no backend tag, so there is nothing for the validation to demand")
+	}
+	return doc.Backend.Image.Tag
 }
