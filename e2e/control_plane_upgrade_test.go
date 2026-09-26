@@ -521,7 +521,7 @@ func cpMigrationJobState(ctx context.Context, server k3s.Runner) (string, error)
 // last saw.
 //
 // IT RETURNS RATHER THAN FAILING, because it runs on the watch callback's
-// goroutine (see cpScalePostgres for the same rule). The caller cancels the run
+// goroutine (see cpSetApplicationLogin for the same rule). The caller cancels the run
 // either way: an arm that never reached the state must not let the upgrade finish.
 func cpWaitForTheBackendStopped(ctx context.Context, server k3s.Runner, within time.Duration) (string, error) {
 	deadline := time.Now().Add(within)
@@ -896,8 +896,8 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	// checkpoint.
 	watcher := newCPWatchWriter(&varOut, controlplane.StageCheckpoint+" ok", func() {
 		defer close(fired)
-		t.Log("the checkpoint is eligible; taking PostgreSQL away from the migration")
-		scaleErr = cpScalePostgres(ctx, server, 0)
+		t.Log("the checkpoint is eligible; denying the migration its database")
+		scaleErr = cpSetApplicationLogin(ctx, server, false)
 	})
 	err := cpRunCLI(t, watcher, home, cpUpgradeArgs(env, name)...)
 	select {
@@ -906,7 +906,7 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 		t.Errorf("the run never reached the checkpoint, so the migration was never denied its database:\n%s", varOut.String())
 	}
 	if scaleErr != nil {
-		t.Fatalf("taking PostgreSQL away at the migration: %v", scaleErr)
+		t.Fatalf("denying the migration its database: %v", scaleErr)
 	}
 	t.Log(varOut.String())
 
@@ -952,11 +952,8 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	// reads the FENCE's own 503, so it reaches the backend through the node and,
 	// while the backend is still at zero replicas, falls back to the version
 	// this operation recorded.
-	if err := cpScalePostgres(ctx, server, 1); err != nil {
-		t.Fatalf("restoring PostgreSQL: %v", err)
-	}
-	if err := cpWaitForPostgres(ctx, server); err != nil {
-		t.Fatal(err)
+	if err := cpSetApplicationLogin(ctx, server, true); err != nil {
+		t.Fatalf("giving the database back: %v", err)
 	}
 	// AND NOW IT IS READY, still behind the fence: the restored backend was
 	// waiting for exactly this.
@@ -984,24 +981,6 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	cpAssertTheUpgradeRolled(t, ctx, server, rerun, "the identical re-run in step (e)")
 	if _, revision, found := cpMigrationJob(t, ctx, server); !found || revision == "" {
 		t.Error("no migration Job at an install revision is on the cluster after the re-run: the record of the schema step is gone")
-	}
-}
-
-// cpWaitForPostgres waits until the PostgreSQL StatefulSet is ready again,
-// because the migration Job it is about to be given has backoffLimit 0: a Job
-// created before the database accepts connections fails permanently.
-func cpWaitForPostgres(ctx context.Context, server k3s.Runner) error {
-	deadline := time.Now().Add(5 * time.Minute)
-	for {
-		out, err := k3s.Kubectl(ctx, server, "get statefulset "+controlplane.ReleaseName+"-postgresql"+
-			" -n "+controlplane.Namespace+" -o jsonpath={.status.readyReplicas}")
-		if err == nil && strings.TrimSpace(out) == "1" {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("the PostgreSQL StatefulSet did not become ready again (%s, last error %v)", strings.TrimSpace(out), err)
-		}
-		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -1424,25 +1403,32 @@ func cpResetToThePreviousCandidate(t *testing.T, ctx context.Context, env cpUpgr
 	return revision
 }
 
-// cpScalePostgres returns the error rather than failing the test, because the
-// forced-failure arm scales the StatefulSet FROM A CALLBACK that runs on the
-// run's own goroutine — and t.Fatalf outside the test goroutine is not allowed.
+// cpApplicationRole is the chart's postgresql.auth.username: the role the
+// backend, the checkpoint and the migration Job all log in as.
+const cpApplicationRole = "kubenest"
+
+// cpSetApplicationLogin denies or restores the application role's LOGIN, which
+// is how step (e) takes the database away from the migration.
 //
-// SCALING TO ZERO WAITS UNTIL THE POD IS GONE. `kubectl scale` returns as soon
-// as the StatefulSet's spec changes, while PostgreSQL is still shutting down and
-// still accepting connections. The callback runs inside the CLI's output write,
-// so the run is paused for as long as this takes; returning early let run 23's
-// migration Job reach a database that was still up and succeed, and step (e)
-// then had no failure to recover from.
-func cpScalePostgres(ctx context.Context, server k3s.Runner, replicas int) error {
-	name := controlplane.ReleaseName + "-postgresql"
-	if _, err := k3s.Kubectl(ctx, server, "scale statefulset "+name+
-		" -n "+controlplane.Namespace+" --replicas="+strconv.Itoa(replicas)); err != nil {
-		return err
+// IT DOES NOT SCALE POSTGRESQL DOWN. The migration stage's first apply is a
+// helm upgrade, and helm's three-way merge puts the StatefulSet's replicas back
+// to the chart's 1. Runs 23 and 24 measured it: PostgreSQL came back before the
+// migration Job connected, the migration succeeded, and the arm had no failure
+// to recover from; the earlier passes had won that race. A role attribute is
+// database state, which no chart apply touches, and a refused login fails the
+// Job at once rather than at a timeout.
+//
+// It returns the error rather than failing the test, because the arm calls it
+// FROM A CALLBACK that runs on the run's own goroutine, and t.Fatalf outside the
+// test goroutine is not allowed. The superuser password is read inside the pod
+// from the file the chart mounts, so it never reaches this process.
+func cpSetApplicationLogin(ctx context.Context, server k3s.Runner, allowed bool) error {
+	attribute := "NOLOGIN"
+	if allowed {
+		attribute = "LOGIN"
 	}
-	if replicas != 0 {
-		return nil
-	}
-	_, err := k3s.Kubectl(ctx, server, "wait --for=delete pod/"+name+"-0 -n "+controlplane.Namespace+" --timeout=180s")
+	_, err := k3s.Kubectl(ctx, server, "exec "+controlplane.ReleaseName+"-postgresql-0 -n "+controlplane.Namespace+
+		` -- sh -c 'PGPASSWORD="$(cat "$POSTGRES_POSTGRES_PASSWORD_FILE")" psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -tAc "ALTER ROLE `+
+		cpApplicationRole+" "+attribute+`"'`)
 	return err
 }
