@@ -162,22 +162,28 @@ func checkReportedVersion(o ValidationOptions, got api.ControlPlaneVersion, addr
 }
 
 // ValidationExpectations works out what the upgraded backend must report, from
-// the TWO IMAGES: the one the chart will run and the one the Deployment runs
-// now.
+// the build this operation started from and the image the chart declares.
 //
 // THE ERA ALONE IS NOT A DISCRIMINATOR. Hardware (2026-09-25) ran an upgrade
 // whose every stage was skipped — it changed nothing — and the validation passed
 // in 0 s against the PREVIOUS candidate's image, because the only checks were
 // "the era is not below the one before" and "the build is not empty". Both held.
 //
-//	the images differ  the chart is moving the backend, so the build that was
-//	                   serving is STALE: it must not answer, and the chart's tag
-//	                   is the prefix the new one must report;
-//	the images match   nothing is moving, so the same build is exactly what a
-//	                   correct run reports — refusing it would refuse every
-//	                   re-run and every resume.
-func ValidationExpectations(ctx context.Context, r k3s.Runner, before api.ControlPlaneVersion, valuesYAML string) (ValidationOptions, error) {
-	out := ValidationOptions{MinContract: before.Contract, StaleBuild: before.Build}
+// IT DOES NOT READ THE RUNNING IMAGE AT ALL, and that is deliberate. The question
+// the validation answers is "is the code this run moved to the one serving?", and
+// the answer has to hold on a resume whose live control plane ALREADY runs the
+// new code — the .3 recovery brings it back behind the fence, so declared and
+// running are the same image there, and a rule keyed on "the images differ"
+// demands nothing exactly when the run has most to answer for. So:
+//
+//	WantBuild   the chart's own tag, which the answering build must start with;
+//	StaleBuild  the build this operation started from, unless the chart's pin IS
+//	            that build: a genuine no-op run reports the same build and
+//	            refusing it would refuse a correct run.
+//	            (See the body for the two cases, and hardware, 2026-09-26, run
+//	            26, for what the previous rule cost.)
+func ValidationExpectations(before api.ControlPlaneVersion, valuesYAML string) (ValidationOptions, error) {
+	out := ValidationOptions{MinContract: before.Contract}
 	declared, ok, err := backendImageFromValues(valuesYAML)
 	if err != nil {
 		return out, err
@@ -195,15 +201,33 @@ func ValidationExpectations(ctx context.Context, r k3s.Runner, before api.Contro
 			return out, fmt.Errorf("the control-plane chart's values.yaml declares no backend.image, so which build the upgrade applies cannot be established; a validation that cannot say what it is looking for is not one")
 		}
 	}
-	running, err := RunningBackendImage(ctx, r)
-	if err != nil {
-		return out, err
-	}
-	if sameImage(declared, running) {
-		out.StaleBuild = ""
+	// THE RULE IS ABOUT THE TWO BUILDS, NOT ABOUT THE TWO IMAGES.
+	//
+	// It used to compare the declared image with the one the Deployment runs and
+	// demand nothing when they matched. On a resume that is wrong: the .3 recovery
+	// brings the NEW code back behind the fence, so the resume finds declared ==
+	// running, and a run that had already moved to the new code still has to be
+	// held to it — "the same image is answering" is also what a run that rolled
+	// NOTHING produces (hardware, 2026-09-26, run 26: the resumed validation
+	// demanded no build at all, `build not "", build prefix ""`).
+	//
+	//	WantBuild   the tag the chart declares, when it declares one: the
+	//	            answering build must start with it, so the image serving can be
+	//	            tied to the one this run applied. An image pinned by digest
+	//	            alone names no build prefix, so nothing is demanded of the
+	//	            build stamp.
+	//	StaleBuild  the build THIS OPERATION started from, unless that build is
+	//	            the one the chart declares: a genuine no-op run — every resume
+	//	            of an already-upgraded control plane — reports exactly that
+	//	            build, and refusing it would refuse a correct run.
+	if declared.tag == "" {
 		return out, nil
 	}
 	out.WantBuild = declared.tag
+	if strings.HasPrefix(before.Build, declared.tag) {
+		return out, nil
+	}
+	out.StaleBuild = before.Build
 	return out, nil
 }
 
@@ -219,15 +243,6 @@ func RunningBackendImageRef(ctx context.Context, r k3s.Runner) (string, error) {
 		return "", fmt.Errorf("the backend Deployment %s/%s names no image, so which build is serving cannot be established", Namespace, backendService)
 	}
 	return ref, nil
-}
-
-// RunningBackendImage reads the image the backend Deployment runs now.
-func RunningBackendImage(ctx context.Context, r k3s.Runner) (postgresImage, error) {
-	ref, err := RunningBackendImageRef(ctx, r)
-	if err != nil {
-		return postgresImage{}, err
-	}
-	return parsePostgresImage(ref), nil
 }
 
 // backendImageFromValues extracts backend.image from a values document. It uses
@@ -272,20 +287,6 @@ func backendImageFromValues(valuesYAML string) (postgresImage, bool, error) {
 		ref += "@" + digest
 	}
 	return parsePostgresImage(ref), true, nil
-}
-
-// sameImage reports whether two references name the same image.
-//
-// THE DIGEST DECIDES WHEN BOTH CARRY ONE, because that is what Kubernetes
-// resolves and what the chart pins; otherwise repository and tag do. The
-// repository is compared with its registry host normalised away, for the reason
-// postgresImage.distribution gives: the chart declares an unqualified
-// repository while the Deployment renders a qualified one.
-func sameImage(a, b postgresImage) bool {
-	if a.digest != "" && b.digest != "" {
-		return a.digest == b.digest
-	}
-	return a.distribution() == b.distribution() && a.tag == b.tag
 }
 
 // retryUnreachable runs check until it passes, returns an error that is not a

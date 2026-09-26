@@ -545,11 +545,38 @@ func normalizeKey(k string) string {
 // The same action has the same ID across attempts and across laptops, which is
 // what lets a successor recognise one it already carried out.
 //
+// IT IS FOR AN ACTION WITH NO INPUT. An action that streams a document has an
+// identity that includes it: InputActionID.
+//
 // The version prefix is there so that a future change to what goes into the
 // identity does not silently collide with identities already written down.
 func ActionID(stage, command string) string {
 	sum := sha256.Sum256([]byte("kubenest-action-v1\x00" + stage + "\x00" + command))
 	return hex.EncodeToString(sum[:16])
+}
+
+// InputActionID is an action's stable identity when it streams its input: the
+// stage, the command AND the document.
+//
+// AN ACTION IS ITS COMMAND AND ITS INPUT. ActionID hashes the command alone, and
+// the HelmChart write sends its document over stdin (k3s.WriteManifest), so the
+// control-plane migration stage's stop apply and its migration apply had ONE
+// identity: the record held that identity as succeeded, and a resume skipped
+// BOTH — including the apply whose Job the run then waited ten minutes for,
+// against a cluster where nothing had been written (hardware, 2026-09-26, run
+// 26). Any stage that writes one manifest twice had the same collision, and so
+// did any resume whose document differed from the recorded one: a different
+// document is a different action, and a successor must submit it.
+//
+// IT IS DOMAIN-SEPARATED FROM ActionID, so adding the input cannot change the
+// identity of a command that has none: the records of operations in flight keep
+// the identities they were written with, and node_reboot's actions (which have
+// no stdin) are unaffected.
+func InputActionID(stage, command string, input []byte) string {
+	sum := sha256.New()
+	sum.Write([]byte("kubenest-action-v2-input\x00" + stage + "\x00" + command + "\x00"))
+	sum.Write(input)
+	return hex.EncodeToString(sum.Sum(nil)[:16])
 }
 
 // validOperationID keeps an operation ID usable as a ConfigMap name suffix and

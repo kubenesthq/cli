@@ -429,6 +429,91 @@ func TestAResumeDoesNotSubmitAnActionThatAlreadySucceeded(t *testing.T) {
 	}
 }
 
+// AN ACTION IS ITS COMMAND AND ITS INPUT
+// (kn-t70-control-plane-version-identity-4xso.8).
+//
+// ActionID hashes the stage and the command alone, and a manifest write sends its
+// document over stdin — so the control-plane migration stage's stop apply and its
+// migration apply (both k3s.WriteManifest of one file) shared one identity, and a
+// resume that recorded either one skipped both: on hardware (2026-09-26, run 26)
+// the resumed stage waited ten minutes for a Job nothing had rendered, while the
+// cluster held nothing from the migration apply.
+func TestAnActionIdentityIncludesTheDocumentItStreams(t *testing.T) {
+	const (
+		stage   = "control-plane-migration"
+		command = "sudo -n install -m 0600 /dev/stdin /var/lib/rancher/k3s/server/manifests/kubenest-cp.yaml.tmp && sudo -n mv -f " +
+			"/var/lib/rancher/k3s/server/manifests/kubenest-cp.yaml.tmp /var/lib/rancher/k3s/server/manifests/kubenest-cp.yaml"
+	)
+	stopApply := []byte("backend:\n  replicas: 0\nmigration:\n  enabled: false\n")
+	migrationApply := []byte("backend:\n  replicas: 0\nmigration:\n  enabled: true\n")
+
+	// DIFFERENT DOCUMENTS ARE DIFFERENT ACTIONS, which is the defect: the two
+	// writes of one chart file must not share an identity.
+	if InputActionID(stage, command, stopApply) == InputActionID(stage, command, migrationApply) {
+		t.Error("two writes of the same command with different documents share one identity, so a resume that recorded either one skips both")
+	}
+	// THE SAME DOCUMENT IS THE SAME ACTION, or a resume would repeat a write it
+	// has already made.
+	if InputActionID(stage, command, stopApply) != InputActionID(stage, command, stopApply) {
+		t.Error("the same write has two identities, so resuming it would repeat it")
+	}
+	// AND IT CANNOT COLLIDE WITH A COMMAND THAT HAS NO INPUT, which is what keeps
+	// every identity already written down exactly what it was.
+	if ActionID(stage, command) == InputActionID(stage, command, nil) {
+		t.Error("an input action's identity collides with the same command without input, so the records of operations in flight would change meaning")
+	}
+}
+
+// A RESUME SUBMITS A WRITE WHOSE DOCUMENT DIFFERS, even when the record holds
+// the same command as succeeded
+// (kn-t70-control-plane-version-identity-4xso.8).
+func TestAResumeSkipsOnlyTheWriteItActuallyMade(t *testing.T) {
+	k := newFakeKube(t)
+	s := newStore(t, k, "ana@laptop")
+	ctx := context.Background()
+	h := acquire(t, s, testRequest("host-1"))
+
+	specs := func(stage, command string) (Spec, bool) {
+		return Spec{Kind: ActionPlan, Postcondition: "written: " + command, Observe: "sudo -n test -s /manifests/kubenest-cp.yaml"}, true
+	}
+	// THE FIRST RUN writes the stop apply. Its transport is a spy: the write is
+	// not record traffic.
+	first := &spyRunner{t: t}
+	wrote := &Guarded{Inner: first, Op: h, Stage: "control-plane-migration", Specs: specs}
+	if err := k3s.WriteManifest(ctx, wrote, "kubenest-cp", []byte("the stop apply\n")); err != nil {
+		t.Fatalf("the first run's write: %v", err)
+	}
+	// WHAT THE RECORD HOLDS is that write's identity, and nothing else.
+	stored, err := s.Find(ctx, h.OperationID())
+	if err != nil {
+		t.Fatalf("reading the record: %v", err)
+	}
+	if len(stored.Record.Actions) != 1 {
+		t.Fatalf("the record holds %d action(s), want the one write: %+v", len(stored.Record.Actions), stored.Record.Actions)
+	}
+	recorded := stored.Record.Actions[0].ID
+
+	// THE RESUME writes the MIGRATION apply: the same command, a different
+	// document. It must reach the cluster.
+	again := &spyRunner{t: t}
+	resumed := &Guarded{Inner: again, Op: h, Stage: "control-plane-migration", Specs: specs, Skip: map[string]bool{recorded: true}}
+	if err := k3s.WriteManifest(ctx, resumed, "kubenest-cp", []byte("the migration apply\n")); err != nil {
+		t.Fatalf("the resumed run's write: %v", err)
+	}
+	if len(again.calls) != 1 {
+		t.Fatalf("the resume submitted %d write(s), want the one whose document the record does not hold: an action's identity must include its input", len(again.calls))
+	}
+	// AND THE WRITE IT *DID* MAKE IS STILL SKIPPED.
+	third := &spyRunner{t: t}
+	repeated := &Guarded{Inner: third, Op: h, Stage: "control-plane-migration", Specs: specs, Skip: map[string]bool{recorded: true}}
+	if err := k3s.WriteManifest(ctx, repeated, "kubenest-cp", []byte("the stop apply\n")); err != nil {
+		t.Fatalf("repeating the recorded write: %v", err)
+	}
+	if len(third.calls) != 0 {
+		t.Fatalf("the resume re-submitted the write it recorded: %v", third.calls)
+	}
+}
+
 // TestAKillBeforeSubmissionResumesWithoutSubmitting: a record that says
 // "recorded, never submitted" is safe to repeat, so the resume repeats it — and
 // the resume itself submits nothing.

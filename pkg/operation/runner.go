@@ -1,6 +1,7 @@
 package operation
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -94,6 +95,21 @@ func (g *Guarded) DialTCP(ctx context.Context, addr string) (net.Conn, error) {
 }
 
 func (g *Guarded) submit(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	// AN ACTION IS ITS COMMAND AND ITS INPUT, so a streamed document is read
+	// BEFORE the identity is decided and then replayed to the transport. Without
+	// it, every write of one file shares an identity: the migration stage's stop
+	// apply and its migration apply are both k3s.WriteManifest of kubenest-cp.yaml,
+	// so a resume that recorded either one skipped both — and waited ten minutes
+	// for a Job nothing had rendered (hardware, 2026-09-26, run 26).
+	var body []byte
+	if stdin != nil {
+		var err error
+		body, err = io.ReadAll(stdin)
+		if err != nil {
+			return sshx.Result{}, fmt.Errorf("reading the document this action streams: %w", err)
+		}
+		stdin = bytes.NewReader(body)
+	}
 	call := func() (sshx.Result, error) {
 		if stdin != nil {
 			return g.Inner.RunInput(ctx, command, stdin)
@@ -113,6 +129,9 @@ func (g *Guarded) submit(ctx context.Context, command string, stdin io.Reader) (
 	}
 
 	id := ActionID(g.Stage, command)
+	if stdin != nil {
+		id = InputActionID(g.Stage, command, body)
+	}
 	if g.Skip[id] {
 		// The predecessor already carried this action out, so it is not
 		// submitted again and there is no output to return: what the record

@@ -393,7 +393,7 @@ func stageGates(ctx context.Context, s *UpgradeSession) error {
 	// moment the backend is still the OLD one: after the fence stage the
 	// Deployments are the chart's, and comparing the chart's image with itself
 	// would answer "unchanged" for every upgrade.
-	expectations, err := ValidationExpectations(ctx, r, s.Opts.Before, s.Opts.Values)
+	expectations, err := ValidationExpectations(s.Opts.Before, s.Opts.Values)
 	if err != nil {
 		return err
 	}
@@ -632,6 +632,22 @@ func stageMigration(ctx context.Context, s *UpgradeSession) error {
 		return err
 	}
 	if err := WaitForMigration(ctx, r, revision, deadline, s.Opts.Reporter); err != nil {
+		// AN INTERRUPT IS NOT A FAILED MIGRATION, and restoring on one is worse
+		// than doing nothing. The context is done, so every read a restore makes
+		// fails with the same cancellation: on hardware (2026-09-26, run 26) the
+		// stage reported "the fence's own Deployment is gone ... the control plane
+		// is running nothing: restore it by hand" about a cluster where the fence
+		// was up, the Job was running and completed, and the successor's own
+		// recovery brought the backend back. The one thing that message tells the
+		// operator to do is the one thing they must not do.
+		//
+		// NOTHING IS DECIDED HERE: a resume establishes the Job's outcome from the
+		// cluster (RecoverStoppedBackend) and brings back the code the schema
+		// matches. The command's own interruption guidance — the record is left
+		// stopped and names the resume — stands.
+		if ctx.Err() != nil {
+			return fmt.Errorf("the run was interrupted while the migration Job was running, and the Job's outcome is not this process's to decide: run the identical command again to resume the operation, which establishes from the cluster what the migration did and brings back the code its schema matches: %w", err)
+		}
 		// PUT THE PREVIOUS CHART BACK BEFORE REPORTING, because the migration
 		// applied this chart with `backend.replicas: 0` and the NEW image — the
 		// chart has one image value for the Job and the Deployment — so a

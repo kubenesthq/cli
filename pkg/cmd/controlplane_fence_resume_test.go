@@ -598,36 +598,25 @@ func TestAResumeWhoseControlPlaneAlreadyRunsTheNewCodeIsTheSameRequest(t *testin
 //
 // The validation's floor ("the counter never goes down") and its refusal of "the
 // build that was serving before this upgrade" are about the operation's OWN
-// starting point, and the build it must refuse is the one THIS OPERATION came
-// from — not whatever the live control plane happens to report now. On a resume
-// whose live control plane already reports the new build while the previous
-// code is still what the Deployment runs (the fence's hold, or the .2 restore's
-// image, with a pod the rollout has not replaced yet), reading "before" from the
-// live control plane would refuse the previous build for answering — and the
-// previous build is exactly what is supposed to serve there.
+// starting point, so the build it must refuse is the one THIS OPERATION came from
+// — not whatever the live control plane reports now. On a resume whose live
+// control plane already runs the new code (the .3 recovery brought it back behind
+// the fence), reading "before" from the live control plane would call the NEW
+// build stale, and the validation would refuse the very code it is there to
+// prove. The rule reads no running image at all: see ValidationExpectations.
 func TestAResumeValidatesAgainstTheRecordedStartingBuild(t *testing.T) {
 	const (
 		startedBuild = "c121ed887750b1d3196d54fe9fd8368791a1bf03"
 		newBuild     = "279b285b0000000000000000000000000000000a"
-		// The image the Deployment runs: the PREVIOUS candidate's, pinned by
-		// digest the way the chart renders a pin.
-		previousImage = "ghcr.io/kubenesthq/kubenest-backend@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	)
-	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
-		if strings.Contains(command, "deployment/"+controlplane.ReleaseName+"-backend") && strings.Contains(command, "image") {
-			return sshx.Result{Stdout: previousImage}, nil
-		}
-		return sshx.Result{}, nil
-	}}
 	values := "domain: kn.example.com\njwtSecret: s\n"
-	ctx := context.Background()
 
 	// THE RESUME'S STARTING POINT: the record's build, which is what the command
 	// passes as the operation's "before" (see resumeStart).
 	resuming := UpgradeFlags{Cluster: "prod-1", To: "1.1", Resume: "0b1e5a3f"}
 	started := resumeStart(resuming, api.ControlPlaneVersion{Contract: 3, Build: newBuild}, api.ControlPlaneVersion{Contract: 3, Build: startedBuild})
 
-	expectations, err := controlplane.ValidationExpectations(ctx, runner, started, values)
+	expectations, err := controlplane.ValidationExpectations(started, values)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -639,15 +628,20 @@ func TestAResumeValidatesAgainstTheRecordedStartingBuild(t *testing.T) {
 		t.Errorf("WantBuild = %q, want the chart's own backend tag %q: the validation must demand the build the chart pins", expectations.WantBuild, wantTag)
 	}
 
-	// AND TODAY'S "before" — the live control plane's build — DEMANDS THE WRONG
-	// REFUSAL: it would refuse the previous build for answering, although the
-	// previous build is what the Deployment runs.
-	todays, err := controlplane.ValidationExpectations(ctx, runner, api.ControlPlaneVersion{Contract: 3, Build: newBuild}, values)
+	// AND TAKING "before" FROM THE LIVE CONTROL PLANE MAKES THE CHECK A NO-OP:
+	// this resume's live build IS the build the chart pins, so nothing is refused
+	// as stale and the PREVIOUS candidate's code could be the one answering — which
+	// is precisely the state this operation came from and has to answer for. (This
+	// arm also proves the assertion above can see a difference.)
+	todays, err := controlplane.ValidationExpectations(api.ControlPlaneVersion{Contract: 3, Build: newBuild}, values)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if todays.StaleBuild != newBuild {
-		t.Fatalf("the live build did not become the stale-build refusal (%+v), so this test cannot see the defect it is about", todays)
+	if todays.StaleBuild != "" {
+		t.Fatalf("the live build was treated as stale (%+v), so this arm's premise — that taking it as the operation's start refuses nothing — does not hold", todays)
+	}
+	if todays.WantBuild != chartBackendTag(t) {
+		t.Fatalf("the live build's expectations demand %q, want the chart's tag %q: the prefix check is not what this arm is about", todays.WantBuild, chartBackendTag(t))
 	}
 }
 

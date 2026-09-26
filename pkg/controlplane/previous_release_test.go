@@ -603,3 +603,92 @@ func TestARunWithTheFenceDownOrABackendRunningNeedsNoRecovery(t *testing.T) {
 		})
 	}
 }
+
+// AN INTERRUPT DURING THE MIGRATION RESTORES NOTHING
+// (kn-t70-control-plane-version-identity-4xso.9).
+//
+// stageMigration treated every error from the migration wait as a failed
+// migration and called restorePreviousRelease with the SAME, already-cancelled
+// context. Every read in it failed, so the fence's Deployment "was gone" and the
+// operator was told "the control plane is running nothing: restore it by hand" —
+// about a cluster where the fence was up, the Job was running and completed, and
+// the successor's own recovery brought the backend back (hardware, 2026-09-26,
+// run 26). An interrupt is the operator stopping the run, not the migration
+// failing, and the successor decides what code comes back from the Job's outcome.
+func TestAnInterruptDuringTheMigrationRestoresNothing(t *testing.T) {
+	values := "domain: kn.example.com\njwtSecret: s\n"
+	kube := newPreviousKube(t)
+	// THE JOB IS RUNNING, so the wait ends because the context is done and not
+	// because the Job reached a verdict.
+	kube.migrationCondition = "running"
+	// AND THE RESTORE WOULD SUCCEED: the fence records the previous code, so an
+	// interrupt that fell through to the restore path would really write a third
+	// document over a control plane nobody asked it to change. (In run 26 those
+	// same facts existed on the cluster, and the restore's reads failed because
+	// the context was already done, which is how it came to report the fence as
+	// gone.)
+	kube.fenceFacts = map[string]string{
+		fencePreviousImageAnnotation:    previousBackendImage,
+		fencePreviousReplicasAnnotation: "1",
+	}
+	s := migrationSession(t, kube, values)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The interrupt lands once the migration stage has stopped the backend and
+	// written its migration apply — the state run 26 was interrupted in.
+	writes := 0
+	kube.FakeRunner.Respond = cancelOnTheMigrationApply(t, kube.FakeRunner.Respond, &writes, cancel)
+
+	err := stageMigration(ctx, s)
+	if err == nil {
+		t.Fatal("an interrupted migration wait did not stop the stage")
+	}
+	// NOTHING WAS APPLIED AFTER THE MIGRATION APPLY: the restore would be a third
+	// write, and it is exactly what must not happen with a cancelled context.
+	if got := chartWrites(kube); got != 2 {
+		t.Errorf("the stage wrote %d chart document(s), want the stop apply and the migration apply alone: the restore must not run on an interrupt", got)
+	}
+	// AND THE FAILURE DOES NOT CLAIM THE CLUSTER IS UNRECOVERABLE. The bead names
+	// the two sentences that were false.
+	for _, lie := range []string{"running nothing", "restore it by hand"} {
+		if strings.Contains(err.Error(), lie) {
+			t.Errorf("an interrupt is reported as %q, which tells the operator to restore a control plane the successor recovers by itself:\n%v", lie, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "interrupted") {
+		t.Errorf("the failure does not say the run was interrupted:\n%v", err)
+	}
+	if s.Restored != nil {
+		t.Error("the stage reported a restore although the run was interrupted, not failed")
+	}
+}
+
+// cancelOnTheMigrationApply wraps a fake runner so that the run is cancelled once
+// the migration stage has written its migration apply: the interrupt run 26 took,
+// placed by what the stage has done rather than by a timer.
+func cancelOnTheMigrationApply(t *testing.T, inner func(string) (sshx.Result, error), writes *int, cancel context.CancelFunc) func(string) (sshx.Result, error) {
+	t.Helper()
+	return func(command string) (sshx.Result, error) {
+		if strings.HasPrefix(command, "sudo -n install -m 0600 ") && strings.Contains(command, ReleaseName+".yaml") {
+			*writes++
+			// The SECOND chart write is the migration apply: the stop apply is
+			// the first, and the wait that follows is where the interrupt lands.
+			if *writes == 2 {
+				cancel()
+			}
+		}
+		return inner(command)
+	}
+}
+
+// chartWrites is how many chart documents the stage wrote.
+func chartWrites(kube *previousKube) int {
+	written := 0
+	for _, command := range kube.Commands() {
+		if strings.HasPrefix(command, "sudo -n install -m 0600 ") && strings.Contains(command, ReleaseName+".yaml") {
+			written++
+		}
+	}
+	return written
+}

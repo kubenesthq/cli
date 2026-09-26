@@ -3,6 +3,8 @@ package controlplane
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 	"kubenest.io/cli/pkg/window"
@@ -99,6 +102,15 @@ type stageRunner struct {
 	// matters is that the delete came BEFORE the apply that renders the Job.
 	deletedMigrationJob      bool
 	deletedMigrationJobAfter int
+
+	// recordMu, recordDoc and recordRV are the in-memory kube-system the
+	// operation Store reads and writes: one ConfigMap and its resourceVersion,
+	// so a test can drive the REAL store, the REAL record and a REAL handle
+	// (the fields of operation.Handle are unexported, so there is no way to fake
+	// one).
+	recordMu  sync.Mutex
+	recordDoc []byte
+	recordRV  int
 }
 
 func newStageRunner(t *testing.T, values string) *stageRunner {
@@ -173,6 +185,14 @@ func newStageRunner(t *testing.T, values string) *stageRunner {
 			s.checkpoint = true
 			s.marker = checkpointMarker("cp/new.dump", 20)
 			return sshx.Result{Stdout: "job created"}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl get configmap kubenest-operation"):
+			stdout, missing := s.readRecord()
+			if missing {
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): configmaps "kubenest-operation" not found`}, nil
+			}
+			return sshx.Result{Stdout: stdout}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl create -f -") || strings.HasPrefix(command, "sudo -n k3s kubectl replace -f -"):
+			return sshx.Result{Stdout: s.writeRecord(t, s.lastInput(t))}, nil
 		case command == migrationJobCmd:
 			// BEFORE the checkpoint-Job read: the migration Job's read is the
 			// same `kubectl get job` shape and would otherwise be answered with
@@ -201,6 +221,42 @@ func newStageRunner(t *testing.T, values string) *stageRunner {
 		}
 	}}
 	return s
+}
+
+// readRecord renders the record ConfigMap the store reads back, and says
+// whether there is one at all.
+func (s *stageRunner) readRecord() (string, bool) {
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	if s.recordDoc == nil {
+		return "", true
+	}
+	body, err := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "ConfigMap",
+		"metadata": map[string]any{"name": "kubenest-operation", "resourceVersion": fmt.Sprint(s.recordRV)},
+		"data":     map[string]any{"record.json": string(s.recordDoc)},
+	})
+	if err != nil {
+		return "", true
+	}
+	return string(body), false
+}
+
+// writeRecord stores one accepted write and answers with the new revision, the
+// way the API server does.
+func (s *stageRunner) writeRecord(t *testing.T, doc []byte) string {
+	t.Helper()
+	var object struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(doc, &object); err != nil {
+		t.Fatalf("the operation Store wrote a document this fake cannot read: %v", err)
+	}
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	s.recordDoc = []byte(object.Data["record.json"])
+	s.recordRV++
+	return fmt.Sprintf(`{"metadata":{"resourceVersion":"%d"}}`, s.recordRV)
 }
 
 func (s *stageRunner) lastInput(t *testing.T) []byte {
@@ -852,7 +908,7 @@ func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
 	}
 	// THE VALIDATION DEMANDS THE NEW BUILD, because the chart's own pin is now
 	// the declared image and it differs from the one the Deployment is running.
-	expectations, err := ValidationExpectations(ctx, runner, s.Opts.Before, values)
+	expectations, err := ValidationExpectations(s.Opts.Before, values)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,4 +1165,77 @@ func fenceObjectsDeleted(runner *stageRunner) int {
 		}
 	}
 	return deleted
+}
+
+// A RESUMED MIGRATION STAGE STILL SUBMITS ITS OWN APPLY
+// (kn-t70-control-plane-version-identity-4xso.8).
+//
+// THE STAGE'S TWO WRITES ARE ONE COMMAND. The stop apply and the migration apply
+// are both k3s.WriteManifest of the control plane's chart, so an identity that
+// hashed the command alone was the same for both: a resume whose record held the
+// stop apply skipped the migration apply too, and waited out its whole deadline
+// for a Job nothing had rendered (hardware, 2026-09-26, run 26 — `skip ee8549cc…
+// (control-plane-migration): the record says this action succeeded`, then ten
+// minutes of `job kubenest-cp-migrate ... is not found yet`).
+//
+// THIS TEST DRIVES THE REAL STORE, THE REAL RECORD AND A REAL HANDLE. The
+// predecessor's stop apply is submitted through the same decorator the stage
+// uses; its identity is read back out of the record; and the resumed stage runs
+// with exactly that identity in its skip set, which is what a resume of an
+// interrupted run carries.
+func TestAResumedMigrationStageStillSubmitsItsMigrationApply(t *testing.T) {
+	ctx := context.Background()
+	values := upgradeTestValues(t, nil)
+	kube := newStageRunner(t, values)
+
+	// THE RECORD OF THE INTERRUPTED RUN, in the cluster the Store reads.
+	store := &operation.Store{Runner: kube}
+	handle, err := store.Acquire(ctx, operation.Request{Kind: operation.KindControlPlaneUpgrade, Cluster: "prod-1"})
+	if err != nil {
+		t.Fatalf("taking the operation record: %v", err)
+	}
+
+	// ITS STOP APPLY, submitted exactly as the stage submits it: the same values
+	// composition, the same Apply, the same decorator with the same Specs — so the
+	// streamed document is byte-identical to the one a stage would write.
+	stopped, err := FenceValues(values, FenceOptions{Up: true, BackendReplicas: int32Ptr(0), MigrationOff: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &operation.Guarded{Inner: kube, Op: handle, Stage: StageMigration, Specs: actionSpecs}
+	if _, err := Apply(ctx, first, stopped); err != nil {
+		t.Fatalf("the interrupted run's stop apply: %v", err)
+	}
+	stored, err := store.Find(ctx, handle.OperationID())
+	if err != nil {
+		t.Fatalf("reading the record back: %v", err)
+	}
+	if len(stored.Record.Actions) != 1 {
+		t.Fatalf("the record holds %d action(s), want the stop apply alone: %+v", len(stored.Record.Actions), stored.Record.Actions)
+	}
+	skip := map[string]bool{stored.Record.Actions[0].ID: true}
+
+	// THE RESUME: the stage's own runner carries the record's identity in its skip
+	// set, which is what resumableSkip hands it.
+	s := testUpgradeSession(t, kube, values)
+	s.WithOperation(handle, skip)
+	s.PollInterval = time.Millisecond
+	s.WaitDeadline = 2 * time.Second
+
+	// The predecessor's own write is already on the fake's list; what matters is
+	// what the RESUMED stage adds.
+	writesBefore := len(kube.applied)
+	if err := stageMigration(ctx, s); err != nil {
+		t.Fatalf("the resumed migration stage failed: %v", err)
+	}
+	// THE MIGRATION APPLY REACHED THE CLUSTER: the stop apply was skipped (the
+	// record holds it) and the migration apply, whose document is different, was
+	// not.
+	added := kube.applied[writesBefore:]
+	if len(added) != 1 {
+		t.Fatalf("the resumed stage wrote %d chart document(s), want the migration apply alone: %+v", len(added), added)
+	}
+	if !added[0].migration {
+		t.Errorf("the resumed stage's write is not the migration apply, so the wait that follows would be for nothing: %s", added[0].raw)
+	}
 }
