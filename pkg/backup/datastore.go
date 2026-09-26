@@ -123,7 +123,7 @@ func ConfigureDatastoreSnapshots(
 			return fmt.Errorf("restart k3s for datastore snapshot configuration: %w", err)
 		}
 		if res.ExitCode != 0 {
-			return fmt.Errorf("restart k3s for datastore snapshot configuration: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
+			return fmt.Errorf("restart k3s for datastore snapshot configuration: exit %d: %s", res.ExitCode, failureLine(res.Stderr))
 		}
 	}
 
@@ -154,7 +154,7 @@ func ConfigureDatastoreSnapshots(
 		return fmt.Errorf("prove datastore snapshot upload: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("prove datastore snapshot upload: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
+		return fmt.Errorf("prove datastore snapshot upload: exit %d: %s", res.ExitCode, failureLine(res.Stderr))
 	}
 	return nil
 }
@@ -181,7 +181,7 @@ func writeDatastoreConfig(ctx context.Context, r k3s.Runner, config []byte) (boo
 		return false, fmt.Errorf("write datastore snapshot configuration: %w", err)
 	}
 	if res.ExitCode != 0 {
-		return false, fmt.Errorf("write datastore snapshot configuration: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
+		return false, fmt.Errorf("write datastore snapshot configuration: exit %d: %s", res.ExitCode, failureLine(res.Stderr))
 	}
 	switch strings.TrimSpace(res.Stdout) {
 	case "changed":

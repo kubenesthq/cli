@@ -39,7 +39,7 @@ func leakTestResponder() func(string) (sshx.Result, error) {
 // covered only the agent's values document.
 func TestTargetCredentialsNeverReachACommandLine(t *testing.T) {
 	r := &fakeRunner{Respond: leakTestResponder()}
-	if err := Configure(context.Background(), r, testManifest(), leakTestTarget(), nil); err != nil {
+	if _, err := Configure(context.Background(), r, testManifest(), leakTestTarget(), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -62,7 +62,7 @@ func TestTargetCredentialsNeverReachACommandLine(t *testing.T) {
 // earned by delivering nothing is the failure mode this whole bead is about.
 func TestTargetCredentialsDoReachTheClusterOverStdin(t *testing.T) {
 	r := &fakeRunner{Respond: leakTestResponder()}
-	if err := Configure(context.Background(), r, testManifest(), leakTestTarget(), nil); err != nil {
+	if _, err := Configure(context.Background(), r, testManifest(), leakTestTarget(), nil); err != nil {
 		t.Fatal(err)
 	}
 

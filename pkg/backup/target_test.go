@@ -210,7 +210,7 @@ func TestConfigureAppliesThenProvesTheTarget(t *testing.T) {
 		"get backuprepositories":    `{"items":[]}`,
 		"get schedule":              "Enabled",
 	})}
-	if err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
+	if _, err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -243,7 +243,7 @@ func TestConfigureWritesTheManifestSchedule(t *testing.T) {
 		"get backuprepositories":    `{"items":[]}`,
 		"get schedule":              "Enabled",
 	})}
-	if err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
+	if _, err := Configure(context.Background(), r, testManifest(), testTarget(), nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, a := range r.Applied() {
@@ -291,7 +291,7 @@ func TestConfigureFailsWithTheStoresReason(t *testing.T) {
 	r := &fakeRunner{Respond: scripted(map[string]string{
 		"get backupstoragelocation": `{"status":{"phase":"Unavailable","message":"AccessDenied: bucket policy"}}`,
 	})}
-	err := Configure(context.Background(), r, testManifest(), testTarget(), nil)
+	_, err := Configure(context.Background(), r, testManifest(), testTarget(), nil)
 	if err == nil {
 		t.Fatal("an Unavailable location must fail Configure")
 	}
@@ -560,12 +560,23 @@ const testBucketName = "kubenest-backups"
 
 // fakeBucket is an httptest endpoint that answers the way an S3-compatible
 // store does when the credential's policy is exactly `allow` (keyed on the
-// object key, or on the list prefix). It is path-style, because the endpoint
+// object key, or on the list prefix) PLUS the ListBucket-without-a-prefix
+// grant k3s's datastore snapshots need. It is path-style, because the endpoint
 // is not AWS. It exists so the scope check can be driven through the real
 // SigV4 client without a bucket, and so the test can assert which operations
 // were actually attempted.
 type fakeBucket struct {
-	allow          func(key string) bool
+	allow func(key string) bool
+	// allowHeadBucket answers the bucket-level HEAD, which S3 authorises as
+	// ListBucket with no s3:prefix. The constructor sets it; a test turns it
+	// off to model the prefix-scoped policy that refuses k3s's snapshot client.
+	allowHeadBucket bool
+	// allowUnprefixedList answers a ListObjectsV2 with no prefix, the other
+	// operation that grant lets through.
+	allowUnprefixedList bool
+	// foreignKeys are keys in the bucket that belong to other prefixes. An
+	// allowed unprefixed listing shows their names.
+	foreignKeys    []string
 	encryption     string // "" = no default encryption configured
 	versioning     string // "" = never configured
 	denyProtection bool   // answer the protection reads with AccessDenied
@@ -578,7 +589,10 @@ type fakeBucket struct {
 
 func newFakeBucket(t *testing.T, allow func(key string) bool) *fakeBucket {
 	t.Helper()
-	f := &fakeBucket{allow: allow, objects: map[string][]byte{}}
+	// The bucket-level grant is ON: it is what the policy the product requires
+	// has to carry, so a test that wants the narrower policy turns it off
+	// explicitly rather than every other test opting in.
+	f := &fakeBucket{allow: allow, allowHeadBucket: true, allowUnprefixedList: true, objects: map[string][]byte{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -621,10 +635,30 @@ func (f *fakeBucket) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := strings.TrimPrefix(r.URL.Path, "/"+testBucketName+"/")
+	// The bucket itself has no trailing separator, so the leading slash is
+	// trimmed separately: a bucket-level HEAD must see an empty key.
+	key := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/"+testBucketName), "/")
+	// A bucket-level HEAD is k3s's existence test; S3 authorises it as
+	// ListBucket on the bucket with no s3:prefix, so it is gated by its own
+	// flag and not by the object key (which is empty here).
+	if r.Method == http.MethodHead && key == "" {
+		if !f.allowHeadBucket {
+			xmlError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	if r.Method == http.MethodGet && q.Has("list-type") {
 		prefix := q.Get("prefix")
-		if !f.allow(prefix) {
+		if prefix == "" {
+			// The unprefixed listing: the other operation the bucket-level
+			// grant opens.
+			if !f.allowUnprefixedList {
+				xmlError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
+				return
+			}
+		} else if !f.allow(prefix) {
 			xmlError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return
 		}
@@ -636,6 +670,11 @@ func (f *fakeBucket) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.mu.Unlock()
+		if prefix == "" {
+			// Every prefix's keys, which is exactly what an unprefixed listing
+			// against the real store returned.
+			keys = append(keys, f.foreignKeys...)
+		}
 		sort.Strings(keys)
 		var b strings.Builder
 		fmt.Fprintf(&b, `<ListBucketResult><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>`, testBucketName, prefix, len(keys))
@@ -737,7 +776,7 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 	// probed the foreign prefixes would pass this half for the wrong reason.
 	narrow := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
 	scoped := scopedTarget(t, narrow.URL())
-	if err := scoped.VerifyScope(ctx, scoped.Client); err != nil {
+	if _, err := scoped.VerifyScope(ctx, scoped.Client); err != nil {
 		t.Fatalf("a credential scoped to prod-1/* must be accepted: %v", err)
 	}
 	for _, want := range []string{
@@ -762,7 +801,7 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 	// prefix must be refused, naming the operation.
 	wide := newFakeBucket(t, func(string) bool { return true })
 	wideTarget := scopedTarget(t, wide.URL())
-	err := wideTarget.VerifyScope(ctx, wideTarget.Client)
+	_, err := wideTarget.VerifyScope(ctx, wideTarget.Client)
 	if err == nil {
 		t.Fatal("a credential that can list the control-plane prefix must be refused")
 	}
@@ -779,7 +818,7 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 		return strings.HasPrefix(key, "prod-1/") || key == "control-plane/scope-check.json"
 	})
 	sneakyTarget := scopedTarget(t, sneaky.URL())
-	err = sneakyTarget.VerifyScope(ctx, sneakyTarget.Client)
+	_, err = sneakyTarget.VerifyScope(ctx, sneakyTarget.Client)
 	if err == nil {
 		t.Fatal("a credential that can read the control-plane prefix must be refused even when the object is absent")
 	}
@@ -791,7 +830,7 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 	// kubectl command may have run, or the credentials Secret would already be
 	// on the host.
 	r := &fakeRunner{}
-	configureErr := Configure(ctx, r, testManifest(), wideTarget.Target, nil)
+	_, configureErr := Configure(ctx, r, testManifest(), wideTarget.Target, nil)
 	if configureErr == nil {
 		t.Fatal("Configure must refuse an out-of-scope credential")
 	}
@@ -810,10 +849,145 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unscoped.VerifyScope(ctx, client); err == nil {
+	if _, err := unscoped.VerifyScope(ctx, client); err == nil {
 		t.Error("a target with no --prefix must be refused: no policy can grant the bucket root without granting control-plane/")
 	} else if !strings.Contains(err.Error(), "--prefix") {
 		t.Errorf("the refusal must name the fix: %v", err)
+	}
+}
+
+// A credential that can do everything inside its own prefix but that the store
+// refuses when k3s tests the bucket exists must be refused at set-target. On
+// hardware that HEAD passed set-target and then failed the install at
+// `platform-backup-target`, so the check has to catch it while the policy can
+// still be fixed.
+func TestVerifyScopeRequiresHeadBucket(t *testing.T) {
+	ctx := context.Background()
+
+	// The prefix-scoped policy with no bucket-level ListBucket grant: the
+	// state the product's required policy produced before this check existed.
+	store := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
+	store.allowHeadBucket = false
+	store.allowUnprefixedList = false
+	target := scopedTarget(t, store.URL())
+
+	findings, err := target.VerifyScope(ctx, target.Client)
+	if err == nil {
+		t.Fatal("a credential that cannot HeadBucket the bucket must be refused: k3s's datastore snapshots test the bucket before every snapshot, so the install fails at its first one")
+	}
+	if findings != (ScopeFindings{}) {
+		t.Errorf("a refusal must not carry findings: %+v", findings)
+	}
+	// The stable facts the operator needs: the operation, and the statement
+	// that has to be added to the policy.
+	for _, want := range []string{"HeadBucket", "s3:ListBucket", "s3:prefix", "Null", testBucketName} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal must name %q so the policy can be fixed: %v", want, err)
+		}
+	}
+	// Non-vacuity: the check actually asked the bucket.
+	if !store.sawPrefix("HEAD /" + testBucketName) {
+		t.Errorf("the check never attempted the bucket HEAD: %v", store.attempts())
+	}
+}
+
+// The grant HeadBucket needs is also the one that lets an unprefixed listing
+// read out every prefix's key names. That is a finding the operator is told
+// about, not a refusal: the credential cannot snapshot without it.
+func TestVerifyScopeReportsUnprefixedListing(t *testing.T) {
+	ctx := context.Background()
+
+	exposed := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
+	exposed.foreignKeys = []string{
+		"cluster-b/workload/backups/daily-2026-09-25.tar",
+		"control-plane/recovery-sets/fleet.json.enc",
+	}
+	exposedTarget := scopedTarget(t, exposed.URL())
+
+	findings, err := exposedTarget.VerifyScope(ctx, exposedTarget.Client)
+	if err != nil {
+		t.Fatalf("the exposure is a finding, not a refusal: %v", err)
+	}
+	if !findings.UnprefixedListing {
+		t.Fatal("the credential listed the bucket with no prefix and the finding must say so")
+	}
+	if findings.ForeignKeys != 2 {
+		t.Errorf("ForeignKeys = %d, want the 2 keys from other prefixes the first page showed", findings.ForeignKeys)
+	}
+	warning := findings.Warning(exposedTarget.Target)
+	if warning == "" {
+		t.Fatal("a credential that can list without a prefix must produce a warning")
+	}
+	for _, want := range []string{"names", "contents", "one bucket per client organisation"} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("the warning must state %q: %s", want, warning)
+		}
+	}
+	if strings.Contains(warning, exposed.foreignKeys[0]) {
+		t.Errorf("the warning must count the foreign keys, not print their names: %s", warning)
+	}
+	if strings.Contains(warning, "\n") {
+		t.Errorf("the warning must be one line: %q", warning)
+	}
+
+	// A policy that keeps the prefix condition on ListBucket refuses the
+	// unprefixed list: no finding, no warning, and still no error.
+	refused := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
+	refused.allowUnprefixedList = false
+	refusedTarget := scopedTarget(t, refused.URL())
+	findings, err = refusedTarget.VerifyScope(ctx, refusedTarget.Client)
+	if err != nil {
+		t.Fatalf("an AccessDenied on the unprefixed list is the preferred state, not a failure: %v", err)
+	}
+	if findings.UnprefixedListing || findings.ForeignKeys != 0 {
+		t.Errorf("a refused unprefixed list must produce no finding, got %+v", findings)
+	}
+	if got := findings.Warning(refusedTarget.Target); got != "" {
+		t.Errorf("a refused unprefixed list must produce no warning, got %q", got)
+	}
+}
+
+// Configure carries the finding back to the caller that writes the warnings,
+// so the exposure is reported exactly once per command rather than printed or
+// dropped inside the library.
+func TestConfigureReportsUnprefixedListing(t *testing.T) {
+	store := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
+	store.foreignKeys = []string{"cluster-b/datastore/etcd-snapshot.tar"}
+	target := scopedTarget(t, store.URL())
+
+	r := &fakeRunner{Respond: scripted(map[string]string{
+		"get backupstoragelocation": `{"status":{"phase":"Available"}}`,
+		"get backuprepositories":    `{"items":[]}`,
+		"get schedule":              "Enabled",
+	})}
+	findings, err := Configure(context.Background(), r, testManifest(), target.Target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warning := findings.Warning(target.Target)
+	if !findings.UnprefixedListing || findings.ForeignKeys != 1 || warning == "" {
+		t.Fatalf("Configure must carry the exposure finding back to its caller, got %+v", findings)
+	}
+	if strings.Contains(warning, "\n") {
+		t.Errorf("the warning must be one line: %q", warning)
+	}
+}
+
+// The refusal a credential outside its prefix gets has to name the whole
+// policy: the object actions, the prefixed ListBucket, and the bucket-level
+// ListBucket k3s's snapshots need. Naming only the first two would send the
+// operator back to a policy that fails at the first snapshot.
+func TestOutsideRefusalNamesAllThreeStatements(t *testing.T) {
+	wide := newFakeBucket(t, func(string) bool { return true })
+	target := scopedTarget(t, wide.URL())
+	_, err := target.VerifyScope(context.Background(), target.Client)
+	if err == nil {
+		t.Fatal("a credential that reaches every prefix must be refused")
+	}
+	for _, want := range []string{"s3:GetObject", "s3:PutObject", "s3:ListBucket", "StringLike", "Null", "s3:prefix"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the policy advice must name %q: %v", want, err)
+		}
 	}
 }
 

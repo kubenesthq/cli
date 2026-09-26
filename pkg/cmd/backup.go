@@ -214,8 +214,12 @@ unconfigured — loud, but never blocking.`,
 				fmt.Fprintf(out, "warning: %s\n", warning)
 			}
 
-			if err := backup.Configure(cmd.Context(), ssh, bundle, target, rep); err != nil {
+			findings, err := backup.Configure(cmd.Context(), ssh, bundle, target, rep)
+			if err != nil {
 				return err
+			}
+			if warning := findings.Warning(target); warning != "" {
+				fmt.Fprintf(out, "warning: %s\n", warning)
 			}
 			if err := backup.ConfigureDatastoreSnapshots(cmd.Context(), ssh, bundle, target, rep); err != nil {
 				return fmt.Errorf("configure datastore snapshots on %s: %w", conn.Servers[0], err)

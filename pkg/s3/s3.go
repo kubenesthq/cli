@@ -1,7 +1,7 @@
 // Package s3 is the CLI's S3 client: the handful of REST operations the
 // recovery-kit flow needs — put, conditional put, get, head, one page of list,
-// and the two bucket-protection reads — authenticated with AWS Signature
-// Version 4.
+// whether the bucket exists, and the two bucket-protection reads —
+// authenticated with AWS Signature Version 4.
 //
 // It exists because the CLI ships no AWS SDK. Signing is implemented over
 // net/http in sigv4.go; the only dependency is the standard library.
@@ -72,7 +72,7 @@ type Versioning struct {
 
 // Error is one refused S3 operation.
 type Error struct {
-	Op         string // "PutObject", "GetObject", "ListObjectsV2", "HeadObject", "GetBucketEncryption", "GetBucketVersioning"
+	Op         string // "PutObject", "GetObject", "ListObjectsV2", "HeadObject", "HeadBucket", "GetBucketEncryption", "GetBucketVersioning"
 	Key        string // object key, or "" for a bucket-level call
 	StatusCode int
 	Code       string // the S3 error Code element, e.g. "AccessDenied", "NoSuchKey", "PreconditionFailed"
@@ -392,6 +392,27 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	return res.body, nil
 }
 
+// HeadBucket reports whether the bucket exists and the credential may see it.
+//
+// k3s's etcd-s3 client calls this before every datastore snapshot, so a
+// credential that cannot pass it makes every snapshot fail. S3 authorises the
+// bucket-level HEAD as s3:ListBucket on the bucket with no s3:prefix, which a
+// prefix-conditioned ListBucket grant does not cover.
+func (c *Client) HeadBucket(ctx context.Context) error {
+	req, err := c.newRequest(ctx, http.MethodHead, "", nil, nil, nil)
+	if err != nil {
+		return err
+	}
+	res, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	if !res.ok() {
+		return c.newError("HeadBucket", "", res.status, res.body)
+	}
+	return nil
+}
+
 // Head returns the object's metadata without its bytes.
 func (c *Client) Head(ctx context.Context, key string) (Object, error) {
 	req, err := c.newRequest(ctx, http.MethodHead, key, nil, nil, nil)
@@ -416,9 +437,13 @@ func (c *Client) Head(ctx context.Context, key string) (Object, error) {
 // List returns one page of the keys under prefix, and whether S3 truncated
 // that page. It never follows NextContinuationToken: the caller decides
 // whether another page is worth asking for. An empty prefix lists the whole
-// bucket.
+// bucket, and sends no prefix parameter at all: a policy tests s3:prefix, and
+// `prefix=` is a different request from the unprefixed one a client makes.
 func (c *Client) List(ctx context.Context, prefix string) (keys []string, truncated bool, err error) {
-	query := url.Values{"list-type": {"2"}, "prefix": {prefix}}
+	query := url.Values{"list-type": {"2"}}
+	if prefix != "" {
+		query.Set("prefix", prefix)
+	}
 	req, err := c.newRequest(ctx, http.MethodGet, "", nil, query, nil)
 	if err != nil {
 		return nil, false, err

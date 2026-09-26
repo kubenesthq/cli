@@ -102,6 +102,12 @@ func (f *fakeProbe) List(_ context.Context, prefix string) ([]string, bool, erro
 func (f *fakeProbe) BucketEncryption(context.Context) (s3.Protection, error) { return s3.Protection{}, nil }
 func (f *fakeProbe) BucketVersioning(context.Context) (s3.Versioning, error) { return s3.Versioning{}, nil }
 
+// HeadBucket answers the bucket-existence HEAD. The checkpoint principal is
+// not k3s's snapshot client — it uploads the control plane's dumps — so the
+// checkpoint scope check does not probe this; the fake says the bucket is
+// there so it can satisfy backup.Bucket.
+func (f *fakeProbe) HeadBucket(context.Context) error { return nil }
+
 func newFakeProbe(allowed func(key string) bool) *fakeProbe {
 	return &fakeProbe{allowed: allowed, objects: map[string][]byte{}}
 }

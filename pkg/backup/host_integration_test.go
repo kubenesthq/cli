@@ -180,7 +180,7 @@ func TestBackupOnRealHost(t *testing.T) {
 		AccessKeyID:     minioUser,
 		SecretAccessKey: minioPassword,
 	}
-	if err := backup.Configure(ctx, client, m, target, reporter); err != nil {
+	if _, err := backup.Configure(ctx, client, m, target, reporter); err != nil {
 		t.Fatalf("Configure: %v", err)
 	}
 	unconfigured, err = backup.Unconfigured(ctx, client)
@@ -356,7 +356,7 @@ data: {value: before-restore}
 	if err := backup.Install(ctx, client, m, reporter); err != nil {
 		t.Fatalf("second Install (idempotence): %v", err)
 	}
-	if err := backup.Configure(ctx, client, m, target, reporter); err != nil {
+	if _, err := backup.Configure(ctx, client, m, target, reporter); err != nil {
 		t.Fatalf("second Configure (idempotence): %v", err)
 	}
 

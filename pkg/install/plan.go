@@ -761,8 +761,14 @@ func stageBackupTarget(ctx context.Context, s *Session) error {
 	for _, warning := range target.Preflight(ctx, target.Client) {
 		s.Logf("  warning: %s", warning)
 	}
-	if err := stages.NewComponentError("velero", backup.Configure(ctx, server, s.Bundle, target, s.Reporter)); err != nil {
+	findings, err := backup.Configure(ctx, server, s.Bundle, target, s.Reporter)
+	if err := stages.NewComponentError("velero", err); err != nil {
 		return err
+	}
+	// What the HeadBucket grant costs, stated once, before the datastore
+	// snapshots depend on it: the credential can see other prefixes' key names.
+	if warning := findings.Warning(target); warning != "" {
+		s.Logf("  warning: %s", warning)
 	}
 	// Every tier uses embedded etcd (decision A), so every control-plane
 	// server gets the same manifest-owned snapshot schedule and S3 target.

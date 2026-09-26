@@ -664,6 +664,64 @@ func TestGetHeadAndErrorMapping(t *testing.T) {
 	}
 }
 
+// TestHeadBucketMapsOutcomes checks the bucket-level HEAD k3s's datastore
+// snapshots depend on: 2xx is nil, and a refusal is the mapped *Error the
+// caller discriminates on by status, because a HEAD carries no body to
+// classify it with.
+func TestHeadBucketMapsOutcomes(t *testing.T) {
+	var status atomic.Int64
+	status.Store(http.StatusOK)
+
+	rec := &recorder{handler: func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}}
+	srv := httptest.NewServer(rec)
+	t.Cleanup(srv.Close)
+
+	c := mustClient(t, Config{
+		Endpoint:        srv.URL,
+		Bucket:          testBucket,
+		Region:          testRegion,
+		AccessKeyID:     testAccessKey,
+		SecretAccessKey: testSecretKey,
+	})
+	ctx := context.Background()
+
+	if err := c.HeadBucket(ctx); err != nil {
+		t.Fatalf("HeadBucket of an existing bucket: %v", err)
+	}
+	req := rec.last(t)
+	if req.method != http.MethodHead {
+		t.Errorf("method = %s, want HEAD", req.method)
+	}
+	// The bucket itself, not an object under it: k3s asks about the bucket.
+	if want := "/" + testBucket; req.path != want {
+		t.Errorf("path = %q, want %q", req.path, want)
+	}
+
+	// A refusal: 403 must map to ErrAccessDenied, with the operation named so
+	// the policy the operator has to change is unambiguous.
+	status.Store(http.StatusForbidden)
+	err := c.HeadBucket(ctx)
+	if err == nil {
+		t.Fatal("403 on HeadBucket must be an error")
+	}
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Errorf("errors.Is(err, ErrAccessDenied) = false for %v", err)
+	}
+	var s3err *Error
+	if !errors.As(err, &s3err) || s3err.Op != "HeadBucket" || s3err.StatusCode != http.StatusForbidden {
+		t.Errorf("Error = %+v, want Op HeadBucket, StatusCode 403", s3err)
+	}
+
+	// Anything else non-2xx is still the package's error type rather than a
+	// nil return that would read as "the bucket is there".
+	status.Store(http.StatusNotFound)
+	if err := c.HeadBucket(ctx); err == nil {
+		t.Error("404 on HeadBucket must be an error, not a silent pass")
+	}
+}
+
 // TestNewValidatesConfig checks the refusals happen before any request is
 // attempted.
 func TestNewValidatesConfig(t *testing.T) {
@@ -714,5 +772,41 @@ func TestNoSchemeMeansHTTPS(t *testing.T) {
 	insecure := mustClient(t, Config{Endpoint: "http://minio.internal:9000", Bucket: testBucket, Region: testRegion, AccessKeyID: "k", SecretAccessKey: "s"})
 	if got := insecure.urlFor("k", nil); got != "http://minio.internal:9000/recovery-kit/k" {
 		t.Errorf("urlFor = %q, want the given http scheme kept", got)
+	}
+}
+
+// An unprefixed listing must send NO prefix parameter. S3 policies test
+// s3:prefix, and `prefix=` (present but empty) is a different request from one
+// without it: a policy whose ListBucket grant is conditioned on s3:prefix being
+// absent refuses the first and allows the second. The scope check's unprefixed
+// probe asks what any client can do with the credential, so it must send the
+// request a client that lists the whole bucket sends.
+func TestAnUnprefixedListSendsNoPrefixParameter(t *testing.T) {
+	rec := &recorder{handler: func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`)
+	}}
+	srv := httptest.NewServer(rec)
+	t.Cleanup(srv.Close)
+	c := mustClient(t, Config{
+		Endpoint:        srv.URL,
+		Bucket:          testBucket,
+		Region:          testRegion,
+		AccessKeyID:     testAccessKey,
+		SecretAccessKey: testSecretKey,
+	})
+
+	if _, _, err := c.List(context.Background(), ""); err != nil {
+		t.Fatalf("List with no prefix: %v", err)
+	}
+	if _, present := rec.last(t).query["prefix"]; present {
+		t.Errorf("an unprefixed List sent a prefix parameter (query %q); the request a policy sees as unprefixed carries none", rec.last(t).rawQuery)
+	}
+
+	if _, _, err := c.List(context.Background(), "clusters/a/"); err != nil {
+		t.Fatalf("List with a prefix: %v", err)
+	}
+	if got := rec.last(t).query.Get("prefix"); got != "clusters/a/" {
+		t.Errorf("prefix parameter = %q, want %q", got, "clusters/a/")
 	}
 }

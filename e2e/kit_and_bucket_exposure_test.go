@@ -491,7 +491,7 @@ func TestKitAndBucketExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = wide.VerifyScope(ctx, wide.Client)
+		_, err = wide.VerifyScope(ctx, wide.Client)
 		if err == nil {
 			t.Fatal("a credential that can read the control-plane prefix was accepted: read access to the control plane's recovery material is a fleet-wide compromise")
 		}
@@ -508,7 +508,7 @@ func TestKitAndBucketExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := narrow.VerifyScope(ctx, narrow.Client); err != nil {
+		if _, err := narrow.VerifyScope(ctx, narrow.Client); err != nil {
 			t.Errorf("the cluster's own scoped credential must pass: %v", err)
 		}
 	})

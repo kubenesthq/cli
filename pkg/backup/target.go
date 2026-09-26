@@ -270,6 +270,11 @@ type Bucket interface {
 	Put(ctx context.Context, key string, body []byte) error
 	Get(ctx context.Context, key string) ([]byte, error)
 	List(ctx context.Context, prefix string) (keys []string, truncated bool, err error)
+	// HeadBucket is the bucket-existence test k3s's etcd-s3 client makes
+	// before every datastore snapshot. It is in this interface because a
+	// credential that cannot pass it cannot snapshot, so the scope check has
+	// to require it rather than discover it mid-install.
+	HeadBucket(ctx context.Context) error
 	BucketEncryption(ctx context.Context) (s3.Protection, error)
 	BucketVersioning(ctx context.Context) (s3.Versioning, error)
 }
@@ -326,6 +331,33 @@ func (t Target) foreignPrefixes() []string {
 	return []string{ControlPlanePrefix, sibling + "/"}
 }
 
+// ScopeFindings is what VerifyScope found past the scope it requires: the
+// reach that the grant k3s's datastore snapshots need also buys. It is a
+// report, never a refusal — a credential that cannot HeadBucket the bucket
+// cannot snapshot, so the grant has to be there, and the honest thing is to
+// say what it exposes rather than to pretend a policy can have one without the
+// other.
+type ScopeFindings struct {
+	// UnprefixedListing is true when the credential could list the bucket with
+	// no prefix at all, which is the same grant HeadBucket needs.
+	UnprefixedListing bool
+	// ForeignKeys is how many keys the first page of that listing showed
+	// outside this cluster's own prefix: other clusters' backup, checkpoint and
+	// recovery-kit names.
+	ForeignKeys int
+}
+
+// Warning renders the one line an operator must see about that reach, or ""
+// when the credential could not list the bucket without a prefix.
+func (f ScopeFindings) Warning(t Target) string {
+	if !f.UnprefixedListing {
+		return ""
+	}
+	return fmt.Sprintf(
+		"the backup credential can list object NAMES across the whole bucket %q without a prefix: the first page showed %d key(s) outside this cluster's %q prefix, so other clusters' backup and checkpoint names are visible to it (contents are not). That reach is inseparable from the ListBucket grant k3s's datastore snapshots need for HeadBucket; keep one bucket per client organisation so the names it can see are that organisation's own",
+		t.Bucket, f.ForeignKeys, t.ownPrefix())
+}
+
 // VerifyScope proves the credential can do its job inside this cluster's own
 // prefix and CANNOT do it anywhere else.
 //
@@ -339,47 +371,87 @@ func (t Target) foreignPrefixes() []string {
 // no key there has still reached it, so an absent object is a failure of the
 // check, not a pass.
 //
+// HeadBucket must also succeed, because k3s calls it before every datastore
+// snapshot and S3 authorises it as ListBucket with no s3:prefix. That is the
+// one grant a prefix-scoped policy has to add, and it is also the one that
+// lets an unprefixed listing through — so the exposure is returned as a
+// finding for the caller to print, not hidden.
+//
 // The refusal names the exact operation that succeeded, because that is what
 // the customer has to change in the policy.
-func (t Target) VerifyScope(ctx context.Context, probe Bucket) error {
+func (t Target) VerifyScope(ctx context.Context, probe Bucket) (ScopeFindings, error) {
 	if probe == nil {
-		return errors.New("the credential scope check needs an S3 client")
+		return ScopeFindings{}, errors.New("the credential scope check needs an S3 client")
 	}
 	own := t.ownPrefix()
 	if own == "" {
-		return fmt.Errorf("--prefix is required to scope a backup credential: with none, this cluster's prefix is the bucket root, the control plane's %q prefix is inside it, and no policy can grant one without the other. Set --prefix (for example --prefix clusters/<cluster-name>) and grant the credential write, read and list on <bucket>/%s/* only", ControlPlanePrefix, "clusters/<cluster-name>")
+		return ScopeFindings{}, fmt.Errorf("--prefix is required to scope a backup credential: with none, this cluster's prefix is the bucket root, the control plane's %q prefix is inside it, and no policy can grant one without the other. Set --prefix (for example --prefix clusters/<cluster-name>) and grant the credential write, read and list on <bucket>/%s/* only", ControlPlanePrefix, "clusters/<cluster-name>")
 	}
 
 	probeKey := path.Join(own, ScopeCheckProbe)
 	body := []byte(fmt.Sprintf("{\"written_by\":\"kubenest backup set-target\",\"scope\":%q,\"at\":%q}\n", own, time.Now().UTC().Format(time.RFC3339)))
 	if err := probe.Put(ctx, probeKey, body); err != nil {
-		return fmt.Errorf("the backup credential cannot write its own prefix %q (PutObject %s): grant it write on <bucket>/%s/*: %w", own, probeKey, own, err)
+		return ScopeFindings{}, fmt.Errorf("the backup credential cannot write its own prefix %q (PutObject %s): grant it write on <bucket>/%s/*: %w", own, probeKey, own, err)
 	}
 	got, err := probe.Get(ctx, probeKey)
 	if err != nil {
-		return fmt.Errorf("the backup credential cannot read back what it just wrote (%s, GetObject %s): Velero must be able to read its own backups: %w", own, probeKey, err)
+		return ScopeFindings{}, fmt.Errorf("the backup credential cannot read back what it just wrote (%s, GetObject %s): Velero must be able to read its own backups: %w", own, probeKey, err)
 	}
 	if !bytes.Equal(got, body) {
-		return fmt.Errorf("the object read back from %s is not the one written: the store or the credential is doing something other than what this check assumes", probeKey)
+		return ScopeFindings{}, fmt.Errorf("the object read back from %s is not the one written: the store or the credential is doing something other than what this check assumes", probeKey)
 	}
 	if _, _, err := probe.List(ctx, own+"/"); err != nil {
-		return fmt.Errorf("the backup credential cannot list its own prefix %q (ListObjectsV2 %s/): Velero must be able to list its own backups: %w", own, own, err)
+		return ScopeFindings{}, fmt.Errorf("the backup credential cannot list its own prefix %q (ListObjectsV2 %s/): Velero must be able to list its own backups: %w", own, own, err)
+	}
+
+	// k3s's etcd-s3 client tests the bucket exists before every snapshot, and
+	// S3 authorises that HEAD as ListBucket with no s3:prefix. A policy scoped
+	// only to the cluster's prefix therefore refuses it and the install dies at
+	// its first snapshot, so the requirement is checked here, where the policy
+	// can still be fixed.
+	if err := probe.HeadBucket(ctx); err != nil {
+		return ScopeFindings{}, headBucketRefusal(t, err)
 	}
 
 	for _, foreign := range t.foreignPrefixes() {
 		if _, _, err := probe.List(ctx, foreign); err == nil {
-			return outsideRefusal(t, "ListObjectsV2", foreign, err)
+			return ScopeFindings{}, outsideRefusal(t, "ListObjectsV2", foreign, err)
 		} else if !errors.Is(err, s3.ErrAccessDenied) {
-			return outsideRefusal(t, "ListObjectsV2", foreign, err)
+			return ScopeFindings{}, outsideRefusal(t, "ListObjectsV2", foreign, err)
 		}
 		key := path.Join(foreign, ScopeCheckProbe)
 		if _, err := probe.Get(ctx, key); err == nil {
-			return outsideRefusal(t, "GetObject", key, err)
+			return ScopeFindings{}, outsideRefusal(t, "GetObject", key, err)
 		} else if !errors.Is(err, s3.ErrAccessDenied) {
-			return outsideRefusal(t, "GetObject", key, err)
+			return ScopeFindings{}, outsideRefusal(t, "GetObject", key, err)
 		}
 	}
-	return nil
+
+	// The unprefixed listing is a report, not a refusal. Every other error is
+	// ignored too: this probe is extra evidence, and a store that fails to
+	// answer it must not fail an install — least of all as a silent "exposed".
+	findings := ScopeFindings{}
+	if keys, _, err := probe.List(ctx, ""); err == nil {
+		findings.UnprefixedListing = true
+		for _, key := range keys {
+			if !strings.HasPrefix(key, own+"/") {
+				findings.ForeignKeys++
+			}
+		}
+	}
+	return findings, nil
+}
+
+// headBucketRefusal is the refusal a credential that cannot check the bucket
+// exists gets. It is not a detail: k3s's etcd-s3 client calls HeadBucket before
+// every datastore snapshot, so without it the install fails at its first one.
+// The statement named here is the only grant that lets it through, and it is
+// also the one that exposes every prefix's key names — which is why the
+// recommendation to keep one bucket per organisation travels with it.
+func headBucketRefusal(t Target, err error) error {
+	return fmt.Errorf(
+		"the backup credential cannot check that bucket %q exists (HeadBucket): k3s's etcd-s3 client tests the bucket before every datastore snapshot, and S3 authorises that HEAD as s3:ListBucket on the bucket with no s3:prefix, so the prefix-scoped grant this credential has refuses it and the install fails at its first snapshot (failed to test for existence of bucket %q: Access Denied). Add a statement granting s3:ListBucket on arn:aws:s3:::%s with condition {\"Null\": {\"s3:prefix\": \"true\"}}. Be aware that this grant also lets the credential list object NAMES, though not contents, anywhere in the bucket; keeping one bucket per client organisation bounds what those names reveal. Store said: %w",
+		t.Bucket, t.Bucket, t.Bucket, err)
 }
 
 // outsideRefusal is the refusal a credential outside its prefix gets, naming
@@ -392,8 +464,8 @@ func outsideRefusal(t Target, op, where string, err error) error {
 		reached = "it returned " + err.Error() + "; a refusal is AccessDenied, and anything else means the credential reached outside its prefix"
 	}
 	return fmt.Errorf(
-		"the backup credential for cluster prefix %q can read outside its own prefix: %s %s succeeded — %s. Refused: a credential that can reach %q or a sibling cluster's prefix is read access to every cluster's backups (and to the fleet's recovery material). Apply a policy granting this credential s3:GetObject, s3:PutObject and s3:ListBucket on <bucket>/%s/* only, and nothing on any other prefix",
-		t.ownPrefix(), op, where, reached, ControlPlanePrefix, t.ownPrefix())
+		"the backup credential for cluster prefix %q can read outside its own prefix: %s %s succeeded — %s. Refused: a credential that can reach %q or a sibling cluster's prefix is read access to every cluster's backups (and to the fleet's recovery material). Apply a policy with three statements: (1) s3:GetObject, s3:PutObject and s3:DeleteObject on arn:aws:s3:::<bucket>/%s/*; (2) s3:ListBucket on arn:aws:s3:::<bucket> with condition {\"StringLike\": {\"s3:prefix\": \"%s/*\"}}; and (3) s3:ListBucket on arn:aws:s3:::<bucket> with condition {\"Null\": {\"s3:prefix\": \"true\"}}, which k3s's datastore snapshots need for HeadBucket and which also exposes object NAMES across the bucket (one bucket per client organisation bounds that). Nothing else: no other prefix and no bucket-wide object access",
+		t.ownPrefix(), op, where, reached, ControlPlanePrefix, t.ownPrefix(), t.ownPrefix())
 }
 
 // Preflight reports what an operator should know about the bucket before
@@ -487,10 +559,16 @@ func TargetURL(t Target) string {
 // validates the location Available, then the default workload Schedule from
 // the manifest. Idempotent — re-running with the same or a corrected target
 // re-applies and re-validates.
-func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t Target, rep converge.Reporter) error {
+//
+// The ScopeFindings it returns is what VerifyScope learned about the
+// credential's reach beyond its prefix. It is returned rather than printed
+// here so the one warning line lands on the output stream the command already
+// writes warnings to, exactly once per command.
+func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t Target, rep converge.Reporter) (ScopeFindings, error) {
 	if err := t.Validate(); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
+	var scope ScopeFindings
 	// Before anything depends on the target: prove the credential is scoped to
 	// this cluster's own prefix. It is deliberately first — a refusal here
 	// leaves the cluster exactly as it was, whereas discovering it after the
@@ -501,28 +579,30 @@ func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t T
 	// (the k3s-side tests); the installer and `backup set-target` always build
 	// it, which is asserted where they do.
 	if t.Client != nil {
-		if err := t.VerifyScope(ctx, t.Client); err != nil {
-			return err
+		findings, err := t.VerifyScope(ctx, t.Client)
+		if err != nil {
+			return ScopeFindings{}, err
 		}
+		scope = findings
 	}
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 
 	secret, err := t.secretManifest()
 	if err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 	if err := apply(ctx, r, "backup target credentials", secret); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 	location, err := t.storageLocationManifest()
 	if err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 	if err := apply(ctx, r, "backup storage location", location); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 
 	res, err := converge.Wait(ctx, storageLocationProbe(r), converge.Options{
@@ -531,19 +611,19 @@ func Configure(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, t T
 		Reporter: rep,
 	})
 	if err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 	if err := res.Err(); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 	if err := reestablishMovedRepositories(ctx, r); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
 
 	if err := EnsureSchedule(ctx, r, bundle, rep); err != nil {
-		return err
+		return ScopeFindings{}, err
 	}
-	return EnsureDrillConfiguration(ctx, r, bundle)
+	return scope, EnsureDrillConfiguration(ctx, r, bundle)
 }
 
 // reestablishMovedRepositories handles Velero's explicit state after a
@@ -765,4 +845,25 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// failureLine picks the line of a command's output that names the failure,
+// rather than the first line of it. k3s writes a harmless warning first
+// ("Unknown flag ... found in config.yaml, skipping") and the real error later
+// on a line it marks level=fatal, so the first line is often the one thing
+// that is not wrong. Server output that does not use k3s's logger keeps its
+// last non-empty line instead.
+func failureLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "level=fatal") {
+			return strings.TrimSpace(line)
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
 }
