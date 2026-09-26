@@ -11,15 +11,17 @@
 //
 // WHY IT WAITS FOR ELIGIBILITY AND NOT FOR THE POD. The runner
 // (kubenest-backend app/services/checkpoint_runner.py) publishes the marker in
-// the `control-plane-checkpoint-status` ConfigMap as its LAST write: the
-// ciphertext is uploaded and read back by size, the manifest is uploaded and
-// read back, and only then is the checkpoint marked eligible. A Job that
-// reached `Complete` while nothing new is published is therefore an
-// INTERRUPTED run, and reporting it as a backup would tell an operator a
-// recovery point exists that does not. The wait is bounded by the bundle
-// manifest's `limits.timeouts.component-ready`, the same deadline the install
-// uses for the components it brings up, and a failed Job is a verdict rather
-// than something to converge out of — backoffLimit is 0, so nothing retries it.
+// the `control-plane-checkpoint-status` ConfigMap as its LAST write: the dump
+// is restored and its row counts compared first, then the ciphertext is
+// uploaded and read back with its SHA-256 checked, the manifest is uploaded,
+// the drill result is published, and only then is the checkpoint marked
+// eligible. A Job that reached `Complete` while nothing new is published is
+// therefore an INTERRUPTED run, and reporting it as a backup would tell an
+// operator a recovery point exists that does not. The wait is bounded by the
+// bundle manifest's `limits.timeouts.component-ready`, the same deadline the
+// install uses for the components it brings up, and a failed Job is a verdict
+// rather than something to converge out of — backoffLimit is 0, so nothing
+// retries it.
 package controlplane
 
 import (

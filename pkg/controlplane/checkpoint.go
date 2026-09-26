@@ -181,7 +181,7 @@ func (t CheckpointTarget) VerifyScope(ctx context.Context, probe backup.Bucket, 
 	}
 	got, err := probe.Get(ctx, probeKey)
 	if err != nil {
-		return fmt.Errorf("the checkpoint credential cannot read back what it just wrote (%s, GetObject %s): the weekly drill restores from this prefix and must be able to read it: %w", own, probeKey, err)
+		return fmt.Errorf("the checkpoint credential cannot read back what it just wrote (%s, GetObject %s): each checkpoint run re-reads the ciphertext it uploaded and compares its SHA-256 with what it sealed, and a recovery lists this prefix from off-host, so a credential that can write without reading cannot take a checkpoint: %w", own, probeKey, err)
 	}
 	if !bytes.Equal(got, body) {
 		return fmt.Errorf("the object read back from %s is not the one written: the store or the credential is doing something other than what this check assumes", probeKey)

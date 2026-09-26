@@ -18,22 +18,26 @@
 //	    checkpoint is eligible. The wall-clock time and the sealed checkpoint's
 //	    size are recorded, and the size is checked to be non-zero: a checkpoint
 //	    of a real database is not an empty object.
-//	(b) revoking a CLI token through the API — minted first, because a CLI
+//	(b) the checkpoint that run produced carries a PASSED restore drill naming
+//	    it: the Job proves its own dump restores before it seals and uploads it
+//	    (kn-drill-identity-u6il), so recovery evidence is a fact about every
+//	    checkpoint rather than about a separate weekly Job.
+//	(c) revoking a CLI token through the API — minted first, because a CLI
 //	    token cannot mint or revoke another; those endpoints take a user session
 //	    — makes a checkpoint that CONTAINS the change eligible within 60 s, and
 //	    the control plane stops reporting the change as unprotected.
-//	(c) suspending the CronJob is visible: the management cluster's `backup`
+//	(d) suspending the CronJob is visible: the management cluster's `backup`
 //	    group reports the newest eligible checkpoint as STALE. The threshold is
 //	    48 h, so the test rewinds the checkpoint's published timestamp — which is
 //	    exactly what 48 hours of a stopped CronJob produces — and the suspension
 //	    is what stops the next run from overwriting it. One report carries it, so
 //	    the wait is bounded by the agent's own cadence.
-//	(d) the nightly retention and the 14-day floor are read from the manifest
+//	(e) the nightly retention and the 14-day floor are read from the manifest
 //	    fields — the CronJob the chart installed and the checkpoint's own
 //	    published retention — rather than by waiting fourteen days.
 //
 // WHERE THE BACKEND'S ANSWER COMES FROM. There is no `kubenest health` command
-// yet (kn-9pgx builds it), so (b) and (c) read the fleet-health API the CLI's
+// yet (kn-9pgx builds it), so (c) and (d) read the fleet-health API the CLI's
 // own client talks to, with the token the CLI holds. The management cluster is
 // identified by the backend's own record — the control-plane recovery kit names
 // the cluster the install ran in — which is the same source the backend's fold
@@ -210,6 +214,44 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 		onDemand = *marker
 	})
 
+	// THE CHECKPOINT `backup now --control-plane` PRODUCED RESTORES. Every
+	// checkpoint Job proves its own dump before it seals and uploads it
+	// (kn-drill-identity-u6il), so the drill result names this run's checkpoint
+	// and there is no separate weekly Job to create — the identity Secret the
+	// old drill needed is gone from the chart along with it. The seal stage
+	// publishes the drill BEFORE eligibility, so a caller that reads the new key
+	// already has the result beside it; the wait is here because reading one
+	// ConfigMap every few seconds is cheap, and a gate that trusts a write order
+	// without checking it cannot report when the order changes.
+	t.Run("the checkpoint backup now produced carries a passed restore drill", func(t *testing.T) {
+		if onDemand.Key == "" {
+			t.Fatal("no on-demand checkpoint was recorded, so this arm has nothing to look for")
+		}
+		var drill map[string]any
+		t47WaitFor(t, 2*time.Minute, 5*time.Second,
+			"a passed restore drill naming "+onDemand.Key,
+			func() (bool, string) {
+				document, err := t47StatusDocument(ctx, runner)
+				if err != nil {
+					return false, err.Error()
+				}
+				got, _ := document["drill"].(map[string]any)
+				if got == nil {
+					return false, "no drill result is published"
+				}
+				if got["status"] != "passed" {
+					return false, fmt.Sprintf("the drill of %v is %v: %v", got["checkpoint"], got["status"], got["detail"])
+				}
+				if got["checkpoint"] != onDemand.Key {
+					return false, fmt.Sprintf("the passed drill names %v, not %s", got["checkpoint"], onDemand.Key)
+				}
+				drill = got
+				return true, fmt.Sprintf("%v passed (row counts matched: %v)", got["checkpoint"], got["row_counts_matched"])
+			})
+		t.Logf("checkpoint %s was restored in its own Job and published with a passed drill at %v",
+			onDemand.Key, drill["completed_at"])
+	})
+
 	t.Run("a revoked CLI token is covered by a checkpoint within 60 s", func(t *testing.T) {
 		pre, err := controlplane.ReadEligibleCheckpoint(ctx, runner)
 		if err != nil {
@@ -270,49 +312,6 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 			})
 	})
 
-	// The weekly restore drill, run once from its own CronJob. A fresh fixture has
-	// never drilled, and "checkpoints exist but none has ever been restored" is a
-	// warning of its own that outranks the staleness the next arm is about (the
-	// third hardware run of this gate saw exactly that), so the drill runs first:
-	// it is also the plan's "the weekly drill's result appears in the management
-	// cluster's backup group".
-	t.Run("the weekly drill restores the newest checkpoint and its result is published", func(t *testing.T) {
-		job := "kubenest-cp-checkpoint-drill-gate-" + strconv.FormatInt(time.Now().Unix(), 10)
-		res, err := runner.Run(ctx, "sudo -n k3s kubectl create job "+job+" --from=cronjob/"+controlplane.CheckpointCronJobName+"-drill -n "+controlplane.Namespace)
-		if err != nil || res.ExitCode != 0 {
-			t.Fatalf("creating the drill Job from its CronJob: %v / exit %d: %s", err, res.ExitCode, res.Stderr)
-		}
-		t.Cleanup(func() {
-			_, _ = runner.Run(context.Background(), "sudo -n k3s kubectl delete job "+job+" -n "+controlplane.Namespace+" --wait=false")
-		})
-		// The drill decrypts the checkpoint with the identity Secret the chart
-		// mounts; without it the pod can never start, which is a finding to
-		// name at once rather than fifteen minutes of "Pending".
-		if _, err := k3s.Kubectl(ctx, runner, "get secret kubenest-cp-checkpoint-identity -n "+controlplane.Namespace+" -o name"); err != nil {
-			t.Fatalf("the drill's identity Secret kubenest-cp-checkpoint-identity does not exist, so its pod cannot mount it and never starts (kn-drill-identity-u6il): %v", err)
-		}
-		started := time.Now()
-		t47WaitFor(t, 15*time.Minute, 10*time.Second, "the drill Job to finish", func() (bool, string) {
-			out, err := k3s.Kubectl(ctx, runner, "get job "+job+" -n "+controlplane.Namespace+" -o jsonpath={.status.conditions[*].type}")
-			if err != nil {
-				return false, err.Error()
-			}
-			if strings.Contains(out, "Failed") {
-				t.Fatalf("the drill Job failed: read it with `kubectl logs job/%s -n %s`", job, controlplane.Namespace)
-			}
-			return strings.Contains(out, "Complete"), "conditions: " + out
-		})
-		document, err := t47StatusDocument(ctx, runner)
-		if err != nil {
-			t.Fatal(err)
-		}
-		drill, _ := document["drill"].(map[string]any)
-		if drill["status"] != "passed" {
-			t.Fatalf("the drill finished but published %v, want status passed", drill)
-		}
-		t.Logf("drill of %v passed in %s (row counts matched: %v)", drill["checkpoint"], time.Since(started).Round(time.Second), drill["row_counts_matched"])
-	})
-
 	t.Run("a stopped checkpoint CronJob shows up as a stale checkpoint", func(t *testing.T) {
 		// The CronJob is SUSPENDED so the rewound timestamp cannot be
 		// overwritten by the next scheduled run while this subtest watches —
@@ -348,9 +347,10 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 			t.Fatalf("publishing the rewound status: %v", err)
 		}
 
-		// The group is a warning either way (the weekly drill has not run on a
-		// fresh fixture), so the assertion is the REASON: with a checkpoint
-		// older than 48 hours, the verdict must say the checkpoint is stale.
+		// The assertion is the REASON, not the status: the verdict checks the
+		// checkpoint's AGE before it looks at the drill, so with a checkpoint
+		// older than 48 hours the newest eligible checkpoint must be named as
+		// stale — whether the drill beside it passed or not.
 		t47WaitFor(t, t47HealthReportWait, 5*time.Second,
 			"the management cluster's backup verdict to report the newest eligible checkpoint as stale",
 			func() (bool, string) {

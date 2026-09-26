@@ -373,15 +373,46 @@ func TestTheChartRendersTheCheckpointCronJobWithTheBackendImageAndTheRecipient(t
 
 	objects := helmTemplate(t, helm, archive, valuesFile, "templates/checkpoint-cronjob.yaml")
 	cronjob := objectNamed(t, objects, "CronJob", ReleaseName+"-checkpoint", true)
-	drill := objectNamed(t, objects, "CronJob", ReleaseName+"-checkpoint-drill", true)
+
+	// ONE CHECKPOINT CRONJOB. The weekly drill and its second scratch claim are
+	// gone (kn-drill-identity-u6il): every checkpoint Job now proves its own
+	// dump restores before it seals and uploads it, so there is no separate Job
+	// and no identity Secret for one to mount.
+	if drill := objectNamed(t, objects, "CronJob", ReleaseName+"-checkpoint-drill", false); drill != nil {
+		t.Error("the chart still renders a separate drill CronJob: the restore runs inside the checkpoint Job now")
+	}
 
 	checkpointPod := mapping(t, dig(t, cronjob, "spec", "jobTemplate", "spec", "template", "spec"))
-	checkpoint := containerNamed(t, checkpointPod, "containers", "checkpoint")
-	if checkpoint == nil {
-		t.Fatal("the checkpoint CronJob has no `checkpoint` container")
+	seal := containerNamed(t, checkpointPod, "containers", "seal")
+	if seal == nil {
+		t.Fatal("the checkpoint CronJob has no `seal` container")
 	}
-	if got := checkpoint["image"]; got != backendImage {
-		t.Errorf("the checkpoint container runs %v, want the backend image %q: the entrypoint that dumps, seals and uploads lives in that image, and a separate tools image is the thing this bead removed", got, backendImage)
+	dump := containerNamed(t, checkpointPod, "initContainers", "dump")
+	if dump == nil {
+		t.Fatal("the checkpoint CronJob has no `dump` init container")
+	}
+	for name, container := range map[string]map[string]any{"dump": dump, "seal": seal} {
+		if got := container["image"]; got != backendImage {
+			t.Errorf("the %s stage runs %v, want the backend image %q: the entrypoint that dumps, proves and seals lives in that image, and a separate tools image is the thing this bead removed", name, got, backendImage)
+		}
+		// The LAST argument is the stage, so a container named one way that
+		// runs another stage is a chart that reads correctly and does nothing
+		// it says.
+		command, _ := container["command"].([]any)
+		if len(command) == 0 || command[len(command)-1] != name {
+			t.Errorf("the %s container runs %v, want the `%s` stage of the entrypoint", name, command, name)
+		}
+	}
+	restore := containerNamed(t, checkpointPod, "initContainers", "restore")
+	if restore == nil {
+		t.Fatal("the checkpoint CronJob has no `restore` init container: nothing would prove the dump restores")
+	}
+	if restore["image"] == backendImage {
+		t.Error("the restore stage was pointed at the backend image: it starts a scratch Postgres, and the backend image carries a client, not a server")
+	}
+	restoreCommand, _ := restore["command"].([]any)
+	if len(restoreCommand) != 1 || restoreCommand[0] != "/scripts/restore.sh" {
+		t.Errorf("the restore stage runs %v, want the script the chart's own ConfigMap mounts at /scripts", restoreCommand)
 	}
 
 	// THE RECIPIENT, and where the objects go: the four values the install
@@ -391,7 +422,7 @@ func TestTheChartRendersTheCheckpointCronJobWithTheBackendImageAndTheRecipient(t
 		{"CHECKPOINT_BUCKET", "kubenest-control-plane-checkpoints"},
 		{"CHECKPOINT_PREFIX", backup.ControlPlanePrefix},
 	} {
-		variable := envOf(t, checkpoint, expected.name)
+		variable := envOf(t, seal, expected.name)
 		if variable == nil {
 			t.Errorf("the checkpoint container has no %s", expected.name)
 			continue
@@ -403,7 +434,7 @@ func TestTheChartRendersTheCheckpointCronJobWithTheBackendImageAndTheRecipient(t
 
 	// The credentials come from the Secret the install creates, named by the
 	// values rather than written into the chart.
-	credentials := envOf(t, checkpoint, "AWS_ACCESS_KEY_ID")
+	credentials := envOf(t, seal, "AWS_ACCESS_KEY_ID")
 	if credentials == nil {
 		t.Fatal("the checkpoint container has no AWS_ACCESS_KEY_ID")
 	}
@@ -442,37 +473,43 @@ func TestTheChartRendersTheCheckpointCronJobWithTheBackendImageAndTheRecipient(t
 		}
 	}
 
-	// THE SAME IMAGE FOR THE DRILL, except the one stage that needs a server.
-	drillPod := mapping(t, dig(t, drill, "spec", "jobTemplate", "spec", "template", "spec"))
-	fetch := containerNamed(t, drillPod, "initContainers", "fetch")
-	verify := containerNamed(t, drillPod, "containers", "verify")
-	if fetch == nil || verify == nil {
-		t.Fatal("the drill CronJob is missing its fetch or verify stage")
+	// NO IDENTITY SECRET, AND NO SECRET VOLUME AT ALL. The drill used to mount
+	// an `age` identity Secret and no install ever wrote it, so its pod could
+	// never start (kn-drill-identity-u6il); the restore that replaced it decrypts
+	// nothing, so the pod needs no Secret mounted and the chart must not name
+	// one.
+	volumes, _ := checkpointPod["volumes"].([]any)
+	if len(volumes) == 0 {
+		t.Fatal("the checkpoint pod renders no volumes: the scratch volume its dump is written to is missing")
 	}
-	for name, container := range map[string]map[string]any{"fetch": fetch, "verify": verify} {
-		if container["image"] != backendImage {
-			t.Errorf("the drill's %s stage runs %v, want the backend image %q", name, container["image"], backendImage)
+	for _, volume := range volumes {
+		entry, _ := volume.(map[string]any)
+		if entry == nil {
+			t.Fatalf("the checkpoint pod has an unreadable volume: %v", volume)
+		}
+		if entry["name"] == "identity" {
+			t.Error("the checkpoint pod still mounts an identity volume: nothing in it decrypts a checkpoint")
+		}
+		if _, ok := entry["secret"]; ok {
+			t.Errorf("the checkpoint pod mounts Secret data (%v): the database password and the store credentials are env secretKeyRefs, which this Job never reads through a volume", entry)
 		}
 	}
-	restore := containerNamed(t, drillPod, "initContainers", "restore")
-	if restore == nil {
-		t.Fatal("the drill CronJob has no `restore` stage")
-	}
-	if restore["image"] == backendImage {
-		t.Error("the drill's restore stage was pointed at the backend image: it starts a scratch Postgres, and the backend image carries a client, not a server")
-	}
 
-	// NOTHING RENDERED NAMES THE TOOLS IMAGE. The chart used to require its
-	// digest and nothing supplied one, which is why the CronJob could not
-	// render; a leftover reference would bring that back.
+	// NOTHING RENDERED NAMES A DRILL, AN IDENTITY OR THE TOOLS IMAGE. The chart
+	// used to require the tools image's digest and nothing supplied one, which
+	// is why the CronJob could not render; the drill's identity Secret and its
+	// own CronJob are the same kind of leftover — a name in the chart that no
+	// correct install can satisfy.
 	for _, set := range [][]map[string]any{objects, backend} {
 		for _, object := range set {
 			body, err := yaml.Marshal(object)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(body), "checkpoint-tools") {
-				t.Errorf("a rendered object still names the tools image:\n%s", body)
+			for _, forbidden := range []string{"checkpoint-tools", "checkpoint-drill", "identitySecret", "checkpoint-identity"} {
+				if strings.Contains(string(body), forbidden) {
+					t.Errorf("a rendered object still names %q:\n%s", forbidden, body)
+				}
 			}
 		}
 	}
