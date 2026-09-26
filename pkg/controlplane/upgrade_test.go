@@ -3,8 +3,12 @@ package controlplane
 import (
 	"context"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -263,6 +267,12 @@ func testUpgradeSession(t *testing.T, runner k3s.Runner, values string) *Upgrade
 	}
 	s.PollInterval = s.Opts.PollInterval
 	s.WaitDeadline = s.Opts.WaitDeadline
+	// A PUBLIC URL THAT ANSWERS FROM THE BACKEND: every production session
+	// carries one (the client the command's own version check used), and the
+	// unfence refuses without one, so the helper provides the smallest one that
+	// answers — a 200 from GET /api/v1/version. The tests about the fence
+	// measurement replace it with an endpoint they control.
+	s.Opts.Public = publicBackendStub(t)
 	journal, err := openTestJournal(t, s.Opts)
 	if err != nil {
 		t.Fatal(err)
@@ -933,4 +943,170 @@ func backendGroupKey(t *testing.T, valuesYAML, key string) (map[string]any, bool
 	backend, _ := doc["backend"].(map[string]any)
 	value, ok := backend[key].(map[string]any)
 	return value, ok
+}
+
+// THE FENCE IS REPORTED DOWN ONLY WHEN THE URL A CLIENT USES ANSWERS FROM THE
+// BACKEND (kn-t70-control-plane-version-identity-4xso.6).
+//
+// stageUnfence measured the HTTPRoute OBJECT: it waited for helm-controller to
+// re-render kubenest-cp-api at the backend Service, then dismantled the fence and
+// reported it down. On hardware (2026-09-26, run 21) the upgrade printed "the
+// fence is down ... answers from the backend again" and the client's very next
+// request to the public URL got HTTP 503 — the gateway was still reprogramming,
+// or still routing to the fence Service the apply had just deleted. A client that
+// acts on "Upgraded" then gets a 503.
+//
+// THE ROUTE OBJECT IS NOT THE ROUTE A CLIENT USES, so the stage now asks the
+// public URL — the same client, CA and endpoint the command's version check used
+// before the fence went up — until the BACKEND answers it, and only then deletes
+// the fence's objects.
+func TestTheFenceIsReportedDownOnlyWhenThePublicURLAnswersFromTheBackend(t *testing.T) {
+	ctx := context.Background()
+	values := upgradeTestValues(t, nil)
+	kube := newStageRunner(t, values)
+	s := testUpgradeSession(t, kube, values)
+	s.PollInterval = time.Millisecond
+	s.WaitDeadline = 2 * time.Second
+
+	// THE PUBLIC URL'S ANSWERS, in order: the fence's own 503, then a plain 503
+	// (a gateway that has not switched yet and carries no fence header), then the
+	// backend's 401 — which is the backend ANSWERING a request, not failing to.
+	var (
+		mu               sync.Mutex
+		asked            int
+		deletedWhenAsked []int
+	)
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		asked++
+		deletedWhenAsked = append(deletedWhenAsked, fenceObjectsDeleted(kube))
+		n := asked
+		mu.Unlock()
+		switch n {
+		case 1:
+			w.Header().Set(api.FenceHeader, api.FenceHeaderUp)
+			http.Error(w, "The KubeNest control plane is being upgraded.", http.StatusServiceUnavailable)
+		case 2:
+			http.Error(w, "no endpoints", http.StatusServiceUnavailable)
+		default:
+			http.Error(w, `{"code": "unauthenticated"}`, http.StatusUnauthorized)
+		}
+	}))
+	t.Cleanup(public.Close)
+	client, err := api.New(public.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Opts.Public = client
+
+	if err := stageUnfence(ctx, s); err != nil {
+		t.Fatalf("the fence was not reported down although the backend answered the public URL: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if asked != 3 {
+		t.Errorf("the public URL was asked %d time(s), want the fence's 503, the plain 503 and then the backend's 401: a stage that reported the fence down without waiting through both 503s would have asked fewer", asked)
+	}
+	for i, deleted := range deletedWhenAsked {
+		if deleted != 0 {
+			t.Errorf("fence object(s) had already been deleted when the public URL was asked for the %dth time: the fence's objects are what the route names while the URL does not answer from the backend", i+1)
+		}
+	}
+	if fenceObjectsDeleted(kube) == 0 {
+		t.Error("the fence's objects were never deleted, so the fence is still up")
+	}
+	if s.FenceState != FenceDown {
+		t.Errorf("the stage left FenceState = %q, want it down now that the URL a client uses answers from the backend", s.FenceState)
+	}
+}
+
+// AN UNFENCE WHOSE PUBLIC URL NEVER RECOVERS FAILS AT THE DEADLINE, AND LEAVES
+// THE FENCE STANDING (kn-t70-control-plane-version-identity-4xso.6).
+//
+// The fence's objects are what the public route names while the gateway has not
+// switched, so deleting them on a URL that still answers 503 is how a customer
+// gets a 503 from a route that has nowhere to go. The stage fails instead, naming
+// the last answer, with the fence still up for the operator to look at.
+func TestAnUnfenceWhosePublicURLNeverRecoversFailsAtTheDeadline(t *testing.T) {
+	ctx := context.Background()
+	values := upgradeTestValues(t, nil)
+	kube := newStageRunner(t, values)
+	s := testUpgradeSession(t, kube, values)
+	// SHORT, because this arm is about the deadline being reached: the wait's
+	// real bound comes from the bundle's component-ready limit.
+	s.PollInterval = time.Millisecond
+	s.WaitDeadline = 50 * time.Millisecond
+
+	// A gateway that never reaches the backend: a 503 with NO fence header,
+	// which is exactly what hardware saw after the fence was dismantled too early.
+	public := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no endpoints", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(public.Close)
+	client, err := api.New(public.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Opts.Public = client
+
+	err = stageUnfence(ctx, s)
+	if err == nil {
+		t.Fatal("the fence was reported down although the public URL never answered from the backend")
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("the failure does not say what the public URL last answered:\n%v", err)
+	}
+	if deleted := fenceObjectsDeleted(kube); deleted != 0 {
+		t.Errorf("the fence's objects were deleted (%d command(s)) although the public URL never answered from the backend: the route then names a Service that is gone", deleted)
+	}
+	if s.FenceState == FenceDown {
+		t.Error("the stage reported the fence down although the public URL still answered 503")
+	}
+}
+
+// A SESSION WITH NO PUBLIC URL CANNOT MEASURE THE FENCE, so it refuses rather
+// than taking the route object for the route a client uses. Every production run
+// carries the client its own version check used.
+func TestAnUnfenceWithNoPublicURLRefusesRatherThanReportingDown(t *testing.T) {
+	ctx := context.Background()
+	values := upgradeTestValues(t, nil)
+	kube := newStageRunner(t, values)
+	s := testUpgradeSession(t, kube, values)
+	s.Opts.Public = nil
+
+	err := stageUnfence(ctx, s)
+	if err == nil {
+		t.Fatal("the fence was reported down by a session that has no public URL to measure")
+	}
+	if deleted := fenceObjectsDeleted(kube); deleted != 0 {
+		t.Errorf("the fence's objects were deleted (%d command(s)) although nothing measured the URL a client uses", deleted)
+	}
+}
+
+// publicBackendStub is a public URL whose backend answers GET /api/v1/version, so
+// a session that is not about the fence measurement still has a URL to ask.
+func publicBackendStub(t *testing.T) *api.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"contract": 3, "build": "c121ed887750b1d3"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := api.New(srv.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// fenceObjectsDeleted counts the commands that remove the fence's own objects:
+// what a stage that reported the fence down has done, and what a stage that has
+// not must not have done.
+func fenceObjectsDeleted(runner *stageRunner) int {
+	deleted := 0
+	for _, command := range runner.Commands() {
+		if strings.Contains(command, "delete deployment/"+fenceName) {
+			deleted++
+		}
+	}
+	return deleted
 }

@@ -103,7 +103,15 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	// replicas, so neither the public route nor the tunnel answers.
 	recorded, recordedWindow := recordedOperationFacts(ctx, nodeRunner, f.Resume)
 
-	client, before, err := controlPlaneForUpgrade(ctx, nodeClient, recorded)
+	// THE PUBLIC URL THIS COMMAND TALKS TO, built once and kept, because the
+	// unfence has to ASK it: the fence is reported down when the URL a client
+	// uses answers from the backend, and the route object helm-controller
+	// re-renders is not that URL (kn-t70-control-plane-version-identity-4xso.6).
+	public, err := controlPlaneClient()
+	if err != nil {
+		return err
+	}
+	client, before, err := controlPlaneForUpgrade(ctx, public, nodeClient, recorded)
 	if err != nil {
 		return err
 	}
@@ -175,6 +183,7 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 		Window:       session.Window,
 		WindowErr:    session.WindowErr,
 		BypassWindow: f.Now,
+		Public:       public,
 		Gates: []controlplane.Gate{
 			{
 				Name:   "Control-plane compatibility",
@@ -659,6 +668,10 @@ func parseRecordedWindow(recorded string) (window.Window, bool) {
 // controlPlaneForUpgrade chooses the client every read of this command uses, and
 // reads the control plane's version with it.
 //
+// THE PUBLIC CLIENT IS THE CALLER'S, so the same URL, CA and token the version
+// check reads through is the one the unfence measures the fence with — and so
+// that a run which takes the tunnel instead still knows the public URL.
+//
 // THE CHOICE IS MADE ONCE, deliberately. A per-call fallback would mean every
 // future read remembering to ask; one decision point means a read added later
 // cannot forget. The order:
@@ -672,11 +685,7 @@ func parseRecordedWindow(recorded string) (window.Window, bool) {
 //	the node cannot either          fall back for the VERSION to what the
 //	                                operation recorded, and let each read that
 //	                                fails say so.
-func controlPlaneForUpgrade(ctx context.Context, node func(context.Context) (*api.Client, error), recorded api.ControlPlaneVersion) (*api.Client, api.ControlPlaneVersion, error) {
-	public, err := controlPlaneClient()
-	if err != nil {
-		return nil, api.ControlPlaneVersion{}, err
-	}
+func controlPlaneForUpgrade(ctx context.Context, public *api.Client, node func(context.Context) (*api.Client, error), recorded api.ControlPlaneVersion) (*api.Client, api.ControlPlaneVersion, error) {
 	source := fencedVersionSource{Public: public, Node: node, Recorded: recorded}
 	reported, known, err := source.version(ctx)
 	if err != nil {

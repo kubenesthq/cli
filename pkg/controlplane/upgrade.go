@@ -162,6 +162,18 @@ type UpgradeOptions struct {
 	Reporter converge.Reporter
 	Out      io.Writer
 
+	// Public is a client for the control plane's PUBLIC route — the base URL, CA
+	// and token the command's own version check used before the fence went up.
+	//
+	// THE UNFENCE NEEDS IT, and cannot work it out for itself: the fence is
+	// reported down when the URL a CLIENT uses answers from the backend, and the
+	// route object helm-controller re-renders is not that URL. A client reached
+	// through the node's tunnel would answer from the backend while the public
+	// URL is still the fence, which is the measurement this exists to make. A run
+	// without one refuses to report the fence down (kn-t70-control-plane-version
+	// -identity-4xso.6); every production run has one.
+	Public *api.Client
+
 	// Now overrides the clock, for tests.
 	Now func() time.Time
 
@@ -219,6 +231,10 @@ type UpgradeSession struct {
 	Fence        FenceReport
 	Record       UpgradeRecord
 	FenceState   FenceState
+	// PublicAnswer is what the URL a client uses answered when this run took the
+	// fence down: the fact the unfence reports the fence down ON, rather than the
+	// route object it re-read (kn-t70-control-plane-version-identity-4xso.6).
+	PublicAnswer PublicAnswer
 
 	// Restored is the previous release's rollout, set by the migration stage
 	// when its Job failed and the previous chart was put back. It carries the
@@ -726,7 +742,23 @@ func stageUnfence(ctx context.Context, s *UpgradeSession) error {
 			if err != nil {
 				return err
 			}
-			return WaitForRouteBackend(ctx, s.runner(StageUnfence), backendService, deadline, s.PollInterval, s.Opts.Reporter)
+			r := s.runner(StageUnfence)
+			if err := WaitForRouteBackend(ctx, r, backendService, deadline, s.PollInterval, s.Opts.Reporter); err != nil {
+				return err
+			}
+			// AND THE ROUTE OBJECT OUTLIVES THE ANSWER A CLIENT GETS. The object
+			// being re-rendered is helm-controller's work; the gateway may still
+			// be reprogramming or still be routing to the fence Service this
+			// stage is about to delete, and a client that acted on "Upgraded" then
+			// got a 503 (hardware, 2026-09-26, run 21). So the URL a CLIENT uses
+			// is asked, through the client and CA this command's own version check
+			// used, until the BACKEND answers it.
+			answer, err := s.waitForThePublicRoute(ctx, deadline)
+			if err != nil {
+				return err
+			}
+			s.PublicAnswer = answer
+			return nil
 		}); err != nil {
 		return err
 	}
@@ -735,8 +767,23 @@ func stageUnfence(ctx context.Context, s *UpgradeSession) error {
 		return err
 	}
 	s.FenceState = FenceDown
-	s.Logf("  the fence is down: %s/%s-api answers from the backend again", Namespace, ReleaseName)
+	s.Logf("  the fence is down: %s/%s-api answers from the backend again, and %s", Namespace, ReleaseName, s.PublicAnswer)
 	return nil
+}
+
+// waitForThePublicRoute asks the URL a client uses until the backend answers it.
+//
+// IT REFUSES WHEN THIS RUN HAS NO SUCH URL, and that refusal is the point: every
+// production run carries the public client its own version check used, so a
+// session without one is one where nothing can measure the fence — and reporting
+// the fence down on the strength of a route OBJECT that is not what a client
+// talks to is exactly the defect this wait exists for (hardware, 2026-09-26;
+// kn-t70-control-plane-version-identity-4xso.6).
+func (s *UpgradeSession) waitForThePublicRoute(ctx context.Context, deadline time.Duration) (PublicAnswer, error) {
+	if s.Opts.Public == nil {
+		return PublicAnswer{}, fmt.Errorf("this run has no client for the control plane's public URL, so whether the URL a customer uses answers from the backend cannot be measured, and the fence is not taken down on the strength of the route object alone")
+	}
+	return WaitForPublicBackend(ctx, s.Opts.Public, deadline, s.PollInterval, s.Opts.Reporter)
 }
 
 // apply writes the control-plane chart's HelmChart through the stage's runner.

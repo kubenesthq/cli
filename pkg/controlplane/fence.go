@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -915,4 +917,112 @@ func kubectlApply(ctx context.Context, r k3s.Runner, doc []byte) error {
 		return fmt.Errorf("applying the previous release Secret: exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return nil
+}
+
+// PublicAnswer is what the control plane's PUBLIC URL answered, and whether the
+// answer came from the fence or from the backend.
+type PublicAnswer struct {
+	// URL is the route the answer came from, as the client was built with it.
+	URL string
+	// Status is the HTTP status the URL answered with. Zero means nothing
+	// answered at all.
+	Status int
+	// Fenced is whether the answer carried the fence's own header, which makes
+	// its 503 a statement about the control plane rather than a gateway failing.
+	Fenced bool
+}
+
+// String names the answer, for a log line and for a failure that has to say what
+// the last answer was.
+func (a PublicAnswer) String() string {
+	switch {
+	case a.Status == 0:
+		return a.URL + " could not be reached"
+	case a.Fenced:
+		return fmt.Sprintf("%s answered from the fence, HTTP %d", a.URL, a.Status)
+	case a.Status >= 500:
+		return fmt.Sprintf("%s answered HTTP %d, which is not the backend answering", a.URL, a.Status)
+	default:
+		return fmt.Sprintf("%s answered from the backend, HTTP %d", a.URL, a.Status)
+	}
+}
+
+// publicRouteCheckName is what the wait reports itself as.
+const publicRouteCheckName = "kubenest-control-plane-public-route"
+
+// WaitForPublicBackend converges until the control plane's PUBLIC URL is answered
+// by the BACKEND, and returns that answer.
+//
+// THE ROUTE OBJECT IS NOT THE ROUTE A CLIENT USES. helm-controller re-rendering
+// kubenest-cp-api at the backend Service says the object was written; the gateway
+// may still be reprogramming, or still be routing to the fence Service the apply
+// just deleted. On hardware (2026-09-26, run 21) the CLI reported the fence down
+// on the object alone, deleted the fence, printed "Upgraded the control plane",
+// and the client's very next request to the public URL got HTTP 503.
+//
+// WHAT COUNTS AS THE BACKEND ANSWERING, and why each case is what it is:
+//
+//	anything but a 5xx or a transport error — a 200, a 401, a 403, a 404: the
+//	route reached the backend, which answered a request it was given. A 404 from
+//	GET /api/v1/version is a control plane that predates the route, and the
+//	fence answers 503 on EVERY path with its own header, so a 404 is proof the
+//	request did not meet the fence;
+//	a 503 that carries the fence's header — the fence itself, still up;
+//	any other 5xx — a gateway or a data plane with nowhere to send the request;
+//	nothing at all — the URL cannot be reached yet.
+//
+// The deadline bounds it, and it is the caller's: the bundle's component-ready
+// limit, as every wait in this procedure.
+func WaitForPublicBackend(ctx context.Context, client *api.Client, deadline, interval time.Duration, rep converge.Reporter) (PublicAnswer, error) {
+	var last PublicAnswer
+	probe := func(ctx context.Context) (bool, converge.State, error) {
+		answer, answered := publicBackendAnswer(ctx, client)
+		last = answer
+		return answered, converge.State{
+			Object: "the control plane's public URL",
+			Status: answer.String(),
+		}, nil
+	}
+	res, err := converge.Wait(ctx, probe, converge.Options{
+		Name:     publicRouteCheckName,
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: rep,
+	})
+	if err != nil {
+		return last, err
+	}
+	if err := res.Err(); err != nil {
+		return last, fmt.Errorf("the control plane's public URL never answered from the backend, and the fence is not taken down while it does not: %w", err)
+	}
+	return last, nil
+}
+
+// publicBackendAnswer asks the public URL once — through the same endpoint the
+// command's version check uses — and says whether the BACKEND answered it.
+func publicBackendAnswer(ctx context.Context, client *api.Client) (PublicAnswer, bool) {
+	answer := PublicAnswer{URL: client.BaseURL()}
+	_, err := client.ControlPlaneVersion(ctx)
+	switch {
+	case err == nil:
+		answer.Status = http.StatusOK
+		return answer, true
+	case api.IsControlPlaneFenced(err):
+		answer.Status, answer.Fenced = http.StatusServiceUnavailable, true
+		return answer, false
+	case api.IsVersionEndpointAbsent(err):
+		answer.Status = http.StatusNotFound
+		return answer, true
+	}
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) {
+		// NOTHING ANSWERED. A transport error is an observation like any other
+		// in this wait: the route may be mid-reprogramming.
+		return answer, false
+	}
+	answer.Status = apiErr.Status
+	if apiErr.Status >= 500 {
+		return answer, false
+	}
+	return answer, true
 }
