@@ -477,6 +477,11 @@ func onlyInstallCluster() (string, error) {
 
 // currentControlPlaneValues reads the values document the control plane is
 // running with, from the HelmChart the CLI applied.
+//
+// IT RETURNS THEM WITHOUT THE FENCE'S backend.image PIN, because what it returns
+// becomes every apply this run makes and that pin names the OLD image (see
+// controlplane.ValuesWithoutTheFencePin, and
+// kn-t70-control-plane-version-identity-4xso.4 for what keeping it cost).
 func currentControlPlaneValues(ctx context.Context, server k3s.Runner) (string, error) {
 	out, err := k3s.Kubectl(ctx, server,
 		"get helmchart "+controlplane.ReleaseName+" -n kube-system -o jsonpath={.spec.valuesContent}")
@@ -486,7 +491,18 @@ func currentControlPlaneValues(ctx context.Context, server k3s.Runner) (string, 
 	if strings.TrimSpace(out) == "" {
 		return "", fmt.Errorf("HelmChart %s in kube-system carries no values, so the settings, secrets and control-plane CA this installation runs with cannot be carried onto the new chart. A control-plane upgrade never renders them again: it would rotate a signing key and replace the CA every agent pins", controlplane.ReleaseName)
 	}
-	return out, nil
+	// THE FENCE'S IMAGE PIN DOES NOT TRAVEL ON INTO THIS RUN. What this read
+	// returns becomes every apply this run makes — the stop apply, the migration
+	// Job, the chart stage and the unfence — and the pin the fence stage (or a
+	// failed migration's restore) wrote is the OLD image. Kept, it re-applies the
+	// old code through all four, and the validation cannot see it, because the
+	// image its expectations compare against comes out of these same values
+	// (kn-t70-control-plane-version-identity-4xso.4).
+	values, err := controlplane.ValuesWithoutTheFencePin(out)
+	if err != nil {
+		return "", fmt.Errorf("the values HelmChart %s in kube-system carries cannot be used as this run's base: %w", controlplane.ReleaseName, err)
+	}
+	return values, nil
 }
 
 // valuesFlagEnabled reports whether a nested boolean in a values document is

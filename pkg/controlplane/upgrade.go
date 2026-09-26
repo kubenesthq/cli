@@ -1210,6 +1210,51 @@ func jobRevision(revision string) string {
 	return revision
 }
 
+// ValuesWithoutTheFencePin returns the values document a run may apply, with any
+// backend.image override removed.
+//
+// IT IS THE INVERSE OF withBackendImage, and it exists for the READ. The fence
+// stage pins backend.image to the image the backend RUNS so that its own apply
+// cannot roll the new chart's image before the migration, and the
+// failed-migration restore pins the previous image for the same reason; both
+// write that pin into the HelmChart's valuesContent, which is where every run
+// takes its base values from. A second process that read those values and kept
+// the pin re-applied the OLD image through its stop apply, its migration Job, its
+// chart stage and its unfence apply: the upgrade rolled nothing, lowered the
+// fence over code nobody had upgraded, and the CLI's own validation could not
+// tell, because the image it compared against came out of the same pinned values
+// (kn-t70-control-plane-version-identity-4xso.4).
+//
+// THE PIN IS THE FENCE'S, NEVER AN INSTALLATION SETTING. The installer's composer
+// writes backend.admin and nothing else under backend (secrets.go's Values), so
+// a backend.image in the HelmChart can only be one of those two pins.
+//
+// NOTHING LOSES A PIN IT NEEDS: the fence stage pins from the backend Deployment
+// it reads, and the previous-code restore pins from the fence's own facts.
+func ValuesWithoutTheFencePin(valuesYAML string) (string, error) {
+	doc := map[string]any{}
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		return "", fmt.Errorf("reading the control-plane values: %w", err)
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	if backend == nil {
+		return valuesYAML, nil
+	}
+	if _, pinned := backend["image"]; !pinned {
+		// NOTHING TO REMOVE, so the document is returned verbatim rather than
+		// round-tripped through a marshaller: values this function had no reason
+		// to change are the values it was given.
+		return valuesYAML, nil
+	}
+	delete(backend, "image")
+	doc["backend"] = backend
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("rendering the control-plane values: %w", err)
+	}
+	return string(out), nil
+}
+
 // withBackendImage pins the chart's backend image.
 //
 // A failed migration must put back the image the backend RAN, and the values a

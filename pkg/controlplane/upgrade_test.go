@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
@@ -704,5 +705,78 @@ func TestTheBackendImageReferenceIsSplitWhereTheChartSplitsIt(t *testing.T) {
 				t.Errorf("ParseBackendImage(%q) = %+v, want %+v", tc.reference, got, tc.want)
 			}
 		})
+	}
+}
+
+// A RE-RUN MUST ROLL THE CHART'S OWN IMAGE, NOT THE ONE THE FENCE PINNED
+// (kn-t70-control-plane-version-identity-4xso.4).
+//
+// The fence stage pins backend.image to the image the backend RUNS so that its
+// own apply does not roll the new chart's image before the migration, and the
+// failed-migration restore writes the same kind of pin. Both land in the
+// HelmChart's valuesContent, and every run takes its base values from there — so
+// a re-run or `--resume` used to start from a document that pinned the OLD image,
+// and its stop apply, its migration Job, its chart stage and its unfence apply
+// all rendered it. The upgrade rolled nothing.
+//
+// AND THE VALIDATION COULD NOT TELL. The image the expectations call "declared"
+// came out of those same pinned values, so it equalled the image the Deployment
+// was running, `ValidationExpectations` cleared StaleBuild and WantBuild, and the
+// only check left was the era floor — which the old code behind the fence meets
+// too, because the "before" facts were read from it. This test asserts both
+// halves: the applies render the chart's own pin, and the expectations demand the
+// build that pin belongs to.
+func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
+	ctx := context.Background()
+	// The values a second process reads off the cluster after the fence stage:
+	// this installation's settings and secrets, and the pin the fence apply
+	// wrote into the HelmChart.
+	pinned := upgradeTestValues(t, map[string]any{
+		"repository": runningBackendRepository,
+		"tag":        recordedPinTag,
+		"pullPolicy": "IfNotPresent",
+	})
+	values, err := ValuesWithoutTheFencePin(pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newStageRunner(t, values)
+	s := testUpgradeSession(t, runner, values)
+	s.Opts.Before = api.ControlPlaneVersion{Contract: 3, Build: "c121ed887750b1d3"}
+
+	for _, stage := range []func(context.Context, *UpgradeSession) error{stageFence, stageCheckpoint, stageMigration, stageChart} {
+		if err := stage(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(runner.applied) < 4 {
+		t.Fatalf("the stages applied %d chart(s), want the fence, the stopped backend, the migration and the new chart: %+v", len(runner.applied), runner.applied)
+	}
+	pinned_ := func(a appliedValues) bool {
+		return a.imageRepository != "" || a.imageTag != "" || a.imageDigest != ""
+	}
+	// THE FENCE APPLY IS THE ONE APPLY THAT MUST PIN, and asserting it here is
+	// what makes the rest of this test able to see a pin at all: a run whose base
+	// values carried no pin would prove nothing about a run whose did.
+	if !pinned_(runner.applied[0]) {
+		t.Fatal("the fence apply carried no image pin, so this test could not see a pin leaking past it")
+	}
+	for i, applied := range runner.applied[1:] {
+		if pinned_(applied) {
+			t.Errorf("apply %d carried backend.image %s:%s@%s, want no override at all: the chart's own pin is the code this run is upgrading to, and it is the fence's pin — not the run's — that has to stay out of the later applies",
+				i+1, applied.imageRepository, applied.imageTag, applied.imageDigest)
+		}
+	}
+	// THE VALIDATION DEMANDS THE NEW BUILD, because the chart's own pin is now
+	// the declared image and it differs from the one the Deployment is running.
+	expectations, err := ValidationExpectations(ctx, runner, s.Opts.Before, values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expectations.WantBuild == "" {
+		t.Errorf("the validation demands no build (%+v), so a control plane still running the old image would pass it", expectations)
+	}
+	if expectations.StaleBuild != s.Opts.Before.Build {
+		t.Errorf("the validation would not refuse the build that was serving before the upgrade (%q), want %q", expectations.StaleBuild, s.Opts.Before.Build)
 	}
 }

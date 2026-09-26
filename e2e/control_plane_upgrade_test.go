@@ -33,7 +33,12 @@
 //	  the eligible checkpoint's timestamp precedes the migration Job's;
 //	the second laptop finds the interrupted operation at its recorded step
 //	  the resumed run is a NEW process with a NEW journal directory, and it
-//	  reports the recorded stage and finishes.
+//	  reports the recorded stage and finishes;
+//	the code serving afterwards is the code the chart pins
+//	  after steps (b), (c) and (e) the backend Deployment runs the backend
+//	  image this binary's chart names, and the control plane reports a build
+//	  whose prefix is that image's tag — which an upgrade that inherited the
+//	  fence's image pin cannot do (kn-t70-control-plane-version-identity-4xso.4).
 //
 // Run from the umbrella workspace, on hosts from
 // `./scripts/ephemeral-env.sh up --profile host`:
@@ -61,6 +66,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/bundles"
@@ -321,6 +328,47 @@ func cpMigrationJob(t *testing.T, ctx context.Context, server k3s.Runner) (creat
 	return fields[0], revision, true
 }
 
+// cpLaptopClient builds the client the installing laptop's own state describes:
+// the control plane's URL and CA, and its token, out of the home tree cpRunCLI
+// was given. Each "laptop" in this gate has its own copy, so a read through it is
+// a read an operator could make.
+func cpLaptopClient(t *testing.T, home string) *api.Client {
+	t.Helper()
+	var config struct {
+		URL string `json:"control_plane_url"`
+		CA  string `json:"control_plane_ca"`
+	}
+	var creds struct {
+		Tokens map[string]struct {
+			Token string `json:"token"`
+		} `json:"tokens"`
+	}
+	for path, into := range map[string]any{
+		filepath.Join(home, ".kubenest", "config.json"):      &config,
+		filepath.Join(home, ".kubenest", "credentials.json"): &creds,
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading the install's laptop state: %v", err)
+		}
+		if err := json.Unmarshal(raw, into); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+	token := creds.Tokens[config.URL].Token
+	if config.URL == "" || token == "" {
+		t.Fatalf("the install's laptop state has no control-plane URL or token (url=%q), so the control plane cannot be read the way an operator reads it", config.URL)
+	}
+	if config.CA == "" {
+		t.Fatalf("the install's laptop state carries no control-plane CA, so a read of it would not verify the control plane's certificate")
+	}
+	client, err := api.New(config.URL, api.WithToken(token), api.WithCACert([]byte(config.CA)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
 // cpBackendImage reads the image the backend Deployment runs: what proves the
 // old code is no longer the one serving.
 func cpBackendImage(t *testing.T, ctx context.Context, server k3s.Runner) string {
@@ -331,6 +379,79 @@ func cpBackendImage(t *testing.T, ctx context.Context, server k3s.Runner) string
 		t.Fatalf("reading the backend image: %v", err)
 	}
 	return strings.TrimSpace(out)
+}
+
+// cpChartBackendImage reads the backend image the chart THIS BINARY carries pins,
+// as the chart's own helper renders it (templates/_helpers.tpl "kubenest.image":
+// repository@digest when a digest is set, repository:tag otherwise), and that
+// image's tag.
+//
+// IT IS READ FROM THE EMBEDDED ARCHIVE because that archive is what an upgrade
+// applies, so this reference is exactly "the code this run is moving to" — and it
+// is what tells an upgrade that moved from one that only said it did.
+func cpChartBackendImage(t *testing.T) (image, tag string) {
+	t.Helper()
+	body, err := controlplane.ChartFile("values.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart this binary carries: %v", err)
+	}
+	var doc struct {
+		Backend struct {
+			Image struct {
+				Repository string `yaml:"repository"`
+				Tag        string `yaml:"tag"`
+				Digest     string `yaml:"digest"`
+			} `yaml:"image"`
+		} `yaml:"backend"`
+	}
+	if err := yaml.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("the chart's values are not readable YAML: %v", err)
+	}
+	pin := doc.Backend.Image
+	switch {
+	case pin.Repository == "":
+		t.Fatalf("the chart this binary carries pins no backend repository: %+v", pin)
+	case pin.Digest != "":
+		return pin.Repository + "@" + pin.Digest, pin.Tag
+	case pin.Tag != "":
+		return pin.Repository + ":" + pin.Tag, pin.Tag
+	}
+	t.Fatalf("the chart this binary carries pins neither a tag nor a digest for the backend: %+v", pin)
+	return "", ""
+}
+
+// cpAssertTheUpgradeRolled asserts that the code serving after an upgrade is the
+// code the chart this binary carries pins.
+//
+// THE HARNESS HALF OF kn-t70-control-plane-version-identity-4xso.4. A run that
+// read its base values off the cluster and kept the backend.image pin the fence
+// stage (or a failed migration's restore) had written there re-applied the OLD
+// image through its stop apply, its migration Job, its chart stage and its
+// unfence apply, and lowered the fence over it while printing that it had
+// upgraded. The CLI's own validation could not see it — the image its expectations
+// compared against came out of those same pinned values, so no build was demanded
+// and only the era floor was left, which the old code behind the fence also meets.
+//
+// TWO FACTS ABOUT THE SAME THING, and both are needed: the Deployment runs the
+// image the chart pins, and the control plane reports a build whose prefix is that
+// image's tag. The tag is short while APP_VERSION carries the whole commit sha, so
+// the prefix is the tie the CLI's own validation uses too.
+func cpAssertTheUpgradeRolled(t *testing.T, ctx context.Context, server k3s.Runner, home, when string) {
+	t.Helper()
+	wantImage, wantTag := cpChartBackendImage(t)
+	if got := cpBackendImage(t, ctx, server); got != wantImage {
+		t.Errorf("after %s the backend Deployment runs %s, want the image the chart this binary carries pins (%s): the run did not move the code", when, got, wantImage)
+	}
+	version, err := cpLaptopClient(t, home).ControlPlaneVersion(ctx)
+	if err != nil {
+		t.Fatalf("reading the control plane's version after %s: %v", when, err)
+	}
+	if version.Build == "" {
+		t.Errorf("after %s the control plane reports no build stamp, so nothing can say which image is serving", when)
+	}
+	if wantTag != "" && !strings.HasPrefix(version.Build, wantTag) {
+		t.Errorf("after %s the control plane reports build %q, which does not start with the chart's backend tag %q: an image this run did not apply is the one serving", when, version.Build, wantTag)
+	}
 }
 
 // cpFenceState reads where the public API route points.
@@ -443,6 +564,12 @@ func TestControlPlaneUpgradeGate(t *testing.T) {
 	if newImage == previousImage {
 		t.Errorf("the backend image is still %s: the new chart did not roll", previousImage)
 	}
+	// AND THE CODE THAT RAN IS THE CODE THIS BINARY PINS, which the comparison
+	// above cannot say on its own: it only says the image moved, and the whole
+	// defect this gate now guards against is a run that DID move the image and
+	// then moved it back to the previous candidate's through the values it read
+	// off the cluster (kn-t70-control-plane-version-identity-4xso.4).
+	cpAssertTheUpgradeRolled(t, ctx, server, home, "the upgrade in step (b)")
 	created, revision, found := cpMigrationJob(t, ctx, server)
 	if !found {
 		t.Fatal("no migration Job is on the cluster after an upgrade that had to migrate: the schema step did not run as a recorded step")
@@ -515,34 +642,17 @@ func cpPrepareControlPlane(t *testing.T, ctx context.Context, env cpUpgradeEnv, 
 // The client is built from the install's own laptop state in home.
 func cpOpenWindowAllWeek(t *testing.T, ctx context.Context, home, name string) {
 	t.Helper()
-	var config struct {
-		URL string `json:"control_plane_url"`
-		CA  string `json:"control_plane_ca"`
-	}
-	var creds struct {
-		Tokens map[string]struct {
-			Token string `json:"token"`
-		} `json:"tokens"`
-	}
+	client := cpLaptopClient(t, home)
 	var journal struct {
 		ClusterID string `json:"cluster_id"`
 	}
-	for path, into := range map[string]any{
-		filepath.Join(home, ".kubenest", "config.json"):            &config,
-		filepath.Join(home, ".kubenest", "credentials.json"):       &creds,
-		filepath.Join(home, ".kubenest", "journals", name+".json"): &journal,
-	} {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("reading the install's laptop state: %v", err)
-		}
-		if err := json.Unmarshal(raw, into); err != nil {
-			t.Fatalf("%s: %v", path, err)
-		}
-	}
-	client, err := api.New(config.URL, api.WithToken(creds.Tokens[config.URL].Token), api.WithCACert([]byte(config.CA)))
+	journalPath := filepath.Join(home, ".kubenest", "journals", name+".json")
+	raw, err := os.ReadFile(journalPath)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reading the install's laptop state: %v", err)
+	}
+	if err := json.Unmarshal(raw, &journal); err != nil {
+		t.Fatalf("%s: %v", journalPath, err)
 	}
 	current, err := client.MaintenanceWindow(ctx, journal.ClusterID)
 	if err != nil {
@@ -776,6 +886,12 @@ func cpAssertMigrationFailureKeepsTheFenceUp(t *testing.T, ctx context.Context, 
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
 		t.Errorf("the re-run finished with the fence %q", report.State)
 	}
+	// AND THE RE-RUN REALLY UPGRADED, not only reported that it did. The re-run
+	// starts from values the RESTORE pinned to the previous image, which is
+	// kn-t70-control-plane-version-identity-4xso.4's second arm: run 19's pass of
+	// this step did not prove the new code rolled, because the CLI's own
+	// validation read its "declared" image out of those same values.
+	cpAssertTheUpgradeRolled(t, ctx, server, rerun, "the identical re-run in step (e)")
 	if _, revision, found := cpMigrationJob(t, ctx, server); !found || revision == "" {
 		t.Error("no migration Job at an install revision is on the cluster after the re-run: the record of the schema step is gone")
 	}
@@ -902,6 +1018,12 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
 		t.Errorf("the resumed run finished with the fence %q", report.State)
 	}
+	// AND IT FINISHED THE UPGRADE, not only the command. This is the arm
+	// kn-t70-control-plane-version-identity-4xso.4 is about: the resumed run takes
+	// its base values off the cluster, where the FIRST run's fence apply had just
+	// pinned the previous candidate's image, so a run that kept that pin re-applied
+	// the old code through every later stage and lowered the fence over it.
+	cpAssertTheUpgradeRolled(t, ctx, server, second, "the resumed run in step (c)")
 
 	// (d) Interrupt DURING THE MIGRATION and finish from a third laptop. The
 	// migration is the step that must not be half-done and unwatched: the fence

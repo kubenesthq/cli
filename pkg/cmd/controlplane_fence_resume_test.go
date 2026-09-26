@@ -424,3 +424,85 @@ func TestTheFenceDownOrABackendRunningIsLeftAloneByTheRecovery(t *testing.T) {
 		})
 	}
 }
+
+// A RUN MUST NOT INHERIT THE FENCE'S IMAGE PIN FROM THE VALUES IT READS
+// (kn-t70-control-plane-version-identity-4xso.4).
+//
+// The fence stage pins backend.image to the image the backend RUNS, so its own
+// apply does not roll the new chart's image before the migration; that pin is
+// written into the HelmChart's valuesContent, and the failed-migration restore
+// writes the same kind. Every run takes its base values from there, so a re-run
+// or `--resume` started from a document that pinned the OLD image: its stop
+// apply, its migration Job, its chart stage and its unfence apply all rendered
+// that old image, and the CLI's own validation could not tell — the image its
+// expectations compare against came out of the same pinned values, so no build
+// was demanded and only the era floor was left, which the old code behind the
+// fence also meets. The upgrade could print "Upgraded the control plane" and
+// lower the fence over code nobody had upgraded.
+//
+// THE PIN IS THE FENCE'S, NOT AN INSTALLATION SETTING. The installer's composer
+// writes backend.admin and nothing else under backend (pkg/controlplane/secrets.go),
+// so a backend.image in the HelmChart can only be one of those two pins. Nothing
+// loses a pin it needs either: the fence stage pins from the backend Deployment
+// it reads, and the previous-code restore pins from the fence's facts.
+//
+// AND EVERYTHING ELSE SURVIVES: the settings, the generated secrets, the CA and
+// the replica count are what this installation runs with, and a run never
+// re-derives them.
+func TestARunTakesItsBaseValuesWithoutTheFencesImagePin(t *testing.T) {
+	ctx := context.Background()
+	pinned := "domain: kn.example.com\n" +
+		"jwtSecret: s\n" +
+		"agentJwtSecret: a\n" +
+		"checkpoint:\n  enabled: true\n" +
+		"gateway:\n  caCertificate: the-control-planes-ca\n" +
+		"backend:\n  admin:\n    email: admin@kn.example.com\n  replicas: 2\n  image:\n" +
+		"    repository: ghcr.io/kubenesthq/kubenest-backend\n" +
+		"    tag: 132b7ea\n" +
+		"    pullPolicy: IfNotPresent\n" +
+		"installRevision: c121ed887750b1d3\n"
+	kube := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "get helmchart ") {
+			return sshx.Result{Stdout: pinned}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+
+	values, err := currentControlPlaneValues(ctx, kube)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(values), &doc); err != nil {
+		t.Fatalf("the base values are not readable YAML: %v", err)
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	if backend == nil {
+		t.Fatalf("the base values carry no backend group: %v", doc)
+	}
+	if image, ok := backend["image"]; ok {
+		t.Errorf("this run's base values still carry backend.image %v, so every later apply would render the OLD image the fence pinned instead of the code this run is upgrading to", image)
+	}
+	// THE SETTINGS, THE SECRETS, THE CA AND THE REPLICA COUNT ARE UNTOUCHED.
+	if doc["domain"] != "kn.example.com" || doc["jwtSecret"] != "s" || doc["agentJwtSecret"] != "a" {
+		t.Errorf("the base values lost a setting: %v", doc)
+	}
+	if doc["installRevision"] != "c121ed887750b1d3" {
+		t.Errorf("the base values lost installRevision: %v", doc)
+	}
+	checkpoint, _ := doc["checkpoint"].(map[string]any)
+	gateway, _ := doc["gateway"].(map[string]any)
+	admin, _ := backend["admin"].(map[string]any)
+	if checkpoint == nil || checkpoint["enabled"] != true {
+		t.Errorf("the base values lost checkpoint.enabled: %v", doc)
+	}
+	if gateway == nil || gateway["caCertificate"] != "the-control-planes-ca" {
+		t.Errorf("the base values lost the control plane's CA: %v", doc)
+	}
+	if admin == nil || admin["email"] != "admin@kn.example.com" {
+		t.Errorf("the base values lost the administrator: %v", doc)
+	}
+	if backend["replicas"] != 2 {
+		t.Errorf("the base values lost backend.replicas: %v", backend)
+	}
+}
