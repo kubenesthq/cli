@@ -454,6 +454,96 @@ func cpAssertTheUpgradeRolled(t *testing.T, ctx context.Context, server k3s.Runn
 	}
 }
 
+// cpBackendReplicas reads the backend Deployment's DESIRED replica count. Zero
+// is the state the migration stage's stop apply leaves behind, and the state
+// step (d) has to interrupt in.
+//
+// IT RETURNS ITS ERROR rather than failing the test, because the poll that uses
+// it runs on a watch callback's goroutine, where t.Fatalf is not allowed.
+func cpBackendReplicas(ctx context.Context, server k3s.Runner) (int32, error) {
+	out, err := k3s.Kubectl(ctx, server, "get deployment "+controlplane.ReleaseName+"-backend"+
+		" -n "+controlplane.Namespace+" -o jsonpath={.spec.replicas}")
+	if err != nil {
+		return -1, err
+	}
+	var replicas int32
+	if _, err := fmt.Sscanf(strings.TrimSpace(out), "%d", &replicas); err != nil {
+		return -1, fmt.Errorf("the backend's replica count %q is not a number", strings.TrimSpace(out))
+	}
+	return replicas, nil
+}
+
+// cpMigrationJobState describes the migration Job's own verdict: the conditions
+// the Job controller writes, or the counts before it writes one. "not found" is
+// an observation, not an error, like cpMigrationJob's.
+func cpMigrationJobState(ctx context.Context, server k3s.Runner) (string, error) {
+	out, err := k3s.Kubectl(ctx, server, "get job "+controlplane.MigrationJobName+
+		" -n "+controlplane.Namespace+" -o json")
+	if err != nil {
+		return "not found", nil
+	}
+	var job struct {
+		Status struct {
+			Active     int32 `json:"active"`
+			Succeeded  int32 `json:"succeeded"`
+			Failed     int32 `json:"failed"`
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(out), &job); err != nil {
+		return "", fmt.Errorf("the migration Job is not readable JSON: %w", err)
+	}
+	for _, condition := range job.Status.Conditions {
+		if condition.Status != "True" {
+			continue
+		}
+		if condition.Type == "Complete" || condition.Type == "Failed" {
+			return condition.Type, nil
+		}
+	}
+	switch {
+	case job.Status.Active > 0:
+		return fmt.Sprintf("running (%d pod(s) active)", job.Status.Active), nil
+	case job.Status.Succeeded > 0:
+		return fmt.Sprintf("succeeded (%d)", job.Status.Succeeded), nil
+	case job.Status.Failed > 0:
+		return fmt.Sprintf("failed (%d, no verdict yet)", job.Status.Failed), nil
+	}
+	return "running (no verdict yet)", nil
+}
+
+// cpWaitForTheBackendStopped waits until the state step (d) exists to interrupt
+// in is ON THE CLUSTER: the migration stage's stop apply has taken the backend to
+// zero replicas AND the migration Job exists. It returns a description of what it
+// last saw.
+//
+// IT RETURNS RATHER THAN FAILING, because it runs on the watch callback's
+// goroutine (see cpScalePostgres for the same rule). The caller cancels the run
+// either way: an arm that never reached the state must not let the upgrade finish.
+func cpWaitForTheBackendStopped(ctx context.Context, server k3s.Runner, within time.Duration) (string, error) {
+	deadline := time.Now().Add(within)
+	last := "nothing read yet"
+	for {
+		replicas, err := cpBackendReplicas(ctx, server)
+		if err != nil {
+			last = fmt.Sprintf("the backend Deployment could not be read: %v", err)
+		} else {
+			job, _ := cpMigrationJobState(ctx, server)
+			last = fmt.Sprintf("backend spec.replicas = %d, migration Job %s", replicas, job)
+			if replicas == 0 && job != "not found" {
+				return last, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return last, fmt.Errorf("waited %s for the migration stage to stop the backend and create its Job; last observation: %s", within, last)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 // cpFenceState reads where the public API route points.
 func cpFenceState(t *testing.T, ctx context.Context, server k3s.Runner) controlplane.FenceReport {
 	t.Helper()
@@ -1025,18 +1115,42 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 	// the old code through every later stage and lowered the fence over it.
 	cpAssertTheUpgradeRolled(t, ctx, server, second, "the resumed run in step (c)")
 
-	// (d) Interrupt DURING THE MIGRATION and finish from a third laptop. The
-	// migration is the step that must not be half-done and unwatched: the fence
-	// is up, the backend is stopped, and the Job's outcome is the one thing a
-	// successor has to establish rather than guess.
+	// (d) Interrupt DURING THE MIGRATION and finish from a third laptop, with the
+	// backend STOPPED behind the fence and the migration Job on the cluster: the
+	// state kn-t70-control-plane-version-identity-4xso.3 exists for, where nothing
+	// is left running to bring the control plane back and the Job's outcome is the
+	// one thing a successor has to establish rather than guess.
+	//
+	// THE INTERRUPT IS PLACED BY WHAT IS ON THE CLUSTER, not by the stage's own
+	// header. Run 22 cancelled on that header and landed BEFORE the stop apply was
+	// submitted — the run said "this action was not submitted: it could not be
+	// recorded first ... context canceled" — so the backend was never stopped and
+	// the resume never exercised the recovery at all. The run is therefore
+	// cancelled only once the state is observable, and what the successor will
+	// find is read and logged before the resume is started.
 	cpResetToThePreviousCandidate(t, ctx, env, server, values)
 	third := cpLaptopHome(t, installingHome)
 	runCtx2, cancel2 := context.WithCancel(ctx)
 	defer cancel2()
 	var thirdOut strings.Builder
+	var (
+		stoppedMu  sync.Mutex
+		stoppedAt  string
+		stoppedErr error
+	)
 	stopAtMigration := newCPWatchWriter(&thirdOut, controlplane.StageMigration, func() {
-		t.Log("the migration stage has started; interrupting the run inside it")
-		cancel2()
+		go func() {
+			// NOTHING IS CANCELLED HERE YET: the stage's header says the migration
+			// stage started, not that the backend has been stopped for it.
+			t.Log("the migration stage has started; waiting for the backend to be stopped behind the fence")
+			seen, err := cpWaitForTheBackendStopped(ctx, server, cpMigrationStopWithin)
+			stoppedMu.Lock()
+			stoppedAt, stoppedErr = seen, err
+			stoppedMu.Unlock()
+			// CANCEL EITHER WAY: a run that was never stopped must not be left to
+			// finish the whole upgrade.
+			cancel2()
+		}()
 	})
 	interrupted2 := make(chan struct{})
 	go func() {
@@ -1044,7 +1158,29 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 		_ = cpRunCLIWithContext(t, runCtx2, stopAtMigration, third, cpUpgradeArgs(env, name)...)
 	}()
 	<-interrupted2
+	stoppedMu.Lock()
+	seenState, seenErr := stoppedAt, stoppedErr
+	stoppedMu.Unlock()
+	if seenErr != nil {
+		t.Fatalf("the migration stage never reached the state this arm exists to interrupt: %v", seenErr)
+	}
 	t.Log(thirdOut.String())
+
+	// WHAT THE SUCCESSOR FINDS, read after the interrupt rather than assumed. The
+	// backend MUST be at zero replicas or the interrupt landed somewhere else and
+	// this arm proves nothing about the recovery.
+	replicas, err := cpBackendReplicas(ctx, server)
+	if err != nil {
+		t.Fatalf("reading the backend's replica count after the interrupt: %v", err)
+	}
+	jobState, err := cpMigrationJobState(ctx, server)
+	if err != nil {
+		t.Fatalf("reading the migration Job's state after the interrupt: %v", err)
+	}
+	t.Logf("the interrupted run stopped with the state a successor must recover: %s; the successor finds backend spec.replicas = %d and migration Job %s", seenState, replicas, jobState)
+	if replicas != 0 {
+		t.Fatalf("the backend is at %d replica(s) after the interrupt, so this arm never reached the stopped state it exists to test", replicas)
+	}
 
 	opID2 := cpOperationID(t, ctx, server)
 	if opID2 == "" {
@@ -1059,6 +1195,13 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 	if report := cpFenceState(t, ctx, server); report.State != controlplane.FenceDown {
 		t.Errorf("the run resumed during the migration finished with the fence %q", report.State)
 	}
+	// AND IT FOUND THE STOPPED BACKEND AND BROUGHT ONE BACK, which is the whole
+	// point of this arm: the recovery's own line, whose opening is stable — what
+	// it found, which code it brought back and the readiness after it follow.
+	if !strings.Contains(out2.String(), "the fence is up and the backend is stopped at zero replicas with") {
+		t.Errorf("the resumed run never reported the recovery this arm exists for, so it did not find a stopped backend behind the fence:\n%s", out2.String())
+	}
+	cpAssertTheUpgradeRolled(t, ctx, server, fourth, "the run resumed during the migration in step (d)")
 	if _, revision, found := cpMigrationJob(t, ctx, server); !found || revision == "" {
 		t.Error("no migration Job at an install revision is on the cluster after the resumed run finished")
 	}
@@ -1083,6 +1226,12 @@ func cpAssertResumeFromASecondLaptop(t *testing.T, ctx context.Context, env cpUp
 // THE CALLER'S CONTEXT MUST NOT BE A CANCELLED RUN'S. Every read taken after an
 // interrupt uses the gate's own context; passing the run's would fail here the
 // same way the CLI's own record write did.
+// cpMigrationStopWithin bounds how long step (d) waits for the migration stage to
+// stop the backend and create its Job. It is generous on purpose: the wait starts
+// when the stage's header prints and the stop apply follows within seconds, but a
+// slow node must not be reported as a failed arm.
+const cpMigrationStopWithin = 5 * time.Minute
+
 func cpOperationID(t *testing.T, ctx context.Context, server k3s.Runner) string {
 	t.Helper()
 	if err := ctx.Err(); err != nil {
