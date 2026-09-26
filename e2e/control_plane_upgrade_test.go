@@ -1427,8 +1427,22 @@ func cpResetToThePreviousCandidate(t *testing.T, ctx context.Context, env cpUpgr
 // cpScalePostgres returns the error rather than failing the test, because the
 // forced-failure arm scales the StatefulSet FROM A CALLBACK that runs on the
 // run's own goroutine — and t.Fatalf outside the test goroutine is not allowed.
+//
+// SCALING TO ZERO WAITS UNTIL THE POD IS GONE. `kubectl scale` returns as soon
+// as the StatefulSet's spec changes, while PostgreSQL is still shutting down and
+// still accepting connections. The callback runs inside the CLI's output write,
+// so the run is paused for as long as this takes; returning early let run 23's
+// migration Job reach a database that was still up and succeed, and step (e)
+// then had no failure to recover from.
 func cpScalePostgres(ctx context.Context, server k3s.Runner, replicas int) error {
-	_, err := k3s.Kubectl(ctx, server, "scale statefulset "+controlplane.ReleaseName+"-postgresql"+
-		" -n "+controlplane.Namespace+" --replicas="+strconv.Itoa(replicas))
+	name := controlplane.ReleaseName + "-postgresql"
+	if _, err := k3s.Kubectl(ctx, server, "scale statefulset "+name+
+		" -n "+controlplane.Namespace+" --replicas="+strconv.Itoa(replicas)); err != nil {
+		return err
+	}
+	if replicas != 0 {
+		return nil
+	}
+	_, err := k3s.Kubectl(ctx, server, "wait --for=delete pod/"+name+"-0 -n "+controlplane.Namespace+" --timeout=180s")
 	return err
 }
