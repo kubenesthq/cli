@@ -426,7 +426,7 @@ func clusterGates(ctx context.Context, r k3s.Runner, values string) []Gate {
 //
 // ITS APPLY CHANGES THE ROUTE AND NOTHING ELSE, and the two things that would
 // otherwise change with it are the backend's image and the migration Job
-// (FenceOptions.BackendImage, FenceOptions.MigrationOff). This is the FIRST
+// (FenceOptions.HeldImage, FenceOptions.MigrationOff). This is the FIRST
 // apply of the procedure: the checkpoint and the migration both come after it,
 // and both must run against the code and the schema the control plane has now.
 //
@@ -464,13 +464,20 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	}
 	// THE IMAGE THE BACKEND RUNS NOW, read before anything is applied. The
 	// chart this binary carries pins the NEW backend image, so the apply that
-	// raises the fence would otherwise roll the backend Deployment — and the
-	// checkpoint CronJob, which runs the same image — onto code that has never
-	// been migrated. That roll happens BEFORE the checkpoint this procedure
-	// exists to take and before the migration that code needs, which is the
-	// invariant the whole ordered procedure buys (hardware finding, 2026-09-25).
-	// An image that cannot be read is refused, never silently replaced by the
-	// chart's new pin.
+	// raises the fence would otherwise roll the backend Deployment onto code
+	// that has never been migrated. That roll happens BEFORE the checkpoint this
+	// procedure exists to take and before the migration that code needs, which is
+	// the invariant the whole ordered procedure buys (hardware finding,
+	// 2026-09-25). An image that cannot be read is refused, never silently
+	// replaced by the chart's new pin.
+	//
+	// THE PIN GOES ON backend.heldImage AND NOT ON backend.image. backend.image
+	// is also the image the checkpoint CronJob and the migration Job run, and
+	// their commands are this chart's: a pin written there held the NEW chart's
+	// checkpoint Job on the OLD backend, whose `dump` container printed a usage
+	// line for a command it did not have, and the upgrade died at the checkpoint
+	// stage (hardware, 2026-09-26;
+	// kn-t70-control-plane-version-identity-4xso.5).
 	image, err := runningBackendImage(ctx, r)
 	if err != nil {
 		return err
@@ -506,7 +513,7 @@ func stageFence(ctx context.Context, s *UpgradeSession) error {
 	// leaving the release failed under failurePolicy: abort (the second half of
 	// the same hardware finding). With it off, helm deletes the Job it had
 	// rendered, and stageMigration creates it again at this run's revision.
-	values, err := FenceValues(fenced, FenceOptions{Up: true, MigrationOff: true, BackendImage: &image})
+	values, err := FenceValues(fenced, FenceOptions{Up: true, MigrationOff: true, HeldImage: &image})
 	if err != nil {
 		return err
 	}
@@ -839,11 +846,16 @@ func (s *UpgradeSession) waitForFenceReady(ctx context.Context, stage string) er
 //
 //	the run's values, unchanged;
 //	fence.enabled          TRUE  — the fence stays up, which is the point;
-//	migration.enabled      FALSE — the chart has ONE backend image for the Job
-//	                               and the Deployment and the Job's pod template
-//	                               is immutable;
-//	backend.image                the image the backend ran BEFORE the upgrade,
-//	                               recorded on the fence at the fence stage;
+//	migration.enabled      FALSE — the migration failed, and this apply is about
+//	                               the code the schema matches, not about
+//	                               re-rendering the Job the failure left behind;
+//	backend.heldImage            the image the backend ran BEFORE the upgrade,
+//	                               recorded on the fence at the fence stage. It
+//	                               holds the DEPLOYMENT alone: the checkpoint and
+//	                               migration Jobs keep running backend.image, the
+//	                               chart's own pin, because their commands are
+//	                               this chart's
+//	                               (kn-t70-control-plane-version-identity-4xso.5);
 //	backend.replicas             the count recorded before the fence stopped it.
 //
 // That is the state from just before the migration, and it is the state to
@@ -946,7 +958,7 @@ func applyBehindFence(ctx context.Context, r k3s.Runner, a fencedApply) (string,
 		if a.PreviousImage == "" {
 			return "", nil, fmt.Errorf("the fence records no %s, so the image the previous release ran cannot be established: nothing was recorded at the fence stage", fencePreviousImageAnnotation)
 		}
-		pinned, err := withBackendImage(values, a.PreviousImage)
+		pinned, err := withHeldBackendImage(values, a.PreviousImage)
 		if err != nil {
 			return "", nil, err
 		}
@@ -966,10 +978,11 @@ func applyBehindFence(ctx context.Context, r k3s.Runner, a fencedApply) (string,
 	// — none of which the later applies change — so keeping it on cannot hit the
 	// immutable-field rule.
 	//
-	// Off, for the previous code, because the chart has ONE backend image for
-	// the Job and the Deployment and the Job's pod template is immutable: an
-	// apply that re-enabled it would render the Job with the new pod template
-	// over the Job that already exists, and helm would fail the release.
+	// Off, for the previous code, and explicitly: the migration has just failed,
+	// so this apply leaves the schema step where the failure left it rather than
+	// re-rendering the release's Job from an apply whose subject is the OLD code.
+	// The Job runs backend.image — the chart's own pin, which no apply under a
+	// fence overrides — so nothing here changes what it would run.
 	if a.Code == backendPrevious {
 		fenced, err = migrationValues(fenced, false)
 	} else {
@@ -1211,12 +1224,12 @@ func jobRevision(revision string) string {
 }
 
 // ValuesWithoutTheFencePin returns the values document a run may apply, with any
-// backend.image override removed.
+// held-image pin removed.
 //
-// IT IS THE INVERSE OF withBackendImage, and it exists for the READ. The fence
-// stage pins backend.image to the image the backend RUNS so that its own apply
-// cannot roll the new chart's image before the migration, and the
-// failed-migration restore pins the previous image for the same reason; both
+// IT IS THE INVERSE OF withHeldBackendImage, and it exists for the READ. The
+// fence stage holds the backend Deployment on the image it RUNS so that its own
+// apply cannot roll the new chart's image before the migration, and the
+// failed-migration restore holds the previous image for the same reason; both
 // write that pin into the HelmChart's valuesContent, which is where every run
 // takes its base values from. A second process that read those values and kept
 // the pin re-applied the OLD image through its stop apply, its migration Job, its
@@ -1226,11 +1239,12 @@ func jobRevision(revision string) string {
 // (kn-t70-control-plane-version-identity-4xso.4).
 //
 // THE PIN IS THE FENCE'S, NEVER AN INSTALLATION SETTING. The installer's composer
-// writes backend.admin and nothing else under backend (secrets.go's Values), so
-// a backend.image in the HelmChart can only be one of those two pins.
+// writes backend.admin and nothing else under backend (secrets.go's Values), so a
+// heldImage can only be one of those two pins.
 //
-// NOTHING LOSES A PIN IT NEEDS: the fence stage pins from the backend Deployment
-// it reads, and the previous-code restore pins from the fence's own facts.
+// NOTHING LOSES A PIN IT NEEDS: the fence stage holds the Deployment from the
+// image it reads, and the previous-code restore holds it from the fence's own
+// facts.
 func ValuesWithoutTheFencePin(valuesYAML string) (string, error) {
 	doc := map[string]any{}
 	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
@@ -1240,13 +1254,13 @@ func ValuesWithoutTheFencePin(valuesYAML string) (string, error) {
 	if backend == nil {
 		return valuesYAML, nil
 	}
-	if _, pinned := backend["image"]; !pinned {
+	if _, held := backend["heldImage"]; !held {
 		// NOTHING TO REMOVE, so the document is returned verbatim rather than
 		// round-tripped through a marshaller: values this function had no reason
 		// to change are the values it was given.
 		return valuesYAML, nil
 	}
-	delete(backend, "image")
+	delete(backend, "heldImage")
 	doc["backend"] = backend
 	out, err := yaml.Marshal(doc)
 	if err != nil {
@@ -1255,13 +1269,17 @@ func ValuesWithoutTheFencePin(valuesYAML string) (string, error) {
 	return string(out), nil
 }
 
-// withBackendImage pins the chart's backend image.
+// withHeldBackendImage holds the backend Deployment on the image it ran before
+// this upgrade.
 //
 // A failed migration must put back the image the backend RAN, and the values a
 // run carries name whatever the chart pins now, so the pin is written here
 // explicitly — repository, tag and digest separately, which is what the chart's
-// image helper reads.
-func withBackendImage(valuesYAML, ref string) (string, error) {
+// image helper reads. It goes under backend.heldImage, which only the backend
+// Deployment reads: backend.image is the chart's own pin and the image the
+// checkpoint and migration Jobs run, whose commands are this chart's
+// (kn-t70-control-plane-version-identity-4xso.5).
+func withHeldBackendImage(valuesYAML, ref string) (string, error) {
 	image := parsePostgresImage(ref)
 	if image.repository == "" {
 		return "", fmt.Errorf("the recorded previous backend image %q names no repository", ref)
@@ -1281,7 +1299,7 @@ func withBackendImage(valuesYAML, ref string) (string, error) {
 	if backend == nil {
 		backend = map[string]any{}
 	}
-	backend["image"] = pin
+	backend["heldImage"] = pin
 	doc["backend"] = backend
 	out, err := yaml.Marshal(doc)
 	if err != nil {

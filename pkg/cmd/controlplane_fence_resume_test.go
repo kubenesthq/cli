@@ -362,9 +362,12 @@ func TestAStoppedBackendBehindAFenceIsBroughtBackBeforeThisCommandReads(t *testi
 		if backend == nil {
 			t.Fatalf("the applied values carry no backend group: %v", values)
 		}
-		image, _ := backend["image"].(map[string]any)
+		image, _ := backend["heldImage"].(map[string]any)
 		if image == nil || image["tag"] != "1acd82d" {
-			t.Errorf("the recovery applied backend.image %v, want the previous code the fence recorded (%s)", image, recoveryPreviousImage)
+			t.Errorf("the recovery applied backend.heldImage %v, want the previous code the fence recorded (%s)", image, recoveryPreviousImage)
+		}
+		if pinned, ok := backend["image"]; ok {
+			t.Errorf("the recovery also wrote backend.image %v, which the checkpoint CronJob and the migration Job run: their commands are the chart's, and an older image does not have them", pinned)
 		}
 		if fence, _ := values["fence"].(map[string]any); fence == nil || fence["enabled"] != true {
 			t.Errorf("the recovery applied fence = %v, want it still up: the code it put back has not been validated", values["fence"])
@@ -428,8 +431,9 @@ func TestTheFenceDownOrABackendRunningIsLeftAloneByTheRecovery(t *testing.T) {
 // A RUN MUST NOT INHERIT THE FENCE'S IMAGE PIN FROM THE VALUES IT READS
 // (kn-t70-control-plane-version-identity-4xso.4).
 //
-// The fence stage pins backend.image to the image the backend RUNS, so its own
-// apply does not roll the new chart's image before the migration; that pin is
+// The fence stage holds the backend Deployment on the image it RUNS
+// (backend.heldImage), so its own apply does not roll the new chart's image
+// before the migration; that pin is
 // written into the HelmChart's valuesContent, and the failed-migration restore
 // writes the same kind. Every run takes its base values from there, so a re-run
 // or `--resume` started from a document that pinned the OLD image: its stop
@@ -442,7 +446,7 @@ func TestTheFenceDownOrABackendRunningIsLeftAloneByTheRecovery(t *testing.T) {
 //
 // THE PIN IS THE FENCE'S, NOT AN INSTALLATION SETTING. The installer's composer
 // writes backend.admin and nothing else under backend (pkg/controlplane/secrets.go),
-// so a backend.image in the HelmChart can only be one of those two pins. Nothing
+// so a backend.heldImage in the HelmChart can only be one of those two pins. Nothing
 // loses a pin it needs either: the fence stage pins from the backend Deployment
 // it reads, and the previous-code restore pins from the fence's facts.
 //
@@ -456,7 +460,7 @@ func TestARunTakesItsBaseValuesWithoutTheFencesImagePin(t *testing.T) {
 		"agentJwtSecret: a\n" +
 		"checkpoint:\n  enabled: true\n" +
 		"gateway:\n  caCertificate: the-control-planes-ca\n" +
-		"backend:\n  admin:\n    email: admin@kn.example.com\n  replicas: 2\n  image:\n" +
+		"backend:\n  admin:\n    email: admin@kn.example.com\n  replicas: 2\n  heldImage:\n" +
 		"    repository: ghcr.io/kubenesthq/kubenest-backend\n" +
 		"    tag: 132b7ea\n" +
 		"    pullPolicy: IfNotPresent\n" +
@@ -480,8 +484,8 @@ func TestARunTakesItsBaseValuesWithoutTheFencesImagePin(t *testing.T) {
 	if backend == nil {
 		t.Fatalf("the base values carry no backend group: %v", doc)
 	}
-	if image, ok := backend["image"]; ok {
-		t.Errorf("this run's base values still carry backend.image %v, so every later apply would render the OLD image the fence pinned instead of the code this run is upgrading to", image)
+	if pin, ok := backend["heldImage"]; ok {
+		t.Errorf("this run's base values still carry backend.heldImage %v, so every later apply would hold the backend Deployment on the OLD image the fence pinned instead of the code this run is upgrading to", pin)
 	}
 	// THE SETTINGS, THE SECRETS, THE CA AND THE REPLICA COUNT ARE UNTOUCHED.
 	if doc["domain"] != "kn.example.com" || doc["jwtSecret"] != "s" || doc["agentJwtSecret"] != "a" {

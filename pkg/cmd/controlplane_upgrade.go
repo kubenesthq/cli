@@ -478,9 +478,9 @@ func onlyInstallCluster() (string, error) {
 // currentControlPlaneValues reads the values document the control plane is
 // running with, from the HelmChart the CLI applied.
 //
-// IT RETURNS THEM WITHOUT THE FENCE'S backend.image PIN, because what it returns
-// becomes every apply this run makes and that pin names the OLD image (see
-// controlplane.ValuesWithoutTheFencePin, and
+// IT RETURNS THEM WITHOUT THE PIN A FENCE OR A RESTORE WROTE, because what it
+// returns becomes every apply this run makes and that pin names the OLD image
+// (see controlplane.ValuesWithoutTheFencePin, and
 // kn-t70-control-plane-version-identity-4xso.4 for what keeping it cost).
 func currentControlPlaneValues(ctx context.Context, server k3s.Runner) (string, error) {
 	out, err := k3s.Kubectl(ctx, server,

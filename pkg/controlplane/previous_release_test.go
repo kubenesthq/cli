@@ -222,14 +222,21 @@ func TestAFailedMigrationPutsThePreviousCodeBackBehindTheFence(t *testing.T) {
 	if applied.chartContent != base64.StdEncoding.EncodeToString(ChartArchive()) {
 		t.Error("the last apply did not carry the chart this binary embeds, which is the only one that can keep the fence up over the old code")
 	}
-	// THE PREVIOUS IMAGE, pinned on the chart that can be fenced.
+	// THE PREVIOUS IMAGE, held on the backend Deployment — and NOT on
+	// backend.image, which is also the image the checkpoint CronJob and the
+	// migration Job run: pinned there, the new chart's Jobs would run the old
+	// image and their commands are this chart's
+	// (kn-t70-control-plane-version-identity-4xso.5).
 	backend, _ := applied.values["backend"].(map[string]any)
 	if backend == nil {
 		t.Fatalf("the restored values carry no backend group: %v", applied.values)
 	}
-	pin, _ := backend["image"].(map[string]any)
+	pin, _ := backend["heldImage"].(map[string]any)
 	if pin == nil || pin["tag"] != "1acd82d" || pin["repository"] != "ghcr.io/kubenesthq/kubenest-backend" {
-		t.Errorf("the restored release pins backend.image %v, want the image the backend ran before the upgrade (%s)", pin, previousBackendImage)
+		t.Errorf("the restored release holds backend.heldImage %v, want the image the backend ran before the upgrade (%s)", pin, previousBackendImage)
+	}
+	if image, ok := backend["image"]; ok {
+		t.Errorf("the restored release also pins backend.image %v, which the checkpoint CronJob and the migration Job run", image)
 	}
 	// THE FENCE STAYS UP.
 	fence, _ := applied.values["fence"].(map[string]any)
@@ -400,9 +407,10 @@ func recoverLikeTheCommand(ctx context.Context, kube *previousKube, values strin
 	})
 }
 
-// broughtBack is what one chart apply put behind the fence: which code, whether
-// the fence stays up, whether the migration Job is on, and at what size the
-// backend runs. Decoded once, so each test reads as the question it asks.
+// broughtBack is what one chart apply put behind the fence: which code the backend
+// Deployment is HELD on, whether the fence stays up, whether the migration Job is
+// on, and at what size the backend runs. Decoded once, so each test reads as the
+// question it asks.
 type broughtBack struct {
 	repository string
 	tag        string
@@ -412,9 +420,9 @@ type broughtBack struct {
 	replicas   any
 }
 
-// pinned reports whether the apply named the backend image itself instead of
-// taking the chart's own pin, which is the whole difference between the previous
-// code and the new one.
+// pinned reports whether the apply held the backend Deployment on an image of its
+// own instead of taking the chart's own pin, which is the whole difference
+// between the previous code and the new one.
 func (b broughtBack) pinned() bool {
 	return b.repository != "" || b.tag != "" || b.digest != ""
 }
@@ -433,7 +441,8 @@ func decodeBroughtBack(t *testing.T, applied appliedRelease) broughtBack {
 		t.Fatalf("the applied values carry no backend group: %v", applied.values)
 	}
 	out.replicas = backend["replicas"]
-	if image, ok := backend["image"].(map[string]any); ok {
+	// The HELD pin: the image the fence or the restore holds the Deployment on.
+	if image, ok := backend["heldImage"].(map[string]any); ok {
 		out.repository, _ = image["repository"].(string)
 		out.tag, _ = image["tag"].(string)
 		out.digest, _ = image["digest"].(string)

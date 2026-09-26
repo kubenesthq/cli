@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"kubenest.io/cli/pkg/backup"
 )
 
 // The version helm-controller reads from the archive is the version this
@@ -632,4 +634,137 @@ func listHas(list any, want any) bool {
 		}
 	}
 	return false
+}
+
+// THE HELD IMAGE HOLDS ONLY THE BACKEND DEPLOYMENT
+// (kn-t70-control-plane-version-identity-4xso.5).
+//
+// The fence stage pins the image the backend RUNS so that its own apply cannot
+// roll the new chart's image before the migration, and the failed-migration
+// restore pins the same reference afterwards. That pin used to be backend.image,
+// which is not only the Deployment's image: the checkpoint CronJob and the
+// migration Job take theirs from it too. While the fence was up, the NEW chart's
+// checkpoint Job therefore ran the OLD backend image — on hardware (2026-09-26)
+// its `dump` container printed `usage: python -m app.services.checkpoint_runner
+// {run|drill-fetch|drill-verify}`, a usage line for a command that image did not
+// have, and the upgrade died at the checkpoint stage.
+//
+// ONLY THE DEPLOYMENT IS HELD ON THE OLD CODE, because the Jobs' COMMANDS are
+// this chart's: a Job rendered from these templates has to run the image its
+// commands belong to.
+func TestTheHeldImageHoldsOnlyTheBackendDeployment(t *testing.T) {
+	helm := requireHelm(t)
+	archive, cliValuesFile := renderInputs(t, Settings{
+		Domain:     "kn.example.com",
+		AdminEmail: "admin@kn.example.com",
+		Checkpoint: &CheckpointTarget{
+			Recipient:         testRecipient,
+			Bucket:            "kubenest-control-plane-checkpoints",
+			Prefix:            backup.ControlPlanePrefix,
+			Region:            "main",
+			Endpoint:          "http://minio.velero-e2e.svc:9000",
+			AccessKeyID:       "AKCHECKPOINT",
+			SecretAccessKey:   "checkpoint-secret",
+			CredentialsSecret: CheckpointCredentialsSecret,
+		},
+	})
+	cliValues, err := os.ReadFile(cliValuesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// THE VALUES THE FENCE STAGE APPLIES: the CLI's own document, plus the pin it
+	// writes. Rendering them is what makes this a test of the pair — the values
+	// the CLI produces and the chart that reads them.
+	held := BackendImage{Repository: runningBackendRepository, Tag: runningBackendTag, Digest: runningBackendDigest}
+	fenced, err := FenceValues(string(cliValues), FenceOptions{Up: true, HeldImage: &held})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// THE MIGRATION JOB HAS TO BE IN THE RENDER for its image to be read: the
+	// chart renders it only when the migration is enabled, which is the state the
+	// stage that creates it applies.
+	values, err := MigrationValues(fenced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valuesFile := filepath.Join(t.TempDir(), "values.yaml")
+	if err := os.WriteFile(valuesFile, []byte(values), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	chartValues, err := ChartFile("values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chartImage, chartPullPolicy := chartBackendImage(t, string(chartValues))
+	heldReference := held.Repository + "@" + held.Digest
+
+	objects := helmTemplate(t, helm, archive, valuesFile, "")
+
+	deployment := objectNamed(t, objects, "Deployment", ReleaseName+"-backend", true)
+	backend := containerNamed(t, mapping(t, dig(t, deployment, "spec", "template", "spec")), "containers", "backend")
+	if backend == nil {
+		t.Fatal("the rendered backend Deployment has no `backend` container")
+	}
+	if got := backend["image"]; got != heldReference {
+		t.Errorf("the backend Deployment runs %v, want the held image the fence pinned (%s): the Deployment is the one workload the pin exists for", got, heldReference)
+	}
+	// AND ITS PULL POLICY STAYS THE CHART'S, because the held pin is a reference
+	// the node has already pulled and the chart's policy is what the install set.
+	if got := backend["imagePullPolicy"]; got != chartPullPolicy {
+		t.Errorf("the held Deployment pulls %v, want the chart's own policy (%s)", got, chartPullPolicy)
+	}
+
+	checkpoint := objectNamed(t, objects, "CronJob", ReleaseName+"-checkpoint", true)
+	checkpointPod := mapping(t, dig(t, checkpoint, "spec", "jobTemplate", "spec", "template", "spec"))
+	for _, stage := range []struct{ key, name string }{{"initContainers", "dump"}, {"containers", "seal"}} {
+		container := containerNamed(t, checkpointPod, stage.key, stage.name)
+		if container == nil {
+			t.Fatalf("the rendered checkpoint Job has no %s container `%s`", stage.key, stage.name)
+		}
+		if got := container["image"]; got != chartImage {
+			t.Errorf("the checkpoint Job's %s container runs %v, want the chart's own backend image (%s): its commands are this chart's, and an older image does not have them", stage.name, got, chartImage)
+		}
+	}
+
+	migration := objectNamed(t, objects, "Job", MigrationJobName, true)
+	migrate := containerNamed(t, mapping(t, dig(t, migration, "spec", "template", "spec")), "containers", "migrate")
+	if migrate == nil {
+		t.Fatal("the rendered migration Job has no `migrate` container")
+	}
+	if got := migrate["image"]; got != chartImage {
+		t.Errorf("the migration Job runs %v, want the chart's own backend image (%s): it is the new schema's migration", got, chartImage)
+	}
+}
+
+// chartBackendImage reads the backend image the chart declares for itself, as the
+// chart's own helper renders it (templates/_helpers.tpl "kubenest.image": a digest
+// wins over a tag), and the pull policy that goes with it.
+func chartBackendImage(t *testing.T, valuesYAML string) (reference, pullPolicy string) {
+	t.Helper()
+	var doc struct {
+		Backend struct {
+			Image struct {
+				Repository string `yaml:"repository"`
+				Tag        string `yaml:"tag"`
+				Digest     string `yaml:"digest"`
+				PullPolicy string `yaml:"pullPolicy"`
+			} `yaml:"image"`
+		} `yaml:"backend"`
+	}
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		t.Fatalf("the chart's values are not readable YAML: %v", err)
+	}
+	image := doc.Backend.Image
+	switch {
+	case image.Repository == "":
+		t.Fatalf("the chart's values declare no backend repository: %+v", image)
+	case image.Digest != "":
+		reference = image.Repository + "@" + image.Digest
+	case image.Tag != "":
+		reference = image.Repository + ":" + image.Tag
+	default:
+		t.Fatalf("the chart's values pin neither a tag nor a digest for the backend: %+v", image)
+	}
+	return reference, image.PullPolicy
 }

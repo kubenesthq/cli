@@ -235,6 +235,13 @@ func RunningBackendImage(ctx context.Context, r k3s.Runner) (postgresImage, erro
 // one parser is enough — and the same precedence: a values override wins over
 // the chart's own defaults, because a document that sets backend.image IS the
 // chart this upgrade applies.
+//
+// IT IS ALWAYS backend.image AND NEVER backend.heldImage. heldImage is the pin
+// the fence and the restore hold the backend DEPLOYMENT on, so it names the code
+// this upgrade is moving AWAY from; the declared image is the code the chart is
+// moving to, and a values document read by a run no longer carries either key
+// (ValuesWithoutTheFencePin), which is why the chart's own values.yaml is what
+// normally answers here.
 func backendImageFromValues(valuesYAML string) (postgresImage, bool, error) {
 	if strings.TrimSpace(valuesYAML) == "" {
 		return postgresImage{}, false, nil

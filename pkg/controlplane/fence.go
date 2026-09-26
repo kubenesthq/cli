@@ -286,15 +286,22 @@ type FenceOptions struct {
 	// failed under failurePolicy: abort (hardware, 2026-09-25). Turning it off
 	// makes helm DELETE the Job instead; the migration stage creates it again.
 	MigrationOff bool
-	// BackendImage, when not nil, pins backend.image to this reference: the
+	// HeldImage, when not nil, pins backend.heldImage to this reference: the
 	// image the backend is RUNNING, read from its Deployment.
 	//
 	// THE APPLY THAT RAISES THE FENCE MUST CHANGE NOTHING BUT THE ROUTE. The
 	// chart a binary carries pins the NEW backend image, so an apply without
-	// this pin rolls the backend Deployment and the checkpoint CronJob onto
-	// code that has never been migrated — before the checkpoint this procedure
-	// exists to take, and before the migration that code needs.
-	BackendImage *BackendImage
+	// this pin rolls the backend Deployment onto code that has never been
+	// migrated — before the checkpoint this procedure exists to take, and
+	// before the migration that code needs.
+	//
+	// IT HOLDS THE DEPLOYMENT AND NOTHING ELSE. backend.image is also the image
+	// the checkpoint CronJob and the migration Job run, and their COMMANDS are
+	// this chart's, so a pin written there held the new chart's checkpoint Job
+	// on the old backend: on hardware (2026-09-26) its `dump` container printed
+	// a usage line for a command that image did not have and the upgrade died at
+	// the checkpoint stage (kn-t70-control-plane-version-identity-4xso.5).
+	HeldImage *BackendImage
 }
 
 // FenceValues returns the values document with the fence applied.
@@ -323,32 +330,35 @@ func FenceValues(valuesYAML string, o FenceOptions) (string, error) {
 	if o.MigrationOff {
 		doc["migration"] = map[string]any{"enabled": false}
 	}
-	if o.BackendImage != nil {
+	if o.HeldImage != nil {
 		backend, _ := doc["backend"].(map[string]any)
 		if backend == nil {
 			backend = map[string]any{}
 		}
 		// A REFERENCE WITH NO DIGEST WRITES AN EMPTY ONE, never an absent one.
-		// Helm merges these values over the chart's defaults, the chart's
-		// default backend.image carries the new release's digest, and the
-		// helper renders repository@digest whenever a digest is set. An absent
-		// key leaves that default in force, so the apply would roll the backend
-		// onto the new image after all; so would a digest left over from an
-		// earlier pin. A reference with a digest needs no tag, because the digest
-		// is what renders. Everything else under backend.image (pullPolicy, and
-		// whatever the chart grows there) is left alone.
-		image, _ := backend["image"].(map[string]any)
+		// Helm merges these values over the chart's defaults, and the chart's
+		// own values.yaml names a NEW backend image; the helper renders
+		// repository@digest whenever a digest is set, so a digest left over from
+		// an earlier pin would keep holding the Deployment on it. A reference
+		// with a digest needs no tag, because the digest is what renders, so a
+		// stale tag goes with it. Everything else under backend.heldImage
+		// (pullPolicy, and whatever the chart grows there) is left alone.
+		//
+		// backend.image IS NOT TOUCHED. It is the chart's own pin AND the image
+		// the Jobs run, and both have to stay exactly as the chart declares them
+		// (kn-t70-control-plane-version-identity-4xso.5).
+		image, _ := backend["heldImage"].(map[string]any)
 		if image == nil {
 			image = map[string]any{}
 		}
-		image["repository"] = o.BackendImage.Repository
-		image["digest"] = o.BackendImage.Digest
-		if o.BackendImage.Tag != "" {
-			image["tag"] = o.BackendImage.Tag
+		image["repository"] = o.HeldImage.Repository
+		image["digest"] = o.HeldImage.Digest
+		if o.HeldImage.Tag != "" {
+			image["tag"] = o.HeldImage.Tag
 		} else {
 			delete(image, "tag")
 		}
-		backend["image"] = image
+		backend["heldImage"] = image
 		doc["backend"] = backend
 	}
 	out, err := yaml.Marshal(doc)

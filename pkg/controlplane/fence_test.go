@@ -418,7 +418,7 @@ func TestThePinnedRunningImageIsWhatTheChartRenders(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", tc.running, err)
 		}
-		values, err := FenceValues(base, FenceOptions{Up: true, MigrationOff: true, BackendImage: &image})
+		values, err := FenceValues(base, FenceOptions{Up: true, MigrationOff: true, HeldImage: &image})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -38,14 +38,32 @@ type appliedValues struct {
 	// The install revision the values carry, which is the revision every
 	// workload is expected to be running afterwards.
 	installRevision string
-	// backend.image as the apply writes it. Empty fields mean the values
-	// mention nothing there, so the CHART's own pin is what renders.
+	// backend.image as the apply writes it: the CHART's pin, and the image the
+	// checkpoint CronJob and the migration Job run. Empty fields mean the values
+	// mention nothing there, so the chart's own pin is what renders.
 	imageRepository string
 	imageTag        string
 	imageDigest     string
+	// backend.heldImage, which only the backend Deployment reads: the image the
+	// fence stage or the failed-migration restore holds it on. Empty means the
+	// Deployment takes the chart's own pin too.
+	heldRepository string
+	heldTag        string
+	heldDigest     string
 	// raw is the applied values document verbatim, for the assertions about the
 	// parts NOT decoded above — the migration Job's pod-template inputs.
 	raw string
+}
+
+// held reports whether the apply holds the backend Deployment on its own image.
+func (a appliedValues) held() bool {
+	return a.heldRepository != "" || a.heldTag != "" || a.heldDigest != ""
+}
+
+// overriding reports whether the apply names any image at all, under either key,
+// so the chart's own pins are not what render.
+func (a appliedValues) overriding() bool {
+	return a.held() || a.imageRepository != "" || a.imageTag != "" || a.imageDigest != ""
 }
 
 // stageRunner is a FakeRunner that answers the reads the fence, checkpoint and
@@ -218,6 +236,11 @@ func decodeApplied(t *testing.T, manifest []byte) appliedValues {
 			out.imageRepository, _ = image["repository"].(string)
 			out.imageTag, _ = image["tag"].(string)
 			out.imageDigest, _ = image["digest"].(string)
+		}
+		if held, ok := backend["heldImage"].(map[string]any); ok {
+			out.heldRepository, _ = held["repository"].(string)
+			out.heldTag, _ = held["tag"].(string)
+			out.heldDigest, _ = held["digest"].(string)
 		}
 	}
 	return out
@@ -398,12 +421,40 @@ func upgradeTestValues(t *testing.T, image map[string]any) string {
 	return string(out)
 }
 
+// upgradeTestValuesHolding is upgradeTestValues with the backend Deployment HELD
+// on an older image: the values a HelmChart carries while a fence is up, and what
+// a run's own read strips before it applies anything (ValuesWithoutTheFencePin).
+func upgradeTestValuesHolding(t *testing.T, held map[string]any) string {
+	t.Helper()
+	values := upgradeTestValues(t, nil)
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(values), &doc); err != nil {
+		t.Fatal(err)
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	if backend == nil {
+		backend = map[string]any{}
+	}
+	backend["heldImage"] = held
+	doc["backend"] = backend
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
 // The fence stage's apply is the FIRST change of the whole procedure and it runs
 // BEFORE the checkpoint and before the migration. The chart this binary carries
-// pins a NEW backend image, so an apply that does not hold the backend to the
-// image it runs now rolls the backend Deployment AND the checkpoint CronJob onto
-// code that has never been migrated — and the checkpoint that follows would be
-// taken by that code, over a schema it may already have moved.
+// pins a NEW backend image, so an apply that does not hold the backend DEPLOYMENT
+// to the image it runs now rolls it onto code that has never been migrated.
+//
+// AND IT HOLDS ONLY THE DEPLOYMENT: the pin goes on backend.heldImage, never on
+// backend.image, because backend.image is also the image the checkpoint CronJob
+// and the migration Job run and their commands are this chart's. A pin written
+// there ran the new chart's `dump` on an old image, which printed a usage line for
+// a command it did not have (hardware, 2026-09-26;
+// kn-t70-control-plane-version-identity-4xso.5).
 //
 // Its values must also turn the chart's migration Job OFF explicitly: the values
 // the run starts from carry migration.enabled, and an apply that reproduced them
@@ -442,7 +493,7 @@ func TestTheFenceApplyKeepsTheRunningBackendImageAndTurnsTheMigrationJobOff(t *t
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			values := upgradeTestValues(t, recordedPin)
+			values := upgradeTestValuesHolding(t, recordedPin)
 			runner := newStageRunner(t, values)
 			runner.runningImage = tc.running
 			s := testUpgradeSession(t, runner, values)
@@ -460,17 +511,21 @@ func TestTheFenceApplyKeepsTheRunningBackendImageAndTurnsTheMigrationJobOff(t *t
 			if got.migration {
 				t.Error("the fence apply left migration.enabled true, so helm would re-render the release's migration Job with a new pod template; that template is immutable and the upgrade would fail")
 			}
-			if got.imageRepository != runningBackendRepository {
-				t.Errorf("the fence apply pins backend.image.repository = %q, want %q: whatever this apply leaves the backend and its checkpoint CronJob on is what takes the checkpoint", got.imageRepository, runningBackendRepository)
+			if got.heldRepository != runningBackendRepository {
+				t.Errorf("the fence apply holds backend.heldImage.repository = %q, want %q: the backend Deployment is what this pin is for", got.heldRepository, runningBackendRepository)
 			}
-			if got.imageDigest != tc.wantDigest {
-				t.Errorf("the fence apply pins backend.image.digest = %q, want %q (the running reference %q)", got.imageDigest, tc.wantDigest, tc.running)
+			if got.heldDigest != tc.wantDigest {
+				t.Errorf("the fence apply holds backend.heldImage.digest = %q, want %q (the running reference %q)", got.heldDigest, tc.wantDigest, tc.running)
 			}
-			if got.imageTag != tc.wantTag {
-				t.Errorf("the fence apply pins backend.image.tag = %q, want %q (the running reference %q)", got.imageTag, tc.wantTag, tc.running)
+			if got.heldTag != tc.wantTag {
+				t.Errorf("the fence apply holds backend.heldImage.tag = %q, want %q (the running reference %q)", got.heldTag, tc.wantTag, tc.running)
 			}
-			if got.imageTag == recordedPinTag || got.imageDigest == recordedPinDigest {
-				t.Errorf("the fence apply left the pin the previous release recorded in the values (tag %q, digest %q): the chart renders whatever those two fields say", got.imageTag, got.imageDigest)
+			if got.imageRepository != "" || got.imageTag != "" || got.imageDigest != "" {
+				t.Errorf("the fence apply also wrote backend.image (%q/%q/%q), which is the chart's own pin AND the image the checkpoint CronJob and the migration Job run: a pin there holds the new chart's Jobs on an older image, whose commands they do not have",
+					got.imageRepository, got.imageTag, got.imageDigest)
+			}
+			if got.heldTag == recordedPinTag || got.heldDigest == recordedPinDigest {
+				t.Errorf("the fence apply left the pin the previous release recorded in the values (tag %q, digest %q): the chart renders whatever those two fields say", got.heldTag, got.heldDigest)
 			}
 		})
 	}
@@ -584,8 +639,8 @@ func TestTheMigrationAndChartAppliesRunTheNewBackendImage(t *testing.T) {
 	if len(runner.applied) < 4 {
 		t.Fatalf("the stages applied %d chart(s), want the fence, the stopped backend, the migration and the new chart: %+v", len(runner.applied), runner.applied)
 	}
-	if runner.applied[0].imageTag == "" && runner.applied[0].imageDigest == "" {
-		t.Fatal("the fence apply carried no image pin, so this test could not see a pin leaking past it")
+	if !runner.applied[0].held() {
+		t.Fatal("the fence apply carried no held image, so this test could not see a pin leaking past it")
 	}
 	// The migration apply is the first one that enables the Job; the new
 	// chart's apply is the last, with the backend running again. (The chart
@@ -608,10 +663,30 @@ func TestTheMigrationAndChartAppliesRunTheNewBackendImage(t *testing.T) {
 	}
 	for _, i := range []int{migration, chart} {
 		got := runner.applied[i]
-		if got.imageRepository != "" || got.imageTag != "" || got.imageDigest != "" {
-			t.Errorf("apply %d carried backend.image repository %q tag %q digest %q, want no override at all: the chart's own pin is what the migration Job and the new backend run", i, got.imageRepository, got.imageTag, got.imageDigest)
+		if got.overriding() {
+			t.Errorf("apply %d names an image (%s), want no override at all under either key: the chart's own pin is what the migration Job and the new backend run, and a held image belongs only in an apply that is holding an old Deployment",
+				i, pinnedDescription(got))
 		}
 	}
+}
+
+// pinnedDescription names what an apply overrode, for a failure message: a
+// mismatch between two runs prints both keys, and which one moved is the answer.
+func pinnedDescription(a appliedValues) string {
+	out := ""
+	if a.held() {
+		out = "backend.heldImage=" + a.heldRepository + ":" + a.heldTag + "@" + a.heldDigest
+	}
+	if a.imageRepository != "" || a.imageTag != "" || a.imageDigest != "" {
+		if out != "" {
+			out += " and "
+		}
+		out += "backend.image=" + a.imageRepository + ":" + a.imageTag + "@" + a.imageDigest
+	}
+	if out == "" {
+		return "no image"
+	}
+	return out
 }
 
 // AN IMAGE REFERENCE IS SPLIT BY THE SAME RULES THE CHART RENDERS IT WITH
@@ -731,7 +806,7 @@ func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
 	// The values a second process reads off the cluster after the fence stage:
 	// this installation's settings and secrets, and the pin the fence apply
 	// wrote into the HelmChart.
-	pinned := upgradeTestValues(t, map[string]any{
+	pinned := upgradeTestValuesHolding(t, map[string]any{
 		"repository": runningBackendRepository,
 		"tag":        recordedPinTag,
 		"pullPolicy": "IfNotPresent",
@@ -752,9 +827,7 @@ func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
 	if len(runner.applied) < 4 {
 		t.Fatalf("the stages applied %d chart(s), want the fence, the stopped backend, the migration and the new chart: %+v", len(runner.applied), runner.applied)
 	}
-	pinned_ := func(a appliedValues) bool {
-		return a.imageRepository != "" || a.imageTag != "" || a.imageDigest != ""
-	}
+	pinned_ := func(a appliedValues) bool { return a.overriding() }
 	// THE FENCE APPLY IS THE ONE APPLY THAT MUST PIN, and asserting it here is
 	// what makes the rest of this test able to see a pin at all: a run whose base
 	// values carried no pin would prove nothing about a run whose did.
@@ -763,8 +836,8 @@ func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
 	}
 	for i, applied := range runner.applied[1:] {
 		if pinned_(applied) {
-			t.Errorf("apply %d carried backend.image %s:%s@%s, want no override at all: the chart's own pin is the code this run is upgrading to, and it is the fence's pin — not the run's — that has to stay out of the later applies",
-				i+1, applied.imageRepository, applied.imageTag, applied.imageDigest)
+			t.Errorf("apply %d names an image (%s), want no override at all: the chart's own pins are the code this run is upgrading to, and it is the fence's pin — not the run's — that has to stay out of the later applies",
+				i+1, pinnedDescription(applied))
 		}
 	}
 	// THE VALIDATION DEMANDS THE NEW BUILD, because the chart's own pin is now
@@ -779,4 +852,85 @@ func TestAResumedRunRollsTheChartsOwnImage(t *testing.T) {
 	if expectations.StaleBuild != s.Opts.Before.Build {
 		t.Errorf("the validation would not refuse the build that was serving before the upgrade (%q), want %q", expectations.StaleBuild, s.Opts.Before.Build)
 	}
+}
+
+// THE FENCE AND THE RESTORE HOLD THE DEPLOYMENT, AND ONLY THE DEPLOYMENT
+// (kn-t70-control-plane-version-identity-4xso.5).
+//
+// Their pin used to be backend.image, which is ALSO the image the checkpoint
+// CronJob and the migration Job run. While the fence was up, the new chart's
+// checkpoint Job therefore ran the old backend: on hardware (2026-09-26) its
+// `dump` container printed `usage: python -m app.services.checkpoint_runner ...`
+// and the upgrade died at the checkpoint stage. The pin belongs on
+// backend.heldImage, which only the backend Deployment reads, and it must leave
+// backend.image exactly as the chart declares it.
+func TestTheFenceAndTheRestorePinOnlyTheHeldImage(t *testing.T) {
+	base := upgradeTestValues(t, nil)
+	held := BackendImage{Repository: runningBackendRepository, Tag: runningBackendTag, Digest: runningBackendDigest}
+
+	// THE FENCE STAGE'S VALUES.
+	fenced, err := FenceValues(base, FenceOptions{Up: true, MigrationOff: true, HeldImage: &held})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHeldPin(t, fenced, held.Repository, held.Tag, held.Digest)
+	if image, ok := backendGroupKey(t, fenced, "image"); ok {
+		t.Errorf("the fence's values carry backend.image %v, which is the chart's own pin AND the image the checkpoint and migration Jobs run", image)
+	}
+
+	// THE FAILED-MIGRATION RESTORE'S VALUES.
+	reference := runningBackendRepository + "@" + runningBackendDigest
+	restored, err := withHeldBackendImage(base, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reference it parses is digest-pinned, so the held pin carries no tag.
+	assertHeldPin(t, restored, runningBackendRepository, "", runningBackendDigest)
+	if image, ok := backendGroupKey(t, restored, "image"); ok {
+		t.Errorf("the restore's values carry backend.image %v, which is the chart's own pin AND the image the checkpoint and migration Jobs run", image)
+	}
+
+	// AND A RUN'S OWN READ DROPS THE HEld PIN, under either spelling: what this
+	// read returns becomes every apply the run makes.
+	stripped, err := ValuesWithoutTheFencePin(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pin, ok := backendGroupKey(t, stripped, "heldImage"); ok {
+		t.Errorf("a run's base values still carry backend.heldImage %v, so its stop apply, its migration Job, its chart stage and its unfence apply would all render the image the fence was holding", pin)
+	}
+	if pin, ok := backendGroupKey(t, stripped, "image"); ok {
+		t.Errorf("a run's base values still carry backend.image %v, so the applies would not render the chart's own pin", pin)
+	}
+}
+
+// assertHeldPin checks the values hold the backend Deployment on exactly this
+// reference. A digest is compared as written — including an empty one, which is
+// what a tag-only reference carries — and a tag is only required when one was
+// given.
+func assertHeldPin(t *testing.T, valuesYAML, wantRepository, wantTag, wantDigest string) {
+	t.Helper()
+	pin, ok := backendGroupKey(t, valuesYAML, "heldImage")
+	if !ok {
+		t.Fatalf("the values carry no backend.heldImage, so the Deployment would run the chart's new image:\n%s", valuesYAML)
+	}
+	if pin["repository"] != wantRepository || pin["digest"] != wantDigest {
+		t.Errorf("backend.heldImage is %v, want repository %s and digest %s", pin, wantRepository, wantDigest)
+	}
+	if wantTag != "" && pin["tag"] != wantTag {
+		t.Errorf("backend.heldImage carries tag %v, want %s", pin["tag"], wantTag)
+	}
+}
+
+// backendGroupKey returns one key of the values' backend group, and whether it is
+// there at all.
+func backendGroupKey(t *testing.T, valuesYAML, key string) (map[string]any, bool) {
+	t.Helper()
+	var doc map[string]any
+	if err := yaml.Unmarshal([]byte(valuesYAML), &doc); err != nil {
+		t.Fatalf("the values are not readable YAML: %v", err)
+	}
+	backend, _ := doc["backend"].(map[string]any)
+	value, ok := backend[key].(map[string]any)
+	return value, ok
 }
