@@ -201,6 +201,12 @@ func cpDial(t *testing.T, ctx context.Context, env cpUpgradeEnv) *sshx.Client {
 // backend from the moment the route switches until it is restored — is about
 // an interval, so it needs an observer that runs during the interval rather
 // than a reading taken afterwards.
+//
+// A FENCE ANSWER IS ONE THE FENCE STAMPED, not any 503. The migration stage
+// stops the backend, and a gateway whose route still names the stopped backend
+// answers 503 too; a watcher that counted every 503 as the fence passed a run
+// whose fence was never raised, because its only 503s were the stopped
+// backend's (T7.0's planted negative, 2026-09-26).
 type cpFenceWatcher struct {
 	url      string
 	client   *http.Client
@@ -209,6 +215,7 @@ type cpFenceWatcher struct {
 	mu       sync.Mutex
 	sawFence bool
 	answers  []int
+	fenced   []bool
 	leaked   []int
 }
 
@@ -230,6 +237,8 @@ func cpStartWatcher(url string, ca []byte) *cpFenceWatcher {
 				_ = resp.Body.Close()
 				w.mu.Lock()
 				w.answers = append(w.answers, resp.StatusCode)
+				w.fenced = append(w.fenced, resp.StatusCode == http.StatusServiceUnavailable &&
+					resp.Header.Get(api.FenceHeader) == api.FenceHeaderUp)
 				w.mu.Unlock()
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -239,18 +248,19 @@ func cpStartWatcher(url string, ca []byte) *cpFenceWatcher {
 }
 
 // close stops the poller and judges what it saw. The fenced interval runs from
-// the first 503 to the last one; any other answer inside it is a request that
-// reached a backend while the fence was meant to be up, which is what S2
-// forbids. Answers after the last 503 are the fence lowered on purpose, so a
-// successful upgrade's closing 200s are not leaks.
+// the first fence answer to the last one; any other answer inside it, a
+// backend's or a gateway's 503 for a backend that is not there, is a request
+// the route sent somewhere other than the fence while it was meant to be up,
+// which is what S2 forbids. Answers after the last fence answer are the fence
+// lowered on purpose, so a successful upgrade's closing 200s are not leaks.
 func (w *cpFenceWatcher) close() {
 	close(w.stop)
 	<-w.done
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	first, last := -1, -1
-	for i, code := range w.answers {
-		if code == http.StatusServiceUnavailable {
+	for i, fenced := range w.fenced {
+		if fenced {
 			if first < 0 {
 				first = i
 			}
@@ -259,7 +269,7 @@ func (w *cpFenceWatcher) close() {
 	}
 	w.sawFence = first >= 0
 	for i := first + 1; first >= 0 && i < last; i++ {
-		if w.answers[i] != http.StatusServiceUnavailable {
+		if !w.fenced[i] {
 			w.leaked = append(w.leaked, w.answers[i])
 		}
 	}
