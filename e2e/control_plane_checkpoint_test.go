@@ -36,6 +36,15 @@
 //	    fields — the CronJob the chart installed and the checkpoint's own
 //	    published retention — rather than by waiting fourteen days.
 //
+// BEFORE ANY OF THEM, AND AS A FIXTURE RATHER THAN AN ASSERTION: the control
+// plane is signed in to under the gate's own HOME (since 1acd82d every
+// control-plane `backup` path checks the control plane's contract era first),
+// and the management cluster is given its first WORKLOAD backup, because its
+// `backup` group reports BACKUP_NEVER_RUN until one completes and a Velero-side
+// warning stands over the control plane's own verdict
+// (kubenest-backend check_backup) — which would hide every reason code the
+// assertions below wait for. See t47Login and t47EnsureAWorkloadBackupExists.
+//
 // WHERE THE BACKEND'S ANSWER COMES FROM. There is no `kubenest health` command
 // yet (kn-9pgx builds it), so (c) and (d) read the fleet-health API the CLI's
 // own client talks to, with the token the CLI holds. The management cluster is
@@ -55,7 +64,9 @@
 // Pass limits, from the bead: the revocation-triggered checkpoint is eligible
 // within 60 s of the change; the on-demand checkpoint within the bundle's
 // component-ready-bounded wait; the CronJob's suspension shows up in the next
-// health report.
+// health report. The fixture's workload backup runs within the bundle's own
+// backup timeout, and the verdict it produces is waited for across one health
+// report interval.
 package e2e
 
 import (
@@ -67,6 +78,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,6 +137,17 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 	// nothing here touches the operator's own state.
 	t.Setenv("HOME", t.TempDir())
 
+	// ...WHICH MEANS THE CONTROL PLANE HAS TO BE SIGNED IN TO FIRST. The
+	// control-plane branch of `backup now` checks the control plane's contract
+	// era before it does anything (pkg/cmd/control_plane_version.go:
+	// commandsNeedingTheControlPlane lists `backup`), and that check needs a
+	// configured, reachable control plane: without this the gate dies in one
+	// second with "no control plane configured: run kubenest login ... first".
+	// The login is the operator's own first step, taken the way an operator in
+	// a script does it — the gate's token on stdin, and the lab control plane's
+	// own CA when the wrapper exported one.
+	t47Login(t, env)
+
 	// The control plane's own record names the cluster it runs in. That is the
 	// backend's source for "which cluster is the management cluster", and the
 	// cluster whose `backup` group the assertions below read.
@@ -142,6 +165,17 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 	// The manifest the run reads its deadline from, at the version the control
 	// plane has recorded for that cluster.
 	bundlePath := t47BundleManifest(t, ctx, env, managementCluster)
+
+	// THE FIXTURE THE VERDICT ARMS NEED, AND IT IS NOT AN ASSERTION. The
+	// management cluster's `backup` group reports BACKUP_NEVER_RUN until its
+	// first workload backup completes, and a WARNING from Velero's side STANDS
+	// OVER the control plane's own verdict
+	// (kubenest-backend app/services/health/evaluate.py::check_backup: "a louder
+	// verdict is never replaced by a quieter one"). On a freshly installed
+	// control plane the nightly schedule is 02:00, so the arms below would wait
+	// for reason codes the fold never reaches (hardware, 2026-09-26). One
+	// workload backup is what the install's own schedule would have produced.
+	t47EnsureAWorkloadBackupExists(t, ctx, cp, env, bundlePath, managementCluster)
 
 	// What is eligible before anything this gate does: every later "a new
 	// checkpoint exists" is measured against this.
@@ -364,6 +398,14 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 	})
 
 	t.Run("the nightly retention and the 14-day floor come from the manifest", func(t *testing.T) {
+		// THE ARM BELOW READS THE CHECKPOINT ARM (a) TOOK. An arm (a) that
+		// failed leaves a zero value here, and a zero value compared against
+		// the floor reports "retention_seconds=0" — a number that was never
+		// published, about a checkpoint that does not exist. Say which arm did
+		// not produce it instead.
+		if onDemand.Key == "" {
+			t.Fatal("no on-demand checkpoint was recorded: arm (a) (`backup now --control-plane`) did not produce one, so there is no published retention to read and the zero value here would be a bogus finding")
+		}
 		// READ, NOT WAITED FOR. Object expiry is a function of the chart's own
 		// fields, so waiting fourteen days would prove nothing that reading
 		// them does not — and the fields are what a chart change has to keep.
@@ -406,11 +448,47 @@ func TestControlPlaneCheckpointGate(t *testing.T) {
 // t47RunCLI runs the real command tree, so the flags and the refusals are the
 // ones an operator gets.
 func t47RunCLI(out io.Writer, args ...string) error {
+	return t47RunCLIWithStdin(out, nil, args...)
+}
+
+// t47RunCLIWithStdin is t47RunCLI for the commands that read their input from
+// stdin — `login --token-stdin` is the one this gate needs: the alternative is
+// the device flow, which waits for a human.
+func t47RunCLIWithStdin(out io.Writer, in io.Reader, args ...string) error {
 	root := cmd.NewRootCommand()
 	root.SetOut(out)
 	root.SetErr(out)
+	if in != nil {
+		root.SetIn(in)
+	}
 	root.SetArgs(args)
 	return root.Execute()
+}
+
+// t47Login stores the control plane's credential in the HOME this gate owns.
+//
+// THE GATE RUNS EVERY OTHER COMMAND UNDER `HOME=<temp dir>`, so the operator's
+// own login does not exist for it — and since 1acd82d every `backup` command
+// checks the control plane's contract era first, which needs one. --ca-file is
+// passed when the wrapper exported KUBENEST_CONTROL_PLANE_CA: the lab control
+// plane's certificate is signed by its own CA, and without it the login fails
+// on the TLS handshake rather than on anything about this gate.
+func t47Login(t *testing.T, env t47Env) {
+	t.Helper()
+	args := []string{"login", "--control-plane", env.controlPlane, "--token-stdin"}
+	if len(env.controlPlaneCA) > 0 {
+		caFile := filepath.Join(t.TempDir(), "control-plane-ca.pem")
+		if err := os.WriteFile(caFile, env.controlPlaneCA, 0o600); err != nil {
+			t.Fatalf("writing the control plane's CA out for the login: %v", err)
+		}
+		args = append(args, "--ca-file", caFile)
+	}
+	var out bytes.Buffer
+	if err := t47RunCLIWithStdin(&out, strings.NewReader(env.token), args...); err != nil {
+		t.Fatalf("logging in to %s (this gate runs under its own HOME, so the control plane has to be signed in to before any `backup` command can check its contract era): %v\n%s",
+			env.controlPlane, err, out.String())
+	}
+	t.Logf("signed in to %s with the gate's token: %s", env.controlPlane, strings.TrimSpace(out.String()))
 }
 
 // t47BackupArgs is the control-plane invocation: the server it reaches and the
@@ -449,6 +527,61 @@ func t47BundleManifest(t *testing.T, ctx context.Context, env t47Env, clusterID 
 		t.Fatal(err)
 	}
 	return path
+}
+
+// t47EnsureAWorkloadBackupExists takes one workload backup of the management
+// cluster, through the real command, and waits until the cluster's `backup`
+// group is decided by the control plane's own facts.
+//
+// THE FIXTURE, NOT AN ASSERTION, AND THE REASON IS A PRECEDENCE.
+// kubenest-backend's check_backup returns Velero's verdict unchanged whenever
+// it is a WARNING or CRITICAL, and the control plane's verdict decides only
+// when Velero's is OK. On a freshly installed control plane the nightly backup
+// schedule is 02:00, so its `backup` group says BACKUP_NEVER_RUN — a WARNING —
+// and every control-plane reason code the arms below wait for (STALE, and the
+// revocation's unprotected-change warning) is unreachable behind it. One
+// completed workload backup is what the install's own schedule would have
+// produced by the time an operator looks.
+//
+// The wait is on the same health report the arms read, so a fixture that did
+// not work fails HERE, naming the code that is still masking the control
+// plane's — rather than leaving a later arm to report a code it never had a
+// chance to see.
+func t47EnsureAWorkloadBackupExists(
+	t *testing.T, ctx context.Context, cp t47API, env t47Env, bundlePath, clusterID string,
+) {
+	t.Helper()
+	name := cp.ClusterName(ctx, t, clusterID)
+	args := []string{"backup", "now", "--cluster", name, "--server", env.server, "--bundle-manifest", bundlePath}
+	if env.sshUser != "" {
+		args = append(args, "--ssh-user", env.sshUser)
+	}
+	if env.sshKey != "" {
+		args = append(args, "--ssh-key", env.sshKey)
+	}
+	var out bytes.Buffer
+	started := time.Now()
+	if err := t47RunCLI(&out, args...); err != nil {
+		t.Fatalf("kubenest backup now --cluster %s (the management cluster's first workload backup, which the verdict arms below need before Velero's BACKUP_NEVER_RUN stops standing over the control plane's own verdict): %v\n%s",
+			name, err, out.String())
+	}
+	t.Logf("management cluster %s took a workload backup in %s: %s",
+		name, time.Since(started).Round(time.Second), strings.TrimSpace(out.String()))
+
+	t47WaitFor(t, t47HealthReportWait, 5*time.Second,
+		"the management cluster's `backup` group to be decided by the control plane's own recovery facts",
+		func() (bool, string) {
+			return t47BackupVerdict(ctx, t, cp, clusterID, func(check t47Check, _ map[string]any) (bool, string) {
+				summary := fmt.Sprintf("%s: %s", check.ReasonCode, check.Message)
+				// "ok" is the control plane's own all-clear, and every other
+				// control-plane verdict names itself; a Velero-side WARNING
+				// would carry neither and would still be masking it.
+				if check.Status == "ok" || strings.HasPrefix(check.ReasonCode, "CONTROL_PLANE_") {
+					return true, summary
+				}
+				return false, summary
+			})
+		})
 }
 
 // t47WaitFor retries until check holds, and fails the test naming what it was
@@ -791,6 +924,29 @@ func (a t47API) ManagementCluster(ctx context.Context, t *testing.T, session, or
 		t.Fatal("the control-plane recovery kit names no cluster: the install records the management cluster on that kit, and without it the backend folds the control plane's checkpoints into no cluster's verdict")
 	}
 	return out.ClusterID
+}
+
+// ClusterName reads the management cluster's own record for its NAME, which is
+// what the CLI's workload `backup now --cluster` is scoped to. The id above is
+// the backend's key for the verdicts this gate reads and is not what the
+// command takes, so the two are read from the same record rather than guessed.
+func (a t47API) ClusterName(ctx context.Context, t *testing.T, clusterID string) string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+"/api/v1/clusters/"+url.PathEscape(clusterID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+a.token)
+	var out struct {
+		Name string `json:"name"`
+	}
+	if err := a.send(req, &out); err != nil {
+		t.Fatalf("reading the management cluster's record: %v", err)
+	}
+	if out.Name == "" {
+		t.Fatal("the management cluster's record carries no name, so its first workload backup cannot be scoped to it")
+	}
+	return out.Name
 }
 
 // MintAndRevoke mints a CLI token and revokes it, and returns a description of
