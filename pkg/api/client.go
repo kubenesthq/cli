@@ -165,7 +165,12 @@ func (c *Client) ListBundles(ctx context.Context) ([]BundleListEntry, error) {
 
 func (c *Client) endpoint(p string) string {
 	u := *c.baseURL
-	u.Path = strings.TrimRight(u.Path, "/") + p
+	// A query in p is a query, not part of the path: appended to the path, its
+	// '?' would be escaped and the request would reach a path that does not
+	// exist.
+	path, query, _ := strings.Cut(p, "?")
+	u.Path = strings.TrimRight(u.Path, "/") + path
+	u.RawQuery = query
 	return u.String()
 }
 

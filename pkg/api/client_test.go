@@ -334,3 +334,26 @@ func selfSignedServer(t *testing.T, handler http.Handler) ([]byte, *httptest.Ser
 	t.Cleanup(srv.Close)
 	return certPEM, srv
 }
+
+// A path with a query reaches the server as a path and a query. endpoint used
+// to append the whole string to the URL's path, so the '?' was escaped and the
+// backend answered 404 (hardware, 2026-09-27: the S4 gate's project lookup).
+func TestGetSendsAQueryAsAQuery(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.Query().Get("cluster_id")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	client, err := New(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, _, err := client.Get(context.Background(), "/api/v1/projects?cluster_id=c-1&items_per_page=100")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("GET: status %d, %v", status, err)
+	}
+	if gotPath != "/api/v1/projects" || gotQuery != "c-1" {
+		t.Errorf("the server saw path %q and cluster_id %q, want /api/v1/projects and c-1", gotPath, gotQuery)
+	}
+}
