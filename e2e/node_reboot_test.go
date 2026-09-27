@@ -234,6 +234,13 @@ func TestNodeRebootGate(t *testing.T) {
 		if !strings.Contains(output[last:], "is Ready") {
 			t.Errorf("the last step does not report the node Ready:\n%s", output[last:])
 		}
+		// THE REBOOT KILLED THIS TEST'S OWN CONNECTION TO THE HOST. Redial
+		// before reading anything else from it: the command redials for the
+		// same reason, and a read over the session the reboot killed fails with
+		// EOF rather than reporting a fact about the node. The fresh runner is
+		// kept in `host`, so the arms after this one read /proc and k3s's TLS
+		// directory through it too.
+		host = connectNodes(t, env)[0].Runner
 		after := hostBootID(t, host)
 		if after == before {
 			t.Errorf("the boot id did not change (%s): the host was not rebooted", after)

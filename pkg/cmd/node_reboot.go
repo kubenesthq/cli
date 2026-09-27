@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"kubenest.io/cli/pkg/api"
@@ -79,6 +80,36 @@ const (
 	gateRecoveryPoint = "Recovery point"
 )
 
+// The two node annotations that say "a reboot is under way and the PLATFORM
+// ordered it" (T2.7, plan 7.4).
+//
+// They are written before the first disruptive step and cleared once the node
+// is back, Ready and uncordoned. Without them a server that is slow to return
+// from a reboot this verb ordered reads, to the backend, exactly like a node
+// that died: the short not-ready grace expires and a NODE_NOT_READY alert fires
+// for a reboot the platform itself performed. The operator reads them off the
+// Node object and reports `planned_reboot` from them; the keys are spelled here
+// rather than imported because the operator is a different module (op3
+// pkg/websocket/health.go), and a rename on either side is a silent loss of the
+// grace rather than a compile error — which is why the two names carry a test
+// each.
+const (
+	// PlannedRebootStartedAtAnnotation carries the instant the reboot was
+	// ordered, in RFC3339 UTC: the operator parses exactly that layout.
+	PlannedRebootStartedAtAnnotation = "kubenest.io/reboot-started-at"
+	// PlannedRebootOperationAnnotation carries the operation record's id, so a
+	// reader can join the node to the operation that is rebooting it.
+	PlannedRebootOperationAnnotation = "kubenest.io/reboot-operation"
+)
+
+// The stages the two marker commands are recorded under, so a successor sees
+// them in the record and a resume can skip a marker that is already on the node
+// instead of resetting a pending reboot's age.
+const (
+	plannedRebootStage      = "planned-reboot"
+	plannedRebootClearStage = "planned-reboot-clear"
+)
+
 // nodeTransport is one open SSH connection to a host, with the host key the
 // handshake negotiated (so the inventory's fingerprint can be re-checked) and
 // the ability to be closed and redialled — a reboot kills the connection.
@@ -88,6 +119,68 @@ type nodeTransport interface {
 	k3s.Runner
 	HostKeyFingerprint() string
 	Close() error
+}
+
+// liveConn is the connection to the cluster's SERVER, and it is the one
+// connection the whole run shares: the operation record's reads and writes, the
+// cordon, the drain, kured's lock, the hold and the planned-reboot marker all
+// go through this object rather than through the connection that happened to
+// be open when they were written.
+//
+// That indirection is the fix for a reboot that kills the session which issued
+// it (kn-t35-…-m8l8.1): the record's store and every operation.Guarded wrapper
+// hold THIS object, so replacing the connection under it is one swap instead of
+// a hunt for every place the old one was captured. A run that kept using the
+// dead session left the node cordoned, the record open and kured's lock held.
+type liveConn struct {
+	mu  sync.Mutex
+	cur nodeTransport
+}
+
+func newLiveConn(conn nodeTransport) *liveConn { return &liveConn{cur: conn} }
+
+// swap replaces the connection. Callers must have verified the new connection
+// (its host key) before handing it over.
+func (c *liveConn) swap(conn nodeTransport) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cur = conn
+}
+
+func (c *liveConn) get() nodeTransport {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cur
+}
+
+func (c *liveConn) Run(ctx context.Context, command string) (sshx.Result, error) {
+	conn := c.get()
+	if conn == nil {
+		return sshx.Result{}, fmt.Errorf("the connection to the cluster's server is closed")
+	}
+	return conn.Run(ctx, command)
+}
+
+func (c *liveConn) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	conn := c.get()
+	if conn == nil {
+		return sshx.Result{}, fmt.Errorf("the connection to the cluster's server is closed")
+	}
+	return conn.RunInput(ctx, command, stdin)
+}
+
+func (c *liveConn) HostKeyFingerprint() string {
+	if conn := c.get(); conn != nil {
+		return conn.HostKeyFingerprint()
+	}
+	return ""
+}
+
+func (c *liveConn) Close() error {
+	if conn := c.get(); conn != nil {
+		return conn.Close()
+	}
+	return nil
 }
 
 // rebootGate is one pre-flight check. Check reports whether it passed, what it
@@ -152,6 +245,11 @@ type nodeReboot struct {
 
 	serverConn nodeTransport
 	target     nodeTransport
+	// conn is serverConn behind a pointer every other holder keeps: the
+	// operation record's store and each operation.Guarded wrapper are built
+	// from it, so replacing the connection after the reboot reaches all of them
+	// (see liveConn).
+	conn *liveConn
 
 	store0 *operation.Store
 	handle *operation.Handle
@@ -485,6 +583,7 @@ func (n *nodeReboot) connect(ctx context.Context) error {
 		return fmt.Errorf("connecting to the cluster's server %s: %w", n.server.SSHAddress, err)
 	}
 	n.serverConn = conn
+	n.conn = newLiveConn(conn)
 	if err := n.checkFingerprint(n.server, conn); err != nil {
 		return err
 	}
@@ -771,7 +870,7 @@ func (n *nodeReboot) checkRecoveryPoint(ctx context.Context) (bool, string, stri
 		return false, "the bundle manifest carries no health.backup.max-backup-age, so the freshness a recovery point must have cannot be judged",
 			"the bundle decides this threshold — a default in code would be a number nobody measured"
 	}
-	unconfigured, err := backup.Unconfigured(ctx, n.serverConn)
+	unconfigured, err := backup.Unconfigured(ctx, n.clusterClient())
 	switch {
 	case err != nil:
 		return false, "whether this cluster has a backup target could not be read, so whether a recovery point exists is unknown: " + err.Error(),
@@ -780,7 +879,7 @@ func (n *nodeReboot) checkRecoveryPoint(ctx context.Context) (bool, string, stri
 		return true, "this cluster has no backup target configured, so it has no recovery point a reboot could make stale (`kubenest backup set-target` is what gives it one)", ""
 	}
 
-	out, err := k3s.Kubectl(ctx, n.serverConn, "get backups.velero.io -n "+backup.Namespace+" -o json")
+	out, err := k3s.Kubectl(ctx, n.clusterClient(), "get backups.velero.io -n "+backup.Namespace+" -o json")
 	if err != nil {
 		return false, "the cluster's workload backups could not be read: " + err.Error(),
 			"the recovery point this reboot could invalidate has to be readable before it is relied on: fix the read, then re-run"
@@ -861,6 +960,8 @@ func (n *nodeReboot) printPlan(gates []gateResult) {
 	}
 	fmt.Fprintf(n.out, "  waiting:   SSH reachable, then %s, then the cluster API answering with the node Ready — each within %s (limits.timeouts.node-reboot)\n", n.serviceName()+" active", n.rebootFor)
 	fmt.Fprintf(n.out, "  interlock: kured's lock is taken for %s (node-drain + node-reboot), and held until the node is back and uncordoned\n", n.ttl)
+	fmt.Fprintf(n.out, "  marker:    %s is annotated %s=<now in RFC3339 UTC> before the first disruptive step (%s) and cleared once it is back and uncordoned, so the backend reads this reboot as planned rather than as a node that died; a node that never returns keeps the marker and is reported as an overrun\n",
+		n.node.Name, PlannedRebootStartedAtAnnotation, n.disruptVerb())
 }
 
 func titleVerb(k3sOnly bool) string {
@@ -897,7 +998,7 @@ func (n *nodeReboot) serviceName() string {
 // openRecord creates the operation record — the lock and the resume path — or
 // takes over the one an interrupted run left behind.
 func (n *nodeReboot) openRecord(ctx context.Context) error {
-	n.store0 = n.store(n.serverConn)
+	n.store0 = n.store(n.clusterClient())
 	req := operation.Request{
 		Kind:    operation.KindNodeReboot,
 		Cluster: n.f.Cluster,
@@ -964,6 +1065,13 @@ func (n *nodeReboot) act(ctx context.Context) error {
 	if err := n.takeInterlock(ctx); err != nil {
 		return err
 	}
+	// The marker goes on HERE: after everything that can refuse and before
+	// anything disruptive. A window refusal, a gate, a failed hold or a lock
+	// kured already holds therefore writes nothing, while a reboot this verb
+	// issues is distinguishable from a dead node from the first cordon onwards.
+	if err := n.markPlannedReboot(ctx); err != nil {
+		return n.unwind(ctx, err)
+	}
 
 	drained := false
 	if !n.f.K3sOnly && n.nodeCount > 1 {
@@ -990,8 +1098,20 @@ func (n *nodeReboot) act(ctx context.Context) error {
 		// concurrency of 1 that halts the sequence instead of letting the next
 		// node go down while somebody works out what happened (PLAN 7.4, "One
 		// node at a time"). The TTL this command took bounds it.
+		//
+		// The planned-reboot MARKER stays too, and that is deliberate: the node
+		// really is still rebooting (or never came back), so the backend must
+		// keep reporting the overrun until somebody clears it.
 		fmt.Fprintf(n.out, "\n%s is NOT back. It is left cordoned, and kured's lock is left held so no other node is rebooted until somebody has looked: the lock expires after %s from when it was taken, and\n  sudo -n k3s kubectl -n kube-system annotate daemonset kured %s-\nreleases it by hand (kured's own documented recovery).\n",
 			n.node.Name, n.ttl, interlock.LockAnnotation)
+		return err
+	}
+
+	// The session that issued the reboot died with the host. Every step from
+	// here — the uncordon, the record's own reads and writes, kured's lock
+	// release and the marker removal — runs through a connection that outlives
+	// the reboot (kn-t35-…-m8l8.1).
+	if err := n.rerigAfterReboot(ctx); err != nil {
 		return err
 	}
 
@@ -999,6 +1119,11 @@ func (n *nodeReboot) act(ctx context.Context) error {
 		if err := n.uncordon(ctx); err != nil {
 			return err
 		}
+	}
+	// The node is back, Ready and uncordoned, so the marker comes off: leaving
+	// it would keep reporting a reboot that has finished as one that never did.
+	if err := n.unmarkPlannedReboot(ctx); err != nil {
+		return err
 	}
 	n.finishDisruptAction(ctx, true)
 	n.release(ctx)
@@ -1010,12 +1135,65 @@ func (n *nodeReboot) act(ctx context.Context) error {
 // because nothing was taken down.
 func (n *nodeReboot) unwind(ctx context.Context, cause error) error {
 	if !n.f.K3sOnly && n.nodeCount > 1 {
-		if _, err := k3s.Kubectl(ctx, n.serverConn, "uncordon "+n.node.Name); err != nil {
+		if _, err := k3s.Kubectl(ctx, n.clusterClient(), "uncordon "+n.node.Name); err != nil {
 			fmt.Fprintf(n.out, "warning: %s could not be uncordoned: %v\n", n.node.Name, err)
 		}
 	}
+	// Nothing was taken down, so the marker goes away with the rest of the
+	// unwound state: a node that is not rebooting must not be reported as one,
+	// and a stale marker would make the backend report an overrun for a host
+	// that never left.
+	if err := n.unmarkPlannedReboot(ctx); err != nil {
+		fmt.Fprintf(n.out, "warning: the planned-reboot marker on %s could not be cleared: %v\n", n.node.Name, err)
+	}
 	n.release(ctx)
 	return cause
+}
+
+// markPlannedReboot annotates the node with the two markers the operator
+// reports and the backend grants the planned-reboot grace from (T2.7).
+//
+// It runs BEFORE the first disruptive step — the cordon, the drain, the reboot
+// or the k3s restart — because the whole value of the marker is that the node
+// is already marked when it stops answering. It is a recorded action like the
+// disruptive steps, so a resume finds it in the record, observes it on the node
+// and skips it rather than resetting a pending reboot's age to now.
+func (n *nodeReboot) markPlannedReboot(ctx context.Context) error {
+	startedAt := n.now().UTC().Format(time.RFC3339)
+	args := "annotate node " + n.node.Name + " " + PlannedRebootStartedAtAnnotation + "=" + startedAt
+	if n.handle != nil {
+		args += " " + PlannedRebootOperationAnnotation + "=" + n.handle.OperationID()
+	}
+	guarded := &operation.Guarded{Inner: n.clusterClient(), Op: n.handle, Stage: plannedRebootStage, Specs: rebootSpecs, Skip: n.skip}
+	if _, err := k3s.Kubectl(ctx, guarded, args+" --overwrite"); err != nil {
+		return fmt.Errorf("marking %s as being in a planned reboot: %w — without the marker the backend reads this reboot as a node that died and alerts on it", n.node.Name, err)
+	}
+	fmt.Fprintf(n.out, "  planned:   %s annotated %s=%s (%s); the backend grants this reboot the planned-reboot grace until the marker is cleared\n",
+		n.node.Name, PlannedRebootStartedAtAnnotation, startedAt, n.disruptVerb())
+	return nil
+}
+
+// unmarkPlannedReboot clears both markers once the node is back, Ready and
+// uncordoned.
+//
+// It goes through a LIVE server connection rather than the one the run started
+// with: on a single-server cluster the server IS the machine that just
+// rebooted, so the connection that issued the reboot died with the host and the
+// command has to redial. Both annotations go in one command, because a node
+// that carries only one of them is a node whose second write failed.
+func (n *nodeReboot) unmarkPlannedReboot(ctx context.Context) error {
+	runner, err := n.liveServer(ctx)
+	if err != nil {
+		return fmt.Errorf("clearing the planned-reboot marker on %s: %w", n.node.Name, err)
+	}
+	guarded := &operation.Guarded{Inner: runner, Op: n.handle, Stage: plannedRebootClearStage, Specs: rebootSpecs, Skip: n.skip}
+	if _, err := k3s.Kubectl(ctx, guarded, "annotate node "+n.node.Name+" "+
+		PlannedRebootStartedAtAnnotation+"- "+PlannedRebootOperationAnnotation+"-"); err != nil {
+		return fmt.Errorf("clearing the planned-reboot marker on %s: %w — the node is back, but until both annotations are gone the backend keeps reporting this reboot as unfinished and alerts on the overrun. Remove them by hand over SSH: sudo -n k3s kubectl annotate node %s %s- %s-",
+			n.node.Name, err, n.node.Name, PlannedRebootStartedAtAnnotation, PlannedRebootOperationAnnotation)
+	}
+	fmt.Fprintf(n.out, "  planned:   %s is back, so the planned-reboot marker is cleared\n", n.node.Name)
+	return nil
 }
 
 // hold takes the node out of kured's pool for the duration of this operation.
@@ -1030,7 +1208,7 @@ func (n *nodeReboot) hold(ctx context.Context) error {
 		fmt.Fprintf(n.out, "  hold:      %s already carries %s=%s, so kured is not running there\n", n.node.Name, day2.NoAutoRebootLabel, day2.NoAutoRebootValue)
 		return nil
 	}
-	guarded := &operation.Guarded{Inner: n.serverConn, Op: n.handle, Stage: "hold", Specs: rebootSpecs, Skip: n.skip}
+	guarded := &operation.Guarded{Inner: n.clusterClient(), Op: n.handle, Stage: "hold", Specs: rebootSpecs, Skip: n.skip}
 	if err := day2.HoldAutomaticReboots(ctx, guarded, n.node.Name); err != nil {
 		return fmt.Errorf("holding %s out of kured's pool: %w", n.node.Name, err)
 	}
@@ -1042,7 +1220,7 @@ func (n *nodeReboot) hold(ctx context.Context) error {
 // takeInterlock takes kured's own lock, which is what stops kured and this
 // command from both deciding to take a node down (T5.1, PLAN 7.2).
 func (n *nodeReboot) takeInterlock(ctx context.Context) error {
-	held, holder, err := interlock.Acquire(ctx, n.serverConn, n.node.Name, n.ttl)
+	held, holder, err := interlock.Acquire(ctx, n.clusterClient(), n.node.Name, n.ttl)
 	if err != nil {
 		return fmt.Errorf("kured's lock could not be taken: %w", err)
 	}
@@ -1059,7 +1237,7 @@ func (n *nodeReboot) takeInterlock(ctx context.Context) error {
 // failure and never hides the run's own error: a node that is back is a
 // success, and a lock left behind is bounded by its TTL.
 func (n *nodeReboot) release(ctx context.Context) {
-	if err := interlock.Release(ctx, n.serverConn, n.node.Name); err != nil {
+	if err := interlock.Release(ctx, n.clusterClient(), n.node.Name); err != nil {
 		fmt.Fprintf(n.out, "warning: kured's lock could not be released: %v (it expires %s after it was taken)\n", err, n.ttl)
 	} else {
 		fmt.Fprintf(n.out, "  interlock: kured's lock released\n")
@@ -1070,7 +1248,7 @@ func (n *nodeReboot) release(ctx context.Context) {
 	// The node did not carry the hold before this run, so putting it back the
 	// way it was found means lifting it. A node that DID carry it — every
 	// server, permanently — is never touched here.
-	if _, err := k3s.Kubectl(ctx, n.serverConn, "label node "+n.node.Name+" "+day2.NoAutoRebootLabel+"-"); err != nil {
+	if _, err := k3s.Kubectl(ctx, n.clusterClient(), "label node "+n.node.Name+" "+day2.NoAutoRebootLabel+"-"); err != nil {
 		fmt.Fprintf(n.out, "warning: the reboot hold on %s could not be lifted: %v\n", n.node.Name, err)
 	}
 }
@@ -1078,7 +1256,7 @@ func (n *nodeReboot) release(ctx context.Context) {
 // cordon makes the node unschedulable. It is the first disruptive step, so it
 // is recorded before it is submitted.
 func (n *nodeReboot) cordon(ctx context.Context) error {
-	guarded := &operation.Guarded{Inner: n.serverConn, Op: n.handle, Stage: "cordon", Specs: rebootSpecs, Skip: n.skip}
+	guarded := &operation.Guarded{Inner: n.clusterClient(), Op: n.handle, Stage: "cordon", Specs: rebootSpecs, Skip: n.skip}
 	if _, err := k3s.Kubectl(ctx, guarded, "cordon "+n.node.Name); err != nil {
 		return fmt.Errorf("cordoning %s: %w", n.node.Name, err)
 	}
@@ -1090,7 +1268,7 @@ func (n *nodeReboot) cordon(ctx context.Context) error {
 // PodDisruptionBudgets. A pod is never force-deleted and a budget is never
 // ignored: an operator's decision, not a tool's.
 func (n *nodeReboot) drain(ctx context.Context) error {
-	guarded := &operation.Guarded{Inner: n.serverConn, Op: n.handle, Stage: "drain", Specs: rebootSpecs, Skip: n.skip}
+	guarded := &operation.Guarded{Inner: n.clusterClient(), Op: n.handle, Stage: "drain", Specs: rebootSpecs, Skip: n.skip}
 	args := "drain " + n.node.Name + " --ignore-daemonsets --delete-emptydir-data --timeout=" + n.drainFor.String()
 	if _, err := k3s.Kubectl(ctx, guarded, args); err != nil {
 		return fmt.Errorf("draining %s within %s (limits.timeouts.node-drain; the drain never force-deletes a pod, so a PodDisruptionBudget that permits no disruption stops it here): %w",
@@ -1102,7 +1280,7 @@ func (n *nodeReboot) drain(ctx context.Context) error {
 
 // uncordon puts the node back into service, and only once it is Ready.
 func (n *nodeReboot) uncordon(ctx context.Context) error {
-	guarded := &operation.Guarded{Inner: n.serverConn, Op: n.handle, Stage: "uncordon", Specs: rebootSpecs, Skip: n.skip}
+	guarded := &operation.Guarded{Inner: n.clusterClient(), Op: n.handle, Stage: "uncordon", Specs: rebootSpecs, Skip: n.skip}
 	if _, err := k3s.Kubectl(ctx, guarded, "uncordon "+n.node.Name); err != nil {
 		return fmt.Errorf("uncordoning %s: %w — the node is Ready but still unschedulable", n.node.Name, err)
 	}
@@ -1294,7 +1472,89 @@ func (n *nodeReboot) liveServer(ctx context.Context) (nodeTransport, error) {
 		return nil, err
 	}
 	n.serverConn = conn
+	if n.conn != nil {
+		// The wrapper every other holder kept moves with it, so a redial here
+		// does not leave the operation record writing through a dead session.
+		n.conn.swap(conn)
+	}
 	return conn, nil
+}
+
+// clusterClient is the runner every cluster read and write goes through: the
+// shared, replaceable connection when the run has connected, and the plain
+// server connection otherwise — a unit test drives one method at a time and a
+// struct built by hand has no wrapper yet.
+func (n *nodeReboot) clusterClient() k3s.Runner {
+	if n.conn != nil {
+		return n.conn
+	}
+	return n.serverConn
+}
+
+// rerigAfterReboot replaces the connection the run reads and writes the cluster
+// through, once the host has come back.
+//
+// THE SESSION THAT ISSUED THE REBOOT DIED WITH THE HOST, and on a single-server
+// cluster that session is also the one the operation record lives on. Every
+// step after the wait — the record's own reads and writes, the uncordon, kured's
+// lock release and the planned-reboot marker removal — therefore has to run
+// through a connection that outlives the reboot. The replacement is dialled and
+// its host key re-checked exactly as the first one was: a redial that skipped
+// the fingerprint check would be a hole in the only thing standing between this
+// verb and rebooting a machine the record does not describe.
+func (n *nodeReboot) rerigAfterReboot(ctx context.Context) error {
+	// A connection that still answers is kept. On a multi-node cluster the
+	// server is a different machine that never went down, and redialling a
+	// healthy session would add a failure mode for nothing.
+	if n.conn != nil {
+		if _, err := n.conn.Run(ctx, "true"); err == nil {
+			return nil
+		}
+	}
+	// The wait has already dialled the host that rebooted, and on a
+	// single-server cluster that host IS the server: adopt that connection
+	// instead of opening a second one to the same machine.
+	if n.target != nil && n.sameHost(n.server, n.host) {
+		if _, err := n.target.Run(ctx, "true"); err == nil {
+			if err := n.checkFingerprint(n.server, n.target); err != nil {
+				return err
+			}
+			n.adoptServer(n.target)
+			return nil
+		}
+	}
+	conn, err := n.dial(ctx, n.server)
+	if err != nil {
+		return fmt.Errorf("connecting to %s again after the reboot: %w", n.server.SSHAddress, err)
+	}
+	if err := n.checkFingerprint(n.server, conn); err != nil {
+		conn.Close()
+		return err
+	}
+	n.adoptServer(conn)
+	return nil
+}
+
+// adoptServer makes conn the run's server connection: the concrete field, the
+// wrapper every holder shares, and the target when the server IS the machine
+// that rebooted. The connection it replaces is closed, because a session to a
+// host that has already rebooted is of no further use.
+func (n *nodeReboot) adoptServer(conn nodeTransport) {
+	if n.serverConn != nil && n.serverConn != conn {
+		n.serverConn.Close()
+	}
+	n.serverConn = conn
+	if n.conn == nil {
+		n.conn = newLiveConn(conn)
+	} else {
+		n.conn.swap(conn)
+	}
+	if n.sameHost(n.server, n.host) {
+		if n.target != nil && n.target != conn {
+			n.target.Close()
+		}
+		n.target = conn
+	}
 }
 
 // nodeReady asks the cluster API whether a node is Ready.
@@ -1396,6 +1656,26 @@ func rebootSpecs(stage, command string) (operation.Spec, bool) {
 			Kind:          operation.ActionSSH,
 			Postcondition: "the node is held out of kured's pool (" + day2.NoAutoRebootLabel + "=" + day2.NoAutoRebootValue + ")",
 			Observe:       `sudo -n k3s kubectl get node $(hostname) -o jsonpath='{.metadata.labels.kubenest\.io/auto-reboot}' | grep -q '^false$'`,
+		}, true
+	case plannedRebootStage:
+		if !strings.Contains(command, "kubectl annotate node ") {
+			return operation.Spec{}, false
+		}
+		name := secondWord(command, "node")
+		return operation.Spec{
+			Kind:          operation.ActionSSH,
+			Postcondition: name + " carries the planned-reboot marker (" + PlannedRebootStartedAtAnnotation + "), so the backend reads the reboot this operation orders as planned",
+			Observe:       `test -n "$(sudo -n k3s kubectl get node ` + name + ` -o jsonpath='{.metadata.annotations.kubenest\.io/reboot-started-at}')"`,
+		}, true
+	case plannedRebootClearStage:
+		if !strings.Contains(command, "kubectl annotate node ") {
+			return operation.Spec{}, false
+		}
+		name := secondWord(command, "node")
+		return operation.Spec{
+			Kind:          operation.ActionSSH,
+			Postcondition: name + " does not carry the planned-reboot marker, so a finished reboot is not reported as one still running",
+			Observe:       `test -z "$(sudo -n k3s kubectl get node ` + name + ` -o jsonpath='{.metadata.annotations.kubenest\.io/reboot-started-at}')"`,
 		}, true
 	}
 	return operation.Spec{}, false
