@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"kubenest.io/cli/pkg/preflight"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/upgrade"
 	"kubenest.io/cli/pkg/window"
 )
@@ -412,15 +414,52 @@ func (f *fakeRecords) Load(context.Context) (api.ClusterBundle, error) {
 	return f.records[len(f.records)-1].ClusterBundle, nil
 }
 
-// Save applies the record with the compare-and-swap the control plane applies:
-// a write based on a revision the record has moved past is REFUSED, not
-// applied.
+// apiRefusal is a fake control-plane refusal that errors.As can match as an
+// *api.Error while still carrying a readable message: the real client builds
+// one from the response body, the fake builds one from the check it imitates.
+type apiRefusal struct {
+	detail string
+	err    *api.Error
+}
+
+func (e apiRefusal) Error() string { return e.detail }
+func (e apiRefusal) Unwrap() error { return e.err }
+
+// Save applies the record with the checks the control plane applies, in the
+// order it applies them: the BODY is validated first (FastAPI refuses a bad
+// enum with 422 before the handler runs), and only then the revision
+// compare-and-swap (409). A write based on a revision the record has moved
+// past is REFUSED, not applied.
+//
+// Every host entry's `volume_group_ownership` must be one of the two enum
+// values — app/schemas/cluster.py:235 requires it on EVERY entry, including a
+// joining one, which is the write this fake exists to keep honest.
 func (f *fakeRecords) Save(_ context.Context, record api.BundleRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A planted failure stands in for whatever the control plane answered.
+	if f.failSave != nil {
+		err := f.failSave
+		f.failSave = nil
+		return err
+	}
+	for i, h := range record.Hosts {
+		if !validOwnership(h.VolumeGroupOwnership) {
+			detail := fmt.Sprintf("hosts[%d].volume_group_ownership: Input should be 'customer-created' or 'installer-created', input: %q",
+				i, h.VolumeGroupOwnership)
+			return apiRefusal{
+				detail: "PUT /api/v1/clusters/prod-1/bundle: [422] " + detail,
+				err:    &api.Error{Status: http.StatusUnprocessableEntity, Detail: detail},
+			}
+		}
+	}
 	current := f.records[len(f.records)-1]
 	if record.Revision != current.Revision {
-		return fmt.Errorf("the inventory has moved on: it is at revision %d, your write carried %d", current.Revision, record.Revision)
+		detail := fmt.Sprintf("the inventory has moved on: it is at revision %d, your write carried %d", current.Revision, record.Revision)
+		return apiRefusal{
+			detail: "PUT /api/v1/clusters/prod-1/bundle: [409] " + detail,
+			err:    &api.Error{Status: http.StatusConflict, Detail: detail},
+		}
 	}
 	f.saved = append(f.saved, record)
 	// The write is journalled where an assertion about ORDER can see it: an
@@ -431,11 +470,6 @@ func (f *fakeRecords) Save(_ context.Context, record api.BundleRecord) error {
 			f.log.record("control-plane", "inventory-write "+h.HostID+" "+h.LifecycleState, nil)
 		}
 	}
-	if f.failSave != nil {
-		err := f.failSave
-		f.failSave = nil
-		return err
-	}
 	if f.failOn > 0 && len(f.saved) == f.failOn {
 		return fmt.Errorf("the control plane did not accept the write (planted for this test)")
 	}
@@ -445,6 +479,11 @@ func (f *fakeRecords) Save(_ context.Context, record api.BundleRecord) error {
 	next.Revision = current.Revision + 1
 	f.records = append(f.records, upgrade.Recorded{ClusterBundle: next})
 	return nil
+}
+
+// validOwnership is the backend's VolumeGroupOwnership enum.
+func validOwnership(v string) bool {
+	return v == string(storage.CustomerCreated) || v == string(storage.InstallerCreated)
 }
 
 // inventory is what the record holds now.
@@ -533,12 +572,15 @@ func clusterRecord(hosts ...api.HostRecord) api.ClusterBundle {
 }
 
 // serverHost and agentHost are inventory entries for the two machines the
-// tests start with.
+// tests start with. They carry the volume-group ownership the control plane
+// requires on EVERY host entry — a real inventory always does, and the fake
+// record now refuses an entry that does not.
 func serverHost() api.HostRecord {
 	return api.HostRecord{
 		HostID: "h-srv", Role: "server", SSHAddress: testServerAddr, SSHPort: 22, SSHUser: "ubuntu",
 		NodeUID: "uid-srv", HostKeyFingerprint: "SHA256:server", JoinAddress: testServerAddr,
 		StorageDevice: "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive1", LifecycleState: "active",
+		VolumeGroupOwnership: string(storage.InstallerCreated),
 	}
 }
 
@@ -547,6 +589,7 @@ func agentHost() api.HostRecord {
 		HostID: "h-agt", Role: "agent", SSHAddress: "10.0.3.8", SSHPort: 22, SSHUser: "ubuntu",
 		NodeUID: "uid-agt", HostKeyFingerprint: "SHA256:agent", JoinAddress: "https://" + testServerAddr + ":6443",
 		StorageDevice: "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive2", LifecycleState: "active",
+		VolumeGroupOwnership: string(storage.InstallerCreated),
 	}
 }
 

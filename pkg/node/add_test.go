@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/window"
 )
 
@@ -342,6 +345,107 @@ func hasCommandOn(commands []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// joiningEntryFor finds the entry written for one host while it was JOINING —
+// the write that happens before the volume group exists on it.
+func joiningEntryFor(t *testing.T, records []api.BundleRecord, address string) api.HostRecord {
+	t.Helper()
+	for _, rec := range records {
+		for _, h := range rec.Hosts {
+			if h.SSHAddress == address && h.LifecycleState == string(StateJoining) {
+				return h
+			}
+		}
+	}
+	t.Fatalf("no joining entry for %s was ever written: %+v", address, records)
+	return api.HostRecord{}
+}
+
+// The joining entry is written BEFORE the volume group exists on the new host,
+// and the control plane requires one of the two ownership values on every host
+// entry, including a joining one (app/schemas/cluster.py:235). `--storage-device`
+// means the installer will create kubenest-vg; no `--storage-device` means the
+// operator created it, and preflight has just proven it exists.
+//
+// Hardware, 2026-09-27: without this the joining write carried
+// volume_group_ownership "" and the control plane answered 422, so every add
+// stopped at record-joining.
+func TestAddRecordsTheVolumeGroupOwnershipInTheJoiningEntry(t *testing.T) {
+	cases := []struct {
+		name   string
+		device string
+		want   string
+	}{
+		{"--storage-device: the installer will create it", testDevice, string(storage.InstallerCreated)},
+		{"no --storage-device: the operator created it", "", string(storage.CustomerCreated)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serverHost(), agentHost())
+			if tc.device != "" {
+				// A fresh host: no volume group yet, so the blank device is the
+				// path being asked for.
+				f.agent.on("vgs", fail(1, "Volume group \"kubenest-vg\" not found"))
+			}
+			const newNode = "prod-1-agt-2"
+			f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+				f.server.setNodes(joinedNodes(t, newNode, true))
+				return sshx.Result{}, nil
+			})
+
+			if _, err := f.runAdd(f.newAdd(AddOptions{StorageDevice: tc.device})); err != nil {
+				t.Fatalf("the add failed: %v\n%s", err, f.out.String())
+			}
+			entry := joiningEntryFor(t, f.records.savedRecords(), testAgentAddr)
+			if entry.VolumeGroupOwnership != tc.want {
+				t.Errorf("the joining entry carries volume_group_ownership %q, want %q", entry.VolumeGroupOwnership, tc.want)
+			}
+		})
+	}
+}
+
+// An inventory write the control plane refuses for its BODY is a 422, not a
+// revision conflict: "the control plane refuses a write based on a revision
+// another operator has moved on from" sends the operator looking for a
+// conflict that is not there. Only the 409 compare-and-swap gets that advice.
+func TestAnInventoryWriteRefusedForItsBodyDoesNotClaimARevisionConflict(t *testing.T) {
+	refusal := func(status int) error {
+		return apiRefusal{
+			detail: fmt.Sprintf("PUT /api/v1/clusters/prod-1/bundle: [%d] refused", status),
+			err:    &api.Error{Status: status, Detail: "refused"},
+		}
+	}
+	cases := []struct {
+		name       string
+		status     int
+		wantAdvice bool
+	}{
+		{"422: the body was refused", http.StatusUnprocessableEntity, false},
+		{"409: the revision moved on", http.StatusConflict, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serverHost(), agentHost())
+			f.records.failSave = refusal(tc.status)
+
+			_, err := f.runAdd(f.newAdd(AddOptions{}))
+			if err == nil {
+				t.Fatal("a refused inventory write must fail the stage")
+			}
+			got := err.Error()
+			if strings.Contains(got, "moved on from") != tc.wantAdvice {
+				if tc.wantAdvice {
+					t.Errorf("a %d is the revision compare-and-swap and must say so:\n%v", tc.status, err)
+				} else {
+					t.Errorf("a %d must not be described as a revision conflict:\n%v", tc.status, err)
+				}
+			}
+			if !strings.Contains(got, "writing the cluster's host inventory at revision") {
+				t.Errorf("the refusal must still name the write it was answering:\n%v", err)
+			}
+		})
+	}
 }
 
 // The cluster's existing server is a member of the cluster: it runs k3s and it

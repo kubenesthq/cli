@@ -9,6 +9,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/window"
 )
 
@@ -558,4 +559,38 @@ func indexIn(entries []entry, substr string) int {
 		}
 	}
 	return -1
+}
+
+// `node replace`'s add half is `node add`'s own record-joining write, so it
+// carried the same empty volume_group_ownership: the replacement's joining
+// entry is written before the volume group exists on it, and the control plane
+// requires one of the two enum values on every entry.
+func TestReplaceRecordsTheVolumeGroupOwnershipInTheJoiningEntry(t *testing.T) {
+	cases := []struct {
+		name   string
+		device string
+		want   string
+	}{
+		{"no --storage-device: the operator created it", "", string(storage.CustomerCreated)},
+		{"--storage-device: the installer will create it", testDevice, string(storage.InstallerCreated)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := replaceFixture(t, true, true)
+			if tc.device != "" {
+				// The replacement is a fresh host: no volume group yet.
+				f.agent.on("vgs", fail(1, "Volume group \"kubenest-vg\" not found"))
+			}
+			const newNode = "prod-1-agt-2"
+			f.joins(t, newNode)
+
+			if _, err := f.runReplace(f.newReplace(ReplaceOptions{StorageDevice: tc.device})); err != nil {
+				t.Fatalf("the replace failed: %v\n%s", err, f.out.String())
+			}
+			entry := joiningEntryFor(t, f.records.savedRecords(), testAgentAddr)
+			if entry.VolumeGroupOwnership != tc.want {
+				t.Errorf("the replacement's joining entry carries volume_group_ownership %q, want %q", entry.VolumeGroupOwnership, tc.want)
+			}
+		})
+	}
 }

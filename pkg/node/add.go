@@ -342,6 +342,12 @@ func (a *Add) stageJoining(ctx context.Context) error {
 	// host is in the record before anything is done to it.
 	a.Host.LifecycleState = string(StateJoining)
 	a.Host.JoinAddress = JoinURL(a.Server)
+	// The control plane requires one of the two volume-group ownership values
+	// on EVERY host entry, including a joining one (app/schemas/cluster.py:235).
+	// It is already decided at this point: --storage-device means the installer
+	// will create kubenest-vg, and no --storage-device means the operator did,
+	// which preflight has just proven.
+	a.Host.VolumeGroupOwnership = string(a.joiningOwnership())
 	st.HostID = a.Host.HostID
 	if err := a.saveState(st); err != nil {
 		return err
@@ -358,6 +364,21 @@ func (a *Add) stageJoining(ctx context.Context) error {
 	}
 	a.Logf("  inventory: %s written as %s at revision %d, so an interrupted join is identifiable", a.Host.HostID, StateJoining, a.Revision-1)
 	return nil
+}
+
+// joiningOwnership is what the joining entry records, before the volume group
+// exists on the new host: --storage-device means the installer will create
+// kubenest-vg, and no --storage-device means the operator created it, which
+// preflight has just checked for. A resumed run that already decided it (the
+// storage stage) keeps that decision.
+func (a *Add) joiningOwnership() storage.Ownership {
+	if a.ownership != "" {
+		return a.ownership
+	}
+	if a.Opts.StorageDevice != "" {
+		return storage.InstallerCreated
+	}
+	return storage.CustomerCreated
 }
 
 // stageJoin joins the machine: the token is read on the server, k3s is
@@ -643,30 +664,8 @@ func (a *Add) upsertHost(host api.HostRecord) []api.HostRecord {
 	return out
 }
 
-// writeInventory writes the cluster's host inventory back, carrying the
-// revision this run read — the compare-and-swap that stops two operators from
-// silently overwriting each other's inventory.
-//
-// Every field the control plane requires on the write is round-tripped from
-// the record that was read, so a node operation cannot erase the bundle
-// version, the profiles or the volume-group ownership it did not intend to
-// touch.
-func (a *Add) writeInventory(ctx context.Context, hosts []api.HostRecord) error {
-	record := api.BundleRecord{
-		BundleVersion:        a.Record.BundleVersion,
-		Profiles:             a.Record.Profiles,
-		HATier:               a.Record.HATier,
-		VolumeGroupOwnership: a.Record.VolumeGroupOwnership,
-		Hosts:                hosts,
-		Revision:             a.Revision,
-	}
-	if err := a.Records.Save(ctx, record); err != nil {
-		return fmt.Errorf("writing the cluster's host inventory at revision %d: %w. The control plane refuses a write based on a revision another operator has moved on from, so re-read the record and re-apply", a.Revision, err)
-	}
-	a.Hosts = hosts
-	a.Revision++
-	return nil
-}
+// writeInventory is Session's: one place builds the record, carries the
+// revision this run read, and words a refused write.
 
 // k3sVersion is the version this cluster runs, from the bundle the cluster
 // records: a node joins at the cluster's version, never at one of its own.

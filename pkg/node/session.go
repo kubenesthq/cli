@@ -3,8 +3,10 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"kubenest.io/cli/pkg/api"
@@ -309,11 +311,26 @@ func (s *Session) writeInventory(ctx context.Context, hosts []api.HostRecord) er
 		Revision:             s.Revision,
 	}
 	if err := s.Records.Save(ctx, record); err != nil {
-		return fmt.Errorf("writing the cluster's host inventory at revision %d: %w. The control plane refuses a write based on a revision another operator has moved on from, so re-read the record and re-apply", s.Revision, err)
+		return inventoryWriteError(s.Revision, err)
 	}
 	s.Hosts = hosts
 	s.Revision++
 	return nil
+}
+
+// inventoryWriteError words a failed inventory write for what it is. A 409 is
+// the revision compare-and-swap, and only that gets the "re-read the record and
+// re-apply" advice. A 422 is the control plane refusing the BODY — a field the
+// contract does not allow, most often — and telling the operator to look for a
+// revision conflict that is not there sends them somewhere wrong; the body's
+// own detail is the answer.
+func inventoryWriteError(revision int, err error) error {
+	base := fmt.Errorf("writing the cluster's host inventory at revision %d: %w", revision, err)
+	var apiErr *api.Error
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict {
+		return fmt.Errorf("%w. The control plane refuses a write based on a revision another operator has moved on from, so re-read the record and re-apply", base)
+	}
+	return base
 }
 
 // findHost looks the machine up in the inventory by anything the operator
