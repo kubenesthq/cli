@@ -38,6 +38,7 @@ uploaded to the control plane and never written to logs.`,
 		NewBackupCommand(),
 		NewRecoveryKitCommand(),
 		NewAlertsCommand(),
+		NewHealthCommand(),
 	)
 	return root
 }
