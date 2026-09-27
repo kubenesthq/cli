@@ -116,6 +116,36 @@ func (l *logbook) commands(host string) []string {
 // hasCommand reports whether anything containing substr ran on any host.
 func (l *logbook) hasCommand(substr string) bool { return l.indexOf(substr) >= 0 }
 
+// inputOf is the stdin payload of the first command containing substr. A
+// streamed write carries what the command cannot: the CoreDNS patch sets the
+// replica count in the document, never in the command string (pkg/k3s), so the
+// count is only observable here.
+func (l *logbook) inputOf(substr string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, e := range l.entries {
+		if strings.Contains(e.command, substr) {
+			return e.input
+		}
+	}
+	return ""
+}
+
+// inputsOf is the stdin payload of every command containing substr, in order,
+// so a test can read the SEQUENCE of counts a cluster-DNS re-assert passes
+// through across a swap.
+func (l *logbook) inputsOf(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, e := range l.entries {
+		if strings.Contains(e.command, substr) {
+			out = append(out, e.input)
+		}
+	}
+	return out
+}
+
 // count counts the commands containing substr.
 func (l *logbook) count(substr string) int {
 	l.mu.Lock()
@@ -144,6 +174,17 @@ func fail(exit int, stderr string) func(*fakeHost, string) (sshx.Result, error) 
 		return sshx.Result{ExitCode: exit, Stderr: stderr}, nil
 	}
 }
+
+// healthyCoreDNSPods is what the fake cluster answers for the CoreDNS pods:
+// two Ready pods on two distinct nodes, which satisfies the layout check for
+// any replica count the rule can ask for (pkg/k3s.CoreDNSReplicas caps it at
+// two). Tests that assert on the layout script their own answer with on().
+const healthyCoreDNSPods = `{"items":[
+  {"metadata":{"name":"coredns-aaaa"},"spec":{"nodeName":"node-a"},
+   "status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},
+  {"metadata":{"name":"coredns-bbbb"},"spec":{"nodeName":"node-b"},
+   "status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}
+]}`
 
 // fakeHost is one scripted machine: the SSH commands a verb makes on it, the
 // k3s objects it answers, and the two compare-and-swap writes it accepts.
@@ -248,6 +289,14 @@ func (h *fakeHost) scripted(command string) (sshx.Result, error) {
 		return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): configmaps "` + name + `" not found`}, nil
 	case strings.Contains(command, "get nodes -o json"):
 		return sshx.Result{Stdout: h.nodes}, nil
+	case strings.Contains(command, "get pods -n kube-system -l k8s-app=kube-dns -o json"):
+		// The fake cluster's cluster DNS is as healthy as it can be asked to
+		// be: TWO Ready pods on two distinct nodes, which is the most the
+		// layout ever requires (pkg/k3s.CoreDNSReplicas caps at two). A test
+		// that cares about the layout scripts its own answer; without this
+		// default every verb whose record stage runs would sit in the
+		// convergence wait until the bundle's component-ready deadline.
+		return sshx.Result{Stdout: healthyCoreDNSPods}, nil
 	case strings.HasPrefix(command, "sudo -n k3s kubectl get node ") && strings.HasSuffix(command, " -o json"):
 		return sshx.Result{Stdout: `{"spec":{"unschedulable":false}}`}, nil
 	case strings.Contains(command, "get pv -o json"):
@@ -573,6 +622,7 @@ limits:
     node-drain: 15m
     node-reboot: 20m
     install-total: 30m
+    component-ready: 10m
 health:
   backup:
     max-backup-age: 24h

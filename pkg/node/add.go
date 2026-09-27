@@ -561,6 +561,16 @@ func (a *Add) stageRecord(ctx context.Context) error {
 		return fmt.Errorf("no host entry was recorded for %s, so there is nothing to complete: the record-joining stage did not run, which means the journal and this command disagree about where the operation is",
 			a.Opts.Agent)
 	}
+	// The machine is a Ready node by now (the join stage waited for it), so the
+	// cluster has one more node than it had: the cluster-DNS layout is re-sized
+	// BEFORE this stage's own record write, so a layout that cannot be put
+	// right leaves the write owed and the resume clean. It sits inside this
+	// stage rather than behind the operation guard because the stage is
+	// AlwaysRun: a resume, or a take-over, runs it again and ends with the
+	// right layout whatever the previous process got to (Session.ensureCoreDNS).
+	if err := a.ensureCoreDNS(ctx); err != nil {
+		return err
+	}
 	a.Host.LifecycleState = string(StateActive)
 	a.Host.NodeUID = a.Node.UID
 	a.Host.StorageDevice = a.Opts.StorageDevice

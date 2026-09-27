@@ -665,3 +665,61 @@ func (s *Session) liftHold(ctx context.Context, node ClusterNode, role Role) err
 func (s *Session) waitReporter() converge.Reporter {
 	return converge.NewTextReporter(s.Out)
 }
+
+// ensureCoreDNS re-asserts the cluster-DNS layout after this verb has changed
+// the cluster's membership — a machine joined, or a machine's Node object is
+// gone — because the layout is a function of how many nodes there are
+// (pkg/k3s.EnsureCoreDNSReplicas).
+//
+// WHY A NODE VERB DOES THIS AT ALL. The installer and the upgrade set the
+// layout while they run, and neither runs again for a membership change:
+//
+//   - a single-node cluster that GROWS through `node add` would keep k3s's one
+//     CoreDNS replica, so losing the node that holds it stops every in-cluster
+//     name lookup until Kubernetes evicts the pod past its toleration — which
+//     is the defect kn-t43 exists for;
+//   - a two-node cluster that SHRINKS to one node through `node remove` would
+//     keep two replicas under a REQUIRED one-pod-per-node anti-affinity, and
+//     one of them would sit Pending for the life of the cluster.
+//
+// THE COUNT COMES FROM THE CLUSTER'S NODE OBJECTS, NOT FROM THE INVENTORY.
+//
+//   - A NotReady node is still a MEMBER, and it is exactly the loss the second
+//     replica exists to cover. Counting only Ready nodes would make this rule
+//     blind to the event it protects against, and would let a transient
+//     NotReady scale a two-node cluster down to one replica permanently, since
+//     nothing re-asserts the layout until the next membership change.
+//   - The Node list is the SCHEDULER's own view, and the scheduler is what
+//     decides where a pod can go. The inventory is control-plane bookkeeping
+//     written at a different moment from the API server's deletion of a Node
+//     object, so a count read from it can race the very change this step is
+//     following — and it counts hosts, not nodes, which are not the same list.
+//   - It is the rule the installer already uses: the node set it just made
+//     Ready.
+//
+// It is NOT recorded as an operation.Action. An action's identity is its stage
+// and its command together, and the command here is the same whether the
+// layout wants one replica or two, so no postcondition could tell a successor
+// whether the step it finds recorded is still the right one. It does not need
+// to be one: the patch and the wait are both idempotent, so a re-run ends with
+// the right layout either way — which is why every caller sits in a stage a
+// --resume or --take-over re-runs.
+func (s *Session) ensureCoreDNS(ctx context.Context) error {
+	if s.ServerConn == nil {
+		return fmt.Errorf("no connection to a server node, so the cluster's DNS layout can be neither read nor set")
+	}
+	nodes, err := ReadClusterNodes(ctx, s.ServerConn)
+	if err != nil {
+		return err
+	}
+	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return err
+	}
+	if err := k3s.EnsureCoreDNSReplicas(ctx, s.ServerConn, len(nodes), deadline, s.waitReporter()); err != nil {
+		return stages.NewComponentError("k3s", fmt.Errorf("cluster DNS across %d node(s): %w", len(nodes), err))
+	}
+	s.Logf("  dns:       CoreDNS runs %d replica(s) across %d node(s), one per node, so a lookup survives the loss of any one of them",
+		k3s.CoreDNSReplicas(len(nodes)), len(nodes))
+	return nil
+}

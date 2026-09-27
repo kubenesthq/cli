@@ -434,6 +434,16 @@ func (r *Remove) stageDelete(ctx context.Context) error {
 // that this machine was here is what stops the CLI from re-adding it by
 // accident without a wipe (PLAN 7.3.2).
 func (r *Remove) stageRecord(ctx context.Context) error {
+	// The Node object is gone (the delete stage completed, and its
+	// postcondition is what a resume re-establishes), so the cluster has one
+	// fewer node: the cluster-DNS layout is re-sized BEFORE this stage's own
+	// record write, so a layout that cannot be put right leaves the write owed
+	// and the resume clean. The stage re-runs whenever its own work did not
+	// finish, so the step is re-applied rather than skipped (and it is
+	// idempotent either way — Session.ensureCoreDNS).
+	if err := r.ensureCoreDNS(ctx); err != nil {
+		return err
+	}
 	r.Host.LifecycleState = string(StateRemoved)
 	if err := r.owe(ctx, "inventory", r.Host.HostID, "the host marked removed"); err != nil {
 		return err

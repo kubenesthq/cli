@@ -41,6 +41,18 @@ const (
 	testCluster    = "prod-1"
 )
 
+// healthyCoreDNSPods is the fake cluster's CoreDNS pod list: two Ready pods on
+// two distinct nodes, the most the layout can ever require
+// (pkg/k3s.CoreDNSReplicas caps at two). Node verbs re-assert the cluster-DNS
+// layout in their record stage, and without an answer here that wait would run
+// to the bundle's component-ready deadline.
+const healthyCoreDNSPods = `{"items":[
+  {"metadata":{"name":"coredns-aaaa"},"spec":{"nodeName":"node-a"},
+   "status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},
+  {"metadata":{"name":"coredns-bbbb"},"spec":{"nodeName":"node-b"},
+   "status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}
+]}`
+
 func serverHost() api.HostRecord {
 	return api.HostRecord{
 		HostID: "h-srv", Role: "server", SSHAddress: testServerAddr, SSHPort: 22, SSHUser: "ubuntu",
@@ -188,6 +200,13 @@ func (h *fakeHost) Run(ctx context.Context, command string) (sshx.Result, error)
 		return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): configmaps "` + name + `" not found`}, nil
 	case strings.Contains(command, "get nodes -o json"):
 		return sshx.Result{Stdout: h.nodeJSON}, nil
+	case strings.Contains(command, "get pods -n kube-system -l k8s-app=kube-dns -o json"):
+		// The same healthy answer pkg/node's harness gives (and for the same
+		// reason): two Ready CoreDNS pods on two distinct nodes is the most the
+		// layout can ask for, so a node verb's record stage converges instead
+		// of sitting until the bundle's component-ready deadline. A test that
+		// cares scripts its own answer with on()/prepend().
+		return sshx.Result{Stdout: healthyCoreDNSPods}, nil
 	case strings.HasPrefix(command, "sudo -n k3s kubectl get node ") && strings.HasSuffix(command, " -o json"):
 		// kured's lock records whether the node was already unschedulable when
 		// it was taken (interlock.nodeUnschedulable), so this read has to
