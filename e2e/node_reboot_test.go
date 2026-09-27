@@ -452,6 +452,12 @@ func hostEpoch(t *testing.T, r k3s.Runner) int64 {
 // to reach the systemd unit, which is not the thing under test.
 func advanceHostClock(t *testing.T, ctx context.Context, r k3s.Runner, epoch int64) {
 	t.Helper()
+	// NTP goes off first. systemd-timesyncd resyncs as soon as the clock is
+	// set by hand, so on hardware (2026-09-27) k3s restarted on the real time
+	// and renewed nothing. restoreHostClock turns NTP back on.
+	if res, err := r.Run(ctx, "sudo -n timedatectl set-ntp false"); err != nil || res.ExitCode != 0 {
+		t.Fatalf("stopping NTP before moving the host clock: %v (exit %d, %s)", err, res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
 	res, err := r.Run(ctx, fmt.Sprintf("sudo -n date -s @%d", epoch))
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("advancing the host clock: %v (exit %d, %s)", err, res.ExitCode, strings.TrimSpace(res.Stderr))
