@@ -473,3 +473,31 @@ func TestRestoreDocumentCarriesProbesConditions(t *testing.T) {
 		t.Error("mode 1 does not restore volume data")
 	}
 }
+
+// On hardware (2026-09-27, S4 on lab w3) a namespace restore sat InProgress
+// for 48 minutes: the restored claim kept the volumeName of a PersistentVolume
+// that went with the deleted namespace, so its Pod never started and no
+// PodVolumeRestore ran. The Restore set includeClusterResources to false,
+// which keeps Velero from processing the volumes at all, so it never cleared
+// that name. P5 measured the working restores with the key left unset.
+func TestRestoreDocumentLeavesClusterResourcesToVelero(t *testing.T) {
+	for name, req := range map[string]restoreRequest{
+		"mode 1": {Name: "r", Backup: "b", Namespace: "payments", OperationID: "abc123"},
+		"mode 2": {Name: "r", Backup: "b", Namespace: "payments", OperationID: "abc123",
+			IncludedResources: []string{"persistentvolumeclaims", "persistentvolumes", "pods"}},
+	} {
+		doc, err := restoreDocument(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parsed struct {
+			Spec map[string]any `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(doc, &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if v, set := parsed.Spec["includeClusterResources"]; set && v == false {
+			t.Errorf("%s: the Restore sets includeClusterResources false, so Velero never processes the volumes and a restored claim waits on its deleted one", name)
+		}
+	}
+}

@@ -1525,6 +1525,10 @@ func safetyBackupDocument(name, namespace, operationID string, ttl time.Duration
 //     restore-wait init container, so the restored pod waits for ever and the
 //     restore reports "Completed with 0 errors" — run 4 of P5;
 //   - restorePVs asks for the volume data, which is the whole point;
+//   - includeClusterResources is left unset, as in every restore P5
+//     measured working. Set to false, it keeps Velero from processing the
+//     volumes at all, so a restored claim keeps the volumeName of a PV that
+//     is gone and waits for ever (hardware, 2026-09-27, S4 on lab w3);
 //   - existingResourcePolicy none (Velero's default) leaves objects that are
 //     still in the cluster alone — that is what keeps an unnamed claim's newer
 //     data out of the way of the fill, together with the modifier below.
@@ -1540,12 +1544,11 @@ func restoreDocument(spec restoreRequest) ([]byte, error) {
 			},
 		},
 		"spec": map[string]any{
-			"backupName":              spec.Backup,
-			"includedNamespaces":      []string{spec.Namespace},
-			"restorePVs":              true,
-			"existingResourcePolicy":  "none",
-			"preserveNodePorts":       false,
-			"includeClusterResources": false,
+			"backupName":             spec.Backup,
+			"includedNamespaces":     []string{spec.Namespace},
+			"restorePVs":             true,
+			"existingResourcePolicy": "none",
+			"preserveNodePorts":      false,
 		},
 	}
 	m := body["spec"].(map[string]any)
