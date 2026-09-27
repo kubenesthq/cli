@@ -67,6 +67,20 @@ func nodeVerb(t *testing.T, args ...string) (string, error) {
 	return out.String(), err
 }
 
+// withSSH appends the gate's SSH user and key to a node verb, the way an
+// operator names them on the command line. The gate's HOME has no SSH config,
+// so without them the CLI dials as the local user through ssh-agent (hardware,
+// 2026-09-27: "Too many authentication failures").
+func withSSH(env gateEnv, args ...string) []string {
+	if env.sshUser != "" {
+		args = append(args, "--ssh-user", env.sshUser)
+	}
+	if env.sshKey != "" {
+		args = append(args, "--ssh-key", env.sshKey)
+	}
+	return args
+}
+
 // spareHost is the machine this gate adds and then removes: S7's 4th host.
 func spareHost(t *testing.T) (string, string) {
 	t.Helper()
@@ -292,7 +306,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 			args = append(args, "--storage-device", spareDevice)
 		}
 		args = append(args, "--now")
-		out, err := nodeVerb(t, args...)
+		out, err := nodeVerb(t, withSSH(env, args...)...)
 		if err != nil {
 			t.Fatalf("node add failed from a second laptop:\n%s\n%v", out, err)
 		}
@@ -343,7 +357,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 	})
 
 	t.Run("remove-of-a-server-is-refused", func(t *testing.T) {
-		out, err := nodeVerb(t, "node", "remove", "--cluster", env.cluster, "--node", env.server, "--now")
+		out, err := nodeVerb(t, withSSH(env, "node", "remove", "--cluster", env.cluster, "--node", env.server, "--now")...)
 		if err == nil {
 			t.Fatalf("removing a server was accepted:\n%s", out)
 		}
@@ -359,7 +373,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 		if holder == "" {
 			t.Skip("no agent of this cluster holds a bound local volume: S5's fixture is not present, so there is nothing for this planted negative to refuse")
 		}
-		out, err := nodeVerb(t, "node", "remove", "--cluster", env.cluster, "--node", holder, "--now")
+		out, err := nodeVerb(t, withSSH(env, "node", "remove", "--cluster", env.cluster, "--node", holder, "--now")...)
 		if err == nil {
 			t.Fatalf("a node holding bound local volumes was removed without --abandon-volumes:\n%s", out)
 		}
@@ -374,7 +388,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 	})
 
 	t.Run("remove-spare", func(t *testing.T) {
-		out, err := nodeVerb(t, "node", "remove", "--cluster", env.cluster, "--node", spare, "--now")
+		out, err := nodeVerb(t, withSSH(env, "node", "remove", "--cluster", env.cluster, "--node", spare, "--now")...)
 		if err != nil {
 			t.Fatalf("node remove failed:\n%s\n%v", out, err)
 		}
@@ -477,7 +491,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 
 		// The isolation confirmation is the operator's step: without it the
 		// command refuses and names the machine, and nothing is removed.
-		out, err := nodeVerb(t, "node", "replace", "--cluster", env.cluster, "--node", dead, "--with", spare, "--now")
+		out, err := nodeVerb(t, withSSH(env, "node", "replace", "--cluster", env.cluster, "--node", dead, "--with", spare, "--now")...)
 		if err == nil {
 			t.Fatalf("a replace of a machine that does not answer was accepted without --confirm-isolated:\n%s", out)
 		}
@@ -495,7 +509,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 		if spareDevice != "" {
 			args = append(args, "--storage-device", spareDevice)
 		}
-		out, err = nodeVerb(t, args...)
+		out, err = nodeVerb(t, withSSH(env, args...)...)
 		if err != nil {
 			t.Fatalf("node replace failed:\n%s\n%v", out, err)
 		}
