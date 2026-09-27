@@ -230,6 +230,21 @@ type VolumeRestoreState struct {
 	Message   string
 }
 
+// RemovedVolume is one volume a mode-2 restore DELIBERATELY took out of a
+// restored pod: the pod the chosen BACKUP holds it under, and the volume's name
+// within that pod. The modifier's strip patch removes exactly these (the
+// volumes that are not named claims), and Velero reports one error for each —
+// "volume not found in pod" — which is the price of those LIVE volumes keeping
+// their contents (probe P5).
+//
+// THE PAIRS, NOT A COUNT: judging a PartiallyFailed verdict means saying which
+// errors are the patch's own and which are not, and that question can only be
+// answered by the (pod, volume) pair each error names.
+type RemovedVolume struct {
+	Pod    string
+	Volume string
+}
+
 // RestoreOutcome is a Velero Restore's terminal verdict.
 type RestoreOutcome struct {
 	Name          string
@@ -1002,7 +1017,13 @@ func (c *k3sCluster) NodeReady(ctx context.Context, node string) (bool, error) {
 	if node == "" {
 		return false, nil
 	}
-	out, err := c.kubectl(ctx, "get node "+node+" -o jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+	// SINGLE-QUOTED FOR THE REMOTE SHELL. The command is run as one
+	// `bash -c <string>` on the node, and an unquoted jsonpath's ?() and
+	// "..." are shell syntax there: hardware (lab w3, 2026-09-27) refused the
+	// whole restore with `exit 2: bash: -c: line 1: syntax error near
+	// unexpected token '('` from this line. Every other jsonpath in this
+	// package is quoted the same way (velero.go:309 says why).
+	out, err := c.kubectl(ctx, "get node "+node+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
 	if err != nil {
 		if notFound(err) {
 			return false, nil
@@ -1861,6 +1882,12 @@ type restoreRequest struct {
 	// a non-Completed verdict is judged against: "Completed with 0 errors" is
 	// not proof that a volume was restored (probe P5, run 4).
 	NamedVolumes []VolumeRef
+	// RemovedVolumes are the (pod, volume) pairs the modifier's strip patch
+	// takes out of the restored pods. Velero reports one error for each of
+	// them, and those errors are the ONLY non-Completed verdict this mode
+	// accepts (checkVolumeRestores). Mode 1 removes nothing and leaves it
+	// empty, so mode 1 keeps the strict rule.
+	RemovedVolumes []RemovedVolume
 }
 
 // modifierConfigMap is a Velero resource-modifier ConfigMap the command writes

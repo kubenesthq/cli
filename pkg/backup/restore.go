@@ -1839,22 +1839,35 @@ func (r *restoreRun) runVeleroRestore(ctx context.Context, name string, spec res
 	if err != nil {
 		return nil, err
 	}
-	if err := checkVolumeRestores(outcome, restores, spec.NamedVolumes); err != nil {
+	if err := checkVolumeRestores(outcome, restores, spec.NamedVolumes, spec.RemovedVolumes); err != nil {
 		return nil, err
 	}
 	fmt.Fprintf(r.out, "  restore:       %s finished as %s with %d error(s) and %d warning(s)%s\n",
 		name, outcome.Phase, outcome.Errors, outcome.Warnings, partialNote(len(restores)))
+	// ONE LINE NAMING WHAT WAS TOLERATED. A PartiallyFailed verdict with errors
+	// in it is exactly what a reader will stop on, so the run says which errors
+	// they were and why they were accepted — the volume the modifier removed
+	// from the restored pod, which is the volume whose live contents this
+	// restore exists to leave alone.
+	if tolerated := removedVolumeFailures(restores, spec.RemovedVolumes); len(tolerated) > 0 {
+		pairs := make([]string, 0, len(tolerated))
+		for _, vr := range tolerated {
+			pairs = append(pairs, vr.Pod+"/"+vr.Volume)
+		}
+		fmt.Fprintf(r.out, "  tolerated:     %d of those error(s) are the modifier's own: %s — %q, so the volume stays as it was and that error is not counted against the restore\n",
+			len(tolerated), strings.Join(pairs, ", "), volumeNotFoundInPod)
+	}
 	return restores, nil
 }
 
-// partialNote explains the ONE non-Completed verdict mode 2 expects: removing a
-// volume from a restored pod makes Velero report an error for it, and that
-// error is the price of the unnamed claim keeping its newer data (probe P5).
+// partialNote says how many PodVolumeRestores Velero wrote for this restore,
+// beside the phase. IT IS PRINTED EVEN WHEN THE COUNT IS ZERO: a Completed
+// restore that wrote no PodVolumeRestore restored nothing at all — probe P5's
+// run 4 — and that count is the one thing a reader needs beside "Completed with
+// 0 errors". It counts what Velero WROTE and not what completed, because the
+// accepted PartiallyFailed verdict has a Failed one among them on purpose.
 func partialNote(volumeRestores int) string {
-	if volumeRestores == 0 {
-		return ""
-	}
-	return fmt.Sprintf(" (%d PodVolumeRestore(s) completed)", volumeRestores)
+	return fmt.Sprintf(" (%d PodVolumeRestore(s) Velero wrote)", volumeRestores)
 }
 
 // waitRestore polls one Velero Restore until it reaches a terminal phase.
@@ -1878,16 +1891,75 @@ func (r *restoreRun) waitRestore(ctx context.Context, name string) (*RestoreOutc
 	}
 }
 
-// checkVolumeRestores refuses a restore that is not Completed, and refuses one
-// that is Completed without having filled every volume it was asked to fill.
+// volumeNotFoundInPod is Velero's own wording for the one error a mode-2 restore
+// of a SUBSET of a pod's volumes expects: the strip patch took the unnamed
+// volume out of the restored pod, and Velero's restore-wait init container —
+// which mounts every backed-up volume — finds nothing to expose for it.
+//
+// It is the wording P5 measured and the wording hardware reported again (lab w3,
+// 2026-09-27: PodVolumeRestore …-9m8ks for pod sel-5df6d6d955-78hxc, volume b:
+// "error getting volume directory name for volume b in pod
+// sel-5df6d6d955-78hxc: volume not found in pod"). Judging an error by another
+// program's wording is worth it here and only here: the alternative is refusing
+// every selective restore, and this is the one string that separates a volume we
+// chose to keep from a volume that failed to come back.
+const volumeNotFoundInPod = "volume not found in pod"
+
+// removedVolumeFailures are the PodVolumeRestores the strip patch is responsible
+// for: Failed, for a (pod, volume) pair the patch removed, carrying Velero's
+// "volume not found in pod" wording. All three are required — the same message
+// on a volume this restore did not remove, or a Failed volume it did not touch,
+// is a real failure and not this.
+func removedVolumeFailures(restores []VolumeRestoreState, removed []RemovedVolume) []VolumeRestoreState {
+	var out []VolumeRestoreState
+	for _, vr := range restores {
+		if isRemovedVolumeFailure(vr, removed) {
+			out = append(out, vr)
+		}
+	}
+	return out
+}
+
+func isRemovedVolumeFailure(vr VolumeRestoreState, removed []RemovedVolume) bool {
+	if vr.Phase != "Failed" || !strings.Contains(vr.Message, volumeNotFoundInPod) {
+		return false
+	}
+	for _, pair := range removed {
+		if pair.Pod == vr.Pod && pair.Volume == vr.Volume {
+			return true
+		}
+	}
+	return false
+}
+
+// checkVolumeRestores decides whether a Velero restore's verdict is one this run
+// may act on.
 //
 // "COMPLETED WITH 0 ERRORS" IS NOT PROOF. Run 4 of probe P5 reported exactly
-// that and restored nothing: without persistentvolumes in the type filter
-// Velero creates no PodVolumeRestore at all, injects its restore-wait init
-// container anyway, and the pod waits for ever. So every named volume must have
-// a Completed PodVolumeRestore of its own.
-func checkVolumeRestores(outcome *RestoreOutcome, restores []VolumeRestoreState, named []VolumeRef) error {
-	var incomplete []string
+// that and restored nothing: without persistentvolumes in the type filter Velero
+// creates no PodVolumeRestore at all, injects its restore-wait init container
+// anyway, and the pod waits for ever. So every NAMED volume must have a
+// Completed PodVolumeRestore of its own, whatever the phase says.
+//
+// PARTIALLYFAILED IS THE ONE OTHER VERDICT MODE 2 EXPECTS, and only for the
+// price of the strip patch. Removing an unnamed volume from a restored pod
+// makes Velero report one error for that (pod, volume) pair, and that error is
+// what keeps the volume's live contents: it is tolerated ONLY when every one of
+// these holds —
+//
+//   - every named claim has a Completed PodVolumeRestore;
+//   - every PodVolumeRestore that did not complete is Failed, is for a pair the
+//     patch removed, and carries Velero's "volume not found in pod" wording;
+//   - the restore's error count is exactly the number of those pair errors;
+//   - there is no failureReason.
+//
+// ANYTHING ELSE IS REFUSED, and mode 1 — which removes nothing, so removed is
+// empty — keeps the strict rule: only a restore whose volumes all completed is
+// acted on.
+func checkVolumeRestores(outcome *RestoreOutcome, restores []VolumeRestoreState, named []VolumeRef, removed []RemovedVolume) error {
+	var failed []string
+	var tolerated []string
+	var toleratedPairs []string
 	completed := map[string]bool{}
 	for _, vr := range restores {
 		if vr.Phase == "Completed" {
@@ -1895,7 +1967,13 @@ func checkVolumeRestores(outcome *RestoreOutcome, restores []VolumeRestoreState,
 			completed[vr.Volume] = true
 			continue
 		}
-		incomplete = append(incomplete, fmt.Sprintf("%s (pod %s, volume %s, phase %s: %s)", vr.Name, vr.Pod, vr.Volume, orUnknown(vr.Phase), orUnknown(vr.Message)))
+		detail := fmt.Sprintf("%s (pod %s, volume %s, phase %s: %s)", vr.Name, vr.Pod, vr.Volume, orUnknown(vr.Phase), orUnknown(vr.Message))
+		if isRemovedVolumeFailure(vr, removed) {
+			tolerated = append(tolerated, detail)
+			toleratedPairs = append(toleratedPairs, vr.Pod+"/"+vr.Volume)
+			continue
+		}
+		failed = append(failed, detail)
 	}
 	// The volumes with no Completed PodVolumeRestore of their own, BY NAME: a
 	// count tells an operator that something is wrong, and these names tell
@@ -1906,27 +1984,71 @@ func checkVolumeRestores(outcome *RestoreOutcome, restores []VolumeRestoreState,
 			unfilled = append(unfilled, volume.Namespace+"/"+volume.Name)
 		}
 	}
-	if outcome.Phase != "Completed" {
-		detail := fmt.Sprintf("Velero Restore %s is %s, not Completed: %d error(s), %d warning(s)", outcome.Name, outcome.Phase, outcome.Errors, outcome.Warnings)
-		if outcome.FailureReason != "" {
-			detail += ", failureReason: " + outcome.FailureReason
-		}
-		if len(incomplete) > 0 {
-			detail += "; PodVolumeRestores that did not complete: " + strings.Join(incomplete, "; ")
+
+	// THE ONE NON-COMPLETED VERDICT THIS MODE ACTS ON: the strip patch's own
+	// errors, the named claims filled, nothing else wrong.
+	if outcome.Phase == "PartiallyFailed" && len(tolerated) > 0 && len(failed) == 0 && len(unfilled) == 0 &&
+		outcome.FailureReason == "" && int64(len(tolerated)) == outcome.Errors {
+		return nil
+	}
+
+	if outcome.Phase == "Completed" {
+		if notCompleted := append(append([]string(nil), failed...), tolerated...); len(notCompleted) > 0 {
+			return fmt.Errorf("Velero Restore %s reports Completed, but these PodVolumeRestores did not: %s", outcome.Name, strings.Join(notCompleted, "; "))
 		}
 		if len(unfilled) > 0 {
-			detail += "; volumes with no Completed PodVolumeRestore: " + strings.Join(unfilled, ", ")
+			return fmt.Errorf("Velero Restore %s reports Completed with %d error(s), but these volume(s) have no Completed PodVolumeRestore, so nothing proves they were filled: %s",
+				outcome.Name, outcome.Errors, strings.Join(unfilled, ", "))
 		}
-		return errors.New(detail)
+		return nil
 	}
-	if len(incomplete) > 0 {
-		return fmt.Errorf("Velero Restore %s reports Completed, but these PodVolumeRestores did not: %s", outcome.Name, strings.Join(incomplete, "; "))
+
+	detail := fmt.Sprintf("Velero Restore %s is %s, not Completed: %d error(s), %d warning(s)", outcome.Name, outcome.Phase, outcome.Errors, outcome.Warnings)
+	if outcome.FailureReason != "" {
+		detail += ", failureReason: " + outcome.FailureReason
+	}
+	if notCompleted := append(append([]string(nil), failed...), tolerated...); len(notCompleted) > 0 {
+		detail += "; PodVolumeRestores that did not complete: " + strings.Join(notCompleted, "; ")
 	}
 	if len(unfilled) > 0 {
-		return fmt.Errorf("Velero Restore %s reports Completed with %d error(s), but these volume(s) have no Completed PodVolumeRestore, so nothing proves they were filled: %s",
-			outcome.Name, outcome.Errors, strings.Join(unfilled, ", "))
+		detail += "; volumes with no Completed PodVolumeRestore: " + strings.Join(unfilled, ", ")
 	}
-	return nil
+	if len(removed) > 0 {
+		// The patch removed volumes, so errors ARE expected to be its own: say
+		// what it removed, which of this verdict's errors were accepted as
+		// theirs, and what refuses the verdict — "PartiallyFailed" on its own
+		// tells an operator nothing about which errors to look at.
+		expected := make([]string, 0, len(removed))
+		for _, pair := range removed {
+			expected = append(expected, pair.Pod+"/"+pair.Volume)
+		}
+		var lacking []string
+		if len(tolerated) == 0 {
+			lacking = append(lacking, fmt.Sprintf("no Failed PodVolumeRestore for one of the removed pairs carrying %q", volumeNotFoundInPod))
+		}
+		if outcome.Phase != "PartiallyFailed" {
+			lacking = append(lacking, "a phase of "+orUnknown(outcome.Phase)+" where the removed volumes' errors make PartiallyFailed")
+		}
+		if len(failed) > 0 {
+			lacking = append(lacking, "PodVolumeRestores that are not a removed volume's error")
+		}
+		if len(unfilled) > 0 {
+			lacking = append(lacking, "named volumes with no Completed PodVolumeRestore")
+		}
+		if outcome.FailureReason != "" {
+			lacking = append(lacking, "a failureReason")
+		}
+		if int64(len(tolerated)) != outcome.Errors {
+			lacking = append(lacking, fmt.Sprintf("%d error(s) where the removed volumes account for %d", outcome.Errors, len(tolerated)))
+		}
+		accepted := "none"
+		if len(toleratedPairs) > 0 {
+			accepted = strings.Join(toleratedPairs, ", ")
+		}
+		detail += fmt.Sprintf("; the strip patch removed %s, and %q is tolerated for each — accepted as the patch's own: %s; refused for: %s",
+			strings.Join(expected, ", "), volumeNotFoundInPod, accepted, strings.Join(lacking, ", "))
+	}
+	return errors.New(detail)
 }
 
 // cronJobModifierDocument renders the resource modifier mode 1's restore

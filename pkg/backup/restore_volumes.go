@@ -135,6 +135,20 @@ func (p backupPod) unnamed() []string {
 	return out
 }
 
+// removedVolumes is every (pod, volume) pair the strip patches take out of the
+// restored pods. It is what Velero will report one "volume not found in pod"
+// error for — the one non-Completed verdict this mode tolerates — and the run
+// needs the pairs, not a count, to tell those errors from a real failure.
+func (p *volumePlan) removedVolumes() []RemovedVolume {
+	var out []RemovedVolume
+	for _, pod := range p.BackupPods {
+		for _, volume := range pod.unnamed() {
+			out = append(out, RemovedVolume{Pod: pod.Name, Volume: volume})
+		}
+	}
+	return out
+}
+
 // runVolumeRestore is mode 2.
 func (r *restoreRun) runVolumeRestore(ctx context.Context) error {
 	if err := r.resolve(ctx); err != nil {
@@ -656,6 +670,11 @@ func (r *restoreRun) volumeRestoreSpec() (restoreRequest, error) {
 		OrLabelSelectors:  plan.LabelSelectors,
 		ResourceModifier:  modifier,
 		NamedVolumes:      plan.Claims,
+		// THE PRICE OF KEEPING THE UNNAMED VOLUMES, handed to the verdict check
+		// before Velero is even asked: the strip patches remove these pairs, and
+		// the one error each of them costs is the only non-Completed verdict
+		// this mode accepts.
+		RemovedVolumes: plan.removedVolumes(),
 	}
 	if len(plan.LabelSelectors) == 1 {
 		spec.LabelSelector = plan.LabelSelectors[0]

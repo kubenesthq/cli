@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -96,5 +97,87 @@ func TestClaimBindingReportsTheNodeEvenWhenItIsTheDeadOne(t *testing.T) {
 	}
 	if binding.Node != "kubenest-lab-w3-2" {
 		t.Errorf("ClaimBinding.Node = %q, want the dead node the volume names (kubenest-lab-w3-2)", binding.Node)
+	}
+}
+
+// THE REMOTE SHELL PARSES THE COMMAND STRING BEFORE kubectl EVER SEES IT. Every
+// call this package makes is sent as ONE string (k3s.Kubectl -> runner.Run ->
+// `ssh host <string>`, which the login shell runs as `bash -c <string>`), so a
+// character the shell reads as syntax is not a path expression at all — the
+// command never runs. Hardware (lab w3, 2026-09-27) died there: NodeReady's
+// unquoted `{.status.conditions[?(@.type=="Ready")].status}` exited 2 with
+// "bash: -c: line 1: syntax error near unexpected token `('", and the whole
+// restore stopped on a read of a node that was up.
+//
+// SO EVERY COMMAND GOES THROUGH THE SHELL'S OWN PARSER, with no cluster
+// involved: `bash -n` parses and runs nothing. THE LIST IS NOT CURATED — the
+// walk below touches every method this package has that builds a command
+// (reads and changes), and every string that came out is checked, because the
+// defect is a property of the strings and not of a hand-picked few.
+func TestEveryClusterCommandParsesUnderTheRemoteShell(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skipf("bash is not on this machine and it is the shell that parses these commands: %v", err)
+	}
+	ctx := context.Background()
+	r := &fakeRunner{
+		Respond: func(command string) (sshx.Result, error) {
+			if strings.Contains(command, "get persistentvolumeclaim ") {
+				// A bound claim, so ClaimBinding goes on to read its volume.
+				return sshx.Result{Stdout: `{"spec":{"volumeName":"pvc-1"},"status":{"phase":"Bound"}}`}, nil
+			}
+			return sshx.Result{Stdout: "{}"}, nil
+		},
+		RespondInput: func(string, []byte) (sshx.Result, error) {
+			return sshx.Result{Stdout: "{}"}, nil
+		},
+	}
+	c := NewK3sCluster(r)
+
+	// Every read.
+	c.Namespace(ctx, "payments")
+	c.Claims(ctx, "payments")
+	c.Workloads(ctx, "payments")
+	c.Pods(ctx, "payments")
+	c.CronJobs(ctx, "payments")
+	c.Jobs(ctx, "payments")
+	c.Applications(ctx, "payments")
+	c.ProjectHold(ctx, "payments")
+	c.DrillRestore(ctx)
+	c.VolumeRestores(ctx, "kubenest-restore-volumes-0f3a57c")
+	c.PodVolumeBackups(ctx, "daily-1")
+	c.RestoreOutcome(ctx, "kubenest-restore-volumes-0f3a57c")
+	c.ClaimBinding(ctx, "payments", "data-0")
+	c.NodeReady(ctx, "lab-w3-1")
+	c.ControllerOwner(ctx, "payments", "replicaset", "web-6d9f")
+	// Every change.
+	c.AnnotateProject(ctx, "payments", PauseAnnotationKey, "0f3a57c")
+	c.ClearProjectAnnotation(ctx, "payments", PauseAnnotationKey)
+	c.ScaleWorkload(ctx, "deployment", "web", "payments", 0)
+	c.DeleteNamespace(ctx, "payments")
+	c.DeleteClaim(ctx, "payments", "data-0")
+	c.SuspendCronJob(ctx, "payments", "nightly", true)
+	c.SuspendJob(ctx, "payments", "nightly-1", true)
+	c.CreateBackup(ctx, "daily-1", []byte("apiVersion: velero.io/v1\nkind: Backup\n"))
+	c.CreateRestore(ctx, "r", []byte("apiVersion: velero.io/v1\nkind: Restore\n"))
+	c.Apply(ctx, "a manifest", []byte("apiVersion: v1\nkind: ConfigMap\n"))
+	c.Delete(ctx, "restore r -n velero")
+
+	commands := r.Commands()
+	var reads, changes int
+	for _, command := range commands {
+		if strings.Contains(command, "kubectl get ") {
+			reads++
+		} else {
+			changes++
+		}
+	}
+	if reads == 0 || changes == 0 {
+		t.Fatalf("the walk sent %d read(s) and %d change(s): the parse check below would then be about half the commands", reads, changes)
+	}
+	for _, command := range commands {
+		if out, err := exec.Command(bash, "-n", "-c", command).CombinedOutput(); err != nil {
+			t.Errorf("the remote shell cannot parse this command, so kubectl would never run it:\n  %s\n  %v: %s", command, err, strings.TrimSpace(string(out)))
+		}
 	}
 }

@@ -170,6 +170,138 @@ func TestVolumeRestorePlanNamesOnlyTheNamedClaims(t *testing.T) {
 	}
 }
 
+// THE VERDICT THE SELECTIVE RESTORE COSTS, accepted end to end. Velero reports
+// PartiallyFailed with one error for the volume the strip patch took out of the
+// restored pod: the init container it injects mounts every backed-up volume,
+// finds the removed one gone, and says so. Probe P5 measured it, and lab w3
+// (2026-09-27) hit it live — "error getting volume directory name for volume b
+// in pod sel-5df6d6d955-78hxc: volume not found in pod" — where mode 2 refused
+// its OWN successful restore: the named claim was refilled, the unnamed volume
+// still held its newer bytes, and the command called that a failure.
+func TestVolumeRestoreAcceptsTheStripPatchPartiallyFailedVerdict(t *testing.T) {
+	f := volumeFixture(t)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "PartiallyFailed", Errors: 1, Warnings: 2}
+	f.cluster.volumes = append(f.cluster.volumes, VolumeRestoreState{
+		Name: "pvr-b", Pod: "payments-6d9f-qqqqq", Volume: "b", ClaimName: "b", Phase: "Failed",
+		Message: "error to expose PVR: error to get pod volume path: error getting volume directory name for volume b in pod payments-6d9f-qqqqq: volume not found in pod",
+	})
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, "")
+	if err != nil {
+		t.Fatalf("the measured PartiallyFailed verdict was refused: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, RestoredStage) {
+		t.Errorf("the run did not reach %q:\n%s", RestoredStage, out)
+	}
+	// The run says which errors it tolerated, so a reader looking at a
+	// PartiallyFailed restore is not left to work out why it was accepted.
+	if !strings.Contains(out, "payments-6d9f-qqqqq/b") {
+		t.Errorf("the run does not name the error it tolerated (pod/volume):\n%s", out)
+	}
+}
+
+// THE RULE, CASE BY CASE. Every case is a PartiallyFailed verdict with the strip
+// patch's error in it and is one thing away from the accepted one above — which
+// is the point: the tolerance covers those errors and nothing else, because the
+// alternative is a restore that quietly reported success over a volume that did
+// not come back.
+func TestCheckVolumeRestoresAcceptsOnlyTheStripPatchErrors(t *testing.T) {
+	const pod = "sel-5df6d6d955-78hxc"
+	named := []VolumeRef{{Namespace: "payments", Name: "a"}}
+	removed := []RemovedVolume{{Pod: pod, Volume: "b"}}
+	completedA := VolumeRestoreState{Name: "pvr-a", Pod: pod, Volume: "a", ClaimName: "a", Phase: "Completed"}
+	removedB := VolumeRestoreState{Name: "pvr-b", Pod: pod, Volume: "b", ClaimName: "b", Phase: "Failed",
+		Message: "error getting volume directory name for volume b in pod " + pod + ": volume not found in pod"}
+	partial := func() *RestoreOutcome {
+		return &RestoreOutcome{Name: "r", Phase: "PartiallyFailed", Errors: 1, Warnings: 2}
+	}
+
+	cases := []struct {
+		name     string
+		outcome  *RestoreOutcome
+		restores []VolumeRestoreState
+		removed  []RemovedVolume
+		// want is what the refusal must say; empty means the verdict is accepted.
+		want string
+	}{
+		{
+			name:     "the measured verdict",
+			outcome:  partial(),
+			restores: []VolumeRestoreState{completedA, removedB},
+			removed:  removed,
+		},
+		{
+			name:     "an extra error",
+			outcome:  &RestoreOutcome{Name: "r", Phase: "PartiallyFailed", Errors: 2, Warnings: 2},
+			restores: []VolumeRestoreState{completedA, removedB},
+			removed:  removed,
+			want:     fmt.Sprintf("%d error(s) where the removed volumes account for %d", 2, 1),
+		},
+		{
+			name:     "an error count that does not match",
+			outcome:  &RestoreOutcome{Name: "r", Phase: "PartiallyFailed", Errors: 0, Warnings: 2},
+			restores: []VolumeRestoreState{completedA, removedB},
+			removed:  removed,
+			want:     fmt.Sprintf("%d error(s) where the removed volumes account for %d", 0, 1),
+		},
+		{
+			name:    "a Failed PodVolumeRestore for a NAMED volume",
+			outcome: partial(),
+			restores: []VolumeRestoreState{
+				{Name: "pvr-a", Pod: pod, Volume: "a", ClaimName: "a", Phase: "Failed", Message: "error copying data for volume a: disk full"},
+				removedB,
+			},
+			removed: removed,
+			want:    "payments/a",
+		},
+		{
+			name:     "the same message on a volume that was not removed",
+			outcome:  partial(),
+			restores: []VolumeRestoreState{completedA, {Name: "pvr-c", Pod: pod, Volume: "c", ClaimName: "c", Phase: "Failed", Message: "volume not found in pod"}},
+			removed:  removed,
+			want:     "PodVolumeRestores that are not a removed volume's error",
+		},
+		{
+			name:     "a Failed removed volume with any other message",
+			outcome:  partial(),
+			restores: []VolumeRestoreState{completedA, {Name: "pvr-b", Pod: pod, Volume: "b", ClaimName: "b", Phase: "Failed", Message: "error copying data for volume b: connection reset"}},
+			removed:  removed,
+			want:     "PodVolumeRestores that are not a removed volume's error",
+		},
+		{
+			name:     "a failureReason",
+			outcome:  &RestoreOutcome{Name: "r", Phase: "PartiallyFailed", Errors: 1, Warnings: 2, FailureReason: "the restore could not reach the backup storage location"},
+			restores: []VolumeRestoreState{completedA, removedB},
+			removed:  removed,
+			want:     "a failureReason",
+		},
+		{
+			name:     "mode 1 removes nothing, so the same verdict is refused",
+			outcome:  partial(),
+			restores: []VolumeRestoreState{completedA, removedB},
+			removed:  nil,
+			want:     "PartiallyFailed, not Completed",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := checkVolumeRestores(c.outcome, c.restores, named, c.removed)
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("the verdict was refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the verdict was accepted, want a refusal naming %q", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("the refusal does not say %q:\n%v", c.want, err)
+			}
+		})
+	}
+}
+
 // THE BEAD'S UNIT ACCEPTANCE (kn-t43-restore-workload-s-stranded-11o7.3): every
 // rule the modifier writes selects the pods the chosen BACKUP holds for the
 // named claims, and never the pod that mounts them today. The fixture's two
