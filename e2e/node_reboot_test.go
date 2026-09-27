@@ -141,6 +141,7 @@ func startRebootWatch(ctx context.Context, t *testing.T, runner k3s.Runner, clie
 }
 
 func TestNodeRebootGate(t *testing.T) {
+	gate := t
 	env := gateEnvironment(t)
 	client, err := api.New(env.controlPlane, api.WithToken(env.token))
 	if err != nil {
@@ -240,7 +241,7 @@ func TestNodeRebootGate(t *testing.T) {
 		// EOF rather than reporting a fact about the node. The fresh runner is
 		// kept in `host`, so the arms after this one read /proc and k3s's TLS
 		// directory through it too.
-		host = connectNodes(t, env)[0].Runner
+		host = dialServer(t, gate, env)
 		after := hostBootID(t, host)
 		if after == before {
 			t.Errorf("the boot id did not change (%s): the host was not rebooted", after)

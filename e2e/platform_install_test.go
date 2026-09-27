@@ -400,6 +400,15 @@ func assertHost(t *testing.T, ctx context.Context, node uninstall.Node, want map
 // installer's own session.
 func connectNodes(t *testing.T, env gateEnv) []uninstall.Node {
 	t.Helper()
+	return []uninstall.Node{{Address: env.server, Role: uninstall.RoleServer, Runner: dialServer(t, t, env)}}
+}
+
+// dialServer opens an SSH connection to the server that stays open as long as
+// owner runs. A gate arm that redials after a reboot passes the gate itself as
+// owner: closed with the arm, the connection was gone before the next arm read
+// through it (hardware, 2026-09-27).
+func dialServer(t, owner *testing.T, env gateEnv) *sshx.Client {
+	t.Helper()
 	opts := sshx.Options{
 		User:           env.sshUser,
 		KeyPath:        env.sshKey,
@@ -414,8 +423,8 @@ func connectNodes(t *testing.T, env gateEnv) []uninstall.Node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { client.Close() })
-	return []uninstall.Node{{Address: env.server, Role: uninstall.RoleServer, Runner: client}}
+	owner.Cleanup(func() { client.Close() })
+	return client
 }
 
 func reporterTo(t *testing.T) converge.Reporter {
