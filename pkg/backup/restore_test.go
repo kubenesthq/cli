@@ -107,21 +107,24 @@ func eligibleFacts(t *testing.T, name string, captureStart, completed time.Time,
 type fakeCluster struct {
 	runner k3s.Runner
 
-	namespace     *NamespaceState
-	claims        []VolumeRef
-	claimLabels   map[string]map[string]string
-	workloads     []WorkloadState
-	pods          []PodState
-	cronjobs      []CronJobState
-	jobs          []JobState
-	apps          []ApplicationState
-	hold          *ProjectHold
-	drill         *DrillRestore
-	volumes       []VolumeRestoreState
-	outcome       *RestoreOutcome
-	bindings      map[string]*ClaimBinding
-	readyNodes    map[string]bool
-	selectorByPod map[string]map[string]string
+	namespace   *NamespaceState
+	claims      []VolumeRef
+	claimLabels map[string]map[string]string
+	workloads   []WorkloadState
+	pods        []PodState
+	// podVolumeBackups is what each backup holds, by backup name: the
+	// PodVolumeBackups' pods, volumes and claim UIDs.
+	podVolumeBackups map[string][]BackupVolumeState
+	cronjobs         []CronJobState
+	jobs             []JobState
+	apps             []ApplicationState
+	hold             *ProjectHold
+	drill            *DrillRestore
+	volumes          []VolumeRestoreState
+	outcome          *RestoreOutcome
+	bindings         map[string]*ClaimBinding
+	readyNodes       map[string]bool
+	selectorByPod    map[string]map[string]string
 	// onProjectHold runs when the operator's acknowledgement is read, which is
 	// the window between the confirmed plan and the destructive step: a test
 	// moves an identity here.
@@ -142,6 +145,11 @@ type fakeCluster struct {
 	backupsMade   []string
 	restoresMade  []restoreRequest
 	modifiersMade []string
+	// writes is the run's OWN steps in order, one label per write it asked the
+	// cluster for. It is what "the stop step runs before the safety backup" and
+	// "the run did not patch a restored CronJob" are claims about, which the
+	// per-call observations (`suspended`, `scaled`) cannot say.
+	writes []string
 	// appliedDocs are the raw documents that reached the API server, so a test
 	// can assert what a modifier RULE says rather than only its name.
 	restoreDocs []restoreDoc
@@ -228,6 +236,13 @@ func (c *fakeCluster) Pods(_ context.Context, namespace string) ([]PodState, err
 		out = append(out, pod)
 	}
 	return out, nil
+}
+
+func (c *fakeCluster) PodVolumeBackups(_ context.Context, backup string) ([]BackupVolumeState, error) {
+	if c.deleted {
+		return nil, nil
+	}
+	return append([]BackupVolumeState(nil), c.podVolumeBackups[backup]...), nil
 }
 
 func (c *fakeCluster) CronJobs(_ context.Context, _ string) ([]CronJobState, error) {
@@ -321,6 +336,7 @@ func (c *fakeCluster) ScaleWorkload(ctx context.Context, kind, name, namespace s
 	if err := c.command(ctx, fmt.Sprintf("scale %s %s -n %s --replicas=%d", kind, name, namespace, replicas)); err != nil {
 		return err
 	}
+	c.note("scale/%s/%s=%d", kind, name, replicas)
 	c.scaled = append(c.scaled, fmt.Sprintf("%s/%s=%d", kind, name, replicas))
 	if replicas == 0 {
 		// The pods go with the scale-down, which is what the run waits for.
@@ -333,6 +349,7 @@ func (c *fakeCluster) DeleteNamespace(ctx context.Context, name string) error {
 	if err := c.command(ctx, "delete namespace "+name+" --wait=false"); err != nil {
 		return err
 	}
+	c.note("delete-namespace/%s", name)
 	c.deleted = true
 	c.namespace = nil
 	return nil
@@ -354,6 +371,7 @@ func (c *fakeCluster) SuspendCronJob(ctx context.Context, namespace, name string
 	if err := c.command(ctx, fmt.Sprintf("patch cronjob %s -n %s --type=merge -p '{\"spec\":{\"suspend\":%t}}'", name, namespace, suspend)); err != nil {
 		return err
 	}
+	c.note("suspend-cronjob/%s=%t", name, suspend)
 	c.suspended[name] = suspend
 	return nil
 }
@@ -362,6 +380,7 @@ func (c *fakeCluster) SuspendJob(ctx context.Context, namespace, name string, su
 	if err := c.command(ctx, fmt.Sprintf("patch job %s -n %s --type=merge -p '{\"spec\":{\"suspend\":%t}}'", name, namespace, suspend)); err != nil {
 		return err
 	}
+	c.note("suspend-job/%s=%t", name, suspend)
 	if c.jobsSuspended == nil {
 		c.jobsSuspended = map[string]bool{}
 	}
@@ -373,6 +392,7 @@ func (c *fakeCluster) CreateBackup(ctx context.Context, name string, doc []byte)
 	if err := c.applyDocument(ctx, name, doc); err != nil {
 		return err
 	}
+	c.note("backup/%s", name)
 	c.backupsMade = append(c.backupsMade, name)
 	return nil
 }
@@ -381,6 +401,7 @@ func (c *fakeCluster) CreateRestore(ctx context.Context, name string, doc []byte
 	if err := c.applyDocument(ctx, name, doc); err != nil {
 		return err
 	}
+	c.note("restore/%s", name)
 	spec := restoreRequest{Name: name}
 	var parsed struct {
 		Spec struct {
@@ -423,9 +444,36 @@ func (c *fakeCluster) Apply(ctx context.Context, what string, doc []byte) error 
 	if err := c.applyDocument(ctx, what, doc); err != nil {
 		return err
 	}
+	c.note("apply/%s", what)
 	c.modifiersMade = append(c.modifiersMade, what)
 	c.restoreDocs = append(c.restoreDocs, restoreDoc{What: what, Doc: append([]byte(nil), doc...)})
 	return nil
+}
+
+// note records one write the run asked the cluster for, in order.
+func (c *fakeCluster) note(format string, args ...any) {
+	c.writes = append(c.writes, fmt.Sprintf(format, args...))
+}
+
+// writeIndex is where the first write whose label begins with prefix happened,
+// or -1.
+func (c *fakeCluster) writeIndex(prefix string) int {
+	for i, write := range c.writes {
+		if strings.HasPrefix(write, prefix) {
+			return i
+		}
+	}
+	return -1
+}
+
+// writesAfter returns the writes recorded after the first one whose label
+// begins with marker.
+func (c *fakeCluster) writesAfter(marker string) []string {
+	at := c.writeIndex(marker)
+	if at < 0 {
+		return nil
+	}
+	return append([]string(nil), c.writes[at+1:]...)
 }
 
 func (c *fakeCluster) applyDocument(ctx context.Context, name string, doc []byte) error {
@@ -559,6 +607,20 @@ func (k *fakeOpKube) commandCount(needle string) int {
 		}
 	}
 	return count
+}
+
+// commandIndex is where the first command containing needle was submitted, or
+// -1. It is the transport's own order, which is what "the stop step runs before
+// the safety backup" is a claim about.
+func (k *fakeOpKube) commandIndex(needle string) int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for i, command := range k.commands {
+		if strings.Contains(command, needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 func configMapNameIn(command string) (string, bool) {
@@ -1102,8 +1164,10 @@ func TestNamespaceRestoreSuspendsCronJobsThroughTheRestoreModifier(t *testing.T)
 	if entry["path"] != "/spec/suspend" || entry["value"] != "true" {
 		t.Errorf("the second rule matches %v, want spec.suspend true — the value the BACKUP held, which is what `matches` is read against", entry)
 	}
-	if _, patched := f.cluster.suspended["nightly"]; patched {
-		t.Error("the run patched a restored CronJob to suspend it: the suspension must travel with the Restore, because a write from here is the window it exists to close")
+	for _, write := range f.cluster.writesAfter("restore/") {
+		if strings.HasPrefix(write, "suspend-cronjob/") {
+			t.Errorf("the run patched a RESTORED CronJob to suspend it (%s): the suspension must travel with the Restore, because a write from here is the window it exists to close. The stop step's suspension of the namespace as it stood runs before the safety backup, not here", write)
+		}
 	}
 }
 
@@ -1130,8 +1194,10 @@ func TestNamespaceRestoreRefusesACronJobTheRestoreLeftRunning(t *testing.T) {
 	if strings.Contains(out, RestoredStage) {
 		t.Errorf("the run reported the namespace as %q with a CronJob still able to run:\n%s", RestoredStage, out)
 	}
-	if len(f.cluster.suspended) != 0 {
-		t.Errorf("the run suspended the CronJobs itself (%v): that write is the window this restore exists to close, and a Job may already have run", f.cluster.suspended)
+	for _, write := range f.cluster.writesAfter("restore/") {
+		if strings.HasPrefix(write, "suspend-cronjob/") {
+			t.Errorf("the run suspended a RESTORED CronJob itself (%s): that write is the window this restore exists to close, and a Job may already have run", write)
+		}
 	}
 	if got := pendingDetailOf(t, f.kube.recordFor(operation.Name), "cronjob/s4-sentinel"); got != "" {
 		t.Errorf("the run recorded %q for a CronJob it refused on: nothing is established about it", got)
@@ -1209,6 +1275,116 @@ func TestNamespaceRestoreActivationPutsBackTheBackupsSuspendValue(t *testing.T) 
 	}
 }
 
+// TestNamespaceRestoreStopSuspendsCronJobsBeforeTheSafetyBackup is kn-x0wv.5:
+// the stop step suspends every CronJob in the namespace as it stands BEFORE the
+// safety backup, and records that it did.
+//
+// THE PLANTED NEGATIVE IS TODAY'S STOP STEP, which scaled the workloads to zero
+// and left the schedules armed: a CronJob creates its Job whenever its schedule
+// comes due, the namespace is not deleted until after the safety backup, and on
+// hardware (S4, lab w3, 2026-09-27) the recreated namespace's `s4-sentinel`
+// fired in exactly that window, against claims the restore had emptied.
+func TestNamespaceRestoreStopSuspendsCronJobsBeforeTheSafetyBackup(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// The namespace as the run finds it, before the restore: a sentinel that
+	// fires every minute and a nightly job.
+	f.cluster.cronjobs = []CronJobState{
+		{Name: "s4-sentinel", Schedule: "* * * * *", Suspend: true, RecordedSuspend: "false"},
+		{Name: "nightly", Schedule: "0 2 * * *", Suspend: true, RecordedSuspend: "false"},
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	backupAt := f.cluster.writeIndex("backup/")
+	if backupAt < 0 {
+		t.Fatalf("the run took no safety backup (%v)", f.cluster.writes)
+	}
+	record := f.kube.recordFor(operation.Name)
+	for _, name := range []string{"s4-sentinel", "nightly"} {
+		at := f.cluster.writeIndex("suspend-cronjob/" + name + "=true")
+		if at < 0 {
+			t.Errorf("the stop step did not suspend CronJob %s (%v): a due schedule can create a Job against the emptied namespace while the restore is under way", name, f.cluster.writes)
+			continue
+		}
+		if !f.cluster.suspended[name] {
+			t.Errorf("CronJob %s was not left suspended (%v)", name, f.cluster.suspended)
+		}
+		if at > backupAt {
+			t.Errorf("CronJob %s was suspended AFTER the safety backup (%v): the window the Job can start in is exactly the one before it", name, f.cluster.writes)
+		}
+		if got := pendingDetailOf(t, record, StoppedCronJobTarget+name); got != "true" {
+			t.Errorf("the operation recorded %q for the CronJob the stop step suspended, want the value it had before (true)", got)
+		}
+	}
+	// The transport saw the same order: the patches precede the first apply,
+	// which is the safety backup's document.
+	patch, apply := f.kube.commandIndex("patch cronjob"), f.kube.commandIndex("apply -f -")
+	if patch < 0 {
+		t.Errorf("no `patch cronjob` reached the transport: %v", f.kube.commands)
+	} else if apply < 0 {
+		t.Error("no document was applied to the cluster at all")
+	} else if patch > apply {
+		t.Errorf("the CronJob patch was submitted after the first apply (commands %v)", f.kube.commands)
+	}
+	// AND THE STOP STEP'S VALUE IS NOT ACTIVATION'S: what activation puts a
+	// restored CronJob back to is the backup's own value.
+	if got := pendingDetailOf(t, record, "cronjob/s4-sentinel"); got != "false" {
+		t.Errorf("the operation recorded %q for the restored CronJob, want the backup's own value false", got)
+	}
+}
+
+// TestNamespaceRestoreActivationTakesTheBackupsCronJobValueNotTheStopSteps: the
+// stop step's record says what the namespace's CronJob was before it was
+// stopped; activation must put the RESTORED CronJob back to the value the
+// BACKUP held (kn-x0wv.3's annotation), not to that one.
+//
+// THE TWO DIFFER HERE ON PURPOSE, which is the only way the mistake is visible:
+// the live CronJob was suspended before the stop step, and the backup ran it.
+// Reading the stop step's entry would leave the namespace's schedule switched
+// off after activation.
+func TestNamespaceRestoreActivationTakesTheBackupsCronJobValueNotTheStopSteps(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// What the restore left: suspended by the modifier, with the annotation
+	// saying the BACKUP ran it.
+	f.cluster.cronjobs = []CronJobState{
+		{Name: "nightly", Schedule: "0 2 * * *", Suspend: true, RecordedSuspend: "false"},
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	record := f.kube.recordFor(operation.Name)
+	if got := pendingDetailOf(t, record, StoppedCronJobTarget+"nightly"); got != "true" {
+		t.Errorf("the stop step recorded %q for CronJob nightly, want the value it had before the step (true): the record must answer what the stop step did", got)
+	}
+	if got := pendingDetailOf(t, record, "cronjob/nightly"); got != "false" {
+		t.Errorf("the operation recorded %q for the restored CronJob, want the backup's own value false", got)
+	}
+
+	// Activation's own decision, with the fake's log of suspend patches cleared
+	// so what is read is what activation wrote.
+	f.cluster.suspended = map[string]bool{}
+	var activated strings.Builder
+	if err := RunRestore(context.Background(), &activated, strings.NewReader(""), f.options(t, RestoreOptions{
+		Namespace: "payments",
+		Activate:  record.OperationID,
+	}), f.deps()); err != nil {
+		t.Fatalf("activation failed: %v\n%s", err, activated.String())
+	}
+	suspended, patched := f.cluster.suspended["nightly"]
+	if !patched {
+		t.Fatalf("activation did not put CronJob nightly back at all:\n%s", activated.String())
+	}
+	if suspended {
+		t.Error("activation left CronJob nightly suspended: it read the value the stop step recorded instead of the backup's, and the namespace's schedule stays off")
+	}
+}
+
 // TestNamespaceRestoreResume: after an interrupted run the record is released,
 // the pause is still in place, and --resume finishes the restore without
 // repeating a step whose postcondition holds and without activating anything.
@@ -1266,6 +1442,148 @@ func TestNamespaceRestoreResume(t *testing.T) {
 	}
 	if suspended, ok := resumed.cluster.suspended["nightly"]; ok && !suspended {
 		t.Error("--resume un-suspended a CronJob: activating is not resuming")
+	}
+}
+
+// TestNamespaceRestoreResumeAfterTheNamespaceDeletion is kn-x0wv.4: a restore
+// interrupted after its namespace deletion and its Restore request is finished
+// by `--resume <id>` ALONE.
+//
+// THE HARDWARE STATE IS THE INTERESTING ONE (S4 on lab w3, 2026-09-27): the
+// interrupted run had already paused the project, deleted the namespace and
+// requested the Velero Restore when it was killed, and by the time the operator
+// resumes, the reconcilers have recreated the namespace — with an empty claim
+// under the recorded name. So the resume reads the namespace from the record
+// (the flag does not exist), treats the deletion the record says succeeded as
+// done, and waits for the Restore the record names instead of creating a second
+// one. The pause stays and nothing activates.
+func TestNamespaceRestoreResumeAfterTheNamespaceDeletion(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// The first run's Restore never reaches a terminal phase: the wait runs out.
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatalf("a restore that never reaches a terminal phase must fail:\n%s", out)
+	}
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("an interrupted restore left no record")
+	}
+	opID := record.OperationID
+	deletion := ""
+	for _, action := range record.Actions {
+		if strings.HasPrefix(action.Stage, "delete-namespace/") {
+			deletion = string(action.Status)
+		}
+	}
+	if deletion != string(operation.ActionSucceeded) {
+		t.Fatalf("the interrupted run's namespace deletion is %q, want %q: this test is about a resume after that step",
+			deletion, operation.ActionSucceeded)
+	}
+
+	// THE CLUSTER THE RESUME FINDS: the namespace is back, with the reconcilers'
+	// own empty claim under the recorded name and a new UID for both.
+	resumed := newRestoreFixture(t, facts)
+	resumed.kube = f.kube
+	resumed.cluster.annotations = f.cluster.annotations
+	resumed.cluster.namespace = &NamespaceState{Name: "payments", UID: "uid-ns-recreated"}
+	resumed.cluster.claims = []VolumeRef{{Namespace: "payments", Name: "data-0", UID: "uid-data-0-recreated"}}
+
+	beforeDeletes := resumed.kube.commandCount("delete namespace payments")
+	// The transport's own log, because the fake's `backupsMade`/`restoresMade`
+	// count the run's CALLS: a write the operation record already holds never
+	// reaches the transport at all, which is the fact being asserted.
+	beforeApplies := resumed.kube.commandCount("apply -f -")
+	var resumedOut strings.Builder
+	// NO --namespace: this is the flag surface the CLI allows for a resume.
+	err = RunRestore(context.Background(), &resumedOut, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps())
+	if err != nil {
+		t.Fatalf("--resume failed: %v\n%s", err, resumedOut.String())
+	}
+	if !strings.Contains(resumedOut.String(), "Restore plan for namespace payments") {
+		t.Errorf("the resumed plan does not name the record's namespace:\n%s", resumedOut.String())
+	}
+	if !strings.Contains(resumedOut.String(), "Resuming operation "+opID) {
+		t.Errorf("the resume did not say which operation it continues:\n%s", resumedOut.String())
+	}
+	if !strings.Contains(resumedOut.String(), RestoredStage) {
+		t.Errorf("the resume did not finish at %q:\n%s", RestoredStage, resumedOut.String())
+	}
+	// THE DELETION IS NOT REPEATED AND NOT WAITED FOR: the namespace is back,
+	// and waiting for it to be gone again would never finish.
+	if after := resumed.kube.commandCount("delete namespace payments"); after != beforeDeletes {
+		t.Errorf("--resume re-submitted the namespace deletion (%d -> %d): the record says the step is done", beforeDeletes, after)
+	}
+	// NOTHING WAS SUBMITTED: the safety backup, the resource modifier and the
+	// Restore are the ones the record names, and a second Restore would run
+	// Velero twice over the same namespace.
+	if after := resumed.kube.commandCount("apply -f -"); after != beforeApplies {
+		t.Errorf("--resume submitted %d document(s) to the cluster: the backup, the modifier and the Restore it continues are all established in the record", after-beforeApplies)
+	}
+	if after := resumed.kube.recordFor(operation.Name); after == nil || after.Stage != RestoredStage {
+		t.Errorf("the record is %+v, want it at %q", after, RestoredStage)
+	}
+	// A RESUME NEVER ACTIVATES.
+	if resumed.cluster.annotations[PauseAnnotationKey] != opID {
+		t.Errorf("--resume lifted the pause (annotations %v)", resumed.cluster.annotations)
+	}
+	if suspended, patched := resumed.cluster.suspended["nightly"]; patched && !suspended {
+		t.Error("--resume un-suspended a CronJob: activating is not resuming")
+	}
+}
+
+// TestNamespaceRestoreResumeRefusesClaimsTheRecordDidNotCreate is the planted
+// negative of kn-x0wv.4: the recorded namespace deletion is treated as done, so
+// a namespace that is gone or recreated does NOT fail the UID pin — but a claim
+// this operation never saw is refused, by name, before anything changes.
+//
+// The distinction is the point. A recreated claim under a RECORDED name is the
+// reconcilers' ordinary work and its new UID is expected; a claim the record
+// never held carries data this restore did not destroy, never showed the
+// operator, and would sit beside the restored objects afterwards.
+func TestNamespaceRestoreResumeRefusesClaimsTheRecordDidNotCreate(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err == nil {
+		t.Fatal("the interrupted run must fail")
+	}
+	opID := f.kube.recordFor(operation.Name).OperationID
+
+	resumed := newRestoreFixture(t, facts)
+	resumed.kube = f.kube
+	resumed.cluster.annotations = f.cluster.annotations
+	resumed.cluster.namespace = &NamespaceState{Name: "payments", UID: "uid-ns-recreated"}
+	resumed.cluster.claims = []VolumeRef{
+		{Namespace: "payments", Name: "data-0", UID: "uid-data-0-recreated"},
+		{Namespace: "payments", Name: "data-1", UID: "uid-data-1-new"},
+	}
+
+	beforeApplies := resumed.kube.commandCount("apply -f -")
+
+	var out strings.Builder
+	err := RunRestore(context.Background(), &out, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps())
+	if err == nil {
+		t.Fatalf("a resume into a namespace holding a claim the record never held must be refused:\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "persistentvolumeclaim/payments/data-1") {
+		t.Errorf("the refusal does not name the claim the record did not create: %v", err)
+	}
+	if strings.Contains(err.Error(), "persistentvolumeclaim/payments/data-0") {
+		t.Errorf("the refusal names the claim the record DID create: %v", err)
+	}
+	if resumed.cluster.deleted {
+		t.Error("a refused resume changed the cluster")
+	}
+	if applies := resumed.kube.commandCount("apply -f -") - beforeApplies; applies != 0 {
+		t.Errorf("a refused resume submitted %d document(s) to the cluster", applies)
+	}
+	if strings.Contains(out.String(), RestoredStage) {
+		t.Errorf("the refused resume reported the namespace as restored:\n%s", out.String())
+	}
+	if resumed.cluster.annotations[PauseAnnotationKey] != opID {
+		t.Errorf("the refusal did not leave the pause in place (annotations %v)", resumed.cluster.annotations)
 	}
 }
 
@@ -1352,16 +1670,36 @@ func TestNamespaceRestoreAbortLeavesTheProjectPaused(t *testing.T) {
 	}
 }
 
-// TestRestoreRefusesToResumeADifferentNamespace: a resume continues the SAME
+// TestRestoreRefusesToResumeIntoChangedIdentities: a resume continues the SAME
 // immutable request, so an identity that moved is refused by name.
+//
+// THE RUN IS INTERRUPTED BEFORE ITS DESTRUCTIVE STEP, which is what makes the
+// claim's UID the thing that catches it. Once this operation's own
+// `delete-namespace` is recorded as done, the claims that went with the
+// namespace are identities its own delete destroyed — a claim recreated under
+// the same name after that is the reconcilers' ordinary state and not a moved
+// identity (kn-x0wv.4). Before the delete, nothing has been destroyed and the
+// UID pin is the whole guarantee that the claim is the one the operator
+// confirmed.
 func TestRestoreRefusesToResumeIntoChangedIdentities(t *testing.T) {
-	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-1*time.Hour), "data-0")
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
 	f := newRestoreFixture(t, facts)
-	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	// A project that never acknowledges the pause stops the run before the
+	// safety backup, so nothing has been deleted.
+	f.cluster.hold = nil
 	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err == nil {
-		t.Fatal("the interrupted run must fail")
+		t.Fatal("a run whose pause is never acknowledged must fail")
 	}
-	opID := f.kube.recordFor(operation.Name).OperationID
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("the interrupted run left no record")
+	}
+	opID := record.OperationID
+	for _, action := range record.Actions {
+		if strings.HasPrefix(action.Stage, "delete-namespace/") {
+			t.Fatalf("the interrupted run deleted the namespace, so this test would be about the wrong guard: %+v", action)
+		}
+	}
 
 	resumed := newRestoreFixture(t, facts)
 	resumed.kube = f.kube

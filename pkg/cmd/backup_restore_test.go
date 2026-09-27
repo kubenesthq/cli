@@ -384,6 +384,10 @@ func (s *stubCluster) VolumeRestores(context.Context, string) ([]backup.VolumeRe
 	return nil, nil
 }
 
+func (s *stubCluster) PodVolumeBackups(context.Context, string) ([]backup.BackupVolumeState, error) {
+	return nil, nil
+}
+
 func (s *stubCluster) RestoreOutcome(context.Context, string) (*backup.RestoreOutcome, error) {
 	return &backup.RestoreOutcome{Phase: "Completed"}, nil
 }

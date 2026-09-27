@@ -31,6 +31,15 @@ import (
 //   - a resource modifier must change the restored pod's pod-template-hash.
 //     Velero strips ownerReferences, so an unchanged pod is adopted by the
 //     scaled-to-zero owner and deleted at once.
+//   - THE MODIFIER MUST NAME THE PODS THE BACKUP HOLDS, not the pods that mount
+//     the claims today. Velero restores the pod the backup captured, under the
+//     name it had at backup time, and builds that pod's PodVolumeRestores from
+//     the PodVolumeBackups that name IT by pod name (pkg/podvolume/util.go:75,
+//     getVolumeBackupInfoForPod -> isPVBMatchPod, Velero 1.18.1). A rule aimed
+//     at a pod the ReplicaSet replaced matches nothing, so the restored pod
+//     keeps its old pod-template-hash, the owner adopts and deletes it, and its
+//     PodVolumeRestores never start (kn-t43-restore-workload-s-stranded-11o7.3:
+//     the backup's dead-b87c65446-d7vlj against the live dead-b87c65446-r9zpb).
 //   - the owner stays at zero until every named claim's PodVolumeRestore is
 //     Completed. Only then does the restored pod become the workload's data.
 //   - a strategic merge patch must remove every volume that was NOT named from
@@ -55,8 +64,17 @@ type volumePlan struct {
 	Skipped   []string
 
 	Claims []VolumeRef
-	// Pods are the live pods that mount a named claim.
+	// Pods are the live pods that mount a named claim. They are what step 3
+	// scales down and what the owner walk reads; they are NOT what the
+	// modifier names, because they are not what Velero restores.
 	Pods []PodState
+	// BackupPods are the pods the CHOSEN BACKUP holds for the named claims,
+	// derived from its PodVolumeBackups. They are the pods the restore creates
+	// and the only names the modifier's rules match. Nil means "not derived
+	// yet": a resume rebuilds mode 2's plan from the record, which carries the
+	// claims and no pods, so the run derives this set again from the same
+	// backup (see ensureBackupPods).
+	BackupPods []backupPod
 	// Owners are the controllers those pods belong to, with the replica counts
 	// activation puts back.
 	Owners []WorkloadState
@@ -74,6 +92,47 @@ type volumePlan struct {
 	AgeAccepted bool
 	Mode        string
 	PVCs        []string
+}
+
+// backupPod is one pod the RESTORE creates, as the BACKUP holds it.
+//
+// THE NAME IS THE WHOLE POINT. Velero restores the pod its PodVolumeBackups
+// name, under that same name (pkg/podvolume/backupper.go:513-528 records it,
+// restorer.go:126 finds the volumes to fill through it), so a modifier rule
+// keyed on today's pod matches nothing after the pod was replaced — the node
+// loss case this mode exists for.
+type backupPod struct {
+	// Name is the pod's name in the BACKUP.
+	Name string
+	// Volumes is every volume the backup holds for this pod, and Named the
+	// ones among them that ARE the named claims. The difference is what the
+	// modifier must remove from the restored pod: Velero restores the data of
+	// every volume of the pod that has a PodVolumeBackup, whether or not the
+	// claim object itself is skipped as already existing (probe P5's selective
+	// fixture), so a volume the backup holds but the operator did not name
+	// would have its live contents overwritten.
+	Volumes []string
+	Named   []string
+	// Strip is the strategic merge patch that removes every unnamed volume the
+	// backup holds for this pod, with its mounts. Empty when there is none, in
+	// which case no rule is written for this pod at all.
+	Strip string
+}
+
+// unnamed is the volumes the backup holds for this pod that are not named
+// claims: exactly the set the strip patch removes.
+func (p backupPod) unnamed() []string {
+	named := map[string]bool{}
+	for _, volume := range p.Named {
+		named[volume] = true
+	}
+	var out []string
+	for _, volume := range p.Volumes {
+		if !named[volume] {
+			out = append(out, volume)
+		}
+	}
+	return out
 }
 
 // runVolumeRestore is mode 2.
@@ -293,7 +352,127 @@ func (r *restoreRun) buildVolumePlan(ctx context.Context) error {
 		}
 		return plan.Owners[i].Name < plan.Owners[j].Name
 	})
+	// LAST, AND IT IS THE MODIFIER'S HALF OF THE PLAN: which pods the BACKUP
+	// holds for these claims, and which of their volumes the modifier has to
+	// take back out of the restored pod.
+	return r.ensureBackupPods(ctx, pods)
+}
+
+// ensureBackupPods derives, from the chosen backup, the pods the restore will
+// create and the volume-strip patch each of them needs.
+//
+// WHY NOT plan.Pods. The pods mounting the claims today are what step 3 scales
+// down; they are not what Velero restores. Velero restores the pod the backup
+// captured, under its backup-time name, and it finds the volumes to fill for
+// that pod by matching the PodVolumeBackups' spec.pod.name against the pod it
+// is restoring (Velero 1.18.1, pkg/podvolume/restorer.go:126 ->
+// pkg/podvolume/util.go:75, getVolumeBackupInfoForPod/isPVBMatchPod). So a
+// modifier keyed on a pod name the ReplicaSet has since replaced changes
+// nothing on the pod that is actually created: the restored pod keeps its
+// pod-template-hash, the scaled-to-zero owner adopts and deletes it, and its
+// PodVolumeRestores never start. That is
+// kn-t43-restore-workload-s-stranded-11o7.3: the backup's
+// dead-b87c65446-d7vlj, today's dead-b87c65446-r9zpb.
+//
+// THE CLAIM LINK IS THE CLAIM'S UID: the PodVolumeBackup's velero.io/pvc-uid
+// label against the named claim's UID. It is the claim's identity, it is what
+// Velero writes for exactly this purpose (pkg/apis/velero/v1/
+// labels_annotations.go: PVCUIDLabel, set at pkg/podvolume/backupper.go:546),
+// and it is what this command already reads back for PodVolumeRestores
+// (claimNamesByUID, velero_resources_test.go). The claim a stranded restore
+// names is the claim that was copied — it is Pending, not deleted — so its UID
+// is still the one the backup recorded. The pvc-name annotation upstream also
+// writes is deliberately NOT used: hardware (lab w3, 2026-09-27) carried the
+// UID label and no claim-name annotation.
+//
+// A NAMED CLAIM THE BACKUP HOLDS NO VOLUME FOR IS REFUSED BY NAME, at plan
+// time: probe P5's run 4 reported "Completed with 0 errors" having restored
+// nothing at all, which is what a plan that cannot fill a claim looks like from
+// further away.
+//
+// live is the pods the plan read and the source of the strip patch's merge keys
+// (container names and mount paths). It is empty on a resume, where the run
+// rebuilds the plan from the record and reads the pods itself.
+func (r *restoreRun) ensureBackupPods(ctx context.Context, live []PodState) error {
+	plan := r.volumePlan
+	held, err := r.deps.Cluster.PodVolumeBackups(ctx, plan.Backup.Name)
+	if err != nil {
+		return err
+	}
+	if len(live) == 0 {
+		if live, err = r.deps.Cluster.Pods(ctx, plan.Namespace); err != nil {
+			return err
+		}
+	}
+	claimOfUID := map[string]string{}
+	for _, claim := range plan.Claims {
+		if claim.UID != "" {
+			claimOfUID[claim.UID] = claim.Name
+		}
+	}
+	byPod := map[string][]BackupVolumeState{}
+	var order []string
+	for _, volume := range held {
+		if volume.Namespace != plan.Namespace || volume.Pod == "" || volume.Volume == "" {
+			continue
+		}
+		if _, seen := byPod[volume.Pod]; !seen {
+			order = append(order, volume.Pod)
+		}
+		byPod[volume.Pod] = append(byPod[volume.Pod], volume)
+	}
+	sort.Strings(order)
+	pods := []backupPod{}
+	found := map[string]bool{}
+	for _, name := range order {
+		pod := backupPod{Name: name}
+		for _, volume := range byPod[name] {
+			pod.Volumes = append(pod.Volumes, volume.Volume)
+			if claim, named := claimOfUID[volume.ClaimUID]; named {
+				found[claim] = true
+				pod.Named = append(pod.Named, volume.Volume)
+			}
+		}
+		// A pod the backup holds only volumes of claims this restore did not
+		// name is not a pod this restore creates: the restore is narrowed by
+		// the owners of the LIVE pods, and its rules name the pods that carry
+		// a named claim.
+		if len(pod.Named) == 0 {
+			continue
+		}
+		pods = append(pods, pod)
+	}
+	var missing []string
+	for _, claim := range plan.Claims {
+		if !found[claim.Name] {
+			missing = append(missing, claim.Namespace+"/"+claim.Name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("backup %s holds no PodVolumeBackup for %s, so it cannot refill %s: a PodVolumeBackup is the backup's own record of a volume it copied, and a named claim without one was not copied by this backup. Nothing has been changed: choose a backup that holds every named claim, or name only the claims this one does",
+			plan.Backup.Name, strings.Join(missing, ", "), namedClaimPhrase(len(missing)))
+	}
+	for i := range pods {
+		strip := pods[i].unnamed()
+		if len(strip) == 0 {
+			continue
+		}
+		patch, err := volumeStripPatch(pods[i].Name, strip, live)
+		if err != nil {
+			return err
+		}
+		pods[i].Strip = patch
+	}
+	plan.BackupPods = pods
 	return nil
+}
+
+// namedClaimPhrase keeps the refusal readable for one claim and for several.
+func namedClaimPhrase(n int) string {
+	if n == 1 {
+		return "it"
+	}
+	return "them"
 }
 
 // resolveOwner walks a pod to the object that has a replica count to put back.
@@ -442,7 +621,20 @@ func (r *restoreRun) renderVolumePlan() {
 		fmt.Fprintf(r.out, "  workload:      %s %s held at 0 replicas (was %d) until every claim is refilled\n", owner.Kind, owner.Name, owner.Replicas)
 	}
 	for _, pod := range p.Pods {
-		fmt.Fprintf(r.out, "  pod:           %s (holder of the claims; the restore fills through it)\n", pod.Name)
+		fmt.Fprintf(r.out, "  pod:           %s (mounts the claims today; scaled to 0, and replaced by the restore)\n", pod.Name)
+	}
+	// BOTH SETS ARE PRINTED, AND THE DIFFERENCE IS THE POINT. The live pods are
+	// what step 3 stops; the BACKUP's pods are what Velero creates and what the
+	// modifier matches. After a node loss the two names differ, and a plan that
+	// showed only the live name is exactly how the modifier came to name the
+	// wrong pod (kn-t43-restore-workload-s-stranded-11o7.3).
+	for _, pod := range p.BackupPods {
+		fmt.Fprintf(r.out, "  restored pod:  %s — the pod %s holds, with the named volumes %s; the restore creates it and the modifier matches it\n",
+			pod.Name, p.Backup.Name, strings.Join(pod.Named, ", "))
+		if unnamed := pod.unnamed(); len(unnamed) > 0 {
+			fmt.Fprintf(r.out, "                 the modifier removes %s from it (with their mounts), so those live volumes are not overwritten\n",
+				strings.Join(unnamed, ", "))
+		}
 	}
 	fmt.Fprintf(r.out, "  selection:     the restore is narrowed to %s\n", describeSelectors(p.LabelSelectors))
 	fmt.Fprintf(r.out, "  unnamed:       every volume of these pods that is NOT named above keeps its current contents, byte for byte\n")
@@ -474,27 +666,35 @@ func (r *restoreRun) volumeRestoreSpec() (restoreRequest, error) {
 
 // volumeModifierDocument renders the two rules probe P5 settled.
 //
+// THE PODS ARE THE BACKUP'S. Both rules' conditions name the pods the chosen
+// backup holds for the named claims (plan.BackupPods), never today's pods that
+// mount them: Velero creates the pod the backup captured, so a rule keyed on
+// the replacement matches nothing and the restored pod is adopted and deleted
+// (kn-t43-restore-workload-s-stranded-11o7.3). The set is derived from the
+// backup, so a resumed run derives the same names from the same backup and
+// builds the same document the interrupted run did.
+//
 // RULE 1 takes the restored pods out of their owner's selector by changing
 // pod-template-hash: Velero strips ownerReferences, so an unchanged pod is
 // adopted by the scaled-to-zero owner and deleted before it can be filled.
 //
-// RULE 2 removes every volume of a restored pod that was NOT named, with its
-// container mounts and Velero's own /restores/<volume> mount, each by its merge
-// key. Velero restores the data of every volume a restored pod mounts that has
-// a backup even when the claim object is skipped as already existing, so
-// without this rule an unnamed claim's newer data is overwritten (P5's
-// selective fixture). The cost is one "volume not found in pod" error per
+// RULE 2 removes every volume the BACKUP holds for a restored pod that was NOT
+// named, with its container mounts and Velero's own /restores/<volume> mount,
+// each by its merge key. Velero restores the data of every volume of the pod
+// that has a PodVolumeBackup even when the claim object is skipped as already
+// existing, so without this rule an unnamed claim's newer data is overwritten
+// (P5's selective fixture). The volumes come from the backup's PodVolumeBackups
+// and not from the live pod, because the live pod is not the pod being patched:
+// a volume only the live pod has would be a deletion of something the restored
+// pod does not carry. The cost is one "volume not found in pod" error per
 // removed volume, which is what makes the restore PartiallyFailed and what the
 // verdict check tolerates — and only that.
 func volumeModifierDocument(operationID string, plan *volumePlan) (*modifierConfigMap, error) {
-	named := map[string]bool{}
-	for _, claim := range plan.Claims {
-		named[claim.Name] = true
+	if len(plan.BackupPods) == 0 {
+		return nil, fmt.Errorf("no pod of backup %s is in the plan, so a modifier could not name the pod Velero will restore. This is a bug: the plan derives the backup's pods from its PodVolumeBackups before it renders", plan.Backup.Name)
 	}
-	podNames := make([]string, 0, len(plan.Pods))
-	podRegexParts := make([]string, 0, len(plan.Pods))
-	for _, pod := range plan.Pods {
-		podNames = append(podNames, pod.Name)
+	podRegexParts := make([]string, 0, len(plan.BackupPods))
+	for _, pod := range plan.BackupPods {
 		podRegexParts = append(podRegexParts, regexpQuote(pod.Name))
 	}
 	rules := []any{
@@ -512,9 +712,8 @@ func volumeModifierDocument(operationID string, plan *volumePlan) (*modifierConf
 			},
 		},
 	}
-	for _, pod := range plan.Pods {
-		patch := volumeStripPatch(pod, named)
-		if patch == "" {
+	for _, pod := range plan.BackupPods {
+		if pod.Strip == "" {
 			continue
 		}
 		rules = append(rules, map[string]any{
@@ -523,37 +722,54 @@ func volumeModifierDocument(operationID string, plan *volumePlan) (*modifierConf
 				"resourceNameRegex": "^(" + regexpQuote(pod.Name) + ")$",
 			},
 			"strategicPatches": []any{
-				map[string]any{"patchData": patch},
+				map[string]any{"patchData": pod.Strip},
 			},
 		})
 	}
 	return modifierDocument(operationID, rules)
 }
 
-// volumeStripPatch builds the strategic merge patch that removes every volume
-// of one pod that is not named, with its mounts. Each deletion is addressed by
-// a merge key (the volume's name, the container's name plus the mountPath),
-// which is why the live pod's containers and mount paths have to be read.
-func volumeStripPatch(pod PodState, named map[string]bool) string {
+// volumeStripPatch builds the strategic merge patch that removes the volumes
+// the BACKUP holds for one restored pod that are not named claims, with their
+// mounts. Each deletion is addressed by a merge key (the volume's name, the
+// container's name plus the mountPath), which is why the mount points have to
+// come from a pod's spec.
+//
+// WHERE THOSE MOUNTS COME FROM. The pod being patched is the BACKUP's, and its
+// spec is inside the backup, which this CLI does not read: Velero performs the
+// restore server-side and no object-store reader exists here (the only S3
+// client in this repository is k3s's etcd snapshot configuration). The live
+// pods are the running instance of the same workload's pod template, so their
+// container names and mount paths for a volume with the same NAME are the merge
+// keys the restored pod carries. A volume the backup holds that no live pod
+// declares is REFUSED rather than guessed at: a patch naming a mount the
+// restored pod does not have cannot be built, and one that removed the wrong
+// mount would be worse than a refusal.
+func volumeStripPatch(name string, strip []string, live []PodState) (string, error) {
 	volumes := []any{}
 	containers := map[string][]any{}
 	initContainers := map[string][]any{}
-	for _, volume := range pod.Volumes {
-		if named[volume.ClaimName] || (volume.ClaimName == "" && len(volume.Mounts) == 0) {
-			continue
+	for _, volume := range strip {
+		mounts := mountsOfVolume(live, volume)
+		if len(mounts) == 0 {
+			return "", fmt.Errorf("backup's pod %s holds volume %s, which is not one of the named claims, so the restore has to take it out of the restored pod before Velero fills it with the backup's data — but no pod in the namespace declares that volume, so the mounts a strategic merge patch must name cannot be read. Nothing has been changed: scale the workload up so a pod of it exists, then re-run", name, volume)
 		}
-		volumes = append(volumes, map[string]any{"name": volume.Name, "$patch": "delete"})
+		volumes = append(volumes, map[string]any{"name": volume, "$patch": "delete"})
 		// VELERO'S OWN MOUNT IS NOT IN THE LIVE POD: it injects a restore-wait
 		// init container that mounts every backed-up volume at
 		// /restores/<volume>, and its resource modifiers run AFTER that
 		// injection. Removing the volume without this mount leaves the pod
 		// invalid ("volumeMounts[0].name: Not found", probe P5 run 6), so the
-		// mount is deleted by its merge keys alongside the volume.
+		// mount is deleted by its merge keys alongside the volume. Its path is
+		// the volume's own name, so it is derived here and not read from a pod.
 		initContainers["restore-wait"] = append(initContainers["restore-wait"], map[string]any{
-			"mountPath": "/restores/" + volume.Name,
+			"mountPath": "/restores/" + volume,
 			"$patch":    "delete",
 		})
-		for _, mount := range volume.Mounts {
+		for _, mount := range mounts {
+			if mount.Container == "restore-wait" {
+				continue
+			}
 			entry := map[string]any{"mountPath": mount.Path, "$patch": "delete"}
 			if mount.Init {
 				initContainers[mount.Container] = append(initContainers[mount.Container], entry)
@@ -563,7 +779,7 @@ func volumeStripPatch(pod PodState, named map[string]bool) string {
 		}
 	}
 	if len(volumes) == 0 {
-		return ""
+		return "", nil
 	}
 	spec := map[string]any{"volumes": volumes}
 	if len(containers) > 0 {
@@ -582,9 +798,27 @@ func volumeStripPatch(pod PodState, named map[string]bool) string {
 	}
 	raw, err := json.Marshal(map[string]any{"spec": spec})
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return string(raw)
+	return string(raw), nil
+}
+
+// mountsOfVolume finds where the pods declare and mount one volume, by the
+// volume's NAME. The pods are the ones the run read — today's instances of the
+// workload's pod template — and a volume's merge keys (its container names and
+// mount paths) are the template's, which is the same template the backed-up pod
+// was created from. Two pods that declare the same volume name with different
+// mounts would be two different templates sharing a name; the first is used,
+// because the pods read here are the ones that mount the named claims.
+func mountsOfVolume(live []PodState, volume string) []PodMount {
+	for _, pod := range live {
+		for _, declared := range pod.Volumes {
+			if declared.Name == volume && len(declared.Mounts) > 0 {
+				return declared.Mounts
+			}
+		}
+	}
+	return nil
 }
 
 func sortedKeys[T any](m map[string]T) []string {
@@ -616,6 +850,16 @@ func regexpQuote(literal string) string {
 // then the claims, then one Velero Restore, then the proof that each named
 // claim was filled.
 func (r *restoreRun) executeVolumeRestore(ctx context.Context) error {
+	// A RESUME REBUILDS THE PLAN FROM THE RECORD, and the record carries the
+	// claims and no pods (restore.go's volumePlanFromRecord), so the pods the
+	// modifier must name are derived again — from the same backup, which the
+	// record names — before anything is applied. Without this a resumed run
+	// would build a modifier that matches no pod at all.
+	if r.volumePlan.BackupPods == nil {
+		if err := r.ensureBackupPods(ctx, nil); err != nil {
+			return err
+		}
+	}
 	if err := r.ensurePause(ctx); err != nil {
 		return err
 	}

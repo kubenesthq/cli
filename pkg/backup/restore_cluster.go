@@ -43,6 +43,13 @@ type RestoreCluster interface {
 	ProjectHold(ctx context.Context, namespace string) (*ProjectHold, error)
 	DrillRestore(ctx context.Context) (*DrillRestore, error)
 	VolumeRestores(ctx context.Context, restoreName string) ([]VolumeRestoreState, error)
+	// PodVolumeBackups reads the volumes the CHOSEN BACKUP holds: one entry per
+	// PodVolumeBackup Velero wrote, naming the pod the backup captured, the
+	// volume within it, and the claim behind that volume by UID. Mode 2's
+	// modifier is built from these and not from today's pods — Velero restores
+	// the pod the backup holds, so a rule aimed at the pod the ReplicaSet
+	// replaced matches nothing (kn-t43-restore-workload-s-stranded-11o7.3).
+	PodVolumeBackups(ctx context.Context, backup string) ([]BackupVolumeState, error)
 	RestoreOutcome(ctx context.Context, name string) (*RestoreOutcome, error)
 	// ClaimBinding reports which volume a claim is bound to, and which node
 	// that volume lives on. It is how mode 2 proves the refilled volume landed
@@ -117,6 +124,21 @@ type PodMount struct {
 	// Init marks a mount of an init container — Velero's own restore-wait is
 	// one, and it mounts every backed-up volume at /restores/<volume>.
 	Init bool
+}
+
+// BackupVolumeState is one volume the BACKUP holds for one pod: a
+// PodVolumeBackup Velero wrote while the pod ran. The pod is named as the
+// BACKUP holds it, which after a node loss is not the pod carrying the claim
+// today, and ClaimUID is the claim the volume was copied from (the
+// velero.io/pvc-uid label), which is how a claim is recognized by identity
+// rather than by a name a recreated object could share.
+type BackupVolumeState struct {
+	Pod       string
+	Namespace string
+	Volume    string
+	// ClaimUID is the UID of the claim behind the volume, or "" for a volume
+	// with no claim behind it.
+	ClaimUID string
 }
 
 // OwnerRef is one controller reference.
@@ -766,6 +788,81 @@ func (c *k3sCluster) claimNamesByUID(ctx context.Context, namespace string) (map
 		byUID[item.Metadata.UID] = item.Metadata.Name
 	}
 	return byUID, nil
+}
+
+// PodVolumeBackups reads the volumes the chosen backup holds, one entry per
+// PodVolumeBackup, in pod then volume order.
+//
+// THE FIELDS ARE THE PINNED VELERO'S (1.18.1, chart 12.1.0), read from the
+// source rather than from what the objects happened to look like:
+//
+//   - spec.pod is a corev1.ObjectReference whose Name and Namespace name the
+//     pod AT BACKUP TIME (pkg/podvolume/backupper.go:513-528,
+//     newPodVolumeBackup), and spec.volume is the volume's name within that pod;
+//   - the label velero.io/backup-name names the Backup (pkg/apis/velero/v1/
+//     labels_annotations.go:20, BackupNameLabel), and the object's owner
+//     reference names it too (backupper.go:504-511). The owner reference is
+//     preferred for the same reason copyRecordBackup prefers it: the label goes
+//     through label.GetValidName, which truncates a long backup name;
+//   - the label velero.io/pvc-uid is the claim's UID (backupper.go:546,
+//     PVCUIDLabel). Velero also writes the claim's NAME as the annotation
+//     velero.io/pvc-name (backupper.go:541,
+//     pkg/podvolume/configs/configs.go:6), but on hardware (lab w3, 2026-09-27)
+//     the object carried the UID label and no claim-name annotation — the same
+//     lesson measured for PodVolumeRestores in velero_resources_test.go — so
+//     nothing here reads the annotation.
+func (c *k3sCluster) PodVolumeBackups(ctx context.Context, backup string) ([]BackupVolumeState, error) {
+	out, err := c.kubectl(ctx, "get podvolumebackups.velero.io -n "+Namespace+" -o json")
+	if err != nil {
+		if notFound(err) || strings.Contains(err.Error(), "the server doesn't have a resource type") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the PodVolumeBackups of backup %s: %w", backup, err)
+	}
+	var document struct {
+		Items []struct {
+			Metadata struct {
+				Labels          map[string]string `json:"labels"`
+				OwnerReferences []struct {
+					Kind       string `json:"kind"`
+					Name       string `json:"name"`
+					APIVersion string `json:"apiVersion"`
+				} `json:"ownerReferences"`
+			} `json:"metadata"`
+			Spec struct {
+				Pod struct {
+					Name      string `json:"name"`
+					Namespace string `json:"namespace"`
+				} `json:"pod"`
+				Volume string `json:"volume"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil {
+		return nil, fmt.Errorf("parsing the PodVolumeBackups of backup %s: %w", backup, err)
+	}
+	volumes := []BackupVolumeState{}
+	for _, item := range document.Items {
+		if copyRecordBackup(item.Metadata.OwnerReferences, item.Metadata.Labels["velero.io/backup-name"]) != backup {
+			continue
+		}
+		if item.Spec.Pod.Name == "" || item.Spec.Volume == "" {
+			continue
+		}
+		volumes = append(volumes, BackupVolumeState{
+			Pod:       item.Spec.Pod.Name,
+			Namespace: item.Spec.Pod.Namespace,
+			Volume:    item.Spec.Volume,
+			ClaimUID:  item.Metadata.Labels["velero.io/pvc-uid"],
+		})
+	}
+	sort.Slice(volumes, func(i, j int) bool {
+		if volumes[i].Pod != volumes[j].Pod {
+			return volumes[i].Pod < volumes[j].Pod
+		}
+		return volumes[i].Volume < volumes[j].Volume
+	})
+	return volumes, nil
 }
 
 func (c *k3sCluster) RestoreOutcome(ctx context.Context, name string) (*RestoreOutcome, error) {

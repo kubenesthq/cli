@@ -21,10 +21,11 @@ import (
 // Two modes, one command. Mode 1 puts a whole NAMESPACE back into the live
 // cluster: it chooses an eligible backup, prints a plan of what will change,
 // waits for the operator's confirmation, pauses the project's reconcilers,
-// takes a safety backup of the namespace as it stands, stops the writers,
-// deletes the namespace and restores it. Mode 2 (restore_volumes.go) does the
-// node-loss path: one workload's stranded claims, refilled in place while the
-// volumes of the same workload that are still fine keep their newer data.
+// stops the namespace's scheduled work and takes a safety backup of the
+// namespace as it stands, stops the writers, deletes the namespace and restores
+// it. Mode 2 (restore_volumes.go) does the node-loss path: one workload's
+// stranded claims, refilled in place while the volumes of the same workload
+// that are still fine keep their newer data.
 //
 // THREE RULES SHAPE EVERYTHING HERE.
 //
@@ -86,6 +87,16 @@ const (
 	// RestoredStage is the stage the record holds while the data is back and
 	// nothing is allowed to run yet.
 	RestoredStage = "restored — awaiting activation"
+	// StopCronJobWrite is the record kind naming the work the stop step did on
+	// one CronJob of the namespace as it stood. It is written ALREADY
+	// DISCHARGED (operation.WriteDone): it answers "what did the stop step do",
+	// and it is not work activation owes.
+	StopCronJobWrite = "stop-cronjob"
+	// StoppedCronJobTarget is where that record entry points. It is its own
+	// target, never "cronjob/<name>", so it can never be read back as the value
+	// activation puts a restored CronJob back to — those come from the backup,
+	// in kn-x0wv.3's annotation.
+	StoppedCronJobTarget = "cronjob-stop/"
 )
 
 // The marker the operator's restore drill puts on ITS Velero Restore. Both
@@ -377,6 +388,12 @@ type restoreRun struct {
 	// skip names the recorded actions a resume established, so Guarded does not
 	// submit them again.
 	skip map[string]bool
+	// skippedStages is the same decision read by STAGE rather than by action
+	// id. A step whose stage is here is done and must not be waited for again:
+	// the deletion of a namespace is the one postcondition that can be undone
+	// under the operation (the reconcilers recreate the namespace), so
+	// "wait until it is gone" is not a fact a resume can re-establish.
+	skippedStages map[string]bool
 	// backupErrTimeout is the deadline for the safety backup's settle wait,
 	// from limits.timeouts.backup.
 	backupErrTimeout time.Duration
@@ -723,7 +740,7 @@ func (r *restoreRun) renderPlan() {
 	if p.Mode == "volumes" {
 		fmt.Fprintf(r.out, "  mode:          volumes — refilling %s in place; every other volume of the same workload keeps its current contents\n", strings.Join(p.PVCs, ", "))
 	} else {
-		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; Jobs are %s and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
+		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs are suspended before the safety backup, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
 	}
 }
 
@@ -871,6 +888,15 @@ func namedClaimUID(plan *restorePlan, name string) string {
 // interrupted restore, resumed after its delete, must not be refused by its own
 // success — and the object the restore put back legitimately has a new UID,
 // which is exactly why activation re-reads and prints it.
+//
+// A CONSUMED NAMESPACE CONSUMES WHAT WAS IN IT. Deleting a namespace destroys
+// every claim in it, and mode 1 records that as the one `delete-namespace/<ns>`
+// action, not as one action per claim. So a recorded claim under a namespace
+// this operation deleted is an identity its own delete destroyed: the
+// reconcilers recreating the namespace, and a claim in it under the recorded
+// name, is the ordinary state after that step (S4 on lab w3, 2026-09-27) and
+// not a moved identity. A claim the record never held is refused by name,
+// separately, because that one is not the operation's own doing.
 func sameIdentity(recorded, live map[string]string, consumed map[string]bool) []string {
 	var moved []string
 	keys := make([]string, 0, len(recorded))
@@ -880,6 +906,9 @@ func sameIdentity(recorded, live map[string]string, consumed map[string]bool) []
 	sort.Strings(keys)
 	for _, k := range keys {
 		if consumed[k] {
+			continue
+		}
+		if namespace := identityNamespaceOf(k); namespace != "" && consumed["namespace/"+namespace] {
 			continue
 		}
 		now := live[k]
@@ -892,6 +921,34 @@ func sameIdentity(recorded, live map[string]string, consumed map[string]bool) []
 		}
 	}
 	return moved
+}
+
+// identityNamespaceOf names the namespace a recorded identity key belongs to,
+// or "" for a key that names none.
+func identityNamespaceOf(key string) string {
+	if rest, ok := strings.CutPrefix(key, "namespace/"); ok {
+		return rest
+	}
+	namespace, _ := claimIdentityOf(key)
+	return namespace
+}
+
+// claimIdentityOf splits a recorded claim identity key into its namespace and
+// claim name. Both shapes count: mode 1 records every claim in the namespace it
+// is about, and mode 2 records the claims it was asked to refill.
+func claimIdentityOf(key string) (namespace, name string) {
+	for _, prefix := range []string{"persistentvolumeclaim/", "named-persistentvolumeclaim/"} {
+		rest, ok := strings.CutPrefix(key, prefix)
+		if !ok {
+			continue
+		}
+		namespace, name, found := strings.Cut(rest, "/")
+		if !found {
+			return "", ""
+		}
+		return namespace, name
+	}
+	return "", ""
 }
 
 // consumedIdentities reads which identities a record says its own steps already
@@ -1021,14 +1078,30 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 	if kind := plan.Record.Request.Kind; kind != operation.KindRestoreNamespace && kind != operation.KindRestoreVolume {
 		return fmt.Errorf("operation %s is a %s, not a restore: it cannot be resumed by this command", opID, kind)
 	}
+	// THE RECORD FILLS IN WHAT THE FLAGS CANNOT. `--resume` takes no
+	// `--namespace` (the CLI refuses it alongside --resume), so the namespace —
+	// and the cluster name every message uses — are the ones the interrupted
+	// run wrote into its immutable request. Reading the live namespace by an
+	// empty name is what produced "namespace  reports no UID, so the plan cannot
+	// be pinned to the namespace it was built against" on hardware
+	// (kn-x0wv.4, lab w3, 2026-09-27).
+	if err := r.adoptRecordedRequest(plan.Record); err != nil {
+		return err
+	}
+	r.skip = plan.Skip()
+	r.skippedStages = skippedStages(plan)
+
 	recorded := recordedIdentities(plan.Record)
 	live, err := r.liveIdentities(ctx)
 	if err != nil {
 		return err
 	}
-	if moved := sameIdentity(recorded, live, consumedIdentities(plan.Record, r.opts.Namespace)); len(moved) > 0 {
+	if moved := sameIdentity(recorded, live, r.consumedIdentitiesFor(plan.Record)); len(moved) > 0 {
 		return fmt.Errorf("operation %s was planned against identities that have moved, so resuming it would restore into different objects:\n  %s",
 			opID, strings.Join(moved, "\n  "))
+	}
+	if err := r.refuseClaimsTheRecordDidNotCreate(ctx, plan.Record, recorded); err != nil {
+		return err
 	}
 	// The resume continues the SAME request, so the backup and the mode are the
 	// record's and not this run's flags, and the plan is rebuilt from what the
@@ -1066,6 +1139,11 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 		}
 		if r.plan != nil {
 			r.plan.Backup = facts
+			// The resumed plan is rendered like the first one was, so the
+			// policy and the conservative age come from the same places.
+			r.plan.Policy = r.policy
+			age, known := facts.Age(r.deps.Now())
+			r.plan.Age, r.plan.AgeKnown = age, known
 		}
 		if r.volumePlan != nil {
 			r.volumePlan.Backup = facts
@@ -1080,9 +1158,93 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 		return err
 	}
 	r.handle = handle
-	r.skip = plan.Skip()
 	r.renderPlan()
 	return nil
+}
+
+// adoptRecordedRequest takes the namespace, and the cluster name, from the
+// record this resume continues. `--resume` takes no `--namespace`: the run it
+// continues is the immutable request the record holds, and the namespace in a
+// mode-1 record is the one the plan was pinned to.
+func (r *restoreRun) adoptRecordedRequest(record *operation.Record) error {
+	namespace := restoreNamespaceOf(record)
+	if namespace == "" {
+		return fmt.Errorf("operation %s records no namespace, so the restore it interrupted cannot be pinned to one: nothing has been changed", record.OperationID)
+	}
+	if r.opts.Namespace != "" && r.opts.Namespace != namespace {
+		fmt.Fprintf(r.out, "  namespace:     the record is about %s, not the %s this run named: the record is the request this resume continues\n", namespace, r.opts.Namespace)
+	}
+	r.opts.Namespace = namespace
+	if r.opts.Cluster == "" {
+		r.opts.Cluster = record.Request.Cluster
+	}
+	return nil
+}
+
+// skippedStages reads a resume plan's decisions by STAGE, which is the shape
+// the steps ask the question in. Plan.Skip is keyed by action id, which only
+// the transport's Guarded decorator matches against.
+func skippedStages(plan *operation.Plan) map[string]bool {
+	done := map[string]bool{}
+	for _, step := range plan.Steps {
+		if step.Decision == operation.DecisionSkip {
+			done[step.Stage] = true
+		}
+	}
+	return done
+}
+
+// consumedIdentitiesFor is consumedIdentities plus the stages this resume's own
+// plan established as done: an action whose postcondition the resume proved
+// holds is as destroyed as one the record says succeeded, and the namespace
+// deletion is the step whose postcondition the reconcilers can undo.
+func (r *restoreRun) consumedIdentitiesFor(record *operation.Record) map[string]bool {
+	consumed := consumedIdentities(record, r.opts.Namespace)
+	if r.skippedStages["delete-namespace/"+r.opts.Namespace] {
+		consumed["namespace/"+r.opts.Namespace] = true
+	}
+	return consumed
+}
+
+// refuseClaimsTheRecordDidNotCreate refuses a resume whose namespace now holds
+// a claim this operation never saw.
+//
+// THE NAMESPACE DELETION IS TREATED AS DONE. After it, a namespace that is gone
+// or that the reconcilers recreated does not fail the UID pin — the recorded
+// namespace and the claims that went with it were destroyed by this operation's
+// own delete, and a claim recreated under the same name is the ordinary state
+// (S4 on lab w3: the recreated namespace holds an empty claim before the resume
+// starts). What is not ordinary is a claim the record never held: it carries
+// data this operation did not destroy and never showed the operator, and
+// restoring into that namespace would leave it beside the restored objects. The
+// refusal names every one of them, and it is decided BEFORE anything changes.
+func (r *restoreRun) refuseClaimsTheRecordDidNotCreate(ctx context.Context, record *operation.Record, recorded map[string]string) error {
+	if !r.consumedIdentitiesFor(record)["namespace/"+r.opts.Namespace] {
+		return nil
+	}
+	known := map[string]bool{}
+	for key := range recorded {
+		if namespace, name := claimIdentityOf(key); namespace == r.opts.Namespace && name != "" {
+			known[name] = true
+		}
+	}
+	claims, err := r.deps.Cluster.Claims(ctx, r.opts.Namespace)
+	if err != nil {
+		return err
+	}
+	var foreign []string
+	for _, claim := range claims {
+		if claim.Namespace != r.opts.Namespace || known[claim.Name] {
+			continue
+		}
+		foreign = append(foreign, fmt.Sprintf("persistentvolumeclaim/%s/%s (uid %s)", claim.Namespace, claim.Name, claim.UID))
+	}
+	if len(foreign) == 0 {
+		return nil
+	}
+	sort.Strings(foreign)
+	return fmt.Errorf("operation %s deleted namespace %s, and what holds that name now carries %d claim(s) this restore did not create:\n  %s\nResuming would restore into them, and the safety backup holds what this operation destroyed rather than these. Nothing has been changed and the pause is left in place: look at them, and either `kubenest backup restore --abort %s`, or remove what does not belong and resume again",
+		record.OperationID, r.opts.Namespace, len(foreign), strings.Join(foreign, "\n  "), record.OperationID)
 }
 
 // volumePlanFromRecord rebuilds mode 2's plan from what the record wrote down,
@@ -1313,7 +1475,7 @@ func (r *restoreRun) verifyIdentities(ctx context.Context) error {
 	// not a moved identity: it is the step the record says is done.
 	consumed := map[string]bool{}
 	if r.handle != nil {
-		consumed = consumedIdentities(r.handle.Record(), r.opts.Namespace)
+		consumed = r.consumedIdentitiesFor(r.handle.Record())
 	}
 	if moved := sameIdentity(recorded, live, consumed); len(moved) > 0 {
 		return fmt.Errorf("the namespace or one of its claims changed since the plan was confirmed, so this is no longer the restore that was planned:\n  %s\nNothing has been destroyed, and the pause is left in place. Re-run the command to plan against what is there now",
@@ -1418,10 +1580,118 @@ func (r *restoreRun) scaleToZero(ctx context.Context) error {
 	return nil
 }
 
+// suspendCronJobs stops the namespace's SCHEDULED work as part of the stop step.
+//
+// WHY IT RUNS BEFORE THE SAFETY BACKUP. A CronJob left running creates a Job
+// whenever its schedule comes due, and the namespace is not deleted until after
+// the safety backup — so a scheduled run can start against the emptied
+// namespace while the restore is under way. On hardware (S4, lab w3,
+// 2026-09-27) the recreated namespace's `s4-sentinel` fired in exactly that
+// window, and the Job it created went with the namespace, leaving no record of
+// it. Scaling the workloads to zero does not stop that: a CronJob's Job starts
+// its own pod. So the schedules are suspended first, and the workloads are
+// scaled to zero after the safety backup, because Velero's file-level copy of a
+// claim needs the pod that mounts it to be running.
+//
+// WHAT IT RECORDS IS NOT WHAT ACTIVATION USES. Each CronJob's value before this
+// step goes into the record under its own target, so "what did the stop step do"
+// is answerable; activation puts each RESTORED CronJob back to the value the
+// BACKUP held, read from the annotation the restore's own resource modifier
+// wrote (kn-x0wv.3), and never from here.
+func (r *restoreRun) suspendCronJobs(ctx context.Context) error {
+	jobs, err := r.deps.Cluster.CronJobs(ctx, r.opts.Namespace)
+	if err != nil {
+		return err
+	}
+	if len(jobs) == 0 {
+		fmt.Fprintf(r.out, "  stop:          no CronJob in namespace %s to suspend\n", r.opts.Namespace)
+		return nil
+	}
+	for _, job := range jobs {
+		was := "false"
+		if job.Suspend {
+			was = "true"
+		}
+		if err := r.stage("stop-cronjob/"+job.Name).SuspendCronJob(ctx, r.opts.Namespace, job.Name, true); err != nil {
+			return fmt.Errorf("suspending CronJob %s in namespace %s before anything is captured or destroyed: %w", job.Name, r.opts.Namespace, err)
+		}
+		if err := r.recordStoppedCronJob(ctx, job.Name, was); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "  stop:          CronJob %s suspended (it was suspended=%s); activation takes its value from the backup, not from this step\n", job.Name, was)
+	}
+	return nil
+}
+
+// recordStoppedCronJob writes down, in the operation, that the stop step
+// suspended one CronJob and what its value was before, as a write that is
+// already DISCHARGED: it is a record of what happened rather than work
+// activation owes. It is written AFTER the patch returned, so the record never
+// claims a suspension that did not happen.
+//
+// ITS TARGET IS ITS OWN ("cronjob-stop/<name>"). Activation reads the value it
+// puts a restored CronJob back to from "cronjob/<name>", so a record entry here
+// can never be mistaken for it.
+func (r *restoreRun) recordStoppedCronJob(ctx context.Context, name, was string) error {
+	target := StoppedCronJobTarget + name
+	now := r.deps.Now()
+	return r.deps.Store.Update(ctx, r.handle, func(rec *operation.Record) error {
+		for i := range rec.Pending {
+			if rec.Pending[i].Target != target || rec.Pending[i].Kind != StopCronJobWrite {
+				continue
+			}
+			rec.Pending[i].Detail = was
+			rec.Pending[i].Status = operation.WriteDone
+			rec.Pending[i].DoneAt = &now
+			return nil
+		}
+		rec.Pending = append(rec.Pending, operation.PendingWrite{
+			Kind:   StopCronJobWrite,
+			Target: target,
+			Detail: was,
+			Status: operation.WriteDone,
+			At:     now,
+			DoneAt: &now,
+		})
+		return nil
+	})
+}
+
+// namespaceDeletionDone reports whether this operation's own delete of the
+// namespace is established: the record says the action succeeded, or the
+// resume's plan proved the postcondition holds. A resumed run does not delete
+// it again and does not wait for it to be gone.
+func (r *restoreRun) namespaceDeletionDone() bool {
+	stage := "delete-namespace/" + r.opts.Namespace
+	if r.skippedStages[stage] {
+		return true
+	}
+	if r.handle == nil {
+		return false
+	}
+	for _, action := range r.handle.Record().Actions {
+		if action.Stage == stage && action.Status == operation.ActionSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
 // deleteNamespace deletes the namespace and waits until the API reports it
 // gone: restoring into a terminating namespace is how a restore comes back
 // half-applied.
+//
+// A DELETION THIS OPERATION ALREADY DID IS NOT WAITED FOR AGAIN. The
+// reconcilers recreate the namespace as soon as it is gone — that is the
+// ordinary state the pause exists to stop mid-flight — so on a resume the
+// namespace can exist again with a new UID, and "wait until it is gone" would
+// never come true. The record's own succeeded action is the fact; the resume
+// goes on to the Restore the record names.
 func (r *restoreRun) deleteNamespace(ctx context.Context) error {
+	if r.namespaceDeletionDone() {
+		fmt.Fprintf(r.out, "  namespace:     %s was deleted by this operation (the step is recorded as done): not deleting it again, and not waiting for the name to stay empty — the reconcilers may have recreated it\n", r.opts.Namespace)
+		return nil
+	}
 	if state, err := r.deps.Cluster.Namespace(ctx, r.opts.Namespace); err != nil {
 		return err
 	} else if state == nil {
@@ -2048,7 +2318,8 @@ func (r *restoreRun) restoreRecord(ctx context.Context, operationID string) (*op
 }
 
 // restoreNamespaceOf reads the namespace a record is about. Mode 1 records it
-// with the identities; mode 2 as well.
+// as an identity of its own; mode 2 records only the claims it refills, and
+// both shapes name the namespace.
 func restoreNamespaceOf(record *operation.Record) string {
 	for _, artifact := range record.Request.Artifacts {
 		if rest, ok := strings.CutPrefix(artifact.Name, "namespace/"); ok {
@@ -2056,10 +2327,8 @@ func restoreNamespaceOf(record *operation.Record) string {
 		}
 	}
 	for _, artifact := range record.Request.Artifacts {
-		if rest, ok := strings.CutPrefix(artifact.Name, "persistentvolumeclaim/"); ok {
-			if name, _, found := strings.Cut(rest, "/"); found {
-				return name
-			}
+		if namespace, _ := claimIdentityOf(artifact.Name); namespace != "" {
+			return namespace
 		}
 	}
 	return ""
@@ -2200,11 +2469,20 @@ func valueOf(command, key string) string {
 // EVERY STEP IS "DO IT, THEN MAKE SURE IT HAPPENED", which is what makes a
 // `--resume` converge: a step whose action the record already holds is not
 // submitted again, and the wait after it re-establishes the same fact.
+//
+// THE STOP STEP STRADDLES THE SAFETY BACKUP. The namespace's CronJobs are
+// suspended BEFORE it, because a due schedule can otherwise start a Job against
+// the emptied namespace in the window between the backup and the delete; the
+// workloads are scaled to zero AFTER it, because a claim's file-level copy
+// needs the pod that mounts it running.
 func (r *restoreRun) execute(ctx context.Context) error {
 	if err := r.ensurePause(ctx); err != nil {
 		return err
 	}
 	if err := r.verifyIdentities(ctx); err != nil {
+		return err
+	}
+	if err := r.suspendCronJobs(ctx); err != nil {
 		return err
 	}
 	if err := r.safetyBackup(ctx); err != nil {

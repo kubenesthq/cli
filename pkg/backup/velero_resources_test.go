@@ -65,3 +65,45 @@ func TestVolumeRestoresNameTheClaimFromItsUID(t *testing.T) {
 		t.Errorf("restores = %+v, want one naming claim s4-data", restores)
 	}
 }
+
+// TestPodVolumeBackupsReadTheBackupsPodsAndVolumes reads mode 2's modifier
+// input the way Velero writes it (1.18.1): spec.pod names the pod AT BACKUP
+// TIME, spec.volume the volume within it, and the label velero.io/pvc-uid the
+// claim behind that volume. Two things the fields decide:
+//
+//   - the velero namespace holds EVERY backup's PodVolumeBackups, so the reader
+//     returns only the chosen backup's — by the owner reference, which a long
+//     backup name cannot truncate the way the velero.io/backup-name label can;
+//   - the claim link is the UID label, not the velero.io/pvc-name annotation
+//     the hardware did not carry, so an object with the annotation and no UID
+//     label names no claim and must not be read as one.
+func TestPodVolumeBackupsReadTheBackupsPodsAndVolumes(t *testing.T) {
+	runner := veleroAPIServer(map[string]string{
+		"podvolumebackups.velero.io": `{"items":[` +
+			`{"metadata":{"name":"daily-good-a","labels":{"velero.io/backup-name":"daily-good","velero.io/pvc-uid":"u-a"},` +
+			`"ownerReferences":[{"apiVersion":"velero.io/v1","kind":"Backup","name":"daily-good"}]},` +
+			`"spec":{"pod":{"name":"dead-b87c65446-d7vlj","namespace":"e2e-restore-volumes"},"volume":"a"}},` +
+			`{"metadata":{"name":"daily-other-a","labels":{"velero.io/backup-name":"daily-other"},` +
+			`"ownerReferences":[{"apiVersion":"velero.io/v1","kind":"Backup","name":"daily-other"}]},` +
+			`"spec":{"pod":{"name":"other-1","namespace":"e2e-restore-volumes"},"volume":"a"}},` +
+			`{"metadata":{"name":"daily-good-b","labels":{"velero.io/backup-name":"daily-good"},"annotations":{"velero.io/pvc-name":"b"},` +
+			`"ownerReferences":[{"apiVersion":"velero.io/v1","kind":"Backup","name":"daily-good"}]},` +
+			`"spec":{"pod":{"name":"dead-b87c65446-d7vlj","namespace":"e2e-restore-volumes"},"volume":"b"}}]}`,
+	})
+	volumes, err := NewK3sCluster(runner).PodVolumeBackups(context.Background(), "daily-good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(volumes) != 2 {
+		t.Fatalf("volumes = %+v, want only the chosen backup's two", volumes)
+	}
+	if volumes[0] != (BackupVolumeState{Pod: "dead-b87c65446-d7vlj", Namespace: "e2e-restore-volumes", Volume: "a", ClaimUID: "u-a"}) {
+		t.Errorf("volumes[0] = %+v, want the backup's pod, its volume and the claim's UID", volumes[0])
+	}
+	if volumes[1].ClaimUID != "" {
+		t.Errorf("volume b carries the pvc-name annotation and no velero.io/pvc-uid label, so it names no claim: got %+v", volumes[1])
+	}
+	if volumes[1].Pod != "dead-b87c65446-d7vlj" || volumes[1].Volume != "b" {
+		t.Errorf("volumes[1] = %+v, want pod dead-b87c65446-d7vlj volume b", volumes[1])
+	}
+}

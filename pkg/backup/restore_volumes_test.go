@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -44,9 +45,24 @@ func volumeFixture(t *testing.T) *restoreFixture {
 		Volumes: []PodVolumeState{
 			{Name: "a", ClaimName: "a", Mounts: []PodMount{{Container: "app", Path: "/a"}}},
 			{Name: "b", ClaimName: "b", Mounts: []PodMount{{Container: "app", Path: "/b"}}},
+			// A volume the backup does not hold at all: nothing restores data
+			// into it, so the modifier must leave it out of the patch it writes
+			// for the restored pod.
+			{Name: "cache", Mounts: []PodMount{{Container: "app", Path: "/cache"}}},
 		},
 	}}
 	f.cluster.resolveReplicaSetOwner = &OwnerRef{Kind: "Deployment", Name: "payments", Controller: true}
+	// THE BACKUP'S POD IS NOT TODAY'S POD. Velero restores the pod the backup
+	// captured — payments-6d9f-qqqqq — while the pod mounting the claims now is
+	// payments-6d9f-abcde, which is the node-loss case the modifier has to
+	// survive (kn-t43-restore-workload-s-stranded-11o7.3: dead-b87c65446-d7vlj
+	// against dead-b87c65446-r9zpb).
+	f.cluster.podVolumeBackups = map[string][]BackupVolumeState{
+		"daily-good": {
+			{Pod: "payments-6d9f-qqqqq", Namespace: "payments", Volume: "a", ClaimUID: "uid-a"},
+			{Pod: "payments-6d9f-qqqqq", Namespace: "payments", Volume: "b", ClaimUID: "uid-b"},
+		},
+	}
 	f.cluster.volumes = []VolumeRestoreState{
 		{Name: "pvr-a", Pod: "payments-6d9f-abcde", Volume: "a", ClaimName: "a", Phase: "Completed"},
 	}
@@ -114,16 +130,21 @@ func TestVolumeRestorePlanNamesOnlyTheNamedClaims(t *testing.T) {
 	}
 
 	// The modifier is what keeps claim b's newer data: it must remove b's
-	// volume, its mount and restore-wait's mount, and leave a alone.
+	// volume, its mount and restore-wait's mount, and leave a alone. It is
+	// written for the pod the BACKUP holds — the pod Velero creates — not the
+	// pod that mounts the claims today.
 	rules := modifierRules(t, f)
 	if len(rules) < 2 {
 		t.Fatalf("the modifier holds %d rule(s), want the pod-template-hash rule and one volume-strip rule", len(rules))
 	}
 	assertHashRule(t, rules[0])
 	strip := stripPatches(t, rules)
-	data := strip["payments-6d9f-abcde"]
+	data := strip["payments-6d9f-qqqqq"]
 	if data == "" {
-		t.Fatalf("no volume-strip rule targets the pod that mounts the claims: %v", strip)
+		t.Fatalf("no volume-strip rule targets the pod the backup holds: %v", strip)
+	}
+	if _, today := strip["payments-6d9f-abcde"]; today {
+		t.Errorf("a volume-strip rule targets today's pod, which the restore does not create: %v", strip)
 	}
 	if !strings.Contains(data, `"name":"b"`) && !strings.Contains(data, `"name": "b"`) {
 		t.Errorf("the volume-strip patch does not remove the unnamed volume b: %s", data)
@@ -136,6 +157,9 @@ func TestVolumeRestorePlanNamesOnlyTheNamedClaims(t *testing.T) {
 	if strings.Contains(data, `"name":"a"`) || strings.Contains(data, `"mountPath":"/a"`) {
 		t.Errorf("the volume-strip patch touches the NAMED volume a, whose data this restore exists to refill: %s", data)
 	}
+	if strings.Contains(data, "cache") {
+		t.Errorf("the volume-strip patch removes a volume the BACKUP does not hold: nothing restores data into it, and the restored pod is not today's pod: %s", data)
+	}
 
 	// The verification is per claim, and it landed on a live node.
 	if !strings.Contains(out, "pvc-fresh-a") || !strings.Contains(out, "lab-node-1") {
@@ -143,6 +167,138 @@ func TestVolumeRestorePlanNamesOnlyTheNamedClaims(t *testing.T) {
 	}
 	if !strings.Contains(out, RestoredStage) {
 		t.Errorf("a volume restore does not stop at %q:\n%s", RestoredStage, out)
+	}
+}
+
+// THE BEAD'S UNIT ACCEPTANCE (kn-t43-restore-workload-s-stranded-11o7.3): every
+// rule the modifier writes selects the pods the chosen BACKUP holds for the
+// named claims, and never the pod that mounts them today. The fixture's two
+// names differ — today's pod is payments-6d9f-abcde, the backup's is
+// payments-6d9f-qqqqq — which is the node-loss case: on hardware the backup
+// held dead-b87c65446-d7vlj while the ReplicaSet had already created
+// dead-b87c65446-r9zpb, the rule matched neither, the restored pod kept its
+// pod-template-hash, and the scaled-to-zero owner deleted it.
+func TestVolumeModifierNamesTheBackupsPodsNotTodays(t *testing.T) {
+	f := volumeFixture(t)
+	const backupPod, livePod = "payments-6d9f-qqqqq", "payments-6d9f-abcde"
+	if f.cluster.pods[0].Name != livePod || f.cluster.podVolumeBackups["daily-good"][0].Pod != backupPod {
+		t.Fatalf("the fixture does not hold two different pod names, so this test proves nothing")
+	}
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, "")
+	if err != nil {
+		t.Fatalf("the volume restore failed: %v\n%s", err, out)
+	}
+	rules := modifierRules(t, f)
+	conditions, _ := rules[0]["conditions"].(map[string]any)
+	regex, _ := conditions["resourceNameRegex"].(string)
+	assertSelects(t, "the pod-template-hash rule", regex, backupPod, livePod)
+
+	strips := 0
+	for _, rule := range rules[1:] {
+		if _, ok := rule["strategicPatches"]; !ok {
+			continue
+		}
+		strips++
+		conditions, _ := rule["conditions"].(map[string]any)
+		regex, _ := conditions["resourceNameRegex"].(string)
+		assertSelects(t, "the volume-strip rule", regex, backupPod, livePod)
+	}
+	if strips != 1 {
+		t.Errorf("the modifier holds %d volume-strip rule(s), want one, for the backup's pod", strips)
+	}
+	// BOTH SETS ARE SHOWN, because they are not the same set: the live pod is
+	// what step 3 stops, the backup's pod is what Velero creates.
+	if !strings.Contains(out, backupPod) || !strings.Contains(out, livePod) {
+		t.Errorf("the plan shows only one of the two pod sets (%s, %s):\n%s", livePod, backupPod, out)
+	}
+}
+
+// assertSelects checks one rule's pod-name condition against the pod the BACKUP
+// holds and the pod that mounts the claim today: the first must match, the
+// second must not.
+func assertSelects(t *testing.T, what, regex, backupPod, livePod string) {
+	t.Helper()
+	if regex == "" {
+		t.Fatalf("%s carries no pod-name condition at all", what)
+	}
+	compiled, err := regexp.Compile(regex)
+	if err != nil {
+		t.Fatalf("%s is not a usable regular expression (%q): %v", what, regex, err)
+	}
+	if !compiled.MatchString(backupPod) {
+		t.Errorf("%s does not select the pod the backup holds (%s): %q", what, backupPod, regex)
+	}
+	if compiled.MatchString(livePod) {
+		t.Errorf("%s selects today's pod (%s), which Velero does not restore: %q", what, livePod, regex)
+	}
+}
+
+// TestVolumeRestoreRefusesANamedClaimTheBackupDoesNotHold is the planted
+// negative: the chosen backup holds no PodVolumeBackup for a named claim, so
+// nothing in it can refill that claim. The plan refuses, naming it, before
+// anything is scaled or deleted — an unnamed refusal here is a restore that
+// reports Completed having filled nothing (probe P5, run 4).
+func TestVolumeRestoreRefusesANamedClaimTheBackupDoesNotHold(t *testing.T) {
+	f := volumeFixture(t)
+	// Only claim b was copied by this backup.
+	f.cluster.podVolumeBackups["daily-good"] = []BackupVolumeState{
+		{Pod: "payments-6d9f-qqqqq", Namespace: "payments", Volume: "b", ClaimUID: "uid-b"},
+	}
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, "")
+	if err == nil {
+		t.Fatalf("a named claim the backup holds nothing for must be refused:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "payments/a") || !strings.Contains(err.Error(), "daily-good") {
+		t.Errorf("the refusal does not name the claim and the backup: %v", err)
+	}
+	if len(f.cluster.deletedClaims) != 0 || len(f.cluster.scaled) != 0 || len(f.cluster.restoresMade) != 0 || len(f.cluster.restoreDocs) != 0 {
+		t.Errorf("the refusal changed the cluster: deleted %v, scaled %v, restores %d, documents %d",
+			f.cluster.deletedClaims, f.cluster.scaled, len(f.cluster.restoresMade), len(f.cluster.restoreDocs))
+	}
+}
+
+// TestVolumeRestoreRefusesAClaimOnlyAnotherBackupHolds: the velero namespace
+// holds every backup's PodVolumeBackups, so a claim is matched against the
+// CHOSEN backup's — the same claim copied by another backup is not this
+// backup's copy, and its pod is not a pod this restore creates.
+func TestVolumeRestoreRefusesAClaimOnlyAnotherBackupHolds(t *testing.T) {
+	f := volumeFixture(t)
+	f.cluster.podVolumeBackups["daily-good"] = []BackupVolumeState{
+		{Pod: "payments-6d9f-qqqqq", Namespace: "payments", Volume: "b", ClaimUID: "uid-b"},
+	}
+	f.cluster.podVolumeBackups["daily-other"] = []BackupVolumeState{
+		{Pod: "payments-6d9f-wwwww", Namespace: "payments", Volume: "a", ClaimUID: "uid-a"},
+	}
+	_, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, "")
+	if err == nil {
+		t.Fatal("a claim only another backup holds must be refused")
+	}
+	if !strings.Contains(err.Error(), "payments/a") {
+		t.Errorf("the refusal does not name the claim: %v", err)
+	}
+	if len(f.cluster.deletedClaims) != 0 || len(f.cluster.restoresMade) != 0 {
+		t.Error("the refusal changed the cluster")
+	}
+}
+
+// TestVolumeRestoreRefusesAVolumeTheLivePodsCannotDescribe: the backup holds a
+// volume that is not a named claim and no pod in the namespace declares, so the
+// container mounts the strip patch has to delete by cannot be read. The plan
+// refuses rather than write a patch that removes the wrong mount or leaves the
+// volume in place for Velero to overwrite.
+func TestVolumeRestoreRefusesAVolumeTheLivePodsCannotDescribe(t *testing.T) {
+	f := volumeFixture(t)
+	f.cluster.podVolumeBackups["daily-good"] = append(f.cluster.podVolumeBackups["daily-good"],
+		BackupVolumeState{Pod: "payments-6d9f-qqqqq", Namespace: "payments", Volume: "left-behind", ClaimUID: "uid-gone"})
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, "")
+	if err == nil {
+		t.Fatalf("a volume no live pod declares must be refused:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "payments-6d9f-qqqqq") || !strings.Contains(err.Error(), "left-behind") {
+		t.Errorf("the refusal does not name the pod and the volume: %v", err)
+	}
+	if len(f.cluster.deletedClaims) != 0 || len(f.cluster.restoresMade) != 0 {
+		t.Error("the refusal changed the cluster")
 	}
 }
 
@@ -354,21 +510,23 @@ func TestVolumeRestoreResumeDoesNotRepeatACompletedStep(t *testing.T) {
 }
 
 // TestVolumeStripPatchLeavesAnUnnamedVolumeAlone is the selective rule at the
-// patch level, with no cluster in the way: a pod whose named claim is a gets a
-// patch that removes b's volume and mounts and never a's.
+// patch level, with no cluster in the way: the backup's pod holds a (named) and
+// b (not named), so the patch removes b's volume, b's mount and restore-wait's
+// mount, and never a's. The volumes are the BACKUP's — the caller passes the
+// ones it found in the PodVolumeBackups — and the merge keys are the live
+// pods'.
 func TestVolumeStripPatchLeavesAnUnnamedVolumeAlone(t *testing.T) {
-	pod := PodState{
+	live := []PodState{{
 		Name: "web-1",
 		Volumes: []PodVolumeState{
 			{Name: "a", ClaimName: "a", Mounts: []PodMount{{Container: "app", Path: "/a"}}},
-			{Name: "b", ClaimName: "b", Mounts: []PodMount{
-				{Container: "app", Path: "/b"},
-				{Container: "restore-wait", Path: "/restores/b", Init: true},
-			}},
-			{Name: "emptyDir", ClaimName: ""},
+			{Name: "b", ClaimName: "b", Mounts: []PodMount{{Container: "app", Path: "/b"}}},
 		},
+	}}
+	patch, err := volumeStripPatch("web-1", []string{"b"}, live)
+	if err != nil {
+		t.Fatalf("building the strip patch: %v", err)
 	}
-	patch := volumeStripPatch(pod, map[string]bool{"a": true})
 	for _, want := range []string{`"name":"b"`, `"mountPath":"/b"`, `"mountPath":"/restores/b"`} {
 		if !strings.Contains(strings.ReplaceAll(patch, " ", ""), want) {
 			t.Errorf("the patch does not remove %s: %s", want, patch)
@@ -377,13 +535,19 @@ func TestVolumeStripPatchLeavesAnUnnamedVolumeAlone(t *testing.T) {
 	if strings.Contains(patch, `"name":"a"`) || strings.Contains(patch, `"mountPath":"/a"`) {
 		t.Errorf("the patch touches the named volume: %s", patch)
 	}
-	if strings.Contains(patch, "emptyDir") {
-		t.Errorf("the patch removes a volume that is not a claim at all: %s", patch)
+	if strings.Contains(patch, "cache") {
+		t.Errorf("the patch removes a volume the backup does not hold: %s", patch)
 	}
-	// A pod that mounts only named claims needs no patch, and gets none: an
-	// empty one would be an object Velero has to parse for nothing.
-	if only := volumeStripPatch(PodState{Name: "solo", Volumes: []PodVolumeState{{Name: "a", ClaimName: "a"}}}, map[string]bool{"a": true}); only != "" {
-		t.Errorf("a pod with no unnamed volume got the patch %s", only)
+	// A backup pod with nothing unnamed needs no patch, and gets none: an empty
+	// one would be an object Velero has to parse for nothing.
+	if only, err := volumeStripPatch("web-1", nil, live); err != nil || only != "" {
+		t.Errorf("a pod with no unnamed volume got (%q, %v)", only, err)
+	}
+	// A volume the backup holds that no live pod declares is a refusal, not a
+	// guess: the merge keys a strategic merge patch deletes by are the pod's
+	// own, and a patch that cannot name them is invalid.
+	if _, err := volumeStripPatch("web-1", []string{"left-behind"}, live); err == nil {
+		t.Error("a volume no live pod declares must be refused")
 	}
 }
 
