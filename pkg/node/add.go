@@ -363,11 +363,23 @@ func (a *Add) stagePreflight(ctx context.Context) error {
 // stageLock creates the operation record, which is the CLI-vs-CLI lock
 // (PLAN 7.2): a second laptop starting an add against this cluster is refused
 // and told who is running one.
+//
+// THE TARGET IS THE HOST, NOT THE NODE IT BECOMES. A host ID is minted by this
+// operation in resolve — before the record exists, which is why it is a target —
+// but the NODE UID is LEARNED by the join: it is empty when the request is made
+// and filled in later from the cluster (resolve already knows that a resumed run
+// must not be refused over a host ID it minted differently, and replace.go's
+// stageLock says the same thing about the machine a join mints). Putting a
+// learned value in the immutable request made every add that stopped after the
+// join un-resumable: the resumed request carried "h-…/uid-new/" against the
+// record's "h-…//" and the request comparison refused it (kn-t52-…-kd2q.2, lab
+// w3). The node the host became is recorded where it belongs — the host's
+// inventory entry, and the journal's node name and UID.
 func (a *Add) stageLock(ctx context.Context) error {
 	request := operation.Request{
 		Kind:    operation.KindNodeAdd,
 		Cluster: a.Cluster,
-		Targets: []operation.Target{{HostID: a.Host.HostID, NodeUID: a.Host.NodeUID}},
+		Targets: []operation.Target{{HostID: a.Host.HostID}},
 		Versions: map[string]string{
 			"bundle": a.Record.BundleVersion,
 			"k3s":    a.k3sVersion(),

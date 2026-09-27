@@ -734,3 +734,171 @@ func TestAddStillRefusesANewHostWhoseDeviceIsNotBlank(t *testing.T) {
 		t.Error("the join was attempted on a machine the pre-flight refused")
 	}
 }
+
+// secondProcess is a later CLI invocation over the same world, the same record
+// and the same journal: a NEW process, which has no machine in hand. The
+// fixture's session copy carries the previous run's RESOLVED state — host,
+// connections, node, inventory — and a verb that inherits it never looks at the
+// machine the operator named on this command line, which is exactly the mistake
+// these tests must not make.
+func secondProcess(t *testing.T, f *nodeFixture, id string) *Session {
+	t.Helper()
+	s := freshSession(t, f, id)
+	s.Host, s.Conn, s.Node, s.Nodes = api.HostRecord{}, nil, ClusterNode{}, nil
+	s.Server, s.ServerConn = api.HostRecord{}, nil
+	s.Record, s.Hosts, s.Revision = api.ClusterBundle{}, nil, 0
+	return s
+}
+
+// stopAfterTheJoin runs one add that dies at the ACTIVE inventory write — the
+// machine has joined and the record does not say so yet — and ends it the way an
+// interrupted process does, so the record says `stopped` and a later --resume is
+// the verb that continues it. It returns the record the dead run left.
+func stopAfterTheJoin(t *testing.T, f *nodeFixture) operation.Record {
+	t.Helper()
+	ctx := context.Background()
+	first := &Add{Session: f.session, Opts: AddOptions{Agent: testAgentAddr}}
+	// The second inventory write is the ACTIVE one: stageJoining writes the host
+	// as joining first, and the run dies before it can say the node is Ready.
+	f.records.failOn = 2
+	_, runErr := stages.Execute(ctx, first, PlanAdd(first))
+	if runErr == nil {
+		t.Fatal("the planted inventory-write failure did not fail the run")
+	}
+	first.Finish(ctx, runErr, true)
+	joiner := hostWithAddress(f.records.inventory(), testAgentAddr)
+	if joiner.LifecycleState != string(StateJoining) {
+		t.Fatalf("the interrupted run left the host as %q, want %q", joiner.LifecycleState, StateJoining)
+	}
+	return readRecord(t, f.server)
+}
+
+// A `node add` that joined its machine and then died at the inventory write can
+// be continued. THE IMMUTABLE REQUEST IS WHAT THE OPERATOR ASKED FOR — this host
+// — and the node the host BECAME is learned by running: it did not exist when
+// the request was made, so learning it must not turn a resumed run into a
+// different request. This is replace's own rule (replace.go, stageLock: the
+// machine a join mints "does not exist until the join it performs").
+//
+// Before this, every add interrupted after the join was un-resumable, and the
+// only way on was a hand-edited record.
+func TestAddResumeContinuesAnAddThatStoppedAfterTheJoin(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+
+	dead := stopAfterTheJoin(t, f)
+	installsBefore := f.log.count("get.k3s.io")
+	if installsBefore != 1 {
+		t.Fatalf("%d install attempts in the interrupted run, want exactly 1", installsBefore)
+	}
+
+	// A second process, the same flags: --resume continues THAT operation.
+	resuming := secondProcess(t, f, "run-2")
+	if err := drive(resuming, AddOptions{Agent: testAgentAddr, Resume: dead.OperationID}); err != nil {
+		t.Fatalf("the add that stopped after the join could not be resumed: %v\n%s", err, f.out.String())
+	}
+	joiner := hostWithAddress(f.records.inventory(), testAgentAddr)
+	if joiner.LifecycleState != string(StateActive) {
+		t.Errorf("the resumed add left the host as %q, want %q: %+v", joiner.LifecycleState, StateActive, joiner)
+	}
+	if joiner.NodeUID == "" {
+		t.Error("the resumed add recorded the host active with no node uid")
+	}
+	// The reconcile established the join from the journal, so the join is not
+	// performed again: the machine is not reinstalled.
+	if got := f.log.count("get.k3s.io"); got != installsBefore {
+		t.Errorf("the resume installed the agent again (%d installs, was %d): the journal says the join completed", got, installsBefore)
+	}
+	after := readRecord(t, f.server)
+	if !after.Terminal || after.Result != string(operation.ResultSucceeded) {
+		t.Errorf("the resumed operation did not finish the record (terminal=%v, result=%q)", after.Terminal, after.Result)
+	}
+}
+
+// The immutable request is still what a resume may not change: a different host
+// — and so a different agent address — is a different operation, and the
+// refusal leaves the record exactly where it was, so the operation it names can
+// still be continued by whoever has the right machine.
+func TestAddResumeStillRefusesADifferentMachine(t *testing.T) {
+	cases := []struct {
+		name  string
+		agent string
+		host  string
+	}{
+		{"a machine this cluster already holds", "10.0.3.8", "SHA256:agent"},
+		{"a machine that is not in the inventory", "10.0.3.11", "SHA256:other"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serverHost(), agentHost())
+			const newNode = "prod-1-agt-2"
+			f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+				f.server.setNodes(joinedNodes(t, newNode, true))
+				return sshx.Result{}, nil
+			})
+			f.addHost(tc.agent, tc.host, nodesJSON(t))
+
+			dead := stopAfterTheJoin(t, f)
+			resuming := secondProcess(t, f, "run-2")
+			err := drive(resuming, AddOptions{Agent: tc.agent, Resume: dead.OperationID})
+			if err == nil {
+				t.Fatalf("a resume named a different machine and was accepted:\n%s", f.out.String())
+			}
+			after := readRecord(t, f.server)
+			if after.Terminal || after.Executor.Token != dead.Executor.Token {
+				t.Errorf("the refused resume terminalized or re-owned the record (terminal=%v, token %q, want %q)",
+					after.Terminal, after.Executor.Token, dead.Executor.Token)
+			}
+			if got := f.lastState("h-agt"); got != string(StateActive) {
+				t.Errorf("the refused resume changed the host the request held: %q", got)
+			}
+		})
+	}
+}
+
+// The same operation, continued the other way: a laptop that DIED after the join
+// leaves the record `running`, so only the operator's --take-over assertion may
+// claim it (kn-yzuv). The request comparison is the same one, so this case was
+// un-resumable for the same reason — and it is the case the take-over work could
+// not test, because its own add test had to plant the interruption BEFORE the
+// join to get past this.
+func TestAddTakeOverContinuesAnAddThatDiedAfterTheJoin(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+
+	stopped := stopAfterTheJoin(t, f)
+	// The laptop died rather than stopping: the record still says its executor
+	// is running, and nothing in this CLI writes that state — which is why only
+	// the operator can say the executor is gone.
+	dead := killRecord(t, f.server)
+	installsBefore := f.log.count("get.k3s.io")
+
+	taking := secondProcess(t, f, "run-2")
+	if err := drive(taking, AddOptions{Agent: testAgentAddr, TakeOver: dead.OperationID, Confirm: true}); err != nil {
+		t.Fatalf("the add that died after the join could not be taken over: %v\n%s", err, f.out.String())
+	}
+	joiner := hostWithAddress(f.records.inventory(), testAgentAddr)
+	if joiner.LifecycleState != string(StateActive) || joiner.NodeUID == "" {
+		t.Errorf("the take-over left the host as %q (uid %q), want %q with its node uid: %+v",
+			joiner.LifecycleState, joiner.NodeUID, StateActive, joiner)
+	}
+	if got := f.log.count("get.k3s.io"); got != installsBefore {
+		t.Errorf("the take-over installed the agent again (%d installs, was %d): the journal says the join completed", got, installsBefore)
+	}
+	after := readRecord(t, f.server)
+	if len(after.TakeOvers) != 1 || after.TakeOvers[0].Replaced.Token != stopped.Executor.Token {
+		t.Errorf("the take-over was not recorded against the dead executor: %+v (want the token %q)",
+			after.TakeOvers, stopped.Executor.Token)
+	}
+	if !after.Terminal || after.Result != string(operation.ResultSucceeded) {
+		t.Errorf("the taken-over operation did not finish the record (terminal=%v, result=%q)", after.Terminal, after.Result)
+	}
+}
