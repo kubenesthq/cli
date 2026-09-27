@@ -285,6 +285,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 		// FROM A SECOND LAPTOP: an empty HOME has no install journal and no
 		// local kit, which is the case the inventory (T5.0) exists for.
 		t.Setenv("HOME", t.TempDir())
+		gateLogin(t, env)
 
 		args := []string{"node", "add", "--cluster", env.cluster, "--agent", spare}
 		if spareDevice != "" {

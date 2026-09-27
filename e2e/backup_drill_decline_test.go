@@ -121,7 +121,7 @@ func TestBackupDrillDeclinesIneligibleBackupImmediately(t *testing.T) {
 	// backup work, and this arm runs under its own HOME like every other e2e
 	// gate, so the token has to be signed in first.
 	t.Setenv("HOME", t.TempDir())
-	drillDeclineLogin(t, env)
+	gateLogin(t, env)
 
 	// The drill's window opens after any backup this bundle can produce, and it
 	// is open before the backup below is taken.
@@ -269,25 +269,6 @@ func drillDeclineOpenTheWindow(
 	return window
 }
 
-// drillDeclineLogin signs the arm's own HOME in to the control plane. Copied
-// from this package's t47 gate on purpose: the credential lives under HOME, and
-// every `backup` command refuses to work without a control plane it can check.
-func drillDeclineLogin(t *testing.T, env gateEnv) {
-	t.Helper()
-	args := []string{"login", "--control-plane", env.controlPlane, "--token-stdin"}
-	if len(env.controlPlaneCA) > 0 {
-		caFile := filepath.Join(t.TempDir(), "control-plane-ca.pem")
-		if err := os.WriteFile(caFile, env.controlPlaneCA, 0o600); err != nil {
-			t.Fatalf("writing the control plane's CA out for the login: %v", err)
-		}
-		args = append(args, "--ca-file", caFile)
-	}
-	var out bytes.Buffer
-	if err := drillDeclineRunCLIWithStdin(&out, strings.NewReader(env.token), args...); err != nil {
-		t.Fatalf("signing in to %s: %v\n%s", env.controlPlane, err, out.String())
-	}
-}
-
 func drillDeclineRunCLI(t *testing.T, env gateEnv, bundlePath string, verb string, extra ...string) {
 	t.Helper()
 	var out bytes.Buffer
@@ -312,12 +293,9 @@ func drillDeclineRunCLIWithContext(ctx context.Context, out io.Writer, env gateE
 	return drillDeclineRunCLIWithStdinContext(ctx, out, nil, append(args, extra...)...)
 }
 
-// drillDeclineRunCLIWithStdin runs the real command tree, so what this arm
-// asserts is the operator's output and exit, not a library call's return value.
-func drillDeclineRunCLIWithStdin(out io.Writer, in io.Reader, args ...string) error {
-	return drillDeclineRunCLIWithStdinContext(context.Background(), out, in, args...)
-}
-
+// drillDeclineRunCLIWithStdinContext runs the real command tree, so what this
+// arm asserts is the operator's output and exit, not a library call's return
+// value.
 func drillDeclineRunCLIWithStdinContext(ctx context.Context, out io.Writer, in io.Reader, args ...string) error {
 	root := cmd.NewRootCommand()
 	root.SetOut(out)

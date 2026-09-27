@@ -22,6 +22,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
@@ -401,6 +403,32 @@ func assertHost(t *testing.T, ctx context.Context, node uninstall.Node, want map
 func connectNodes(t *testing.T, env gateEnv) []uninstall.Node {
 	t.Helper()
 	return []uninstall.Node{{Address: env.server, Role: uninstall.RoleServer, Runner: dialServer(t, t, env)}}
+}
+
+// gateLogin signs the test's HOME in to the control plane with the gate's
+// token, the way a second laptop does: `kubenest login --token-stdin`, with
+// --ca-file when the control plane's certificate is signed by its own CA. A
+// gate that runs a command under its own HOME needs it first, because every
+// verb that reaches the control plane refuses without a login.
+func gateLogin(t *testing.T, env gateEnv) {
+	t.Helper()
+	args := []string{"login", "--control-plane", env.controlPlane, "--token-stdin"}
+	if len(env.controlPlaneCA) > 0 {
+		caFile := filepath.Join(t.TempDir(), "control-plane-ca.pem")
+		if err := os.WriteFile(caFile, env.controlPlaneCA, 0o600); err != nil {
+			t.Fatalf("writing the control plane's CA out for the login: %v", err)
+		}
+		args = append(args, "--ca-file", caFile)
+	}
+	var out bytes.Buffer
+	root := cmd.NewRootCommand()
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetIn(strings.NewReader(env.token))
+	root.SetArgs(args)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("signing in to %s: %v\n%s", env.controlPlane, err, out.String())
+	}
 }
 
 // dialServer opens an SSH connection to the server that stays open as long as
