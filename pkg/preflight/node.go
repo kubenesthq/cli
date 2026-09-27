@@ -33,6 +33,14 @@ func checkNode(ctx context.Context, opts Options, node Node, rep *Report) {
 	}
 	rep.add(Result{Check: CheckSSH, Node: node.Address, Outcome: Pass, Detail: "connected"})
 
+	// A node that is here only as the other end of the port checks — the
+	// cluster's existing server during `node add` — is running the cluster, so
+	// the host checks below would refuse it every time. Its reachability is
+	// above; the port checks prove the paths to and from it separately.
+	if node.PortPeer {
+		return
+	}
+
 	checkOS(ctx, opts, node, rep)
 	checkPrivilege(ctx, node, rep)
 	checkExistingKubernetes(ctx, node, rep)

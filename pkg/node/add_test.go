@@ -333,3 +333,115 @@ func hostWithAddress(hosts []api.HostRecord, address string) api.HostRecord {
 	}
 	return api.HostRecord{}
 }
+
+// hasCommandOn reports whether any command run on one host contains substr.
+func hasCommandOn(commands []string, substr string) bool {
+	for _, cmd := range commands {
+		if strings.Contains(cmd, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// The cluster's existing server is a member of the cluster: it runs k3s and it
+// already has kubenest-vg. `node add` uses it as the other end of the
+// node-to-node port checks and as the join path, and must NOT run the
+// install's HOST checks against it — those refuse any machine that is already
+// running the cluster, so running them on the server makes the verb impossible
+// against a live cluster.
+//
+// Hardware, 2026-09-27: a lab-w3 node add was refused with "Existing Kubernetes
+// on 5.75.252.113: already present: k3s" and "Volume group on 5.75.252.113:
+// kubenest-vg already exists on this node: omit --storage-device".
+func TestAddRunsTheHostChecksOnlyOnTheNewHost(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	// The server is a real cluster member...
+	f.server.on("command -v", ok("k3s\ncontainerd\n"))
+	// ...and the new host is fresh: no kubenest-vg, so --storage-device is the
+	// path being asked for.
+	f.agent.on("vgs", fail(1, "Volume group \"kubenest-vg\" not found"))
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+	const device = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive2"
+
+	if _, err := f.runAdd(f.newAdd(AddOptions{StorageDevice: device})); err != nil {
+		t.Fatalf("an add against a running cluster must pass preflight and join: %v\n%s", err, f.out.String())
+	}
+
+	// The server is still the other end of the port checks.
+	if !hasCommandOn(f.log.commands(testServerAddr), "kubenest-preflight-port-probe") {
+		t.Errorf("the existing server must still be checked as the other end of the node-to-node ports; what ran on it:\n%s",
+			strings.Join(f.log.commands(testServerAddr), "\n"))
+	}
+	// But no host check ran on it. These are the commands the per-host checks
+	// issue (OS, privilege, existing Kubernetes, sizing, volume group, egress).
+	serverCommands := strings.Join(f.log.commands(testServerAddr), "\n")
+	for _, hostCheck := range []string{
+		"/etc/os-release", "apt-config dump", "sudo -n true",
+		"k3s rke2 kubelet containerd", "MemTotal", "vgs kubenest-vg",
+		"blkid -p", "test -b ", "curl -s",
+	} {
+		if strings.Contains(serverCommands, hostCheck) {
+			t.Errorf("the install's host checks must not run on the existing server: %q did", hostCheck)
+		}
+	}
+	// The new host got them, including the existing-Kubernetes check and the
+	// blank-device check the flag asks for.
+	agentCommands := strings.Join(f.log.commands(testAgentAddr), "\n")
+	for _, hostCheck := range []string{"k3s rke2 kubelet containerd", "blkid -p"} {
+		if !strings.Contains(agentCommands, hostCheck) {
+			t.Errorf("the new host must still get %q; what ran on it:\n%s", hostCheck, agentCommands)
+		}
+	}
+}
+
+// The server's exception is not a general weakening: the machine being added
+// still gets every host check, so one that already runs Kubernetes is refused.
+func TestAddStillRefusesANewHostThatRunsKubernetes(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	f.agent.on("command -v", ok("k3s\ncontainerd\n"))
+
+	_, err := f.runAdd(f.newAdd(AddOptions{}))
+	if err == nil {
+		t.Fatal("a machine that already runs Kubernetes must not join")
+	}
+	if !strings.Contains(err.Error(), "Existing Kubernetes") {
+		t.Errorf("the refusal must be the Existing Kubernetes check: %v", err)
+	}
+	if !strings.Contains(err.Error(), testAgentAddr) {
+		t.Errorf("the refusal must be about the new host, not the server: %v", err)
+	}
+	if f.log.hasCommand("get.k3s.io") {
+		t.Error("the join was attempted on a machine the pre-flight refused")
+	}
+}
+
+// --storage-device is a check on the NEW host: a device that is not blank is
+// still refused there, and the refusal names the new host.
+func TestAddStillRefusesANewHostWhoseDeviceIsNotBlank(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	f.agent.on("vgs", fail(1, "Volume group \"kubenest-vg\" not found"))
+	f.agent.on("blkid -p", ok("TYPE=\"ext4\"\n"))
+	const device = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive2"
+
+	_, err := f.runAdd(f.newAdd(AddOptions{StorageDevice: device}))
+	if err == nil {
+		t.Fatal("a --storage-device that is not blank must be refused")
+	}
+	if !strings.Contains(err.Error(), device) {
+		t.Errorf("the refusal must name the device: %v", err)
+	}
+	if !strings.Contains(err.Error(), testAgentAddr) {
+		t.Errorf("the refusal must be about the new host, not the server: %v", err)
+	}
+	if strings.Contains(err.Error(), testServerAddr) {
+		t.Errorf("the existing server must not be refused: %v", err)
+	}
+	if f.log.hasCommand("get.k3s.io") {
+		t.Error("the join was attempted on a machine the pre-flight refused")
+	}
+}

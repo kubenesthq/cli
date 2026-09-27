@@ -281,6 +281,12 @@ func (a *Add) stageWindow(ctx context.Context) error {
 // not join a cluster at install may not join one later. Nothing has been
 // written anywhere at this point, which is what makes abandoning an add here
 // free.
+//
+// The cluster's existing server is passed along as a PortPeer: it opens the
+// connection the join goes through and it is the other end of the node-to-node
+// port checks, but the per-host checks are for the machine being ADDED. The
+// server already runs k3s and already has kubenest-vg, so running the install's
+// host checks against it refuses every add by construction.
 func (a *Add) stagePreflight(ctx context.Context) error {
 	report, err := preflight.Run(ctx, preflight.Options{
 		Bundle:        a.Bundle,
@@ -289,7 +295,7 @@ func (a *Add) stagePreflight(ctx context.Context) error {
 		Profiles:      a.Record.Profiles,
 		StorageDevice: a.Opts.StorageDevice,
 		Nodes: []preflight.Node{
-			{Address: a.Server.SSHAddress, Role: a.Server.Role, Runner: a.ServerConn},
+			{Address: a.Server.SSHAddress, Role: a.Server.Role, Runner: a.ServerConn, PortPeer: true},
 			{Address: a.Opts.Agent, Role: string(RoleAgent), Runner: a.Conn},
 		},
 		Egress:  a.Egress,

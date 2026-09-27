@@ -135,6 +135,14 @@ type Node struct {
 	// the same reason: after stage 7, "--storage-device must be blank" would
 	// otherwise refuse the installer's own work on every resume.
 	StorageIsOurs bool
+	// PortPeer marks a node that is here only as the other end of the
+	// node-to-node port checks — the cluster's existing server during `node
+	// add`, which already runs the cluster. Its per-host checks (existing
+	// Kubernetes, the volume group, the OS, the sizing) would always refuse a
+	// machine that is running the cluster, so only its SSH reachability is
+	// checked; the port checks still prove the paths to and from it, and it is
+	// still a node for the tier's node-count arithmetic.
+	PortPeer bool
 }
 
 // EgressTarget is one URL the install needs to reach from the nodes. The list
