@@ -387,6 +387,9 @@ actively harmed you.`,
 			if f.Resume != "" && !f.ControlPlane {
 				return fmt.Errorf("--resume continues an interrupted CONTROL-PLANE upgrade, so it needs --control-plane: a workload cluster's upgrade resumes by re-running the identical command, which reads its own journal")
 			}
+			if err := f.recovery().Validate(); err != nil {
+				return err
+			}
 			if f.Now && f.Wait {
 				return fmt.Errorf("--now and --wait ask for opposite things: --now acts immediately regardless of the maintenance window, --wait holds until the window opens")
 			}

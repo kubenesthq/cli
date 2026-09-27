@@ -29,6 +29,13 @@ type NodeRemoveFlags struct {
 	AbandonVolumes bool
 	// Resume continues an interrupted remove by operation id.
 	Resume string
+	// TakeOver takes over a removal whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv).
+	TakeOver string
+	// Confirm is that assertion, which --take-over requires: the CLI never
+	// infers that the previous executor is gone.
+	Confirm bool
 	// Wait holds until the maintenance window opens, holding nothing while it
 	// waits.
 	Wait bool
@@ -39,11 +46,17 @@ type NodeRemoveFlags struct {
 	SSHKey  string
 }
 
+// recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm.
+func (f NodeRemoveFlags) recovery() operation.Recovery {
+	return operation.Recovery{Resume: f.Resume, TakeOver: f.TakeOver, Confirm: f.Confirm}
+}
+
 func (f NodeRemoveFlags) validate() error {
 	if f.Wait && f.Now {
 		return fmt.Errorf("--wait and --now are mutually exclusive: --wait holds for the maintenance window, --now acts immediately and bypasses it")
 	}
-	return nil
+	return f.recovery().Validate()
 }
 
 // newNodeRemoveCommand is `kubenest node remove`.
@@ -111,6 +124,8 @@ disruptive operation at a time, resumable with --resume) AND kured's own lock.`,
 	fs.StringVar(&f.Node, "node", "", "the node to remove: an inventory host ID, an SSH address, or the cluster's Node name (required)")
 	fs.BoolVar(&f.AbandonVolumes, "abandon-volumes", false, "remove the node even though local volumes on it will be destroyed, acknowledging that the data on them is gone; certifies nothing about backups")
 	fs.StringVar(&f.Resume, "resume", "", "continue an interrupted removal by operation id, as reported when it stopped")
+	fs.StringVar(&f.TakeOver, "take-over", "", "take over a removal whose record still says its executor is running, on your assertion that the previous executor and its outstanding actions have stopped (requires --confirm)")
+	fs.BoolVar(&f.Confirm, "confirm", false, "with --take-over: your assertion that the previous executor and its outstanding actions have stopped")
 	fs.BoolVar(&f.Wait, "wait", false, "hold until the maintenance window opens — holding nothing while it waits — then take the locks and re-check every gate")
 	fs.BoolVar(&f.Now, "now", false, "act immediately, bypassing ONLY the maintenance window; the interlock, volume and disruption-budget checks still run")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user to reach the node with; the host inventory's user is used by default")
@@ -128,6 +143,8 @@ func runNodeRemove(ctx context.Context, out io.Writer, client *api.Client, f Nod
 		Node:           f.Node,
 		AbandonVolumes: f.AbandonVolumes,
 		Resume:         f.Resume,
+		TakeOver:       f.TakeOver,
+		Confirm:        f.Confirm,
 		Wait:           f.Wait,
 		Now:            f.Now,
 	}}

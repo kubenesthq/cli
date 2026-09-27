@@ -51,11 +51,24 @@ type RemoveOptions struct {
 	AbandonVolumes bool
 	// Resume continues an interrupted remove by operation id.
 	Resume string
+	// TakeOver takes over a removal whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv). It requires
+	// Confirm — the assertion is the operator's, and the CLI never infers it.
+	TakeOver string
+	// Confirm is that assertion, alongside TakeOver.
+	Confirm bool
 	// Wait holds until the maintenance window opens, holding nothing while it
 	// waits.
 	Wait bool
 	// Now bypasses the maintenance window and NOTHING else.
 	Now bool
+}
+
+// Recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm.
+func (o RemoveOptions) Recovery() operation.Recovery {
+	return operation.Recovery{Resume: o.Resume, TakeOver: o.TakeOver, Confirm: o.Confirm}
 }
 
 // Remove is `kubenest node remove`: the one node verb that can destroy data.
@@ -293,7 +306,7 @@ func (r *Remove) stageLock(ctx context.Context) error {
 			"volumes": fmt.Sprintf("%d", len(r.volumes)),
 		},
 	}
-	return r.openRecord(ctx, operation.KindNodeRemove, request, r.Opts.Resume)
+	return r.openRecord(ctx, operation.KindNodeRemove, request, r.Opts.Recovery())
 }
 
 // stageHold takes the node out of kured's pool and then kured's own lock, in

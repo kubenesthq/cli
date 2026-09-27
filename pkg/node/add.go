@@ -52,11 +52,24 @@ type AddOptions struct {
 	StorageDevice string
 	// Resume continues an interrupted add by operation id.
 	Resume string
+	// TakeOver takes over an add whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv). It requires
+	// Confirm — the assertion is the operator's, and the CLI never infers it.
+	TakeOver string
+	// Confirm is that assertion, alongside TakeOver.
+	Confirm bool
 	// Wait holds until the maintenance window opens, holding nothing while it
 	// waits.
 	Wait bool
 	// Now bypasses the maintenance window and NOTHING else.
 	Now bool
+}
+
+// Recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm.
+func (o AddOptions) Recovery() operation.Recovery {
+	return operation.Recovery{Resume: o.Resume, TakeOver: o.TakeOver, Confirm: o.Confirm}
 }
 
 // addState is what a resumed add carries across processes: the host it is
@@ -129,7 +142,7 @@ func (a *Add) saveState(st addState) error {
 
 // stageResolve answers what this cluster IS and which machine joins it.
 func (a *Add) stageResolve(ctx context.Context) error {
-	return a.ResolveNewHost(ctx, a.Opts.Resume != "")
+	return a.ResolveNewHost(ctx, a.Opts.Recovery().ID() != "")
 }
 
 // ResolveNewHost answers what this cluster IS and which machine joins it, and
@@ -306,7 +319,7 @@ func (a *Add) stageLock(ctx context.Context) error {
 			"k3s":    a.k3sVersion(),
 		},
 	}
-	return a.openRecord(ctx, operation.KindNodeAdd, request, a.Opts.Resume)
+	return a.openRecord(ctx, operation.KindNodeAdd, request, a.Opts.Recovery())
 }
 
 // stageJoining writes the host into the inventory BEFORE anything is done to

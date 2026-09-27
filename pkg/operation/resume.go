@@ -3,6 +3,7 @@ package operation
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -228,6 +229,12 @@ func (p *Plan) reconcile(ctx context.Context, s *Store, a Action) (Step, *Blocke
 // can see a heartbeat stop but it cannot see a laptop that is asleep, and a
 // network partition is a reason to do nothing rather than a reason to proceed.
 // Elapsed time never releases ownership.
+//
+// THIS IS THE CLAIM A --resume MAKES, and it is the reason a record whose
+// executor died without recording its stop is not resumable: the record says
+// `running`, and no observation can turn that into `stopped`. An operator who
+// can see the machine is the only one who can say so, and that is
+// TakeOverAsserted.
 func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 	if !validOperationID(opID) {
 		return nil, fmt.Errorf("%w: operation id %q is not a usable identity", ErrTakeOverRefused, opID)
@@ -249,10 +256,23 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 	if live == nil || live.Record.OperationID != opID {
 		return nil, fmt.Errorf("%w: operation %s has no live record — it was finished or a later operation replaced it", ErrTakeOverRefused, opID)
 	}
-	if rec.Executor.State != ExecutorStopped {
+	switch rec.Executor.State {
+	case ExecutorStopped:
+		// What this claim needs, and the only state it continues.
+	case ExecutorPaused:
+		// A paused executor is between stages BY ITS OWN RECORD: it is alive
+		// and coming back, so there is no ambiguity for an assertion to
+		// resolve and neither command takes its record (PLAN 7.2, T2.3).
 		return nil, fmt.Errorf(
-			"%w: operation %s is still %s (held by %s, last heartbeat %s). A take-over needs the previous executor stopped and its actions reconciled; a stale record or a network partition alone never permits one",
+			"%w: operation %s is %s (held by %s, last heartbeat %s). A paused executor is between stages by its own record, so it is alive and coming back and its record is not taken from it; wait for it, or stop it from the machine that started it so its record says stopped",
 			ErrTakeOverRefused, opID, rec.Executor.State, holder(rec), rec.Executor.Heartbeat.UTC().Format("2006-01-02T15:04:05Z"))
+	default:
+		// `running` is ambiguous in a way only a person can settle: a laptop
+		// that is asleep and one that is off look identical from here. So the
+		// refusal names the one command that lets the operator settle it.
+		return nil, fmt.Errorf(
+			"%w: operation %s is still %s (held by %s, last heartbeat %s), and this command continues an operation whose record says its executor stopped. An executor that died could not record that, and this CLI cannot see a laptop that is off: if you know the previous executor and its outstanding actions have stopped, assert it — --take-over %s --confirm — which reconciles the recorded actions and continues the operation",
+			ErrTakeOverRefused, opID, rec.Executor.State, holder(rec), rec.Executor.Heartbeat.UTC().Format("2006-01-02T15:04:05Z"), opID)
 	}
 	for _, a := range rec.Actions {
 		if a.Status == ActionRecorded || a.Status == ActionSubmitted {
@@ -277,4 +297,159 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 	}
 	next.Revision = rv
 	return &Handle{store: s, rec: &next, rv: rv, token: next.Executor.Token}, nil
+}
+
+// TakeOverAsserted hands an interrupted operation to this executor on the
+// operator's explicit assertion that the previous executor and its outstanding
+// actions have stopped.
+//
+// It is what `--take-over <operation-id> --confirm` does, and it exists because
+// a record cannot always say what a resume needs. An executor that died — a
+// laptop that lost power, a connection that dropped, a reboot that took the
+// session with it — never wrote `stopped`, and the only writer of that state is
+// `Stop`, which needs the dead executor's own ownership token. Requiring the
+// record to say `stopped` therefore locked such a record for good: on hardware
+// (2026-09-27, lab w3) a `node reboot` that lost its SSH session left the node
+// cordoned and every later command on the cluster refused with "another
+// operation holds the record" (kn-yzuv).
+//
+// THE OPERATOR'S ASSERTION IS THE FACT (PLAN 7.2). The CLI can see a heartbeat
+// go stale and it cannot see the difference between a laptop that is asleep and
+// one that is off, so it never guesses: the person who can see the machine says
+// so, and the record says who said it. A stale record or a network partition
+// alone still permits nothing.
+//
+// WHAT IS ASSERTED IS THE EXECUTOR AND ITS OUTSTANDING ACTIONS, NOT THEIR
+// OUTCOMES. The outcomes are the reconciliation's business, and the caller runs
+// one (Resume) before this: an action whose postcondition cannot be established
+// stops the resume with the reconciliation step named, and so stops the
+// take-over before it claims anything. This is why the outstanding actions are
+// not re-checked here — the reconcile that just ran is what established them.
+//
+// A record whose executor is already `stopped` needs no assertion, so it is
+// refused and names --resume as the verb that continues it; a paused executor
+// is alive by its own record (T2.3); and a terminal record has nothing left to
+// take over.
+func TakeOverAsserted(ctx context.Context, s *Store, opID string) (*Handle, error) {
+	if !validOperationID(opID) {
+		return nil, fmt.Errorf("%w: operation id %q is not a usable identity", ErrTakeOverRefused, opID)
+	}
+	stored, err := s.Find(ctx, opID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the record for %s could not be read (%v), and a record this executor cannot see never permits a take-over", ErrTakeOverRefused, opID, err)
+	}
+	rec := stored.Record
+	if rec.Terminal {
+		return nil, fmt.Errorf("%w: operation %s is terminal (%s), so nothing is left to take over", ErrTakeOverRefused, opID, rec.Result)
+	}
+	live, err := s.Current(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: the live record could not be read (%v)", ErrTakeOverRefused, err)
+	}
+	if live == nil || live.Record.OperationID != opID {
+		return nil, fmt.Errorf("%w: operation %s has no live record — it was finished or a later operation replaced it", ErrTakeOverRefused, opID)
+	}
+	switch rec.Executor.State {
+	case ExecutorStopped:
+		return nil, fmt.Errorf(
+			"%w: operation %s records its executor stopped already (held by %s), so there is nothing to assert: --resume %s continues it",
+			ErrTakeOverRefused, opID, holder(rec), opID)
+	case ExecutorPaused:
+		return nil, fmt.Errorf(
+			"%w: operation %s is %s (held by %s, last heartbeat %s). A paused executor is between stages by its own record, so it is alive and coming back and its record is not taken from it; wait for it, or stop it from the machine that started it",
+			ErrTakeOverRefused, opID, rec.Executor.State, holder(rec), rec.Executor.Heartbeat.UTC().Format("2006-01-02T15:04:05Z"))
+	}
+
+	now := s.now()
+	next := *rec
+	// THE ASSERTION IS WRITTEN WITH THE CLAIM, in the one compare-and-swap that
+	// changes hands: a record that changed ownership without saying who said the
+	// previous executor was gone would be indistinguishable from theft, and a
+	// second write could fail on its own and leave that state behind.
+	next.TakeOvers = append(slices.Clone(rec.TakeOvers), TakeOverRecord{
+		Operator: s.Operator,
+		At:       now,
+		Replaced: rec.Executor,
+	})
+	next.Executor = Executor{
+		Token:     NewToken(),
+		Operator:  s.Operator,
+		State:     ExecutorRunning,
+		Heartbeat: now,
+	}
+	next.UpdatedAt = now
+	rv, err := s.replace(ctx, Name, &next, live.ResourceVersion)
+	if err != nil {
+		return nil, fmt.Errorf("%w: claiming the record: %v", ErrTakeOverRefused, err)
+	}
+	next.Revision = rv
+	return &Handle{store: s, rec: &next, rv: rv, token: next.Executor.Token}, nil
+}
+
+// Recovery is how an operator takes up an interrupted operation: `--resume`, or
+// `--take-over` with the confirmation that only a person can give.
+//
+// It exists so that the two flags, their mutual exclusion and the confirmation
+// `--take-over` requires live in ONE place rather than in every verb — the
+// verbs' flag surfaces differ, and a rule restated per verb drifts (PLAN 7.2:
+// "a take-over requires the previous executor and its outstanding actions to be
+// stopped").
+type Recovery struct {
+	// Resume is the `--resume` operation id, or "".
+	Resume string
+	// TakeOver is the `--take-over` operation id, or "".
+	TakeOver string
+	// Confirm is `--confirm` alongside `--take-over`: the operator's assertion
+	// that the previous executor and its outstanding actions have stopped.
+	Confirm bool
+}
+
+// Validate refuses the flag combinations before anything is read.
+func (r Recovery) Validate() error {
+	if r.Resume != "" && r.TakeOver != "" {
+		return fmt.Errorf("%w: --resume and --take-over are two ways to take up the same operation and cannot both be given: --resume continues an operation whose record says the previous executor stopped, --take-over asserts that it has", ErrTakeOverRefused)
+	}
+	if r.TakeOver != "" && !r.Confirm {
+		return fmt.Errorf("%w: --take-over requires --confirm. The take-over IS your assertion that the previous executor and its outstanding actions have stopped — the CLI cannot see a laptop that is off or a partition that is still there, so it never makes that assertion for you. Pass --confirm with --take-over %s if that is what you found", ErrTakeOverRefused, r.TakeOver)
+	}
+	return nil
+}
+
+// ID is the operation this recovery takes up, or "" for a new operation.
+func (r Recovery) ID() string {
+	if r.TakeOver != "" {
+		return r.TakeOver
+	}
+	return r.Resume
+}
+
+// IsTakeOver reports whether this is the operator's assertion rather than a
+// resume.
+func (r Recovery) IsTakeOver() bool { return r.TakeOver != "" }
+
+// Progress is what the verbs print about the reconciliation that ran, in the
+// CLI's own words, with the operation named.
+func (r Recovery) Progress(plan *Plan) string {
+	verb := "Resuming"
+	if r.IsTakeOver() {
+		verb = "Taking over"
+	}
+	return fmt.Sprintf("%s operation %s, stopped at %s: %d step(s) established, %d to repeat.",
+		verb, r.ID(), plan.Record.Stage, len(plan.Skip()), len(plan.Steps)-len(plan.Skip()))
+}
+
+// Claim claims the record for this executor, after the caller has reconciled it
+// with Resume.
+//
+// The assertion is the whole difference: a resume claims a record that already
+// says its executor stopped, and a take-over claims one that cannot say it
+// because the operator has said it instead.
+func (r Recovery) Claim(ctx context.Context, s *Store) (*Handle, error) {
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	if r.TakeOver != "" {
+		return TakeOverAsserted(ctx, s, r.TakeOver)
+	}
+	return TakeOver(ctx, s, r.Resume)
 }

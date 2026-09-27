@@ -38,6 +38,8 @@ func addControlPlaneUpgradeFlags(cmd *cobra.Command, f *UpgradeFlags) {
 	fs := cmd.Flags()
 	fs.BoolVar(&f.ControlPlane, "control-plane", false, "upgrade the KubeNest control plane itself: fence the public API, take a checkpoint, run the migration Job, roll the new chart and validate it through the node (the management cluster)")
 	fs.StringVar(&f.Resume, "resume", "", "continue an interrupted control-plane upgrade by operation id, as reported when it stopped. Every remote action is recorded before it is submitted, so this reconciles what happened instead of repeating it")
+	fs.StringVar(&f.TakeOver, "take-over", "", "take over an upgrade whose record still says its executor is running, on your assertion that the previous executor and its outstanding actions have stopped (requires --confirm); it reconciles exactly as --resume does, for a workload cluster or for --control-plane")
+	fs.BoolVar(&f.Confirm, "confirm", false, "with --take-over: your assertion that the previous executor and its outstanding actions have stopped")
 }
 
 // runControlPlaneUpgrade is `kubenest platform upgrade --control-plane`.
@@ -101,7 +103,7 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	// What the operation recorded when it began, when this run continues one.
 	// It is the last resort: a failed migration leaves the backend at zero
 	// replicas, so neither the public route nor the tunnel answers.
-	recorded, recordedWindow := recordedOperationFacts(ctx, nodeRunner, f.Resume)
+	recorded, recordedWindow := recordedOperationFacts(ctx, nodeRunner, f.recovery().ID())
 
 	// THE PUBLIC URL THIS COMMAND TALKS TO, built once and kept, because the
 	// unfence has to ASK it: the fence is reported down when the URL a client
@@ -354,9 +356,13 @@ func controlPlaneLock(
 	started api.ControlPlaneVersion,
 	recordedWindow string,
 ) (*operation.Store, *operation.Handle, map[string]bool, error) {
-	store := &operation.Store{Runner: server}
+	// The operator is named on every record this command writes: the refusal a
+	// second laptop reads names them, and a take-over assertion has to say WHO
+	// asserted that the previous executor was gone.
+	store := &operation.Store{Runner: server, Operator: upgrade.OperatorName()}
 	req := operationRequest(f, session, started, recordedWindow)
-	if f.Resume == "" {
+	recovery := f.recovery()
+	if recovery.ID() == "" {
 		handle, err := store.Acquire(ctx, req)
 		if err != nil {
 			return nil, nil, nil, err
@@ -365,9 +371,9 @@ func controlPlaneLock(
 	}
 
 	// THE RECORD IS READ BEFORE ANYTHING IS SUBMITTED, and its probes are
-	// read-only. A resume that reconciled by changing things would be a resume
-	// that guesses.
-	plan, err := operation.Resume(ctx, store, f.Resume)
+	// read-only. A resume — and a take-over — that reconciled by changing
+	// things would be one that guesses.
+	plan, err := operation.Resume(ctx, store, recovery.ID())
 	if err != nil {
 		var blocked *operation.BlockedError
 		if errors.As(err, &blocked) {
@@ -378,12 +384,11 @@ func controlPlaneLock(
 	if err := plan.Verify(req); err != nil {
 		return nil, nil, nil, err
 	}
-	fmt.Fprintf(out, "Resuming operation %s, stopped at %s: %d step(s) established, %d to repeat.\n",
-		f.Resume, plan.Record.Stage, len(plan.Skip()), len(plan.Steps)-len(plan.Skip()))
+	fmt.Fprintln(out, recovery.Progress(plan))
 	for _, step := range plan.Steps {
 		fmt.Fprintf(out, "  %s %s (%s): %s\n", step.Decision, step.ActionID, step.Stage, step.Reason)
 	}
-	handle, err := operation.TakeOver(ctx, store, f.Resume)
+	handle, err := recovery.Claim(ctx, store)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -409,7 +414,7 @@ func controlPlaneLock(
 // resume whose record carries no version facts — an operation recorded by a build
 // that did not write them. Those keep the behaviour they had.
 func resumeStart(f UpgradeFlags, live, recorded api.ControlPlaneVersion) api.ControlPlaneVersion {
-	if f.Resume == "" || recorded == (api.ControlPlaneVersion{}) {
+	if f.recovery().ID() == "" || recorded == (api.ControlPlaneVersion{}) {
 		return live
 	}
 	return recorded
@@ -440,7 +445,7 @@ func operationRequest(f UpgradeFlags, session *upgrade.Session, started api.Cont
 	// operation may find the public route fenced and the backend at zero
 	// replicas, and the window gate refuses a window it cannot read. The record
 	// is in the cluster and needs no backend.
-	if f.Resume != "" && recordedWindow != "" {
+	if f.recovery().ID() != "" && recordedWindow != "" {
 		req.Versions[recordedWindowKey] = recordedWindow
 	} else if session.Window != nil {
 		if spec, err := json.Marshal(session.Window.Spec()); err == nil {

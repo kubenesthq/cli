@@ -100,11 +100,25 @@ type ReplaceOptions struct {
 	StorageDevice string
 	// Resume continues an interrupted replace by operation id.
 	Resume string
+	// TakeOver takes over a replace whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv). It requires
+	// Confirm — the assertion is the operator's, and the CLI never infers it.
+	TakeOver string
+	// Confirm is that assertion, alongside TakeOver.
+	Confirm bool
 	// Wait holds until the maintenance window opens, holding nothing while it
 	// waits.
 	Wait bool
 	// Now bypasses the maintenance window and NOTHING else.
 	Now bool
+}
+
+// Recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm. The
+// composed halves both continue the ONE operation this replace holds.
+func (o ReplaceOptions) Recovery() operation.Recovery {
+	return operation.Recovery{Resume: o.Resume, TakeOver: o.TakeOver, Confirm: o.Confirm}
 }
 
 // replaceState is what a resumed replace carries across processes: the order
@@ -169,14 +183,18 @@ func NewReplace(s *Session, opts ReplaceOptions) *Replace {
 		Agent:         opts.With,
 		StorageDevice: opts.StorageDevice,
 		Resume:        opts.Resume,
+		TakeOver:      opts.TakeOver,
+		Confirm:       opts.Confirm,
 		Wait:          opts.Wait,
 		Now:           opts.Now,
 	}}
 	r.remove = &Remove{Session: s, Opts: RemoveOptions{
-		Node:   opts.Node,
-		Resume: opts.Resume,
-		Wait:   opts.Wait,
-		Now:    opts.Now,
+		Node:     opts.Node,
+		Resume:   opts.Resume,
+		TakeOver: opts.TakeOver,
+		Confirm:  opts.Confirm,
+		Wait:     opts.Wait,
+		Now:      opts.Now,
 	}}
 	return r
 }
@@ -322,7 +340,7 @@ func (r *Replace) stageResolve(ctx context.Context) error {
 		if err := r.remove.ResolveOldHost(ctx); err != nil {
 			return err
 		}
-		if r.Opts.Resume == "" {
+		if r.Opts.Recovery().ID() == "" {
 			if err := r.remove.CheckRemovable(); err != nil {
 				return err
 			}
@@ -522,7 +540,7 @@ func (r *Replace) stageLock(ctx context.Context) error {
 			"storage-device": r.Opts.StorageDevice,
 		},
 	}
-	return r.openRecord(ctx, operation.KindNodeReplace, request, r.Opts.Resume)
+	return r.openRecord(ctx, operation.KindNodeReplace, request, r.Opts.Recovery())
 }
 
 // resolveSpare is the resolution of the machine that JOINS, run from a session
@@ -540,7 +558,7 @@ func (r *Replace) stageLock(ctx context.Context) error {
 func (r *Replace) resolveSpare(ctx context.Context) error {
 	r.Host = api.HostRecord{}
 	r.Node = ClusterNode{}
-	return r.add.ResolveNewHost(ctx, r.Opts.Resume != "")
+	return r.add.ResolveNewHost(ctx, r.Opts.Recovery().ID() != "")
 }
 
 // stageRemoveResolve is the removal's own resolution, pointed at the machine

@@ -255,6 +255,24 @@ type Executor struct {
 	Heartbeat time.Time `json:"heartbeat"`
 }
 
+// TakeOverRecord is one recorded take-over: the operator's explicit assertion
+// that the previous executor and its outstanding actions have stopped.
+//
+// It is written down because a take-over replaces an executor the CLI could not
+// observe — a laptop that lost power never wrote `stopped`, and only that
+// executor's own token could have — so the record is the only place a later
+// reader can see who made the assertion and what they made it about. A record
+// that changed hands without this would be indistinguishable from theft.
+type TakeOverRecord struct {
+	// Operator is who asserted it, in their own words — "ana@laptop".
+	Operator string `json:"operator"`
+	// At is when they asserted it.
+	At time.Time `json:"at"`
+	// Replaced is the executor the assertion replaced. Its token is the one
+	// that stops working from here.
+	Replaced Executor `json:"replaced"`
+}
+
 // ActionStatus is where one remote action got to.
 //
 // The gap between Recorded and Submitted is the whole reason this type exists:
@@ -354,8 +372,11 @@ type Record struct {
 	Result      string         `json:"result,omitempty"`
 	Actions     []Action       `json:"actions,omitempty"`
 	Pending     []PendingWrite `json:"pending,omitempty"`
-	StartedAt   time.Time      `json:"started_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	// TakeOvers are the operator assertions that handed this record to another
+	// executor, oldest first. Empty for a record nobody has taken over.
+	TakeOvers []TakeOverRecord `json:"take_overs,omitempty"`
+	StartedAt time.Time        `json:"started_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
 	// Revision is the resourceVersion this record was last written at. It
 	// travels inside the JSON so the mirror route can refuse a record revision
 	// older than the one it already holds without re-reading the ConfigMap.

@@ -50,6 +50,17 @@ type NodeRebootFlags struct {
 	SSHKey  string
 	// Resume continues an interrupted reboot by operation id.
 	Resume string
+	// TakeOver takes over a reboot whose record says its executor is still
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv). It requires
+	// --confirm — the assertion is the operator's, and the CLI never infers it.
+	TakeOver string
+}
+
+// recovery is the two recovery flags as pkg/operation's Recovery, which is
+// where their rules live: mutually exclusive, and --take-over needs --confirm.
+func (f NodeRebootFlags) recovery() operation.Recovery {
+	return operation.Recovery{Resume: f.Resume, TakeOver: f.TakeOver, Confirm: f.Confirm}
 }
 
 // validate refuses the flag combinations before anything is read.
@@ -60,7 +71,7 @@ func (f NodeRebootFlags) validate() error {
 	if f.Wait && !f.Confirm {
 		return fmt.Errorf("--wait without --confirm would hold for the maintenance window and then do nothing: pass --confirm with --wait")
 	}
-	return nil
+	return f.recovery().Validate()
 }
 
 // The three steps the CLI observes from OUTSIDE the node (PLAN 7.3). Each is
@@ -1008,7 +1019,7 @@ func (n *nodeReboot) openRecord(ctx context.Context) error {
 			"mode":   n.mode(),
 		},
 	}
-	if n.f.Resume == "" {
+	if n.f.Resume == "" && n.f.TakeOver == "" {
 		handle, err := n.store0.Acquire(ctx, req)
 		if err != nil {
 			return err
@@ -1017,22 +1028,23 @@ func (n *nodeReboot) openRecord(ctx context.Context) error {
 		fmt.Fprintf(n.out, "  record:    %s (resume with --resume %s if this is interrupted)\n", handle.OperationID(), handle.OperationID())
 		return nil
 	}
-	// A resume reconciles BEFORE anything is repeated: the probes are
-	// read-only, and what a resume cannot establish it stops on rather than
-	// guessing (PLAN 7.2).
-	plan, err := operation.Resume(ctx, n.store0, n.f.Resume)
+	recovery := n.f.recovery()
+	// A resume — and a take-over — reconciles BEFORE anything is repeated: the
+	// probes are read-only, and what a reconciliation cannot establish stops it
+	// rather than guessing (PLAN 7.2). A take-over adds nothing here except the
+	// operator's assertion, because the reconcile is the same one.
+	plan, err := operation.Resume(ctx, n.store0, recovery.ID())
 	if err != nil {
 		return err
 	}
 	if err := plan.Verify(req); err != nil {
 		return err
 	}
-	fmt.Fprintf(n.out, "Resuming operation %s, stopped at %s: %d step(s) established, %d to repeat.\n",
-		n.f.Resume, plan.Record.Stage, len(plan.Skip()), len(plan.Steps)-len(plan.Skip()))
+	fmt.Fprintln(n.out, recovery.Progress(plan))
 	for _, step := range plan.Steps {
 		fmt.Fprintf(n.out, "  %s %s (%s): %s\n", step.Decision, step.ActionID, step.Stage, step.Reason)
 	}
-	handle, err := operation.TakeOver(ctx, n.store0, n.f.Resume)
+	handle, err := recovery.Claim(ctx, n.store0)
 	if err != nil {
 		return err
 	}

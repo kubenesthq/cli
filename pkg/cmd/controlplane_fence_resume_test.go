@@ -605,10 +605,11 @@ func TestAResumeWhoseControlPlaneAlreadyRunsTheNewCodeIsTheSameRequest(t *testin
 // build stale, and the validation would refuse the very code it is there to
 // prove. The rule reads no running image at all: see ValidationExpectations.
 func TestAResumeValidatesAgainstTheRecordedStartingBuild(t *testing.T) {
-	const (
-		startedBuild = "c121ed887750b1d3196d54fe9fd8368791a1bf03"
-		newBuild     = "279b285b0000000000000000000000000000000a"
-	)
+	const startedBuild = "c121ed887750b1d3196d54fe9fd8368791a1bf03"
+	// The live build is the one the chart this binary carries pins: its tag,
+	// extended to a whole commit sha the way APP_VERSION reports it.
+	tag := chartBackendTag(t)
+	newBuild := tag + strings.Repeat("0", 39-len(tag)) + "a"
 	values := "domain: kn.example.com\njwtSecret: s\n"
 
 	// THE RESUME'S STARTING POINT: the record's build, which is what the command

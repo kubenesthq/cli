@@ -118,14 +118,66 @@ func (s *Session) windowf(out io.Writer, format string, args ...any) {
 // so a resume can tell this record from a different move wearing the same
 // cluster's name.
 func (s *Session) LockOperation(ctx context.Context) (*operation.Store, *operation.Handle, error) {
-	if s.From == nil || s.To == nil {
-		return nil, nil, fmt.Errorf("this session has no bundle transition to record, so the operation record could not name what it is about")
-	}
-	server, err := s.Server()
+	store, err := s.operationStore()
 	if err != nil {
 		return nil, nil, err
 	}
-	store := &operation.Store{
+	req, err := s.operationRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	handle, err := store.Acquire(ctx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, handle, nil
+}
+
+// TakeOverOperation reconciles the upgrade this run continues and claims its
+// record on the operator's assertion that the previous executor and its
+// outstanding actions have stopped.
+//
+// IT IS WHAT `--take-over <operation-id> --confirm` DOES FOR AN UPGRADE. The
+// reconcile runs first — it submits nothing, it establishes what the recorded
+// actions did from their postconditions, and it stops naming the reconciliation
+// step when it cannot — and only then does the assertion change hands, which is
+// the order the plan fixes (7.2). The assertion is recorded in the record, so
+// the history says who said the dead executor was gone.
+func (s *Session) TakeOverOperation(ctx context.Context, out io.Writer, recovery operation.Recovery) (*operation.Store, *operation.Handle, error) {
+	store, err := s.operationStore()
+	if err != nil {
+		return nil, nil, err
+	}
+	req, err := s.operationRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	plan, err := operation.Resume(ctx, store, recovery.ID())
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := plan.Verify(req); err != nil {
+		return nil, nil, err
+	}
+	s.windowf(out, "%s\n", recovery.Progress(plan))
+	for _, step := range plan.Steps {
+		s.windowf(out, "  %s %s (%s): %s\n", step.Decision, step.ActionID, step.Stage, step.Reason)
+	}
+	handle, err := recovery.Claim(ctx, store)
+	if err != nil {
+		return nil, nil, err
+	}
+	return store, handle, nil
+}
+
+// operationStore is the record-as-lock store for this session: one ConfigMap
+// in kube-system, reached over the connection to a server.
+func (s *Session) operationStore() (*operation.Store, error) {
+	server, err := s.Server()
+	if err != nil {
+		return nil, err
+	}
+	return &operation.Store{
 		Runner:   server,
 		Operator: OperatorName(),
 		// The control plane's copy is display and check_upgrade: the record in
@@ -134,6 +186,15 @@ func (s *Session) LockOperation(ctx context.Context) (*operation.Store, *operati
 		// failing the operation.
 		Mirror:          s.API,
 		MirrorClusterID: s.journalClusterID(),
+	}, nil
+}
+
+// operationRequest is the immutable request this upgrade is about: the bundle
+// transition and the nodes, so a resume can tell this record from a different
+// move wearing the same cluster's name.
+func (s *Session) operationRequest() (operation.Request, error) {
+	if s.From == nil || s.To == nil {
+		return operation.Request{}, fmt.Errorf("this session has no bundle transition to record, so the operation record could not name what it is about")
 	}
 	req := operation.Request{
 		Kind:     operation.KindUpgrade,
@@ -146,11 +207,7 @@ func (s *Session) LockOperation(ctx context.Context) (*operation.Store, *operati
 		// here.
 		req.Targets = append(req.Targets, operation.Target{HostID: n.Address})
 	}
-	handle, err := store.Acquire(ctx, req)
-	if err != nil {
-		return nil, nil, err
-	}
-	return store, handle, nil
+	return req, nil
 }
 
 // journalClusterID is the control plane's id for this cluster, when the

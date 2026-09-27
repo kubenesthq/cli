@@ -53,6 +53,7 @@ type restoreFlagState struct {
 	pvcs          []string
 	includeJobs   bool
 	resume        string
+	takeOver      string
 	activate      string
 	abort         string
 	acceptDataAge bool
@@ -86,10 +87,19 @@ func (s restoreFlagState) validate() error {
 	if s.resume != "" {
 		chosen = append(chosen, "--resume")
 	}
+	if s.takeOver != "" {
+		chosen = append(chosen, "--take-over")
+	}
 	if len(chosen) > 1 {
-		return fmt.Errorf("%s are mutually exclusive: a restore is resumed, activated or aborted, never two of them at once", joinWords(chosen))
+		return fmt.Errorf("%s are mutually exclusive: a restore is resumed, taken over, activated or aborted, never two of them at once", joinWords(chosen))
 	}
 	if len(chosen) == 1 {
+		// The take-over's confirmation is the operator's assertion that the
+		// previous executor and its outstanding actions have stopped, and it
+		// lives in pkg/operation so the rule is stated once.
+		if err := (operation.Recovery{TakeOver: s.takeOver, Confirm: s.confirm}).Validate(); err != nil {
+			return err
+		}
 		// A follow-on command acts on the record, so it takes none of the flags
 		// that describe a new restore. --namespace stays allowed (and optional):
 		// it names the namespace the record is about.
@@ -145,6 +155,7 @@ func (s restoreFlagState) options() backup.RestoreOptions {
 		PVCs:          s.pvcs,
 		IncludeJobs:   s.includeJobs,
 		Resume:        s.resume,
+		TakeOver:      s.takeOver,
 		Activate:      s.activate,
 		Abort:         s.abort,
 		AcceptDataAge: s.acceptDataAge,
@@ -204,6 +215,14 @@ project stays paused. Then:
   kubenest backup restore --resume <operation-id>     continue an interrupted restore
   kubenest backup restore --abort <operation-id>      give up; the project stays paused
 
+If the run that was interrupted died without recording its stop -- its laptop
+lost power, or its connection went away -- its record still says the executor is
+running, and --resume refuses it. An operator who can see that the previous
+executor and its outstanding actions have stopped says so, and the assertion is
+written into the record:
+
+  kubenest backup restore --take-over <operation-id> --confirm
+
 The hold is the annotation kubenest.io/reconcile-paused on the project's Project
 resource in kubenest-system, so it survives the namespace's deletion. The
 operation record in kube-system is the lock: a second operator is refused while
@@ -234,10 +253,11 @@ this one runs, and an interrupted run is resumable from any laptop.`,
 	fs.StringArrayVar(&state.pvcs, "pvc", nil, "refill this claim in place (repeatable); selects the volume mode for after a node loss")
 	fs.BoolVar(&state.includeJobs, "include-jobs", false, "restore Jobs deliberately; they run at activation")
 	fs.StringVar(&state.resume, "resume", "", "continue an interrupted restore by operation id; never activates anything")
+	fs.StringVar(&state.takeOver, "take-over", "", "take over a restore whose record still says its executor is running, on your assertion that the previous executor and its outstanding actions have stopped (requires --confirm); reconciles exactly as --resume does")
 	fs.StringVar(&state.activate, "activate", "", "let a restored namespace run again, by operation id")
 	fs.StringVar(&state.abort, "abort", "", "give up on a restore by operation id; the project stays paused")
 	fs.BoolVar(&state.acceptDataAge, "accept-data-age", false, "accept a backup older than the bundle's recovery-point policy")
-	fs.BoolVar(&state.confirm, "confirm", false, "confirm the printed plan without a prompt (the non-interactive path)")
+	fs.BoolVar(&state.confirm, "confirm", false, "confirm the printed plan without a prompt (the non-interactive path); with --take-over it is the assertion that the previous executor and its outstanding actions have stopped")
 	fs.BoolVar(&state.keepRestored, "keep-restored", false, "activation: the restored configuration wins over the current desired state")
 	fs.BoolVar(&state.keepDesired, "keep-desired", false, "activation: the current desired state wins over the restored configuration")
 	return cmd

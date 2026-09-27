@@ -481,14 +481,15 @@ func (s *Session) lockTTL() (time.Duration, error) {
 }
 
 // openRecord creates the operation record — the lock and the resume path — or
-// takes over the one an interrupted run left behind.
+// takes up the one an interrupted run left behind, by resume or by the
+// operator's take-over assertion.
 //
 // The record exists BEFORE the first side effect: it is what a second laptop
 // refuses on, and what a resume reads to find out what already happened. The
 // kind is the verb's, so an add can never adopt a remove's record.
-func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request operation.Request, resume string) error {
+func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request operation.Request, recovery operation.Recovery) error {
 	s.store = s.Store(s.ServerConn)
-	if resume == "" {
+	if recovery.ID() == "" {
 		handle, err := s.store.Acquire(ctx, request)
 		if err != nil {
 			return err
@@ -497,19 +498,19 @@ func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request o
 		s.Logf("  record:    %s (resume with --resume %s if this is interrupted)", handle.OperationID(), handle.OperationID())
 		return nil
 	}
-	// A resume reconciles BEFORE anything is repeated: the probes are
-	// read-only, and what a resume cannot establish it stops on rather than
-	// guessing (PLAN 7.2).
-	plan, err := operation.Resume(ctx, s.store, resume)
+	// A resume — and a take-over — reconciles BEFORE anything is repeated: the
+	// probes are read-only, and what a reconciliation cannot establish stops it
+	// rather than guessing (PLAN 7.2). A take-over adds nothing here except the
+	// operator's assertion: the reconcile is the same one.
+	plan, err := operation.Resume(ctx, s.store, recovery.ID())
 	if err != nil {
 		return err
 	}
 	if err := plan.Verify(request); err != nil {
 		return err
 	}
-	s.Logf("Resuming operation %s, stopped at %s: %d step(s) established, %d to repeat.",
-		resume, plan.Record.Stage, len(plan.Skip()), len(plan.Steps)-len(plan.Skip()))
-	handle, err := operation.TakeOver(ctx, s.store, resume)
+	s.Logf("%s", recovery.Progress(plan))
+	handle, err := recovery.Claim(ctx, s.store)
 	if err != nil {
 		return err
 	}

@@ -34,6 +34,14 @@ type NodeReplaceFlags struct {
 	StorageDevice string
 	// Resume continues an interrupted replace by operation id.
 	Resume string
+	// TakeOver takes over a replace whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv).
+	TakeOver string
+	// Confirm is that assertion, which --take-over requires: the CLI never
+	// infers that the previous executor is gone. It is not --confirm-isolated,
+	// which answers a different question about a different machine.
+	Confirm bool
 	// Wait holds until the maintenance window opens, holding nothing while it
 	// waits.
 	Wait bool
@@ -45,11 +53,17 @@ type NodeReplaceFlags struct {
 	SSHKey  string
 }
 
+// recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm.
+func (f NodeReplaceFlags) recovery() operation.Recovery {
+	return operation.Recovery{Resume: f.Resume, TakeOver: f.TakeOver, Confirm: f.Confirm}
+}
+
 func (f NodeReplaceFlags) validate() error {
 	if f.Wait && f.Now {
 		return fmt.Errorf("--wait and --now are mutually exclusive: --wait holds for the maintenance window, --now acts immediately and bypasses it")
 	}
-	return nil
+	return f.recovery().Validate()
 }
 
 // newNodeReplaceCommand is `kubenest node replace`.
@@ -146,6 +160,8 @@ operation's immutable request.`,
 	fs.BoolVar(&f.ConfirmIsolated, "confirm-isolated", false, "confirm that a machine which does not answer is powered off or isolated at the provider and stays that way until it is wiped. Required by the order that removes first, and recorded as your answer rather than assumed")
 	fs.StringVar(&f.StorageDevice, "storage-device", "", "a blank device on the machine that joins, to create kubenest-vg on, as /dev/disk/by-id/...; omit when the volume group already exists there")
 	fs.StringVar(&f.Resume, "resume", "", "continue an interrupted replace by operation id, as reported when it stopped")
+	fs.StringVar(&f.TakeOver, "take-over", "", "take over a replace whose record still says its executor is running, on your assertion that the previous executor and its outstanding actions have stopped (requires --confirm)")
+	fs.BoolVar(&f.Confirm, "confirm", false, "with --take-over: your assertion that the previous executor and its outstanding actions have stopped")
 	fs.BoolVar(&f.Wait, "wait", false, "hold until the maintenance window opens — holding nothing while it waits — then take the locks and re-check every gate")
 	fs.BoolVar(&f.Now, "now", false, "act immediately, bypassing ONLY the maintenance window; the interlock, volume and role checks still run")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user to reach the machines with; the host inventory's user is used by default")
@@ -168,6 +184,8 @@ func runNodeReplace(ctx context.Context, out io.Writer, client *api.Client, f No
 		ConfirmIsolated: f.ConfirmIsolated,
 		StorageDevice:   f.StorageDevice,
 		Resume:          f.Resume,
+		TakeOver:        f.TakeOver,
+		Confirm:         f.Confirm,
 		Wait:            f.Wait,
 		Now:             f.Now,
 	})

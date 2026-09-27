@@ -51,6 +51,20 @@ type UpgradeFlags struct {
 	// over the state the record describes, while a resume takes the recorded
 	// operation over and does not repeat the steps it already carried out.
 	Resume string
+	// TakeOver takes over an upgrade whose record still says its executor is
+	// running, on the operator's assertion that the previous executor and its
+	// outstanding actions have stopped (PLAN 7.2, kn-yzuv). It works for both
+	// the workload upgrade and --control-plane, and it requires Confirm.
+	TakeOver string
+	// Confirm is that assertion, alongside --take-over: the CLI never infers
+	// that the previous executor is gone.
+	Confirm bool
+}
+
+// recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm.
+func (f UpgradeFlags) recovery() operation.Recovery {
+	return operation.Recovery{Resume: f.Resume, TakeOver: f.TakeOver, Confirm: f.Confirm}
 }
 
 // buildUpgradeSession assembles everything an upgrade needs: the cluster's
@@ -247,15 +261,13 @@ func runUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
 
 	// The record-as-lock, taken AFTER the window opened. `defer` is not enough
 	// here: the record has three endings, and a pause is not one of them.
-	var (
-		lockStore  *operation.Store
-		lockHandle *operation.Handle
-	)
-	if f.Wait {
-		lockStore, lockHandle, err = session.LockOperation(ctx)
-		if err != nil {
-			return err
-		}
+	//
+	// A take-over is the fourth beginning: it reconciles the record an
+	// interrupted upgrade left and claims it on the operator's assertion, so
+	// the run continues over a cluster whose record says who took it on.
+	lockStore, lockHandle, err := upgradeLock(ctx, out, session, f)
+	if err != nil {
+		return err
 	}
 
 	fmt.Fprintf(out, "Upgrading %s from bundle %s to %s.\n", f.Cluster, session.From.Bundle, session.To.Bundle)
@@ -272,6 +284,26 @@ func runUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
 			len(result.Skipped), strings.Join(result.Skipped, ", "))
 	}
 	return nil
+}
+
+// upgradeLock takes the operation record for a workload upgrade.
+//
+// IT IS THE ONE PLACE THE FLAGS DECIDE WHAT THE RECORD GETS: a take-over
+// reconciles the record an interrupted upgrade left and claims it on the
+// operator's assertion (PLAN 7.2), --wait takes a fresh one now that the window
+// is open, and a plain run takes no record here because the stages that act do.
+//
+// A take-over IS NOT --resume: a workload cluster's upgrade resumes by re-running
+// the identical command over its own journal, and `platform upgrade --resume` is
+// refused without --control-plane for exactly that reason.
+func upgradeLock(ctx context.Context, out io.Writer, session *upgrade.Session, f UpgradeFlags) (*operation.Store, *operation.Handle, error) {
+	switch recovery := f.recovery(); {
+	case recovery.IsTakeOver():
+		return session.TakeOverOperation(ctx, out, recovery)
+	case f.Wait:
+		return session.LockOperation(ctx)
+	}
+	return nil, nil, nil
 }
 
 // endOperation closes the operation record the way the run ended.

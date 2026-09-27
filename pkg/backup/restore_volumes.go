@@ -89,7 +89,7 @@ func (r *restoreRun) runVolumeRestore(ctx context.Context) error {
 	// or planned.
 	// A RESUME PLANS FROM THE RECORD, exactly as mode 1 does: the request it
 	// continues is immutable, so there is nothing new to choose or confirm.
-	if r.opts.Resume == "" {
+	if r.opts.recovery().ID() == "" {
 		if err := r.refuseWhileDrillRuns(ctx); err != nil {
 			return err
 		}

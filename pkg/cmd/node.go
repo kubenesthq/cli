@@ -92,12 +92,13 @@ so kured and this command can never take a node down at the same time.`,
 	fs := cmd.Flags()
 	fs.StringVar(&f.Cluster, "cluster", "", "cluster whose node to act on (required)")
 	fs.StringVar(&f.Node, "node", "", "the node: a cluster node name, an SSH address, or a host ID from the cluster's host inventory (required)")
-	fs.BoolVar(&f.Confirm, "confirm", false, "confirm the action. Without it the plan is printed and nothing on the cluster or the host is changed")
+	fs.BoolVar(&f.Confirm, "confirm", false, "confirm the action. Without it the plan is printed and nothing on the cluster or the host is changed. With --take-over it is the assertion that the previous executor and its outstanding actions have stopped")
 	fs.BoolVar(&f.Wait, "wait", false, "hold until the maintenance window opens — holding nothing while it waits — then take the operation record and re-check every gate (requires --confirm)")
 	fs.BoolVar(&f.Now, "now", false, "act immediately, bypassing ONLY the maintenance window; quorum, storage, recovery-point and kured-interlock checks still run")
 	fs.BoolVar(&f.K3sOnly, "k3s-only", false, "restart k3s (or k3s-agent) instead of rebooting the host: renews this node's k3s leaf certificates and never reboots")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user to reach the node with; the host inventory's user is used by default")
 	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
 	fs.StringVar(&f.Resume, "resume", "", "continue an interrupted reboot by operation id, as reported when it stopped")
+	fs.StringVar(&f.TakeOver, "take-over", "", "take over a reboot whose record still says its executor is running, on your assertion that the previous executor and its outstanding actions have stopped (requires --confirm)")
 	return cmd
 }

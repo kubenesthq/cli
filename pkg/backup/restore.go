@@ -255,6 +255,12 @@ type RestoreOptions struct {
 	Resume   string
 	Activate string
 	Abort    string
+	// TakeOver is the fourth way to take up an interrupted restore: it claims
+	// a record whose executor is still `running` on the operator's assertion
+	// that the previous executor and its outstanding actions have stopped
+	// (PLAN 7.2, kn-yzuv). It needs Confirm, and it reconciles exactly as a
+	// resume does.
+	TakeOver string
 	// AcceptDataAge is the operator's explicit acceptance of a backup older
 	// than the bundle's recovery-point policy.
 	AcceptDataAge bool
@@ -270,8 +276,21 @@ type RestoreOptions struct {
 	Bundle *manifest.Manifest
 }
 
+// recovery is the two recovery flags as pkg/operation's Recovery, where their
+// rules live: mutually exclusive, and --take-over requires --confirm. It is
+// empty for a new restore and for a follow-on that acts on a record without
+// taking it up (--activate, --abort).
+//
+// --confirm means the same thing here as it does for a new restore: the
+// operator affirming the thing this run is about, which for --take-over is that
+// the previous executor and its outstanding actions have stopped.
+func (o RestoreOptions) recovery() operation.Recovery {
+	return operation.Recovery{Resume: o.Resume, TakeOver: o.TakeOver, Confirm: o.Confirm}
+}
+
 // Mode names what this run will do, for messages and for the record's version
-// map.
+// map. A take-over is a resume with the operator's assertion behind it: it
+// continues the recorded request, so it names the same mode.
 func (o RestoreOptions) Mode() string {
 	switch {
 	case len(o.PVCs) > 0:
@@ -280,7 +299,7 @@ func (o RestoreOptions) Mode() string {
 		return "activate"
 	case o.Abort != "":
 		return "abort"
-	case o.Resume != "":
+	case o.Resume != "" || o.TakeOver != "":
 		return "resume"
 	default:
 		return "namespace"
@@ -411,7 +430,7 @@ func (r *restoreRun) runNamespaceRestore(ctx context.Context) error {
 	if err := r.resolve(ctx); err != nil {
 		return err
 	}
-	if r.opts.Resume == "" {
+	if r.opts.recovery().ID() == "" {
 		if err := r.chooseBackup(ctx); err != nil {
 			return err
 		}
@@ -957,13 +976,15 @@ func (r *restoreRun) recordKind() operation.Kind {
 	return operation.KindRestoreNamespace
 }
 
-// openRecord takes the operation lock — or takes over the record an interrupted
-// run left behind — BEFORE the first change this run makes.
+// openRecord takes the operation lock — or takes up the record an interrupted
+// run left behind, by resume or by the operator's take-over assertion — BEFORE
+// the first change this run makes.
 func (r *restoreRun) openRecord(ctx context.Context) error {
 	if r.deps.Store == nil {
 		return fmt.Errorf("a restore needs the operation record: it is the lock that keeps two operators from driving one cluster at once")
 	}
-	if r.opts.Resume == "" {
+	recovery := r.opts.recovery()
+	if recovery.ID() == "" {
 		handle, err := r.deps.Store.Acquire(ctx, r.request())
 		if err != nil {
 			return err
@@ -972,7 +993,7 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 		fmt.Fprintf(r.out, "  record:        %s (resume with `kubenest backup restore --resume %s` if this is interrupted)\n", handle.OperationID(), handle.OperationID())
 		return nil
 	}
-	return r.resumeRecord(ctx)
+	return r.resumeRecord(ctx, recovery)
 }
 
 // resumeRecord reconciles an interrupted restore before repeating anything.
@@ -980,17 +1001,19 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 // The order matters and is the plan's (7.2): read the record, establish what
 // happened from the recorded postconditions, verify that the request and the
 // identities are still the ones this operation was planned against, and only
-// then take the record over.
-func (r *restoreRun) resumeRecord(ctx context.Context) error {
-	plan, err := operation.Resume(ctx, r.deps.Store, r.opts.Resume)
+// then take the record up — by the resume's claim, or by the operator's
+// take-over assertion when the record cannot say its executor stopped.
+func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recovery) error {
+	opID := recovery.ID()
+	plan, err := operation.Resume(ctx, r.deps.Store, opID)
 	if err != nil {
 		return err
 	}
 	if plan.Terminal {
-		return fmt.Errorf("operation %s is terminal (%s): there is nothing to resume", r.opts.Resume, plan.Record.Result)
+		return fmt.Errorf("operation %s is terminal (%s): there is nothing to resume", opID, plan.Record.Result)
 	}
 	if kind := plan.Record.Request.Kind; kind != operation.KindRestoreNamespace && kind != operation.KindRestoreVolume {
-		return fmt.Errorf("operation %s is a %s, not a restore: it cannot be resumed by this command", r.opts.Resume, kind)
+		return fmt.Errorf("operation %s is a %s, not a restore: it cannot be resumed by this command", opID, kind)
 	}
 	recorded := recordedIdentities(plan.Record)
 	live, err := r.liveIdentities(ctx)
@@ -999,7 +1022,7 @@ func (r *restoreRun) resumeRecord(ctx context.Context) error {
 	}
 	if moved := sameIdentity(recorded, live, consumedIdentities(plan.Record, r.opts.Namespace)); len(moved) > 0 {
 		return fmt.Errorf("operation %s was planned against identities that have moved, so resuming it would restore into different objects:\n  %s",
-			r.opts.Resume, strings.Join(moved, "\n  "))
+			opID, strings.Join(moved, "\n  "))
 	}
 	// The resume continues the SAME request, so the backup and the mode are the
 	// record's and not this run's flags, and the plan is rebuilt from what the
@@ -1042,12 +1065,11 @@ func (r *restoreRun) resumeRecord(ctx context.Context) error {
 			r.volumePlan.Backup = facts
 		}
 	}
-	fmt.Fprintf(r.out, "Resuming operation %s, stopped at %q: %d step(s) already established, %d to repeat.\n",
-		r.opts.Resume, plan.Record.Stage, len(plan.Skip()), len(plan.Steps)-len(plan.Skip()))
+	fmt.Fprintln(r.out, recovery.Progress(plan))
 	for _, step := range plan.Steps {
 		fmt.Fprintf(r.out, "  %s %s (%s): %s\n", step.Decision, step.ActionID, step.Stage, step.Reason)
 	}
-	handle, err := operation.TakeOver(ctx, r.deps.Store, r.opts.Resume)
+	handle, err := recovery.Claim(ctx, r.deps.Store)
 	if err != nil {
 		return err
 	}
