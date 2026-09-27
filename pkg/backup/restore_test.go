@@ -508,7 +508,12 @@ func newFakeOpKube() *fakeOpKube {
 	return &fakeOpKube{objects: map[string]map[string]any{}}
 }
 
-func (k *fakeOpKube) Run(_ context.Context, command string) (sshx.Result, error) {
+// Run fails on a cancelled context, as the real SSH transport does: a write
+// made with the context of a run the operator interrupted never lands.
+func (k *fakeOpKube) Run(ctx context.Context, command string) (sshx.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return sshx.Result{}, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.commands = append(k.commands, command)
@@ -534,7 +539,10 @@ func (k *fakeOpKube) Run(_ context.Context, command string) (sshx.Result, error)
 	return sshx.Result{ExitCode: 0}, nil
 }
 
-func (k *fakeOpKube) RunInput(_ context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+func (k *fakeOpKube) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return sshx.Result{}, err
+	}
 	body, err := io.ReadAll(stdin)
 	if err != nil {
 		return sshx.Result{}, err
@@ -1925,3 +1933,36 @@ func TestRecoveryPointAgeIsInTheManifest(t *testing.T) {
 
 // guard against the file being unused by the vet-less test build.
 var _ = os.Getenv
+
+// On hardware (2026-09-27, S4's interrupted arm on lab w3) a restore cancelled
+// once its Velero Restore existed left its record saying the executor was
+// running, so `--resume` was refused as a take-over: the run released the
+// record with the context that had just been cancelled, and that write failed.
+func TestACancelledRestoreStillRecordsItsExecutorStopped(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deps := f.deps()
+	sleep := deps.Sleep
+	deps.Sleep = func(ctx context.Context, d time.Duration) error {
+		if len(f.cluster.restoresMade) > 0 {
+			cancel() // the operator's interrupt, once the Restore exists
+			return ctx.Err()
+		}
+		return sleep(ctx, d)
+	}
+	var out strings.Builder
+	err := RunRestore(ctx, &out, strings.NewReader(""), f.options(t, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}), deps)
+	if err == nil {
+		t.Fatalf("a cancelled restore reported success:\n%s", out.String())
+	}
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("the cancelled restore left no record")
+	}
+	if record.Executor.State != operation.ExecutorStopped {
+		t.Errorf("the cancelled run left its executor %q, so `--resume` would be refused as a take-over:\n%s", record.Executor.State, out.String())
+	}
+}

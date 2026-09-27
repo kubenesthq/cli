@@ -1330,6 +1330,10 @@ func (r *restoreRun) release(ctx context.Context, runErr error) {
 	if r.handle == nil {
 		return
 	}
+	// An interrupted run is released too: its own context is cancelled by the
+	// interrupt, a write made with it never lands, and a record left "running"
+	// refuses the --resume the interruption is for (hardware, 2026-09-27).
+	ctx = context.WithoutCancel(ctx)
 	if runErr != nil {
 		if err := r.handle.Heartbeat(ctx, "failed: "+oneLine(runErr.Error())); err != nil {
 			fmt.Fprintf(r.out, "warning: the operation record could not be told the failing stage: %v\n", err)
