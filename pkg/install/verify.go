@@ -285,6 +285,20 @@ func cleanupVerifyNamespace(ctx context.Context, r k3s.Runner) {
 // registered this cluster through the control plane it now hosts, so there is
 // a control plane to ask from stage 9 onwards — and the tunnel stage 9 built
 // is what reaches it.
+//
+// The heartbeat it waits for must be STRICTLY LATER than the one the control
+// plane already had when the check started. Passing on any heartbeat at all
+// certifies a re-run install of a cluster that stopped reporting hours ago
+// (kn-2xdk): the heartbeat it reads is the one the retired agent left behind,
+// and the command reports a pass for a cluster nothing is feeding.
+//
+// Both times compared are the CONTROL PLANE's record of the same field, never
+// this process's clock. The laptop's clock and the control plane's are two
+// different clocks, and a skew between them would either pass a stale cluster
+// or strand a healthy one.
+//
+// A first install has no heartbeat when the stage starts, so any heartbeat is
+// later than none and the check behaves exactly as it always has.
 func verifyClusterReportsIn(ctx context.Context, s *Session) error {
 	if s.API == nil || s.Jnl.ClusterID == "" {
 		return fmt.Errorf("no registered cluster to check: stage 2 must run before stage 13")
@@ -295,10 +309,32 @@ func verifyClusterReportsIn(ctx context.Context, s *Session) error {
 	}
 	clusterID := s.Jnl.ClusterID
 
+	// The heartbeat the control plane reports BEFORE the check starts waiting.
+	// Read once here, outside the convergence loop, so a heartbeat that
+	// arrives between this read and the first poll still counts as the new
+	// one and a healthy cluster is not made to wait a full heartbeat interval
+	// for nothing.
+	//
+	// If this read fails, the probe establishes the baseline on its first
+	// successful poll instead: the answer is then "later than the first
+	// moment the control plane answered", which is later, never earlier, than
+	// the stage's start. An unreachable control plane is something to
+	// converge on rather than a verdict — but it must never leave the check
+	// with no baseline at all, because a baseline of "nothing" is exactly what
+	// passes a stale heartbeat.
+	baselineKnown := false
+	var baseline *time.Time
+	if health, err := s.API.ClusterHealth(ctx, clusterID); err == nil {
+		baseline, baselineKnown = health.LastHeartbeat, true
+	}
+
 	probe := func(ctx context.Context) (bool, converge.State, error) {
 		health, err := s.API.ClusterHealth(ctx, clusterID)
 		if err != nil {
 			return false, converge.State{Object: "cluster " + clusterID, Status: "the control plane is not answering"}, err
+		}
+		if !baselineKnown {
+			baseline, baselineKnown = health.LastHeartbeat, true
 		}
 		state := converge.State{Object: "cluster " + health.Name, Status: health.Status}
 		switch health.Status {
@@ -312,7 +348,15 @@ func verifyClusterReportsIn(ctx context.Context, s *Session) error {
 			state.Detail = "no fleet-telemetry heartbeat yet; the agent dials the hub outbound, so check that the cluster can reach it"
 			return false, state, nil
 		}
-		state.Status = health.Status + ", first heartbeat " + health.LastHeartbeat.Format(time.RFC3339)
+		if baseline != nil && !health.LastHeartbeat.After(*baseline) {
+			// The stale time goes in the state, and so into the failure: the
+			// heartbeat the operator is looking at is what names the problem
+			// — an agent that never dialled, or one whose token was retired.
+			state.Status = health.Status + ", last heartbeat " + health.LastHeartbeat.Format(time.RFC3339) + " predates this check"
+			state.Detail = "the control plane had this heartbeat before the check started, so the cluster has not reported since"
+			return false, state, nil
+		}
+		state.Status = health.Status + ", new heartbeat " + health.LastHeartbeat.Format(time.RFC3339)
 		return true, state, nil
 	}
 
