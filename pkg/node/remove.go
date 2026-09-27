@@ -216,6 +216,11 @@ func (r *Remove) ResolveAccess(ctx context.Context, conn Transport) error {
 // object carries the name, and the UID that answers is what the inventory is
 // matched on — so the name the cluster uses and the machine the record
 // describes cannot disagree.
+//
+// The match is hostForNode's, so an entry the cluster still holds is preferred
+// when a Node object matches a removed record as well: a new machine at a
+// removed host's address registers the same address, and the record of the
+// machine that is gone must not answer for the machine that is there.
 func (r *Remove) hostByNodeName(ctx context.Context) (api.HostRecord, error) {
 	server, serverConn, err := ReadyServer(ctx, r.Hosts, r.Dial)
 	if err != nil {
@@ -231,13 +236,8 @@ func (r *Remove) hostByNodeName(ctx context.Context) (api.HostRecord, error) {
 		if n.Name != r.Opts.Node {
 			continue
 		}
-		for _, h := range r.Hosts {
-			if h.NodeUID != "" && h.NodeUID == n.UID {
-				return h, nil
-			}
-			if n.Matches(h) {
-				return h, nil
-			}
+		if h, found := hostForNode(r.Hosts, n); found {
+			return h, nil
 		}
 		return api.HostRecord{}, fmt.Errorf("the cluster's node %s (uid %s) is not in its inventory, so there is no machine this operation can record as removed. Re-run the install's record stage, or run `kubenest node add --agent <address>` to adopt the host explicitly",
 			n.Name, n.UID)

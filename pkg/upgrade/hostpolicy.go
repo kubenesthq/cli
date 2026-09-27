@@ -428,8 +428,23 @@ func (n hostNodes) matchNodes(s *Session) (map[string]string, error) {
 
 // inventoryNodeUID is the Node UID the cluster's recorded inventory holds for a
 // host, matched on either address the record carries for it.
+//
+// THE ENTRY THE CLUSTER STILL HOLDS ANSWERS FIRST, which is pkg/node's FindHost
+// rule for the same reason it has it there: one address can carry two entries —
+// a removed host keeps its address, and a cloud hands a freed address to the
+// next machine — and a hold placed under the name of the machine that is gone
+// is a hold on nobody. A removed record answers only when nothing else does.
 func inventoryNodeUID(s *Session, address string) string {
-	for _, host := range s.Cluster.Hosts {
+	inventory := s.Cluster.Hosts
+	for _, host := range inventory {
+		if host.NodeUID == "" || host.LifecycleState == removedHostState {
+			continue
+		}
+		if host.SSHAddress == address || host.JoinAddress == address {
+			return host.NodeUID
+		}
+	}
+	for _, host := range inventory {
 		if host.NodeUID == "" {
 			continue
 		}
@@ -439,3 +454,10 @@ func inventoryNodeUID(s *Session, address string) string {
 	}
 	return ""
 }
+
+// removedHostState is the inventory's word for a host that was taken out of the
+// cluster and kept as a record. It is pkg/node's StateRemoved by value: that
+// package and this one are siblings (pkg/node may not import pkg/upgrade, and
+// this file needs one constant, not a dependency), and the value is the
+// control-plane enum the record's own schema pins.
+const removedHostState = "removed"

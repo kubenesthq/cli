@@ -180,8 +180,12 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 	// reuse is a REMOVED entry the operator named by its ADDRESS. Whether the
 	// machine answering there is the one that record describes is a fact only
 	// the dial can read, so it is decided below and this entry is left alone.
+	//
+	// The lookup itself is FindHost's, which prefers an entry the cluster still
+	// HOLDS when the same word names one of those as well — a resumed add finds
+	// its own joining entry at a removed host's address that way.
 	var reuse api.HostRecord
-	if existing, found := a.findHostForAdd(a.Opts.Agent); found {
+	if existing, found := a.findHost(a.Opts.Agent); found {
 		switch LifecycleState(existing.LifecycleState) {
 		case StateJoining:
 			a.Host = existing
@@ -290,27 +294,6 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 	}
 	a.ownership = storage.Ownership(st.Ownership)
 	return nil
-}
-
-// findHostForAdd looks the machine up in the inventory the way this verb needs
-// it: an entry the cluster still HOLDS at what the operator typed wins over a
-// removed one.
-//
-// ONE ADDRESS CAN CARRY TWO ENTRIES — a host that was removed, and the new
-// machine this command then gave that address to — and the removed entry is the
-// older one, so a plain FindHost returns it first. A resumed add that took it
-// would dial a machine already in the journal, mint it a SECOND host ID and
-// leave a stale joining entry behind; the entry that is not removed is this
-// operation's own earlier write, and it is the one that decides what joins.
-func (a *Add) findHostForAdd(want string) (api.HostRecord, bool) {
-	host, found := a.findHost(want)
-	if !found || LifecycleState(host.LifecycleState) != StateRemoved {
-		return host, found
-	}
-	if held, ok := heldHost(a.Hosts, want); ok {
-		return held, true
-	}
-	return host, found
 }
 
 // removedRefusal is this verb's word on the one thing it will not do with a

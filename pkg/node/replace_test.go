@@ -638,3 +638,51 @@ func TestReplaceAddsItsReplacementAtARemovedHostsAddress(t *testing.T) {
 		t.Errorf("the replaced host is recorded as %q, want removed", f.lastState("h-agt"))
 	}
 }
+
+// `node replace --node <address>` follows the same rule as `node remove --node
+// <address>`: the machine it takes out is the MACHINE THAT IS THERE at that
+// address, not the record of the machine that was there before it, and that
+// record is left as it is. The replacement is a new machine at an address of its
+// own and joins under a host ID of its own.
+func TestReplacePrefersTheMachineAtAnAddressOverTheRemovedRecordItSharesItWith(t *testing.T) {
+	const spareAddr = "10.0.3.10"
+	f := newFixture(t, serverHost(), removedAgent(), reusedAddressHost())
+	// The machine being replaced is the one at the shared address, and it
+	// answers with the host key its own entry recorded.
+	f.server.setNodes(nodesJSON(t,
+		testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+		testNode{Name: testReusedNode, UID: testReusedNodeUID, Addresses: []string{testAgentAddr}, Ready: true},
+	))
+	// The replacement is a fresh machine at an address of its own, and it joins
+	// this cluster when the agent installer runs on it.
+	spare := f.addHost(spareAddr, "SHA256:spare", nodesJSON(t))
+	spare.on("get.k3s.io", func(_ *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(nodesJSON(t,
+			testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+			testNode{Name: testReusedNode, UID: testReusedNodeUID, Addresses: []string{testAgentAddr}, Ready: true},
+			testNode{Name: "prod-1-rep-1", UID: "uid-rep", Addresses: []string{spareAddr}, Ready: true},
+		))
+		return sshx.Result{}, nil
+	})
+
+	if _, err := f.runReplace(f.newReplace(ReplaceOptions{Node: testAgentAddr, With: spareAddr})); err != nil {
+		t.Fatalf("the machine at a removed host's address could not be replaced: %v\n%s", err, f.out.String())
+	}
+	if state := f.lastState(testReusedHostID); state != string(StateRemoved) {
+		t.Errorf("the replaced machine is recorded as %q, want %q", state, StateRemoved)
+	}
+	if !f.log.hasCommand("delete node " + testReusedNode) {
+		t.Error("the Node object of the replaced machine was not deleted")
+	}
+	gone, found := f.hostIn("h-gone")
+	if !found {
+		t.Fatal("the record of the machine that was already gone was deleted")
+	}
+	if gone.LifecycleState != string(StateRemoved) || gone.HostKeyFingerprint != "SHA256:gone" {
+		t.Errorf("the replace changed the record of the machine that was already gone: %+v", gone)
+	}
+	replacement, found := withAddress(f.records.inventory(), spareAddr)
+	if !found || replacement.LifecycleState != string(StateActive) {
+		t.Errorf("the replacement is not recorded active at %s: %+v", spareAddr, replacement)
+	}
+}

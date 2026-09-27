@@ -484,6 +484,14 @@ func (n *nodeReboot) windowRule(ctx context.Context) error {
 // CLI can learn which machine a name refers to. The value may be the host ID
 // the record minted, the SSH address it reaches the host at, the address the
 // host joined through, or the Node UID the cluster's own object carries.
+//
+// A REMOVED ENTRY IS NEVER THE ANSWER HERE, which is deliberate and is where
+// this verb parts company with pkg/node's FindHost: that lookup prefers the
+// entry the cluster still holds but falls back to a removed one when nothing
+// else matches, so the inventory verbs can still address a record on purpose
+// (`--node <removed host ID>`). Rebooting is not a bookkeeping verb — a removed
+// host has no Node object to reboot, and one address can carry a removed record
+// and the machine that took it over, which this skips for that reason.
 func (n *nodeReboot) resolveHost() (api.HostRecord, error) {
 	var matches []api.HostRecord
 	for _, h := range n.hosts {

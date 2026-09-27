@@ -89,10 +89,26 @@ func CheckFingerprint(host api.HostRecord, conn Transport) error {
 // address the host joined through, or the Node UID the cluster's own object
 // carries.
 //
-// It does NOT filter on lifecycle state: whether a removed host is a refusal
-// or a machine to look at is the verb's question, and a lookup that answered
-// it would be answering with the caller's policy.
+// ONE WORD CAN NAME TWO ENTRIES, and then the one the cluster still HOLDS is
+// what the word means. A removed entry keeps its address for good, and an
+// address is handed to the next machine that asks for it — a static or elastic
+// address moving to a replacement VM is routine — so an entry that was written
+// first (the removed record) and an entry written later (the machine now at that
+// address) can both match. Every verb that acts on a MACHINE means the machine
+// that is there, so the held entry is returned first and a removed one answers
+// only when nothing else does — which is how `--node <removed host ID>` still
+// finds the record it names, host IDs being unique.
+//
+// It does NOT filter on lifecycle state: whether a removed host is a refusal or
+// a machine to look at is still the verb's question, and a lookup that answered
+// it would be answering with the caller's policy. This is the ORDER of an
+// ambiguous answer, not a policy about removed hosts.
 func FindHost(hosts []api.HostRecord, want string) (api.HostRecord, bool) {
+	for _, h := range hosts {
+		if LifecycleState(h.LifecycleState) != StateRemoved && hostMatches(h, want) {
+			return h, true
+		}
+	}
 	for _, h := range hosts {
 		if hostMatches(h, want) {
 			return h, true
@@ -114,19 +130,25 @@ func hostMatches(h api.HostRecord, want string) bool {
 	return false
 }
 
-// heldHost finds the entry among everything the operator's word names that the
-// cluster still HOLDS — the machine itself, not the removed record of one that
-// was there before.
+// hostForNode is FindHost's rule for a lookup the OPERATOR did not make: the
+// inventory entry a Node object of the cluster describes, held entries before
+// removed ones, for the same reason a word can name two entries.
 //
-// ONE ADDRESS CAN CARRY BOTH: a host that was removed keeps its address for
-// good, and an address is handed to the next machine that asks for it, so the
-// newer entry sits behind the older one and FindHost returns the removed record
-// first. A question about the machine that is there now — is it active, does
-// the join continue on it — must not be answered by the record of the machine
-// that is gone.
-func heldHost(hosts []api.HostRecord, want string) (api.HostRecord, bool) {
+// A machine at a reused address is the case that needs it. The Node object of
+// the machine that is THERE matches the removed record too — the removed entry
+// kept the address the node registers under — and an answer from the record of
+// the machine that is gone is how a verb ends up refusing a node it can see.
+func hostForNode(hosts []api.HostRecord, n ClusterNode) (api.HostRecord, bool) {
+	describes := func(h api.HostRecord) bool {
+		return (h.NodeUID != "" && h.NodeUID == n.UID) || n.Matches(h)
+	}
 	for _, h := range hosts {
-		if LifecycleState(h.LifecycleState) != StateRemoved && hostMatches(h, want) {
+		if LifecycleState(h.LifecycleState) != StateRemoved && describes(h) {
+			return h, true
+		}
+	}
+	for _, h := range hosts {
+		if describes(h) {
 			return h, true
 		}
 	}

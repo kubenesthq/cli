@@ -40,6 +40,11 @@ const (
 	testAgentNode  = "prod-1-agt-1"
 	testPID        = "10.0.3.9"
 	testDevice     = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive3"
+	// The machine a later `node add` gives a removed host's address to: its own
+	// host ID and Node object, at the address the removed record still holds.
+	testReusedHostID  = "h-new"
+	testReusedNode    = "prod-1-agt-2"
+	testReusedNodeUID = "uid-new"
 )
 
 // entry is one command a verb issued, in the order it was issued, with the
@@ -623,6 +628,20 @@ func removedAgent() api.HostRecord {
 		HostID: "h-gone", Role: "agent", SSHAddress: testAgentAddr, SSHPort: 22, SSHUser: "ubuntu",
 		NodeUID: "uid-gone", HostKeyFingerprint: "SHA256:gone", JoinAddress: "https://" + testServerAddr + ":6443",
 		StorageDevice: testDevice, LifecycleState: string(StateRemoved),
+		VolumeGroupOwnership: string(storage.InstallerCreated),
+	}
+}
+
+// reusedAddressHost is the entry a later `node add` writes for a new machine at
+// an address a removed record still holds: a host ID of its own, active, its own
+// host key, and the Node object it joined as. It is what makes ONE ADDRESS CARRY
+// TWO ENTRIES — the case every lookup has to answer for, and the one the lab hit
+// when w5 was given w4's address.
+func reusedAddressHost() api.HostRecord {
+	return api.HostRecord{
+		HostID: testReusedHostID, Role: "agent", SSHAddress: testAgentAddr, SSHPort: 22, SSHUser: "ubuntu",
+		NodeUID: testReusedNodeUID, HostKeyFingerprint: "SHA256:newagent", JoinAddress: "https://" + testServerAddr + ":6443",
+		StorageDevice: testDevice, LifecycleState: string(StateActive),
 		VolumeGroupOwnership: string(storage.InstallerCreated),
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/install"
@@ -798,6 +799,48 @@ func TestTheStageNamesMatchTheBackendStageLiteral(t *testing.T) {
 	}
 	if !literal[StageHostPolicy] {
 		t.Errorf("%s is not in the backend's InstallStage literal: its name is on the wire like every other stage's", StageHostPolicy)
+	}
+}
+
+// ONE ADDRESS CAN CARRY TWO ENTRIES. A removed host keeps its address for good,
+// and an address is handed to the next machine that asks for it — the same reuse
+// `node add` accepts — so the inventory can hold the record of the machine that
+// is gone and the machine that is there under one address. The lookup the hold
+// placement falls back on must answer with the entry the cluster still HOLDS:
+// the removed record's Node UID names a node that is gone, and a hold placed
+// under its name is a hold on nobody.
+func TestTheInventoryLookupPrefersTheHostTheClusterStillHolds(t *testing.T) {
+	const address = "167.233.20.250"
+	removed := api.HostRecord{
+		HostID: "h-gone", Role: "agent", SSHAddress: address, SSHPort: 22, SSHUser: "ubuntu",
+		NodeUID: "uid-gone", LifecycleState: "removed", JoinAddress: address,
+		VolumeGroupOwnership: "installer-created",
+	}
+	held := api.HostRecord{
+		HostID: "h-new", Role: "agent", SSHAddress: address, SSHPort: 22, SSHUser: "ubuntu",
+		NodeUID: "uid-new", LifecycleState: "active", JoinAddress: address,
+		VolumeGroupOwnership: "installer-created",
+	}
+	// The removed record comes FIRST, the way a real inventory reads: it was
+	// written when the machine joined, and the new host was appended after it.
+	cases := []struct {
+		name    string
+		hosts   []api.HostRecord
+		address string
+		want    string
+	}{
+		{"the machine now at the address, not the record of the one that was there", []api.HostRecord{removed, held}, address, "uid-new"},
+		{"the removed record answers when it is the only entry at the address", []api.HostRecord{removed}, address, "uid-gone"},
+		{"an address only the held host carries", []api.HostRecord{held}, address, "uid-new"},
+		{"an address no entry carries", []api.HostRecord{held}, "167.233.20.251", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Session{Cluster: Recorded{ClusterBundle: api.ClusterBundle{Hosts: tc.hosts}}}
+			if got := inventoryNodeUID(s, tc.address); got != tc.want {
+				t.Errorf("inventoryNodeUID(s, %s) = %q, want %q", tc.address, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -248,3 +248,90 @@ func TestRemoveFixtureIsReachable(t *testing.T) {
 	}
 	var _ sshx.Result
 }
+
+// An address a removed host still holds can be given to a new machine, and the
+// inventory then holds two entries at that address. Both ways of naming that
+// machine mean THE MACHINE THAT IS THERE: its address, and the name of its Node
+// object. The removed record answers only when it is what the operator actually
+// named (by its host ID, which nothing else can match).
+//
+// Hardware, 2026-09-27 (lab w3): after the add arm gave w5 w4's address,
+// `node remove --cluster lab-w3 --node 167.233.20.250` resolved to w4's REMOVED
+// entry and refused — "already recorded as \"removed\", so there is nothing to
+// remove" — with the machine that is actually there never looked at.
+func TestRemovePrefersTheMachineAtAnAddressOverTheRemovedRecordItSharesItWith(t *testing.T) {
+	cases := []struct {
+		name string
+		node string
+	}{
+		{"named by the address it shares with the removed record", testAgentAddr},
+		{"named by its Node object's name", testReusedNode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serverHost(), removedAgent(), reusedAddressHost())
+			f.server.setNodes(nodesJSON(t,
+				testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+				testNode{Name: testReusedNode, UID: testReusedNodeUID, Addresses: []string{testAgentAddr}, Ready: true},
+			))
+
+			if _, err := f.runRemove(f.newRemove(RemoveOptions{Node: tc.node})); err != nil {
+				t.Fatalf("the machine at a removed host's address could not be removed: %v\n%s", err, f.out.String())
+			}
+			if state := f.lastState(testReusedHostID); state != string(StateRemoved) {
+				t.Errorf("the machine at the address is recorded as %q, want %q", state, StateRemoved)
+			}
+			if !f.log.hasCommand("delete node " + testReusedNode) {
+				t.Error("the Node object of the machine at the address was not deleted")
+			}
+			gone, found := f.hostIn("h-gone")
+			if !found {
+				t.Fatal("the record of the machine that was already gone was deleted")
+			}
+			if gone.LifecycleState != string(StateRemoved) || gone.HostKeyFingerprint != "SHA256:gone" || gone.NodeUID != "uid-gone" {
+				t.Errorf("the removal changed the record of the machine that was already gone: %+v", gone)
+			}
+		})
+	}
+}
+
+// The record of a machine that is gone is still what is acted on when it is what
+// the operator named: by its own host ID, or at an address nothing else holds.
+// Both are refused exactly as before — removing the same machine twice is not a
+// repair, and its disks may still hold another cluster's data.
+func TestRemoveStillRefusesARemovedHostNamedByItsHostID(t *testing.T) {
+	cases := []struct {
+		name string
+		node string
+	}{
+		{"named by its host ID", "h-gone"},
+		{"named by the address only it carries", testAgentAddr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, serverHost(), removedAgent())
+
+			_, err := f.runRemove(f.newRemove(RemoveOptions{Node: tc.node}))
+			if err == nil {
+				t.Fatalf("a host that is already removed was removed again:\n%s", f.out.String())
+			}
+			// The refusal is about the record the operator named, and it changed
+			// nothing: no connection, no inventory write, no Node object deleted.
+			if !strings.Contains(err.Error(), "h-gone") {
+				t.Errorf("the refusal does not name the removed record it refused: %v", err)
+			}
+			if f.dialer.dialed(testAgentAddr) {
+				t.Error("a machine was dialled for a host that is refused")
+			}
+			if len(f.records.savedRecords()) != 0 {
+				t.Errorf("%d inventory write(s) happened for a refused host", len(f.records.savedRecords()))
+			}
+			if f.log.hasCommand("delete node") || f.log.hasCommand("k3s-agent-uninstall.sh") {
+				t.Error("a refused host was acted on")
+			}
+			if state := f.lastState("h-gone"); state != string(StateRemoved) {
+				t.Errorf("the removed entry is now %q, want %q", state, StateRemoved)
+			}
+		})
+	}
+}
