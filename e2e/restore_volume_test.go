@@ -10,8 +10,8 @@
 // an operator would type:
 //
 //	dead-node   a pod's two claims both lived on the agent; the agent is
-//	            stopped, the claims are stranded, and the restore refills both
-//	            on the live server.
+//	            killed, the claims are stranded, and the restore refills both
+//	            on a live node.
 //	selective   a pod mounts two claims on a LIVE node; newer data is written
 //	            into the one that is NOT named, only the other is destroyed and
 //	            refilled, and the unnamed one must keep its newer bytes.
@@ -238,11 +238,26 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		agent := lab.agentNode()
 		workload := "dead"
 		tag := fmt.Sprintf("%d", time.Now().UnixNano())
-		// Both claims are placed on the agent by pinning the workload there.
-		lab.apply(s5WorkloadDocument(workload, map[string]string{"kubernetes.io/hostname": agent}, true))
+		// BOTH CLAIMS ARE PLACED ON THE AGENT BY CORDONING EVERY OTHER NODE while
+		// the workload first schedules, as probe P5 did, and the workload
+		// itself names no node: its local volumes' node affinity is then the
+		// only thing that holds it there, which is the case the verb is for. A
+		// first version pinned it with a kubernetes.io/hostname nodeSelector;
+		// the backup then held a pod that could only run on the dead node, and
+		// on hardware (2026-09-27) its PodVolumeRestores never started.
+		uncordon := lab.cordonAllBut(agent)
+		lab.apply(s5WorkloadDocument(workload, nil, true))
 		lab.waitFor(5*time.Minute, "the fixture's pod on the agent", func() (bool, string) {
 			return lab.podRunning(workload), lab.podState(workload)
 		})
+		uncordon()
+		if node := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " -o jsonpath={.items[0].spec.nodeName}")); node != agent {
+			t.Fatalf("the fixture's pod runs on %q, want the agent %s", node, agent)
+		}
+		// Whatever this arm leaves, the next arm's backup must cover: a claim
+		// no running pod mounts has no copy, and makes every later backup
+		// ineligible for the namespace (hardware, 2026-09-27).
+		t.Cleanup(func() { lab.removeWorkload(workload) })
 		lab.writeClaim(workload, "/a", "dead-a-"+tag)
 		lab.writeClaim(workload, "/b", "dead-b-"+tag)
 
@@ -524,8 +539,9 @@ func TestRestoreVolumeResume(t *testing.T) {
 
 // --- fixture helpers ---
 
-// stopAgent takes the agent away the way a dead node is: its k3s-agent unit
-// stops, so its volumes are unreachable and its Node goes NotReady. The stop
+// stopAgent takes the agent away the way a dead node is: k3s and every
+// container it started are killed, so its volumes are unreachable, nothing on
+// it runs, and its Node goes NotReady. The stop
 // happens on the agent's OWN host, found by the hostname k3s names the node
 // with, because the API server that could tell us which host that is runs on
 // the node we are about to take away.
@@ -542,11 +558,17 @@ func (l *s5Lab) stopAgent(node string) {
 		if strings.TrimSpace(out.Stdout) != node {
 			continue
 		}
-		res, err := runner.Run(context.Background(), "sudo -n systemctl stop k3s-agent")
+		// k3s-killall.sh stops k3s-agent AND every container it started.
+		// Stopping the service alone leaves the node's pods running: on
+		// hardware (2026-09-27) Velero's server was one of them, went on
+		// serving the restore, and when Kubernetes evicted it five minutes
+		// later its replacement failed the restore in progress. A dead
+		// machine runs nothing.
+		res, err := runner.Run(context.Background(), "sudo -n /usr/local/bin/k3s-killall.sh >/dev/null")
 		if err != nil || res.ExitCode != 0 {
-			l.t.Fatalf("stopping k3s-agent on %s (%s): %v exit %d", node, name, err, res.ExitCode)
+			l.t.Fatalf("killing k3s and its containers on %s (%s): %v exit %d", node, name, err, res.ExitCode)
 		}
-		l.t.Logf("k3s-agent stopped on %s (%s)", node, name)
+		l.t.Logf("k3s-agent and its containers killed on %s (%s)", node, name)
 		return
 	}
 	l.t.Fatalf("no lab node's SSH session reports the hostname %s, so the agent could not be taken away", node)
@@ -572,6 +594,51 @@ func (l *s5Lab) startAgent(node string) {
 		return
 	}
 	l.t.Errorf("no lab node's SSH session reports the hostname %s, so its agent was not started again", node)
+}
+
+// cordonAllBut cordons every node except the one named, so the next pod the
+// scheduler places lands there, and returns the function that uncordons them.
+// The uncordon is also registered as a cleanup, so a failed arm cannot leave
+// the lab with one schedulable node.
+func (l *s5Lab) cordonAllBut(node string) func() {
+	l.t.Helper()
+	var cordoned []string
+	for _, name := range strings.Fields(l.kubectl("get nodes -o jsonpath={.items[*].metadata.name}")) {
+		if name == node {
+			continue
+		}
+		l.kubectl("cordon " + name)
+		cordoned = append(cordoned, name)
+	}
+	done := false
+	uncordon := func() {
+		if done {
+			return
+		}
+		done = true
+		for _, name := range cordoned {
+			if _, err := l.kubectlStatus("uncordon " + name); err != nil {
+				l.t.Errorf("uncordoning %s: %v", name, err)
+			}
+		}
+	}
+	l.t.Cleanup(uncordon)
+	return uncordon
+}
+
+// removeWorkload deletes a fixture's Deployment and its two claims. It runs as
+// a cleanup, so it reports rather than stops.
+func (l *s5Lab) removeWorkload(workload string) {
+	l.t.Helper()
+	for _, args := range []string{
+		"-n " + s5Namespace + " delete deployment " + workload + " --ignore-not-found --wait=true --timeout=2m",
+		"-n " + s5Namespace + " delete pod -l app=" + workload + " --ignore-not-found --grace-period=0 --force",
+		"-n " + s5Namespace + " delete pvc " + workload + "-a " + workload + "-b --ignore-not-found --wait=false",
+	} {
+		if _, err := l.kubectlStatus(args); err != nil {
+			l.t.Errorf("removing the %s fixture: kubectl %s: %v", workload, args, err)
+		}
+	}
 }
 
 func (l *s5Lab) backupNow() {
@@ -799,7 +866,9 @@ func s5NamespaceDocument() string {
 	return fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata: {name: %s}\n", s5Namespace)
 }
 
-// s5WorkloadDocument is a Deployment with two claims, pinned to one node. Both
+// s5WorkloadDocument is a Deployment with two claims, pinned by a nodeSelector
+// to one node when one is given (the selective arm pins it to the server; the
+// dead-node arm must not pin it, see there). Both
 // claims carry the workload's selector labels, which the mode REQUIRES before it
 // deletes anything (Velero's selector has to match the claim for it to come
 // back), and the unnamed one of the two keeps its current contents because the
