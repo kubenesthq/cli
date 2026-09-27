@@ -6,9 +6,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewNodeCommand groups the node-lifecycle verbs (PLAN 7.3). Reboot is the
-// first of them; add, remove and replace (T5.2-T5.4) join this group, and the
-// one registration line in root.go is shared by whoever lands here first.
+// NewNodeCommand groups the node-lifecycle verbs (PLAN 7.3): reboot (T3.5),
+// add (T5.2) and remove (T5.3). Replace (T5.4) joins them.
 //
 // The verbs live under `node` rather than under `platform` because they act on
 // ONE machine of an existing cluster, which the cluster's own record names
@@ -18,7 +17,7 @@ func NewNodeCommand() *cobra.Command {
 		Use:   "node",
 		Short: "Operate one node of a cluster",
 	}
-	cmd.AddCommand(newNodeRebootCommand())
+	cmd.AddCommand(newNodeRebootCommand(), newNodeAddCommand(), newNodeRemoveCommand())
 	return cmd
 }
 
