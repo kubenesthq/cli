@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/deprecation"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -219,7 +220,19 @@ func checkWindow(s *Session) GateResult {
 
 // checkBundlePath refuses a transition the target bundle does not offer for
 // this cluster's shape. Untested transitions are not offered.
-func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier string) GateResult {
+//
+// FIVE QUESTIONS, IN THIS ORDER, and the order is the message: is the target
+// AHEAD of the running bundle at all (Kubernetes does not downgrade), is it a
+// different bundle, does this cluster's shape still fit the target, does the
+// catalog DECLARE the transition (plan 7.10) — and only then, is the target
+// within one bundle of the running one in the catalog's published sequence
+// (decision K, kn-mtpf). An operator who is told "you skipped a bundle" when the
+// declared edges say nothing learns the wrong thing to go and fix.
+//
+// `sequence` is the catalog's published order. The gate does not compare version
+// strings to measure distance: "1.10" sorts before "1.9" as text, and a
+// security-only release must not consume a hop.
+func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier string, sequence []bundles.Release) GateResult {
 	// A BACKWARD transition is refused here, before anything is touched,
 	// rather than discovered at the point of no return. Kubernetes does not
 	// downgrade and neither does k3s: a bundle whose Kubernetes pin is older
@@ -259,9 +272,153 @@ func checkBundlePath(from, to *manifest.Manifest, profiles []string, haTier stri
 			}
 		}
 	}
+	if refusal, ok := checkDeclaredUpgradeEdge(from, to); !ok {
+		return refusal
+	}
+	if refusal, ok := checkOneBundleAhead(from, to, sequence); !ok {
+		return refusal
+	}
 	return GateResult{
 		Gate: GateBundlePath, Passed: true,
 		Detail: fmt.Sprintf("%s → %s is offered for the %s tier and this cluster's profile set", from.Bundle, to.Bundle, haTier),
+	}
+}
+
+// checkDeclaredUpgradeEdge refuses a transition the target's manifest does not
+// declare (plan 7.10: "the catalog declares its upgrade edges ... undeclared
+// transitions are refused").
+//
+// A TARGET THAT DECLARES NOTHING HAS NOT BEEN ASKED. 0.9, 1.0 and 1.1 are
+// released documents with no `upgrade-from`, and refusing a transition into them
+// because of that silence would refuse the upgrade the product demonstrates
+// (1.0 -> 1.1, the one the compatibility tests run). What the field is FOR is the
+// release that declares its sources and thereby says which ones it does NOT
+// support: 1.2 declares 1.0 and 1.1, so a cluster on 0.9 is refused here — with
+// the step to take, since "undeclared" is only actionable when the fix names a
+// bundle.
+func checkDeclaredUpgradeEdge(from, to *manifest.Manifest) (GateResult, bool) {
+	if len(to.UpgradeFrom) == 0 {
+		return GateResult{}, true
+	}
+	for _, version := range to.UpgradeFrom {
+		if version == from.Bundle {
+			return GateResult{}, true
+		}
+	}
+	next := oldestNewerVersion(from.Bundle, to.UpgradeFrom)
+	fix := "it may be upgraded from " + humanVersions(to.UpgradeFrom)
+	if next != "" {
+		fix = fmt.Sprintf("upgrade to %s first — `kubenest platform upgrade --to %s` — and then to %s; the declared sources for %s are %s",
+			next, next, to.Bundle, to.Bundle, humanVersions(to.UpgradeFrom))
+	}
+	return GateResult{
+		Gate: GateBundlePath, Passed: false,
+		Detail: fmt.Sprintf("bundle %s declares no upgrade edge from %s", to.Bundle, from.Bundle),
+		Fix:    fix,
+	}, false
+}
+
+// checkOneBundleAhead refuses a target more than one bundle ahead in the
+// catalog's PUBLISHED SEQUENCE, naming the intermediate bundle to step through
+// (decision K, kn-mtpf).
+//
+// TWO BUNDLES ARE SUPPORTED AT A TIME, AND THE REASON IS THE SCAN. The
+// deprecation scan runs against the Kubernetes version pinned by the named
+// target and only that one, so an API removed at an intermediate bundle and
+// irrelevant again later still breaks workloads there, and a hop over it never
+// scans for it. Skipping a bundle is skipping the check that makes the upgrade
+// safe.
+//
+// A SECURITY-ONLY RELEASE DOES NOT CONSUME THE HOP. When a bundle exists only
+// because a component needed patching, it is skipped when the distance is
+// measured — 1.0 -> 1.2 is one hop when 1.1 was security-only — because the
+// operator did not choose to skip it, we chose to issue it.
+//
+// DISTANCE COMES FROM `sequence` AND NEVER FROM COMPARING VERSION STRINGS.
+// "1.10" is newer than "1.9" and sorts first as text, so a string comparison
+// would refuse a legal hop and permit an illegal one.
+//
+// AN UNMEASURABLE HOP IS REFUSED, not passed: if a bundle is missing from the
+// sequence, this gate cannot say how far apart two bundles are, and "I could not
+// tell" is not "they are adjacent". A BACKWARD move is not this check's
+// business — the Kubernetes-pin check above owns it, and this gate falls through
+// rather than inventing a second opinion on the same question.
+func checkOneBundleAhead(from, to *manifest.Manifest, sequence []bundles.Release) (GateResult, bool) {
+	index := make(map[string]int, len(sequence))
+	for i, release := range sequence {
+		index[release.Version] = i
+	}
+	fromIndex, knownFrom := index[from.Bundle]
+	toIndex, knownTo := index[to.Bundle]
+	if !knownFrom || !knownTo {
+		missing := from.Bundle
+		if knownFrom {
+			missing = to.Bundle
+		}
+		return GateResult{
+			Gate: GateBundlePath, Passed: false,
+			Detail: fmt.Sprintf("bundle %s is not in the bundle catalog this CLI carries, so how far apart %s and %s are cannot be checked",
+				missing, from.Bundle, to.Bundle),
+			Fix: "upgrade the CLI to a release whose catalog carries both bundles — this gate will not pass a hop it cannot measure, because the check it stands for is the one that makes the upgrade safe",
+		}, false
+	}
+	if toIndex <= fromIndex {
+		// Backward or equal. Equal is refused earlier; a backward bundle move is
+		// refused earlier too when it moves Kubernetes, and is otherwise the
+		// product's existing behaviour rather than this rule's to change.
+		return GateResult{}, true
+	}
+	var skipped []string
+	for _, release := range sequence[fromIndex+1 : toIndex] {
+		if release.SecurityOnly {
+			continue
+		}
+		skipped = append(skipped, release.Version)
+	}
+	if len(skipped) == 0 {
+		return GateResult{}, true
+	}
+	next := skipped[0]
+	return GateResult{
+		Gate: GateBundlePath, Passed: false,
+		Detail: fmt.Sprintf("%s → %s skips %s: bundles are stepped through one at a time",
+			from.Bundle, to.Bundle, humanVersions(skipped)),
+		Fix: fmt.Sprintf("upgrade to %s first — `kubenest platform upgrade --to %s` — and then to %s. The deprecation scan runs against the Kubernetes version pinned by the target and only that one, so a bundle you jump over is never scanned for an API removal it carries",
+			next, next, to.Bundle),
+	}, false
+}
+
+// oldestNewerVersion is the oldest version in `versions` newer than `from`, or ""
+// when there is none. It is the STEP to name in a refusal: bundles are stepped
+// through one at a time, so naming the newest would hand back a hop the
+// adjacency rule refuses.
+func oldestNewerVersion(from string, versions []string) string {
+	oldest := ""
+	for _, version := range versions {
+		cmp, err := manifest.CompareBundleVersions(from, version)
+		if err != nil || cmp >= 0 {
+			continue
+		}
+		if oldest == "" {
+			oldest = version
+			continue
+		}
+		if c, err := manifest.CompareBundleVersions(version, oldest); err == nil && c < 0 {
+			oldest = version
+		}
+	}
+	return oldest
+}
+
+// humanVersions renders bundle versions as prose.
+func humanVersions(versions []string) string {
+	switch len(versions) {
+	case 0:
+		return "none"
+	case 1:
+		return versions[0]
+	default:
+		return strings.Join(versions[:len(versions)-1], ", ") + " or " + versions[len(versions)-1]
 	}
 }
 

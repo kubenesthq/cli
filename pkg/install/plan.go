@@ -495,7 +495,12 @@ func (b bundleCatalog) ListBundles(ctx context.Context) ([]preflight.BundleEntry
 	}
 	out := make([]preflight.BundleEntry, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, preflight.BundleEntry{Version: e.Version, HATiers: e.HATiers, Profiles: e.Profiles})
+		out = append(out, preflight.BundleEntry{
+			Version:     e.Version,
+			HATiers:     e.HATiers,
+			Profiles:    e.Profiles,
+			UpgradeOnly: e.UpgradeOnly,
+		})
 	}
 	return out, nil
 }

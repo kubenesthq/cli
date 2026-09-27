@@ -73,7 +73,13 @@ func Raw(version string) ([]byte, error) {
 	return raw, nil
 }
 
-// Versions is every bundle version built into this binary, sorted.
+// Versions is every bundle version built into this binary, in the catalog's
+// PUBLISHED ORDER, oldest first.
+//
+// NUMERIC, NOT LEXICOGRAPHIC: "1.10" is newer than "1.9" and sorting the names
+// as strings puts it first. The order is load-bearing — `Catalog` offers bundles
+// oldest-first and the bundle-path gate measures adjacency in this sequence
+// (kn-mtpf) — so there is exactly one ordering rule and it is this one.
 func Versions() []string {
 	entries, err := fs.ReadDir(files, dir)
 	if err != nil {
@@ -88,19 +94,57 @@ func Versions() []string {
 		}
 		out = append(out, strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix))
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		cmp, err := manifest.CompareBundleVersions(out[i], out[j])
+		return err == nil && cmp < 0
+	})
 	return out
 }
 
+// Release is one entry of the catalog's published sequence: a bundle version and
+// whether that release exists only to carry a patched component.
+type Release struct {
+	Version string
+	// SecurityOnly marks a release that does not consume the two-release
+	// support window: the bundle-path gate skips it when it measures how far
+	// ahead a target bundle is, so 1.0 -> 1.2 is one hop when 1.1 was
+	// security-only (decision K, kn-mtpf).
+	SecurityOnly bool
+}
+
+// Sequence is the catalog's published sequence, oldest first, with each release's
+// security-only marker.
+//
+// THE BUNDLE-PATH GATE WALKS THIS AND NOTHING ELSE. "How far ahead is this
+// target" is a question about the catalog's order; comparing version strings
+// answers a different question — "1.10" sorts before "1.9" — and an adjacency
+// check built on that answer refuses a legal hop and allows an illegal one.
+func Sequence() ([]Release, error) {
+	out := make([]Release, 0, len(Versions()))
+	for _, v := range Versions() {
+		m, err := Manifest(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, Release{Version: m.Bundle, SecurityOnly: m.SecurityOnly})
+	}
+	return out, nil
+}
+
 // Entry is one offered bundle, in the shape preflight checks a request
-// against: which version, which tiers, which profiles.
+// against: which version, which tiers, which profiles, and whether it is still
+// offered as a NEW install.
 type Entry struct {
 	Version  string
 	HATiers  []string
 	Profiles []string
+	// UpgradeOnly marks a bundle that is no longer offered as a NEW install
+	// (F19): preflight refuses an install of one and names the installable
+	// bundle. Absent in the manifest is false.
+	UpgradeOnly bool
 }
 
-// Catalog is every bundle this binary carries, parsed.
+// Catalog is every bundle this binary carries, parsed, in published order.
 //
 // It stands in for the control plane's bundle list when there is no control
 // plane to ask yet — the --control-plane install — and it is deliberately the
@@ -115,9 +159,10 @@ func Catalog() ([]Entry, error) {
 			return nil, err
 		}
 		out = append(out, Entry{
-			Version:  m.Bundle,
-			HATiers:  m.HATiers,
-			Profiles: m.Profiles.Names(),
+			Version:     m.Bundle,
+			HATiers:     m.HATiers,
+			Profiles:    m.Profiles.Names(),
+			UpgradeOnly: m.UpgradeOnly,
 		})
 	}
 	return out, nil

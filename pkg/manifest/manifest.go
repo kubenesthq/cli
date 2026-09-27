@@ -41,6 +41,27 @@ type Manifest struct {
 	// Health is the thresholds fleet health is evaluated against (kn-j5s).
 	Health   Health   `yaml:"health"`
 	Profiles Profiles `yaml:"profiles"`
+	// UpgradeFrom are the bundle versions this bundle is a supported upgrade
+	// TARGET for. Empty means the catalog declares no edge into it, which is
+	// how an undeclared transition is refused (plan 7.10). It is the set of
+	// supported sources, not a licence to skip a release: the bundle-path gate
+	// still refuses a target more than one bundle ahead and names the
+	// intermediate step (decision K, kn-mtpf).
+	UpgradeFrom []string `yaml:"upgrade-from"`
+	// SecurityOnly marks a release that exists only to carry a patched
+	// component. Absent is false. The bundle-path gate SKIPS a security-only
+	// release when it measures how far ahead a target is, so 1.0 -> 1.2 is one
+	// hop when 1.1 was security-only (decision K, kn-mtpf).
+	SecurityOnly bool `yaml:"security-only"`
+	// UpgradeOnly marks a bundle that is no longer offered as a NEW install
+	// (F19). Absent is false, and a bundle is installable until the release
+	// that supersedes it flips the flag on it. Preflight refuses an install of
+	// one and names the installable bundle.
+	UpgradeOnly bool `yaml:"upgrade-only"`
+	// Compatibility is the declared window between bundles and the control
+	// plane (decision L, kn-opj8). Zero value means the bundle states none —
+	// which is every released manifest before 1.2, and never a refusal.
+	Compatibility Compatibility `yaml:"compatibility"`
 }
 
 // Components maps component name to pinned version.

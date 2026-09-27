@@ -158,6 +158,10 @@ type BundleEntry struct {
 	Version  string
 	HATiers  []string
 	Profiles []string
+	// UpgradeOnly marks a bundle that is no longer offered as a NEW install
+	// (F19). It is still a valid upgrade TARGET — that is what the name says —
+	// so this refuses only the install, and names the bundle to install instead.
+	UpgradeOnly bool
 }
 
 // Options is what preflight checks the nodes against.
@@ -240,6 +244,22 @@ func checkControlPlaneAndBundle(ctx context.Context, opts Options, rep *Report) 
 		if opts.ControlPlaneInstall {
 			detail = fmt.Sprintf("this CLI does not carry bundle %q", opts.BundleVersion)
 			fix = "it carries " + orNone(offered) + "; upgrade the CLI to a release that ships the bundle you want"
+		}
+		rep.add(Result{Check: CheckBundle, Outcome: Fail, Detail: detail, Fix: fix})
+		return
+	}
+	// F19. A bundle marked upgrade-only is no longer offered as a NEW install:
+	// once the release that supersedes it ships, pilots start there and this one
+	// stays reachable only by upgrading TO it. Refused HERE, before stage 3
+	// writes a byte to a host, and with the installable bundle named — a refusal
+	// that does not say what to install instead is a refusal an operator has to
+	// guess their way past.
+	if found.UpgradeOnly {
+		detail := fmt.Sprintf("bundle %s is upgrade-only: it is not offered as a new install", found.Version)
+		fix := "install the newest bundle this catalog offers"
+		if installable := newestInstallable(bundles); installable != "" {
+			fix = fmt.Sprintf("install bundle %s instead — `--bundle %s`. Bundle %s is reached by upgrading to it, so an existing cluster moves with `kubenest platform upgrade --to %s`",
+				installable, installable, found.Version, installable)
 		}
 		rep.add(Result{Check: CheckBundle, Outcome: Fail, Detail: detail, Fix: fix})
 		return
@@ -405,6 +425,29 @@ func contains(haystack []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// newestInstallable is the newest bundle the catalog offers as a NEW install, or
+// "" when it offers none (a broken catalog, which validate_bundles.py refuses on
+// the directory itself).
+//
+// NUMERIC, because "1.10" is newer than "1.9" and sorting the strings says
+// otherwise — and this value is handed to a human as the thing to install.
+func newestInstallable(entries []BundleEntry) string {
+	newest := ""
+	for _, entry := range entries {
+		if entry.UpgradeOnly {
+			continue
+		}
+		if newest == "" {
+			newest = entry.Version
+			continue
+		}
+		if cmp, err := manifest.CompareBundleVersions(newest, entry.Version); err == nil && cmp < 0 {
+			newest = entry.Version
+		}
+	}
+	return newest
 }
 
 func orNone(items []string) string {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -89,8 +90,92 @@ func TestCatalogMatchesTheManifests(t *testing.T) {
 			t.Fatal(err)
 		}
 		if len(e.HATiers) != len(m.HATiers) {
-			t.Errorf("bundle %s: catalog offers %v, the manifest offers %v", e.Version, e.HATiers, m.HATiers)
+			t.Errorf("bundle %s: catalog offers %v, the manifest offers %v", e.Version, m.HATiers, m.HATiers)
 		}
+		if e.UpgradeOnly != m.UpgradeOnly {
+			t.Errorf("bundle %s: catalog says upgrade-only=%v, the manifest says %v",
+				e.Version, e.UpgradeOnly, m.UpgradeOnly)
+		}
+	}
+}
+
+// BUNDLE 1.2 IS CARRIED, and the markers it declares are read. The release is
+// what this wave exists to cut, so a build that cannot install it is a build
+// that cannot run the wave's scenarios at all.
+func TestTheEmbeddedCatalogCarriesBundle12(t *testing.T) {
+	if !contains(strings.Join(Versions(), ","), "1.2") {
+		t.Fatalf("this binary does not carry bundle 1.2: it carries %v", Versions())
+	}
+	if got := Versions()[len(Versions())-1]; got != "1.2" {
+		t.Errorf("1.2 is the newest bundle this catalog carries, but the published order ends at %s", got)
+	}
+	m, err := Manifest("1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The two pins T7.2 moved, read from the shipped document rather than from
+	// this test: 1.2 moves the Kubernetes PATCH (so S2 really runs the stage
+	// that is the point of no return) and the agent chart (the candidate that
+	// carries the release's producers).
+	pin, err := m.Core.Version("k3s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pin != "v1.35.8+k3s1" {
+		t.Errorf("bundle 1.2 pins k3s %s, and it has to be a NEWER 1.35 patch than 1.1's v1.35.7+k3s1", pin)
+	}
+	agent, err := m.Core.Version("kubenest-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent != "2.7.0-rc.1" {
+		t.Errorf("bundle 1.2 pins kubenest-agent %s, want the candidate 2.7.0-rc.1", agent)
+	}
+	// The declarations. 1.2 is installable and is not security-only (it consumes
+	// the support window), and its window names the eras and the bundles.
+	if m.UpgradeOnly {
+		t.Error("bundle 1.2 is the install target; it must not be marked upgrade-only")
+	}
+	if m.SecurityOnly {
+		t.Error("bundle 1.2 moves a Kubernetes patch and the agent chart, so it is not a security-only release")
+	}
+	if len(m.UpgradeFrom) != 2 || m.UpgradeFrom[0] != "1.0" || m.UpgradeFrom[1] != "1.1" {
+		t.Errorf("bundle 1.2 declares upgrade-from %v, want [1.0 1.1]", m.UpgradeFrom)
+	}
+	if !m.Compatibility.ControlPlane.Supports(3) {
+		t.Error("bundle 1.2 declares a control-plane window with no era 3, which is the era it needs")
+	}
+}
+
+// The published sequence is the catalog's ORDER, and the gate that measures
+// adjacency walks it rather than comparing versions as strings. Two-digit minors
+// are where the two answers differ, so the ordering rule is asserted here rather
+// than left to the one place that happens to consume it.
+func TestThePublishedSequenceOrdersNumbersNotStrings(t *testing.T) {
+	sequence, err := Sequence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sequence) != len(Versions()) {
+		t.Fatalf("sequence has %d entries for %d embedded manifests", len(sequence), len(Versions()))
+	}
+	for i, release := range sequence {
+		if release.Version != Versions()[i] {
+			t.Fatalf("sequence[%d] is %s and Versions()[%d] is %s", i, release.Version, i, Versions()[i])
+		}
+		m, err := Manifest(release.Version)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if release.SecurityOnly != m.SecurityOnly {
+			t.Errorf("bundle %s: sequence says security-only=%v, the manifest says %v",
+				release.Version, release.SecurityOnly, m.SecurityOnly)
+		}
+	}
+	// The release markers are declarations, and 1.2 states its own side of both.
+	last := sequence[len(sequence)-1]
+	if last.Version != "1.2" || last.SecurityOnly {
+		t.Errorf("the head of the published sequence is %+v, want 1.2 and not security-only", last)
 	}
 }
 

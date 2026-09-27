@@ -7,6 +7,7 @@ import (
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/component/certmanager"
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/component/gatewayapi"
@@ -67,7 +68,15 @@ func stagePreflight(ctx context.Context, s *Session) error {
 	}
 	var report GateReport
 
-	report.add(checkBundlePath(s.From, s.To, s.installedProfiles(), s.haTier()))
+	// THE CATALOG'S PUBLISHED SEQUENCE, read once. The bundle-path gate measures
+	// how far ahead a target is in THIS order rather than by comparing version
+	// strings (kn-mtpf), and a sequence that cannot be read is a refusal rather
+	// than a gate that silently stops checking adjacency.
+	sequence, err := bundles.Sequence()
+	if err != nil {
+		return fmt.Errorf("the bundle catalog this CLI carries cannot be read, so whether this transition is offered cannot be checked: %w", err)
+	}
+	report.add(checkBundlePath(s.From, s.To, s.installedProfiles(), s.haTier(), sequence))
 	report.add(checkWindow(s))
 
 	dwell, err := s.To.Limits.Timeouts.For("node-ready")

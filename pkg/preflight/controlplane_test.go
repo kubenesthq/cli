@@ -79,6 +79,41 @@ func TestControlPlaneInstallStillChecksTheRequestAgainstTheBundle(t *testing.T) 
 	})
 }
 
+// F19: a bundle the catalog marks upgrade-only is not offered as a NEW install.
+// The refusal has to name the bundle to install instead — "upgrade-only" alone
+// tells an operator what they cannot do and nothing about what they can.
+func TestAnUpgradeOnlyBundleIsRefusedAsANewInstall(t *testing.T) {
+	opts := controlPlaneInstallOptions(t)
+	opts.BundleVersion = "1.1"
+	opts.Catalog = fakeCatalog{entries: []preflight.BundleEntry{
+		{Version: "1.0", HATiers: []string{"single-server"}},
+		{Version: "1.1", HATiers: []string{"single-server"}, UpgradeOnly: true},
+		{Version: "1.2", HATiers: []string{"single-server"}},
+	}}
+
+	rep, err := preflight.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatal("an upgrade-only bundle must not be installed as a new install")
+	}
+	res, ok := outcomeOf(rep, preflight.CheckBundle)
+	if !ok || res.Outcome != preflight.Fail {
+		t.Fatalf("the bundle check did not carry the refusal: %+v", rep.Results)
+	}
+	if !strings.Contains(res.Detail, "upgrade-only") {
+		t.Errorf("the refusal must say why: %q", res.Detail)
+	}
+	if !strings.Contains(res.Fix, "1.2") {
+		t.Errorf("the fix must name the bundle to install instead: %q", res.Fix)
+	}
+
+	// The positive control: the install TARGET is not refused, so the check is
+	// about the requested bundle and not about the catalog being marked at all.
+	opts.BundleVersion = "1.2"
+	if _, err := preflight.Run(context.Background(), opts); err != nil {
+		t.Fatalf("the installable bundle must pass: %v", err)
+	}
+}
+
 // A binary with no catalog cannot check the request at all. That is a broken
 // build, not a login problem, and the fix it names has to say so.
 func TestControlPlaneInstallWithNoCatalogBlamesTheBinaryNotTheLogin(t *testing.T) {

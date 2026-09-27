@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"kubenest.io/cli/pkg/bundles"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/window"
 )
 
@@ -114,7 +116,7 @@ limits: {timeouts: {node-ready: 5m}}
 profiles: {ha: {}}
 `)
 	t.Run("a tier the target does not offer", func(t *testing.T) {
-		got := checkBundlePath(from, to, nil, "single-server")
+		got := checkBundlePath(from, to, nil, "single-server", testSequence(t))
 		if got.Passed {
 			t.Fatal("a bundle that drops this cluster's permanent tier cannot be a target")
 		}
@@ -123,7 +125,7 @@ profiles: {ha: {}}
 		}
 	})
 	t.Run("a profile the target drops", func(t *testing.T) {
-		got := checkBundlePath(from, to, []string{"observability"}, "ha")
+		got := checkBundlePath(from, to, []string{"observability"}, "ha", testSequence(t))
 		if got.Passed {
 			t.Fatal("a bundle that drops an installed profile cannot be a target")
 		}
@@ -132,12 +134,12 @@ profiles: {ha: {}}
 		}
 	})
 	t.Run("already there", func(t *testing.T) {
-		if got := checkBundlePath(from, from, nil, "ha"); got.Passed {
+		if got := checkBundlePath(from, from, nil, "ha", testSequence(t)); got.Passed {
 			t.Error("upgrading a cluster to the version it already runs is not an upgrade")
 		}
 	})
 	t.Run("a supported transition", func(t *testing.T) {
-		if got := checkBundlePath(from, to, nil, "ha"); !got.Passed {
+		if got := checkBundlePath(from, to, nil, "ha", testSequence(t)); !got.Passed {
 			t.Errorf("want a pass: %s", got.Detail)
 		}
 	})
@@ -152,7 +154,7 @@ func TestABackwardTransitionIsRefused(t *testing.T) {
 	newer := parseManifest(t, "bundle: \"1.0\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
 	older := parseManifest(t, "bundle: \"0.9\"\ncore: {k3s: v1.35.6+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
 
-	got := checkBundlePath(newer, older, nil, "single-server")
+	got := checkBundlePath(newer, older, nil, "single-server", testSequence(t))
 	if got.Passed {
 		t.Fatal("moving to an older Kubernetes version must be refused")
 	}
@@ -164,11 +166,11 @@ func TestABackwardTransitionIsRefused(t *testing.T) {
 
 	// Forward is fine, and equal Kubernetes with a newer bundle is fine —
 	// a bundle may move only its charts.
-	if got := checkBundlePath(older, newer, nil, "single-server"); !got.Passed {
+	if got := checkBundlePath(older, newer, nil, "single-server", testSequence(t)); !got.Passed {
 		t.Errorf("a forward transition must pass: %s", got.Detail)
 	}
 	sameK8s := parseManifest(t, "bundle: \"1.1\"\ncore: {k3s: v1.35.7+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
-	if got := checkBundlePath(newer, sameK8s, nil, "single-server"); !got.Passed {
+	if got := checkBundlePath(newer, sameK8s, nil, "single-server", testSequence(t)); !got.Passed {
 		t.Errorf("a chart-only bundle move must pass: %s", got.Detail)
 	}
 }
@@ -313,7 +315,7 @@ profiles: {ha: {}}
 	}
 
 	// ONLY the window: the other gates are untouched.
-	if other := checkBundlePath(s.From, s.To, nil, "single-server"); other.Passed {
+	if other := checkBundlePath(s.From, s.To, nil, "single-server", testSequence(t)); other.Passed {
 		t.Error("--now must not bypass the bundle-path gate: a tier the target does not offer is still refused")
 	}
 
@@ -322,5 +324,163 @@ profiles: {ha: {}}
 	s.Opts.BypassWindow = false
 	if got := checkWindow(s); got.Passed {
 		t.Fatal("without --now a cluster with no window must refuse")
+	}
+}
+
+// testSequence is the catalog's published sequence, in the shape the gate reads
+// it. Tests that pass nil here would exercise the unmeasurable-hop refusal
+// rather than the adjacency rule.
+func testSequence(t *testing.T) []bundles.Release {
+	t.Helper()
+	sequence, err := bundles.Sequence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sequence
+}
+
+// syntheticBundle is a manifest with only what a path gate reads: the version,
+// a tier it offers, and (when given) the sources it declares.
+func syntheticBundle(t *testing.T, body string) *manifest.Manifest {
+	t.Helper()
+	return parseManifest(t, body)
+}
+
+// TWO BUNDLES AT A TIME (decision K). `--to 1.2` from 1.0 is refused because
+// 1.1 is a bundle you must step through: the deprecation scan runs against the
+// Kubernetes version the named target pins and only that one, so a bundle you
+// jump over is never scanned for an API removal it carries. This is S2's first
+// planted negative, and it goes through the REAL shipped manifests so it is the
+// transition the product offers that is being tested.
+func TestCheckBundlePathRefusesATwoBundleHop(t *testing.T) {
+	sequence := testSequence(t)
+	from, err := bundles.Manifest("1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := bundles.Manifest("1.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := checkBundlePath(from, to, nil, "single-server", sequence)
+	if got.Passed {
+		t.Fatal("1.0 -> 1.2 skips 1.1 and must be refused")
+	}
+	// The Fix names the intermediate bundle AND the command that takes it: a
+	// refusal that says "you skipped a bundle" without saying which one is a
+	// refusal an operator cannot act on.
+	if !strings.Contains(got.Detail, "1.1") {
+		t.Errorf("the refusal must name the skipped bundle: %s", got.Detail)
+	}
+	if !strings.Contains(got.Fix, "1.1") || !strings.Contains(got.Fix, "upgrade --to 1.1") {
+		t.Errorf("the fix must name the step and the command that takes it: %s", got.Fix)
+	}
+
+	// The positive control. Without it, a gate that refused every hop would pass
+	// the assertions above.
+	oneHop, err := bundles.Manifest("1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if passed := checkBundlePath(oneHop, to, nil, "single-server", sequence); !passed.Passed {
+		t.Errorf("1.1 -> 1.2 is one hop and must pass: %s / %s", passed.Detail, passed.Fix)
+	}
+
+	// And the UNDECLARED edge, which 1.2 declares and its predecessors do not:
+	// 0.9 is not one of the sources 1.2 declares, so this is refused for that
+	// reason rather than for distance, and the fix names the first declared
+	// source above it.
+	oldest, err := bundles.Manifest("0.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	undeclared := checkBundlePath(oldest, to, nil, "single-server", sequence)
+	if undeclared.Passed {
+		t.Fatal("0.9 is not a declared source for 1.2 and the transition must be refused")
+	}
+	if !strings.Contains(undeclared.Detail, "declares no upgrade edge from 0.9") {
+		t.Errorf("the refusal must be the declared-edge one, not a distance: %s", undeclared.Detail)
+	}
+	if !strings.Contains(undeclared.Fix, "1.0") {
+		t.Errorf("the fix must name the first declared source above 0.9: %s", undeclared.Fix)
+	}
+}
+
+// THE COUNT COMES FROM THE CATALOG'S ORDER, NOT FROM THE VERSION STRINGS.
+// "1.10" is newer than "1.9" and sorts before it as text, so an adjacency check
+// built on string order computes the distance backwards: it would pass the
+// two-hop 1.9 -> 1.11 below, because in string order the target looks like it
+// comes first.
+func TestTheAdjacencyCheckUsesCatalogOrderNotStringOrder(t *testing.T) {
+	sequence := []bundles.Release{{Version: "1.9"}, {Version: "1.10"}, {Version: "1.11"}}
+	manifest := func(version string) *manifest.Manifest {
+		return syntheticBundle(t, "bundle: \""+version+"\"\ncore: {k3s: v1.35.8+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+	}
+	nine, ten, eleven := manifest("1.9"), manifest("1.10"), manifest("1.11")
+
+	// One hop in the catalog, and the hop a string comparison calls backward.
+	if got := checkBundlePath(nine, ten, nil, "single-server", sequence); !got.Passed {
+		t.Errorf("1.9 -> 1.10 is adjacent in the catalog and must pass: %s / %s", got.Detail, got.Fix)
+	}
+	// Two hops in the catalog, and a hop a string comparison passes.
+	got := checkBundlePath(nine, eleven, nil, "single-server", sequence)
+	if got.Passed {
+		t.Fatal("1.9 -> 1.11 skips 1.10 and must be refused")
+	}
+	if !strings.Contains(got.Fix, "1.10") {
+		t.Errorf("the fix must name the intermediate bundle: %s", got.Fix)
+	}
+	// The same two bundles with the sequence the strings would give: the check
+	// reads what it is handed, so this is the order the catalog has and not a
+	// re-derivation of it.
+	stringOrder := []bundles.Release{{Version: "1.10"}, {Version: "1.11"}, {Version: "1.9"}}
+	if got := checkBundlePath(nine, ten, nil, "single-server", stringOrder); !got.Passed {
+		t.Errorf("the check must walk the sequence it is given: %s", got.Detail)
+	}
+}
+
+// A SECURITY-ONLY RELEASE DOES NOT CONSUME THE HOP (decision K). A release that
+// exists only because a component needed patching was not skipped by the
+// operator — we chose to issue it — so 1.0 -> 1.2 is one hop when 1.1 was
+// security-only, and two when it was not.
+func TestASecurityOnlyReleaseDoesNotConsumeTheHop(t *testing.T) {
+	manifest := func(version string) *manifest.Manifest {
+		return syntheticBundle(t, "bundle: \""+version+"\"\ncore: {k3s: v1.35.8+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+	}
+	one, two := manifest("1.0"), manifest("1.2")
+
+	ordinary := []bundles.Release{{Version: "1.0"}, {Version: "1.1"}, {Version: "1.2"}}
+	if got := checkBundlePath(one, two, nil, "single-server", ordinary); got.Passed {
+		t.Fatal("with 1.1 an ordinary release, 1.0 -> 1.2 is two hops and must be refused")
+	}
+
+	securityOnly := []bundles.Release{{Version: "1.0"}, {Version: "1.1", SecurityOnly: true}, {Version: "1.2"}}
+	if got := checkBundlePath(one, two, nil, "single-server", securityOnly); !got.Passed {
+		t.Errorf("with 1.1 security-only, 1.0 -> 1.2 is one hop and must pass: %s / %s", got.Detail, got.Fix)
+	}
+
+	// And the shipped catalog agrees: 1.1 is NOT security-only, so the real hop
+	// is the refused one.
+	sequence := testSequence(t)
+	for _, release := range sequence {
+		if release.Version == "1.1" && release.SecurityOnly {
+			t.Error("the shipped catalog marks 1.1 security-only: that is a claim about the release, not about the hop")
+		}
+	}
+}
+
+// An unmeasurable hop is refused rather than passed: "I could not tell" is not
+// "they are adjacent", the same rule the window gate follows.
+func TestAHopTheCatalogCannotMeasureIsRefused(t *testing.T) {
+	from := syntheticBundle(t, "bundle: \"1.0\"\ncore: {k3s: v1.35.8+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+	to := syntheticBundle(t, "bundle: \"9.9\"\ncore: {k3s: v1.35.8+k3s1}\nha-tiers: [single-server]\nlimits: {timeouts: {node-ready: 5m}}\n")
+
+	got := checkBundlePath(from, to, nil, "single-server", testSequence(t))
+	if got.Passed {
+		t.Fatal("a target the catalog does not carry cannot be measured and must not pass")
+	}
+	if !strings.Contains(got.Detail, "9.9") {
+		t.Errorf("the refusal must name the bundle it could not place: %s", got.Detail)
 	}
 }

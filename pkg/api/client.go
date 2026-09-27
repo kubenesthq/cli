@@ -137,6 +137,11 @@ type BundleListEntry struct {
 	Version  string   `json:"version"`
 	HATiers  []string `json:"ha_tiers"`
 	Profiles []string `json:"profiles"`
+	// UpgradeOnly marks a bundle the control plane no longer offers as a NEW
+	// install (F19). Preflight refuses an install of one and names the
+	// installable bundle, which is why the flag travels with the offer rather
+	// than only inside the manifest the CLI fetches afterwards.
+	UpgradeOnly bool `json:"upgrade_only"`
 }
 
 // ListBundles returns the bundle catalog this control plane offers. It is
