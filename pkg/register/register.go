@@ -64,7 +64,7 @@ type API interface {
 	ListOrgs(ctx context.Context) ([]api.Org, error)
 	ListOrgClusters(ctx context.Context, orgID string) ([]api.Cluster, error)
 	CreateCluster(ctx context.Context, orgID, name, description string) (*api.Cluster, error)
-	MintAgentCredentials(ctx context.Context, clusterID string) (*api.AgentCredentials, error)
+	MintAgentCredentials(ctx context.Context, clusterID, bundleVersion string) (*api.AgentCredentials, error)
 }
 
 // ResolveOrg picks the organization to register under.
@@ -198,13 +198,20 @@ func (b *Bundle) HasRepoCredential() bool {
 
 // MintCredentials issues the cluster's install-time credentials.
 //
+// `bundleVersion` is the bundle this install places on the cluster, and it is
+// sent so the control plane can resolve the OPERATOR CHART REFERENCE from that
+// bundle's own source. The mint is stage 2 and the cluster's bundle record is
+// written at the last stage, so this request is the only place a first install
+// can say which bundle it is placing; empty means "not known here", and the
+// control plane resolves from the cluster's record or its released default.
+//
 // NOT IDEMPOTENT, deliberately: every call rotates. Call it once per install
 // run, before anything is written to a host, and never again in that run.
-func MintCredentials(ctx context.Context, client API, clusterID string) (*api.AgentCredentials, error) {
+func MintCredentials(ctx context.Context, client API, clusterID, bundleVersion string) (*api.AgentCredentials, error) {
 	if clusterID == "" {
 		return nil, errors.New("register: cluster id is required to mint credentials")
 	}
-	creds, err := client.MintAgentCredentials(ctx, clusterID)
+	creds, err := client.MintAgentCredentials(ctx, clusterID, bundleVersion)
 	if err != nil {
 		return nil, fmt.Errorf("minting install credentials for cluster %s: %w", clusterID, err)
 	}
@@ -219,6 +226,10 @@ type Options struct {
 	ClusterName string
 	// Description is recorded on creation and ignored when adopting.
 	Description string
+	// BundleVersion is the bundle this run installs, sent on the mint request
+	// so the control plane resolves the operator chart reference from that
+	// bundle's own source rather than from the newest one in its catalog.
+	BundleVersion string
 }
 
 // Register runs stage 2 end to end: resolve the org, create-or-adopt the
@@ -240,7 +251,7 @@ func Register(ctx context.Context, client API, opts Options) (*Bundle, error) {
 		return nil, err
 	}
 
-	creds, err := MintCredentials(ctx, client, cluster.ID)
+	creds, err := MintCredentials(ctx, client, cluster.ID, opts.BundleVersion)
 	if err != nil {
 		return nil, err
 	}

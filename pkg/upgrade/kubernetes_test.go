@@ -3,11 +3,14 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
+	"kubenest.io/cli/pkg/bundles"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/sshx"
 )
 
@@ -100,4 +103,76 @@ func TestAgentUpgradeDefaultsToASingleReplica(t *testing.T) {
 	if !ready {
 		t.Errorf("ready = false (%s), want a single unset replica count to mean one", state)
 	}
+}
+
+// THE AGENT UPGRADE MOVES THE CHART SOURCE, NOT ONLY THE VERSION
+// (kn-t72...0xx7.1). A bundle pins its operator as
+// <sources.kubenest-agent>:<core.kubenest-agent>, and the two move
+// independently: bundle 1.2's chart lives in the candidate channel while every
+// released bundle's lives on the stable path. A version-only patch leaves
+// spec.chart on the old registry and asks it for a chart version that is not
+// there, so the 1.1 -> 1.2 upgrade either fails to pull or pulls a same-named
+// chart from a registry 1.2 never named.
+//
+// Both directions are asserted, because the risk runs both ways: a patch that
+// always wrote the candidate source would hand it to clusters that did not ask
+// for it.
+func TestTheAgentUpgradeMovesTheChartSourceAsWellAsTheVersion(t *testing.T) {
+	for _, tc := range []struct {
+		bundle      string
+		wantChart   string
+		wantVersion string
+	}{
+		{"1.1", "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2", "2.6.17"},
+		{"1.2", "oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2", "2.7.0-rc.1"},
+	} {
+		t.Run(tc.bundle, func(t *testing.T) {
+			m, err := bundles.Manifest(tc.bundle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			version, err := m.Core.Version("kubenest-agent")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if version != tc.wantVersion {
+				t.Fatalf("bundle %s pins the agent at %s, want %s", tc.bundle, version, tc.wantVersion)
+			}
+			r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+				switch {
+				case strings.HasPrefix(command, agentPatchCmd()):
+					return sshx.Result{}, nil
+				case command == agentProbeCmd():
+					return sshx.Result{Stdout: agentDeploymentJSON(agent.ChartName+"-"+version, 2, 2, 1, 1, 1)}, nil
+				default:
+					t.Fatalf("unscripted command: %q", command)
+					return sshx.Result{}, nil
+				}
+			}}
+
+			if err := upgradeAgentChart(context.Background(), r, m, version, converge.NewTextReporter(io.Discard)); err != nil {
+				t.Fatalf("upgrading the agent to bundle %s: %v", tc.bundle, err)
+			}
+
+			var patch string
+			for _, command := range r.Commands() {
+				if strings.Contains(command, "patch helmchart") {
+					patch = command
+				}
+			}
+			if patch == "" {
+				t.Fatalf("the agent upgrade never patched the HelmChart; it ran:\n%s", strings.Join(r.Commands(), "\n"))
+			}
+			for _, want := range []string{tc.wantChart, tc.wantVersion} {
+				if !strings.Contains(patch, want) {
+					t.Errorf("the patch does not carry %s: %s", want, patch)
+				}
+			}
+		})
+	}
+}
+
+// agentPatchCmd is the command the upgrade runs to move the agent's HelmChart.
+func agentPatchCmd() string {
+	return "sudo -n k3s kubectl patch helmchart " + agent.ReleaseName() + " -n kube-system --type merge"
 }

@@ -65,6 +65,89 @@ type InstallFlags struct {
 	// machine that never ran it.
 	FleetRecipient string
 	InstanceID     string
+
+	// Cluster is --cluster: the cluster's IMMUTABLE id, which is what a
+	// recovery adopts by. It is deliberately a different flag from --name: a
+	// display name never authorises adoption, and two clusters can share one.
+	Cluster string
+	// RestoreFrom is --restore-from: what a recovery starts from. "latest" is
+	// the newest eligible recovery set for this cluster.
+	RestoreFrom string
+	// RecoveryKit is --recovery-kit: where the kit comes from. "s3" is the
+	// bucket the recovery sets and kits live in.
+	RecoveryKit string
+	// FleetKeyFile is the file holding the fleet recovery key. It is a file
+	// rather than a flag value for the reason every other credential is: a
+	// secret on a command line lands in shell history and in `ps`.
+	FleetKeyFile string
+	// Backup names one backup instead of the recovery set's newest.
+	Backup string
+	// OldHostFenced is the operator's explicit confirmation that the machine
+	// being replaced cannot come back. A recovery refuses without it.
+	OldHostFenced bool
+	// AcknowledgeSingleOperator is the F20 acknowledgement, needed only when
+	// the backup target cannot create an object conditionally.
+	AcknowledgeSingleOperator bool
+	// AdminPassword is the control-plane administrator's password, needed only
+	// by a --control-plane recovery: the accounts are in the restored
+	// database, so the recovery signs in as the operator who already exists.
+	AdminPassword string
+}
+
+// recovering reports whether this is a recovery install.
+func (f InstallFlags) recovering() bool { return f.RestoreFrom != "" || f.RecoveryKit != "" }
+
+// recoveringCluster reports whether this is a WORKLOAD cluster recovery, which
+// is the shape selected by an immutable id rather than by a name.
+func (f InstallFlags) recoveringCluster() bool { return f.recovering() && !f.ControlPlane }
+
+// validateRecovery owns the refusals a recovery install makes before anything
+// is read from anywhere.
+//
+// THE TWO FLAGS ARE A PAIR. `--restore-from` says what to rebuild from and
+// `--recovery-kit` says where the kit that opens it comes from; either alone is
+// a command that cannot do what it says, and accepting one would leave the
+// operator believing a recovery was configured when none was.
+func (f *InstallFlags) validateRecovery() error {
+	switch {
+	case f.RestoreFrom == "":
+		return fmt.Errorf("--recovery-kit needs --restore-from: name what the recovery starts from (today: latest)")
+	case f.RecoveryKit == "":
+		return fmt.Errorf("--restore-from needs --recovery-kit: name where the recovery kit comes from (today: s3), because a recovery with no kit has no repository password and no join token")
+	case f.RestoreFrom != "latest":
+		return fmt.Errorf("--restore-from %q is not something this release recovers from: the only value is latest, the newest eligible recovery set for the cluster", f.RestoreFrom)
+	case f.RecoveryKit != "s3":
+		return fmt.Errorf("--recovery-kit %q is not a kit source this release has: the only value is s3", f.RecoveryKit)
+	}
+	if f.BackupTarget == "" {
+		return fmt.Errorf("a recovery needs --backup-target: it is the only thing that says which bucket holds this cluster's recovery set and backup, and the fleet recovery key alone does not name a store (S3 credentials come from KUBENEST_BACKUP_ACCESS_KEY_ID / KUBENEST_BACKUP_SECRET_ACCESS_KEY)")
+	}
+	if f.FleetKeyFile == "" {
+		return fmt.Errorf("a recovery needs --fleet-key-file: the fleet recovery key is what opens the kit, and it is read from a file rather than taken on the command line so it does not land in shell history or in `ps`")
+	}
+	// The fencing confirmation is flag shape, and it is checked here as well as
+	// in the recovery pre-flight: this is the earliest point an operator can be
+	// told, and the stage check is what protects a caller that did not come
+	// through this command.
+	if !f.OldHostFenced {
+		return fmt.Errorf("a recovery needs --old-host-fenced: power the machine being replaced off at its provider, or make it unreachable, then confirm it. An old host that rejoins after the new one registers is two clusters behind one identity, and every operation after that is against whichever answered")
+	}
+	if f.ControlPlane {
+		// A control-plane recovery re-registers the MANAGEMENT cluster, so it
+		// is named — by the name its own restored record already carries.
+		if f.Cluster != "" {
+			return fmt.Errorf("--cluster does not apply to a --control-plane recovery: the id of the management cluster this rebuilds is in the recovery set's binding, and naming it here could only disagree with the set")
+		}
+		return nil
+	}
+	// A WORKLOAD CLUSTER IS ADOPTED BY ITS IMMUTABLE ID, NEVER BY ITS NAME.
+	if f.Cluster == "" {
+		return fmt.Errorf("--restore-from needs --cluster <cluster-id>: a recovery adopts a cluster by its IMMUTABLE id, and a display name never authorises adoption — two clusters can carry the same name, and the one that comes back would be whichever the control plane answered with first. The id is in the recovery set's binding, or in `kubenest cluster list`")
+	}
+	if f.Name != "" {
+		return fmt.Errorf("--name does not select anything in a recovery and is not accepted here: the cluster this rebuilds is chosen by --cluster <cluster-id>, which no display name can stand in for. Remove --name; the name comes back from the cluster's own record")
+	}
+	return nil
 }
 
 // controlPlaneDomain is the domain this install serves the control plane
@@ -96,7 +179,12 @@ func (f *InstallFlags) Validate() error {
 	if f.Bundle == "" {
 		return fmt.Errorf("--bundle is required: the bundle version pins every component (see the Bundle contents page)")
 	}
-	if f.Name == "" {
+	if f.recovering() {
+		if err := f.validateRecovery(); err != nil {
+			return err
+		}
+	}
+	if f.Name == "" && !f.recoveringCluster() {
 		return fmt.Errorf("--name is required: the cluster is recorded under this name")
 	}
 	if f.ControlPlane && f.Org != "" {
@@ -214,6 +302,14 @@ this machine is logged in to; it needs no control plane of its own.`,
 	fs.StringVar(&f.BackupTarget, "backup-target", "", "S3-compatible backup target for Velero (optional; unset reports backup: unconfigured)")
 	fs.StringVar(&f.FleetRecipient, "fleet-recipient", "", "the fleet recovery key's PUBLIC recipient (age1...); normally read from this machine's config after a --control-plane install")
 	fs.StringVar(&f.InstanceID, "instance-id", "", "the instance id every recovery kit is bound to; normally read from this machine's config after a --control-plane install")
+	fs.StringVar(&f.Cluster, "cluster", "", "the cluster's IMMUTABLE id, for a recovery: --restore-from adopts the cluster this names, and a display name never authorises adoption")
+	fs.StringVar(&f.RestoreFrom, "restore-from", "", "RECOVER an existing cluster instead of installing a new one: the newest eligible recovery set (today: latest)")
+	fs.StringVar(&f.RecoveryKit, "recovery-kit", "", "where the recovery kit comes from, with --restore-from (today: s3, the bucket --backup-target names)")
+	fs.StringVar(&f.FleetKeyFile, "fleet-key-file", "", "file holding the fleet recovery key (the AGE-SECRET-KEY-1... printed once at control-plane install); required by a recovery")
+	fs.StringVar(&f.Backup, "backup", "", "name one backup the recovery set must record as completed, instead of its newest")
+	fs.BoolVar(&f.OldHostFenced, "old-host-fenced", false, "confirm the machine being replaced is powered off or unreachable; a recovery refuses without it")
+	fs.BoolVar(&f.AcknowledgeSingleOperator, "acknowledge-single-operator", false, "acknowledge the documented single-operator rule when the backup target cannot create an object conditionally (F20)")
+	fs.StringVar(&f.AdminPassword, "admin-password", "", "the control-plane administrator's password, for a --control-plane recovery: the accounts are in the restored database (or KUBENEST_ADMIN_PASSWORD)")
 	return cmd
 }
 

@@ -73,7 +73,7 @@ func (f *fakeAPI) CreateCluster(_ context.Context, orgID, name, _ string) (*api.
 	return &created, nil
 }
 
-func (f *fakeAPI) MintAgentCredentials(_ context.Context, clusterID string) (*api.AgentCredentials, error) {
+func (f *fakeAPI) MintAgentCredentials(_ context.Context, clusterID, _ string) (*api.AgentCredentials, error) {
 	f.mintCalls++
 	f.nextVersion++
 	return &api.AgentCredentials{
@@ -312,7 +312,7 @@ func TestBundleCannotBeSerialized(t *testing.T) {
 }
 
 func TestMintCredentialsRequiresACluster(t *testing.T) {
-	if _, err := register.MintCredentials(context.Background(), &fakeAPI{}, ""); err == nil {
+	if _, err := register.MintCredentials(context.Background(), &fakeAPI{}, "", "1.2"); err == nil {
 		t.Fatal("expected an error for an empty cluster id")
 	}
 }

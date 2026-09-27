@@ -3,8 +3,17 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -221,4 +230,107 @@ func TestDeviceFlowDenialAndExpiryAreTerminal(t *testing.T) {
 		}
 		srv.Close()
 	}
+}
+
+// A control plane restored WITHOUT the kit's certificate authority is refused
+// by a CLI that already holds that authority — and that check is LIVE, not
+// assumed.
+//
+// T4.8's planted negative. The whole reason the control-plane kit carries
+// CONTROL_PLANE_CA is that every CLI and agent in the fleet pinned it at install
+// time: a recovery that minted a fresh authority would produce a control plane
+// nobody can reach, and the first symptom would be an unexplained TLS failure
+// halfway through an operation. This asserts the failure rather than describing
+// it, over REAL TLS against two REAL authorities — a mocked transport would
+// prove nothing about a certificate chain.
+func TestAControlPlaneRestoredWithoutTheKitsCAIsRefused(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"data": []}`))
+	})
+	// The authority the recovery set's kit carries, and a control plane that
+	// was restored under it.
+	kitsAuthorityPEM, kitsServer := selfSignedServer(t, handler)
+
+	// A DIFFERENT authority: what got installed when the kit's CA was not used.
+	deadAuthorityPEM, deadServer := selfSignedServer(t, handler)
+
+	// The CLI holds the authority from the DEAD control plane's kit, and dials
+	// the restored one, which presents a different chain. The handshake fails.
+	wrong, err := New(deadServer.URL, WithCACert(deadAuthorityPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrong.ListBundles(context.Background()); err != nil {
+		t.Fatalf("a CLI holding its own control plane's authority could not reach it: %v", err)
+	}
+	mismatched, err := New(kitsServer.URL, WithCACert(deadAuthorityPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = mismatched.ListBundles(context.Background())
+	if err == nil {
+		t.Fatal("a control plane presenting a certificate from an authority the CLI does not hold was accepted: the kit's CA is then not what identifies the control plane")
+	}
+	var unknown x509.UnknownAuthorityError
+	if !errors.As(err, &unknown) && !strings.Contains(strings.ToLower(err.Error()), "certificate") {
+		t.Fatalf("the refusal is not a certificate-verification failure, so it would read as an outage rather than as the wrong authority: %v", err)
+	}
+
+	// The positive control: the same CLI, holding the RESTORED control plane's
+	// authority (the kit's), reaches it. Without this the test would pass for a
+	// client that can reach nothing at all.
+	trusted, err := New(kitsServer.URL, WithCACert(kitsAuthorityPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trusted.ListBundles(context.Background()); err != nil {
+		t.Fatalf("a CLI holding the recovered control plane's own authority could not reach it: %v", err)
+	}
+}
+
+// selfSignedServer runs a real HTTPS server under its own freshly minted
+// authority and returns the authority's PEM and the server. httptest's own
+// helper reuses ONE certificate for every server it starts, which cannot express
+// "two authorities", so the certificate is minted here.
+func selfSignedServer(t *testing.T, handler http.Handler) ([]byte, *httptest.Server) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "kubenest-test-authority"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	leaf, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewUnstartedServer(handler)
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{leaf}}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return certPEM, srv
 }

@@ -94,6 +94,15 @@ const platformCAMountPath = "/etc/kubenest/platform-ca"
 type ValuesOptions struct {
 	BackendURLOverride string
 	ControlPlaneCA     []byte
+	// RecoveryMode installs the operator so that its FIRST start holds every
+	// project. It is set only by a recovery (T4.8/T4.9): the restored data is
+	// not yet the desired state, and an operator that reconciled before the
+	// restore finished would overwrite it with whatever the control plane last
+	// knew. The hold is the chart's kubenest.recoveryMode, which the operator
+	// turns into KUBENEST_RECOVERY_MODE; every project stays held until it
+	// carries kubenest.io/reconcile-activated, which the CLI writes only after
+	// that project's data is back.
+	RecoveryMode bool
 }
 
 // Values renders the chart values for one cluster's agent.
@@ -190,6 +199,13 @@ func Values(creds *api.AgentCredentials, opts ValuesOptions) (string, error) {
 		// runs inside it, whose in-cluster service name is not the public hub
 		// URL the mint returned.
 		values["kubenest"].(map[string]any)["backendURL"] = opts.BackendURLOverride
+	}
+	if opts.RecoveryMode {
+		// A recovery install's operator starts HELD. The value is written into
+		// the chart values rather than applied afterwards, because an operator
+		// that starts first and is held second has already created namespaces
+		// and synced Applications against data that is not restored yet.
+		values["kubenest"].(map[string]any)["recoveryMode"] = true
 	}
 	if len(opts.ControlPlaneCA) > 0 {
 		values["extraVolumes"] = []any{map[string]any{

@@ -25,7 +25,9 @@ import (
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/node"
+	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/preflight"
+	"kubenest.io/cli/pkg/recovery"
 	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/register"
 	"kubenest.io/cli/pkg/sshx"
@@ -58,6 +60,12 @@ type Options struct {
 	// AdminEmail is the control plane's first administrator, admin@<domain>
 	// by default.
 	AdminEmail string
+	// AdminPassword is the administrator account's password, needed only by a
+	// control-plane RECOVERY: the accounts live in the restored database, so
+	// the recovery has to sign in as the operator who already exists to
+	// register the management cluster through the control plane it rebuilt.
+	// It is held in memory only and never journalled.
+	AdminPassword string
 	// ControlPlaneCA is the PEM of the authority the control plane's serving
 	// certificate chains to. A registered install reads it from this machine's
 	// config, where `kubenest login --ca-file` or a --control-plane install
@@ -77,20 +85,45 @@ type Options struct {
 	// cannot open.
 	FleetRecipient string
 	InstanceID     string
+	// Recovery is a RECOVERY install: rebuild a cluster from its bucket rather
+	// than build a new one. It carries the immutable id the cluster is adopted
+	// by, the fleet recovery key, and the two confirmations the operator must
+	// give. Nil for every other install.
+	Recovery *RecoveryOptions
 }
 
 // Identity is the part of the request a resume must match exactly. The install
 // MODE is part of it: a journal started as a registered install must not be
 // resumed as a control-plane one, because the stages that already ran would
 // have been aiming at a different control plane.
+//
+// A RECOVERY IS A THIRD MODE, and a resume must not cross into it either. The
+// stages differ, and a recovery that resumed into a normal install would write
+// over a cluster that is being rebuilt rather than rebuilt from its bucket.
 func (o Options) Identity() Identity {
 	mode := "registered"
-	if o.ControlPlaneInstall {
+	switch {
+	case o.Recovery != nil && o.Recovery.Kind == recoverykit.KindControlPlane:
+		mode = "recovery-control-plane"
+	case o.Recovery != nil:
+		mode = "recovery-cluster"
+	case o.ControlPlaneInstall:
 		mode = "control-plane"
+	}
+	cluster := o.Name
+	var restoreFrom, recoveryKit, backup string
+	if o.Recovery != nil {
+		// A recovery is keyed by the cluster's immutable id, not by a display
+		// name: the journal for a rebuilt cluster has to be the one the next
+		// run of the same recovery finds, whatever the name turns out to be.
+		if o.Recovery.ClusterID != "" {
+			cluster = o.Recovery.ClusterID
+		}
+		restoreFrom, recoveryKit, backup = o.Recovery.RestoreFrom, o.Recovery.Kit, o.Recovery.Backup
 	}
 	return Identity{
 		Kind:    Kind,
-		Cluster: o.Name,
+		Cluster: cluster,
 		Fields: map[string]string{
 			"mode":             mode,
 			"bundle":           o.Bundle,
@@ -100,6 +133,9 @@ func (o Options) Identity() Identity {
 			"servers":          stages.List(o.Servers),
 			"agents":           stages.List(o.Agents),
 			"profiles":         stages.List(o.Profiles),
+			"restore-from":     restoreFrom,
+			"--recovery-kit":   recoveryKit,
+			"backup":           backup,
 		},
 	}
 }
@@ -201,6 +237,40 @@ type Session struct {
 	// that generated it (the first control-plane install). Every other install
 	// is handed the public recipient and has no private half to hold.
 	fleetKey *recoverykit.FleetKey
+
+	// Recovery state, filled by the recovery stages.
+	//
+	// recoverySel is the set, kit and backup the select stage read from the
+	// bucket. It is held rather than re-read so every later stage restores the
+	// artifact the operator was shown, not whatever the bucket holds by then.
+	recoverySel *recovery.Selection
+	// recoveryStore is the bucket those reads came from.
+	recoveryStore recovery.Store
+	// recoveryTargetValue is the parsed --backup-target.
+	recoveryTargetValue backup.Target
+	// recoveryCopy is the off-cluster copy the ownership stage writes and
+	// claims through. It is built from the target once; a resumed run keeps
+	// the one it already built rather than rebuilding a client it does not
+	// need, and a test can hand one in over a fake writer.
+	recoveryCopy *operation.Copy
+	// recoveryOpID and recoveryOwnerKey name the off-cluster operation this
+	// recovery took ownership of, so the record and the ownership object can be
+	// named in the operator's messages rather than described.
+	recoveryOpID     string
+	recoveryOwnerKey string
+	// recoveryRecipient is the PUBLIC half of the fleet key this process
+	// holds. A recovery holds the private half, so it can derive the recipient
+	// every kit it writes must be sealed to.
+	recoveryRecipient string
+	// recoveryValues is the control-plane chart values a control-plane
+	// recovery applied, kept so the checkpoint stage can start the backend from
+	// the same document rather than re-rendering one that might differ.
+	recoveryValues string
+	// recoveryCheckpoint is the checkpoint the pre-flight selected, with its
+	// sealed dump, and whether the migration Job has to run for it.
+	recoveryCheckpoint      *controlplane.BucketCheckpoint
+	recoveryCheckpointDump  []byte
+	recoveryMigrationNeeded bool
 
 	closers []io.Closer
 }
@@ -333,8 +403,58 @@ func (s *Session) NodesWithRole(role NodeRole) []Node {
 // platform-day2 and register, so the cluster that hosts the control plane is
 // registered through the control plane it now hosts, by the normal path.
 func Plan(s *Session) []Stage {
-	bind := func(f func(context.Context, *Session) error) stages.StageFunc {
+	bind := stageBinder(func(f func(context.Context, *Session) error) stages.StageFunc {
 		return func(ctx context.Context) error { return f(ctx, s) }
+	})
+	// A RECOVERY IS ITS OWN PLAN, not an install with a flag: the six steps of
+	// PLAN 7.9 need stages an install has no room for — selecting and checking
+	// the set before anything is written, taking ownership outside the cluster,
+	// opening an existing repository before Velero starts, and releasing the
+	// projects recovery mode held only after their data is back — and it must
+	// NOT run the stages that write a new kit, register a new cluster, or
+	// initialise anything over what is being recovered.
+	if s.Opts.Recovery != nil {
+		if s.Opts.Recovery.Kind == recoverykit.KindControlPlane {
+			return controlPlaneRecoveryPlan(s, bind)
+		}
+		return []Stage{
+			// Step 2's read, and step 2's four answers plus the fencing
+			// confirmation and the host's capacity. Both write nothing, so a
+			// refusal here has cost the operator nothing.
+			{Name: StageRecoverySelect, AlwaysRun: true, Run: bind(stageRecoverySelect)},
+			{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
+			{Name: StageRecoveryPreflight, Run: bind(stageRecoveryPreflight)},
+			// Step 1: ownership outside the cluster, recorded in the operation
+			// before the first change.
+			{Name: StageRecoveryOwnership, Run: bind(stageRecoveryOwnership)},
+			{Name: StageK3sServer, Component: "k3s", Run: bind(stageK3sServer)},
+			{Name: StageK3sAgents, Component: "k3s", Run: bind(stageK3sAgents)},
+			{Name: StageNetworking, Component: "traefik", Run: bind(stageNetworking)},
+			{Name: StageCerts, Component: "cert-manager", Run: bind(stageCerts)},
+			{Name: StageStorage, Component: "openebs-lvm-localpv", Run: bind(stageStorage)},
+			// The kit's repository password goes on BEFORE Velero starts, or
+			// Velero writes its vendored default into the Secret and the
+			// repository is opened under that instead (probe P3 question 2).
+			{Name: StageRecoveryRepository, Run: bind(stageRecoveryRepository)},
+			{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
+			{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
+			{Name: StageBackupTarget, Component: "velero", Run: bind(stageBackupTarget)},
+			// Step 4: adopt the cluster the immutable id names and record the
+			// new physical incarnation, retiring the old one's credentials.
+			{Name: StageRegister, AlwaysRun: true, Run: bind(stageRecoveryRegister)},
+			// The operator is installed in RECOVERY MODE: its very first start
+			// holds every project, so nothing reconciles before the data is
+			// back.
+			{Name: StageAgent, Component: "kubenest-agent", Run: bind(stageAgent)},
+			// Step 5, then step 6's activation. The restore leaves every
+			// project paused; activation is what lets the restored Jobs,
+			// CronJobs and containers run, and it runs only after.
+			{Name: StageRecoveryRestore, Run: bind(stageRecoveryRestore)},
+			{Name: StageProfiles, Run: bind(stageProfiles)},
+			{Name: StageRecord, Run: bind(stageRecord)},
+			{Name: StageVerify, AlwaysRun: true, Run: bind(Verify)},
+			{Name: StageRecoveryActivate, Run: bind(stageRecoveryActivate)},
+		}
 	}
 	if s.Opts.ControlPlaneInstall {
 		return []Stage{
@@ -536,7 +656,7 @@ func stageRegister(ctx context.Context, s *Session) error {
 		return s.saveRecord()
 	}
 
-	creds, err := register.MintCredentials(ctx, s.API, cluster.ID)
+	creds, err := register.MintCredentials(ctx, s.API, cluster.ID, s.Opts.Bundle)
 	if err != nil {
 		return err
 	}
@@ -1442,6 +1562,10 @@ func stageAgent(ctx context.Context, s *Session) error {
 	if s.Opts.ControlPlaneInstall {
 		opts.BackendURLOverride = controlplane.HubInClusterURL
 	}
+	// A recovery's operator starts held: every project stays held until the
+	// recovery activates it, because the restored data is not yet the desired
+	// state (T4.2).
+	opts.RecoveryMode = s.Opts.RecoveryMode()
 	opts.ControlPlaneCA = s.Opts.ControlPlaneCA
 	return stages.NewComponentError("kubenest-agent",
 		agent.Install(ctx, server, s.Bundle, creds, opts, s.Reporter))

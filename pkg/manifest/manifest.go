@@ -41,6 +41,12 @@ type Manifest struct {
 	// Health is the thresholds fleet health is evaluated against (kn-j5s).
 	Health   Health   `yaml:"health"`
 	Profiles Profiles `yaml:"profiles"`
+	// Sources are the version-less base references the core pins are pulled
+	// from, keyed by component. The version is ALWAYS the core pin; a source
+	// says only WHERE that version lives, which is why a bundle can move a
+	// component between registries (the candidate channel is a different OCI
+	// repository) without the version moving too.
+	Sources Components `yaml:"sources"`
 	// UpgradeFrom are the bundle versions this bundle is a supported upgrade
 	// TARGET for. Empty means the catalog declares no edge into it, which is
 	// how an undeclared transition is refused (plan 7.10). It is the set of

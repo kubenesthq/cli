@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,7 +147,7 @@ func TestErrorCarriesTheContractCode(t *testing.T) {
 			"details": {"required_scope": "clusters:register"}}}`))
 	}))
 
-	_, err := c.MintAgentCredentials(context.Background(), "cluster-1")
+	_, err := c.MintAgentCredentials(context.Background(), "cluster-1", "")
 	var apiErr *api.Error
 	if !asAPIError(err, &apiErr) {
 		t.Fatalf("expected *api.Error, got %T: %v", err, err)
@@ -194,7 +195,7 @@ func TestMintDecodesCredentialsButKeepsThemUnprintable(t *testing.T) {
 			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://reg/kubenest-agent:2.2.0", "creates_workload_applications": false}}`))
 	}))
 
-	creds, err := c.MintAgentCredentials(context.Background(), "cluster-1")
+	creds, err := c.MintAgentCredentials(context.Background(), "cluster-1", "")
 	if err != nil {
 		t.Fatalf("MintAgentCredentials: %v", err)
 	}
@@ -234,7 +235,7 @@ func TestMintRejectsAResponseWithNoToken(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"cluster_id": "cluster-1", "agent_jwt": {"token": ""}}`))
 	}))
-	if _, err := c.MintAgentCredentials(context.Background(), "cluster-1"); err == nil {
+	if _, err := c.MintAgentCredentials(context.Background(), "cluster-1", ""); err == nil {
 		t.Fatal("expected an error for an empty agent token")
 	}
 }
@@ -247,7 +248,7 @@ func TestMintWithoutGitOpsHasNoRepoCredential(t *testing.T) {
 			"repo_credential": null,
 			"operator": {"namespace": "kubenest-system", "chart_ref": "oci://x:1", "creates_workload_applications": false}}`))
 	}))
-	creds, err := c.MintAgentCredentials(context.Background(), "c1")
+	creds, err := c.MintAgentCredentials(context.Background(), "c1", "")
 	if err != nil {
 		t.Fatalf("a control plane without Gitea must still mint: %v", err)
 	}
@@ -263,7 +264,7 @@ func TestMintWithoutOwnershipDeclarationStillDecodes(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"cluster_id":"c1","agent_jwt":{"token":"t"},"operator":{"namespace":"kubenest-system","chart_ref":"oci://x:1"}}`))
 	}))
-	creds, err := c.MintAgentCredentials(context.Background(), "c1")
+	creds, err := c.MintAgentCredentials(context.Background(), "c1", "")
 	if err != nil {
 		t.Fatalf("legacy mint: %v", err)
 	}
@@ -283,6 +284,70 @@ func TestRegisterCallsSendTheBearerToken(t *testing.T) {
 	}
 	if got != "Bearer knp_test" {
 		t.Errorf("Authorization = %q", got)
+	}
+}
+
+// The mint request carries the bundle this install places on the cluster
+// (kn-t72…0xx7.1). The control plane resolves the operator chart reference from
+// THAT bundle's own source; without it, a cluster being installed at a bundle
+// whose chart lives in a candidate channel is handed the wrong registry.
+//
+// Asserted on the wire rather than on a fake client: the body IS the mechanism,
+// and a test that watched a function argument would pass while the request
+// carried nothing.
+func TestTheMintRequestCarriesTheBundleItInstalls(t *testing.T) {
+	var got []byte
+	c, _ := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading the mint request body: %v", err)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json for a request with a body", ct)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"cluster_id":"c1","agent_jwt":{"token":"t","hub_url":"wss://hub/ws/operator","token_version":1},"operator":{"namespace":"kubenest-system","chart_ref":"oci://reg/agent:1.0.0"}}`))
+	}))
+
+	if _, err := c.MintAgentCredentials(context.Background(), "c1", "1.2"); err != nil {
+		t.Fatalf("MintAgentCredentials: %v", err)
+	}
+	var body struct {
+		BundleVersion string `json:"bundle_version"`
+	}
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("the mint body is not JSON (%q): %v", got, err)
+	}
+	if body.BundleVersion != "1.2" {
+		t.Errorf("the mint body names bundle %q, want 1.2 — the control plane cannot resolve 1.2's "+
+			"operator source from a request that does not say which bundle is being installed", body.BundleVersion)
+	}
+}
+
+// No bundle known means no body, not an empty one: the control plane reads an
+// absent bundle as "resolve from the cluster's record, then the default", and a
+// caller that sent `{"bundle_version":""}` would be asking it to look up a
+// version that cannot exist.
+func TestAMintWithNoBundleSendsNoBody(t *testing.T) {
+	var got []byte
+	c, _ := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		got, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("reading the mint request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"cluster_id":"c1","agent_jwt":{"token":"t","hub_url":"wss://hub/ws/operator","token_version":1},"operator":{"namespace":"kubenest-system","chart_ref":"oci://reg/agent:1.0.0"}}`))
+	}))
+
+	if _, err := c.MintAgentCredentials(context.Background(), "c1", ""); err != nil {
+		t.Fatalf("MintAgentCredentials: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("the mint request carried a body with no bundle to name: %q", got)
 	}
 }
 

@@ -271,16 +271,29 @@ func planProbe(r k3s.Runner, plan, target string, want int) converge.Probe {
 	}
 }
 
-// upgradeAgentChart moves the KubeNest agent to a new chart version without
-// re-minting its identity. An ordinary bundle upgrade changes only the chart
-// pin: valuesContent can contain credentials and customer choices, and is
+// upgradeAgentChart moves the KubeNest agent to the target bundle's chart
+// without re-minting its identity. An ordinary bundle upgrade changes only the
+// chart pin: valuesContent can contain credentials and customer choices, and is
 // deliberately left exactly as it was.
+//
+// THE PATCH MOVES THE SOURCE AS WELL AS THE VERSION. A bundle pins its operator
+// as <sources.kubenest-agent>:<core.kubenest-agent>, and the two can move
+// independently: bundle 1.2's chart lives in the candidate channel while every
+// released bundle's lives on the stable path. Patching only spec.version would
+// leave spec.chart pointing at the old registry and ask it for a chart version
+// that is not there — the upgrade would fail to pull, or worse, pull a same-named
+// chart from a registry the target bundle never named. A manifest that declares
+// no source leaves the chart alone, because then the bundle says nothing about
+// where its chart lives.
 func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, version string, rep converge.Reporter) error {
 	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
-	patch := fmt.Sprintf(`{"spec":{"version":%q}}`, version)
+	patch, err := agentChartPatch(bundle, version)
+	if err != nil {
+		return err
+	}
 	if _, err := k3s.Kubectl(ctx, r,
 		fmt.Sprintf("patch helmchart %s -n kube-system --type merge -p %s", agent.ReleaseName(), shellQuote(patch))); err != nil {
 		return fmt.Errorf("moving the agent chart to %s: %w", version, err)
@@ -293,6 +306,27 @@ func upgradeAgentChart(ctx context.Context, r k3s.Runner, bundle *manifest.Manif
 		return err
 	}
 	return res.Err()
+}
+
+// agentChartPatch is the merge patch that moves the agent's HelmChart to a
+// bundle's operator: the version always, and the chart SOURCE when the bundle
+// declares one.
+//
+// ONE PIN, ONE PLACE. The version is the bundle's core.kubenest-agent pin, never
+// a second copy of it here, and the source is the bundle's own
+// sources.kubenest-agent — the same two values the control plane composes the
+// install-time chart_ref from (kn-z6e4), so an install and an upgrade of the
+// same bundle cannot disagree about where its chart lives.
+func agentChartPatch(bundle *manifest.Manifest, version string) (string, error) {
+	spec := map[string]string{"version": version}
+	if source := bundle.Sources["kubenest-agent"]; source != "" {
+		spec["chart"] = source
+	}
+	body, err := json.Marshal(map[string]any{"spec": spec})
+	if err != nil {
+		return "", fmt.Errorf("building the agent chart patch: %w", err)
+	}
+	return string(body), nil
 }
 
 // agentUpgradedProbe waits for the operator Deployment to be running the new

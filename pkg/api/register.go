@@ -10,10 +10,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -320,21 +322,51 @@ type AgentCredentials struct {
 	Operator       OperatorInstallInfo `json:"operator"`
 }
 
+// mintRequest is the body of the credential mint: the bundle this install is
+// placing on the cluster.
+//
+// WHY THE BUNDLE TRAVELS WITH THE REQUEST. The mint is stage 2 and the cluster's
+// bundle record is written at the last stage, so at mint time the control plane
+// has no record to read. It resolves the operator chart reference from this
+// bundle's own `sources.kubenest-agent` plus its `core.kubenest-agent` pin
+// (kn-z6e4), and without it falls back to the newest RELEASED bundle — which
+// hands a cluster being installed at a bundle whose chart lives elsewhere (a
+// candidate channel, a future mirror) the wrong registry. Absent is not an
+// error: a caller that does not know the bundle sends no body and gets the
+// control plane's default.
+type mintRequest struct {
+	BundleVersion string `json:"bundle_version"`
+}
+
 // MintAgentCredentials issues the cluster's install-time credentials.
 // Scope: clusters:register.
+//
+// `bundleVersion` is the bundle this install places on the cluster; empty means
+// "not known here" and the request carries no body.
 //
 // CALLING THIS ROTATES. Every call increments token_version, replaces the
 // stored agent JWT, and registers a fresh deploy key while deleting superseded
 // ones after the control plane's grace window. Calling it a second time during
 // a resume invalidates credentials an earlier run already placed on hosts —
 // see pkg/register.
-func (c *Client) MintAgentCredentials(ctx context.Context, clusterID string) (*AgentCredentials, error) {
+func (c *Client) MintAgentCredentials(ctx context.Context, clusterID, bundleVersion string) (*AgentCredentials, error) {
+	var payload io.Reader
+	if bundleVersion != "" {
+		body, err := json.Marshal(mintRequest{BundleVersion: bundleVersion})
+		if err != nil {
+			return nil, err
+		}
+		payload = bytes.NewReader(body)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/agent-credentials"), nil)
+		c.endpoint("/api/v1/clusters/"+url.PathEscape(clusterID)+"/agent-credentials"), payload)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 
 	var out AgentCredentials
 	if err := c.do(req, &out); err != nil {

@@ -19,6 +19,7 @@ import (
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/uninstall"
@@ -97,7 +98,12 @@ func installSources(ctx context.Context, f InstallFlags) (*api.Client, *manifest
 		return nil, bundle, nil
 	}
 
-	client, err := controlPlaneClientChecked(ctx, "platform install")
+	// A RECOVERY DOES NOT CHECK THE CONTROL PLANE'S CONTRACT ERA. It checks
+	// compatibility against the recovery set's manifest, which is a document
+	// the operator holds (PLAN 7.8) — and the whole point of the verb is that
+	// the control plane may be the thing that is gone. The client is built
+	// unchecked for exactly that reason; every other install keeps the check.
+	client, err := controlPlaneClientOrDefault(f)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -110,6 +116,32 @@ func installSources(ctx context.Context, f InstallFlags) (*api.Client, *manifest
 		return nil, nil, fmt.Errorf("bundle %s from the control plane is not a valid manifest: %w", f.Bundle, err)
 	}
 	return client, bundle, nil
+}
+
+// controlPlaneClientOrDefault is the client one install shape uses: the
+// version-checked one for an ordinary install, and the plain one for a
+// recovery.
+func controlPlaneClientOrDefault(f InstallFlags) (*api.Client, error) {
+	if f.recovering() {
+		return controlPlaneClient()
+	}
+	return controlPlaneClientChecked(context.Background(), "platform install")
+}
+
+// readFleetKeyFile reads the fleet recovery key from a file. It is a file
+// rather than a flag value for the reason the recovery-kit check reads it from
+// one: a fleet key on a command line is a fleet key in shell history and in
+// `ps`.
+func readFleetKeyFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading the fleet recovery key from %s: %w", path, err)
+	}
+	key := strings.TrimSpace(string(raw))
+	if key == "" {
+		return "", fmt.Errorf("%s is empty: it must hold the AGE-SECRET-KEY-1... the control-plane install printed once", path)
+	}
+	return key, nil
 }
 
 // runInstall is `kubenest platform install`.
@@ -158,7 +190,48 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 		opts.ControlPlaneCA = []byte(cfg.ControlPlaneCA)
 	}
 
-	journalPath, err := install.JournalPath(f.Name)
+	// A RECOVERY carries what only the operator has: the fleet recovery key,
+	// the two confirmations, and — for a control-plane recovery — the
+	// administrator's own password. The key is read from a file and lives in
+	// this process only.
+	if f.recovering() {
+		fleetKey, err := readFleetKeyFile(f.FleetKeyFile)
+		if err != nil {
+			return err
+		}
+		kind := recoverykit.KindCluster
+		if f.ControlPlane {
+			kind = recoverykit.KindControlPlane
+			opts.AdminPassword = f.AdminPassword
+			if opts.AdminPassword == "" {
+				opts.AdminPassword = os.Getenv("KUBENEST_ADMIN_PASSWORD")
+			}
+			if opts.AdminPassword == "" {
+				return fmt.Errorf("a --control-plane recovery needs --admin-password (or KUBENEST_ADMIN_PASSWORD): the administrator accounts live in the checkpoint's database, so signing in to the rebuilt control plane means signing in as an account that already exists")
+			}
+		}
+		opts.Recovery = &install.RecoveryOptions{
+			ClusterID:                 f.Cluster,
+			RestoreFrom:               f.RestoreFrom,
+			Kit:                       f.RecoveryKit,
+			FleetKey:                  fleetKey,
+			Backup:                    f.Backup,
+			OldHostFenced:             f.OldHostFenced,
+			AcknowledgeSingleOperator: f.AcknowledgeSingleOperator,
+			Kind:                      kind,
+		}
+		if err := opts.Recovery.Validate(); err != nil {
+			return err
+		}
+	}
+
+	journalCluster := f.Name
+	if f.recoveringCluster() {
+		// The journal is keyed by the immutable id, so the next run of the same
+		// recovery finds it whatever the display name turns out to be.
+		journalCluster = f.Cluster
+	}
+	journalPath, err := install.JournalPath(journalCluster)
 	if err != nil {
 		return err
 	}

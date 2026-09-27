@@ -113,6 +113,13 @@ func TestPlatformInstallHelpListsExactlyItsFlagSurface(t *testing.T) {
 		"help": true, "instance-id": true, "name": true,
 		"org": true, "profile": true, "server": true, "ssh-key": true, "ssh-user": true,
 		"storage-device": true,
+		// The recovery surface (T4.8/T4.9). It is on THIS command deliberately:
+		// rebuilding a lost host is an install of the same bundle under an
+		// identity that already exists, and a separate verb would be a second
+		// implementation of the same stages.
+		"cluster": true, "restore-from": true, "recovery-kit": true,
+		"fleet-key-file": true, "backup": true, "old-host-fenced": true,
+		"acknowledge-single-operator": true, "admin-password": true,
 	}
 	got := map[string]bool{}
 	inFlags := false
@@ -523,5 +530,119 @@ func TestSetWindowSurfacesTheControlPlanesRefusal(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("nothing was stored, so no stored window may be reported:\n%s", out.String())
+	}
+}
+
+// A recovery is configured by TWO flags that only mean anything together, and
+// the install command must accept them as a pair.
+//
+// `--restore-from latest` says what to rebuild from; `--recovery-kit s3` says
+// where the kit that opens it comes from. A recovery with one and not the other
+// is a command that cannot do what it says — and the operator would believe a
+// recovery was configured when none was.
+func TestInstallAcceptsRestoreFromAndRecoveryKitTogether(t *testing.T) {
+	recovery := func() InstallFlags {
+		return InstallFlags{
+			Bundle:        "1.1",
+			Servers:       []string{"10.0.9.9"},
+			HATier:        "single-server",
+			RestoreFrom:   "latest",
+			RecoveryKit:   "s3",
+			BackupTarget:  "s3://kubenest-kit/clusters/prod-1?endpoint=minio.internal:9000&region=main",
+			FleetKeyFile:  "/home/op/fleet-key.txt",
+			OldHostFenced: true,
+		}
+	}
+
+	// The workload shape: the cluster is named by its IMMUTABLE id, never by a
+	// display name.
+	f := recovery()
+	f.Cluster = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c17"
+	if err := f.Validate(); err != nil {
+		t.Fatalf("a workload recovery was refused: %v", err)
+	}
+
+	// The all-in-one shape: the management cluster is named, and its id is read
+	// from the recovery set's binding rather than passed in.
+	f = recovery()
+	f.ControlPlane = true
+	f.Name = "managed-1"
+	f.Domain = "example.test"
+	f.AdminPassword = "the-operator's-own-password"
+	if err := f.Validate(); err != nil {
+		t.Fatalf("a control-plane recovery was refused: %v", err)
+	}
+
+	// And the refusals that keep the pair meaningful.
+	f = recovery()
+	f.Cluster = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c17"
+	f.OldHostFenced = false
+	if err := f.Validate(); err == nil || !strings.Contains(err.Error(), "old-host-fenced") {
+		t.Fatalf("a recovery without the fencing confirmation was accepted: %v", err)
+	}
+}
+
+// TestRestoreFromWithoutARecoveryKitIsRefused, and its mirror: either flag
+// alone is refused, and the refusal names the other one.
+func TestRestoreFromWithoutARecoveryKitIsRefused(t *testing.T) {
+	base := func() InstallFlags {
+		return InstallFlags{
+			Bundle: "1.1", Name: "prod-1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+		}
+	}
+
+	f := base()
+	f.RestoreFrom = "latest"
+	err := f.Validate()
+	if err == nil {
+		t.Fatal("--restore-from without --recovery-kit was accepted: nothing would open the backup")
+	}
+	// The refusal must say the flag is MISSING, not merely that its value is
+	// not one this release has: an operator told "s3 is not a kit source" would
+	// change the value of a flag they never passed.
+	if !strings.Contains(err.Error(), "needs --recovery-kit") {
+		t.Fatalf("the refusal does not say that --recovery-kit is missing: %v", err)
+	}
+
+	f = base()
+	f.RecoveryKit = "s3"
+	err = f.Validate()
+	if err == nil {
+		t.Fatal("--recovery-kit without --restore-from was accepted: nothing says what to rebuild from")
+	}
+	if !strings.Contains(err.Error(), "needs --restore-from") {
+		t.Fatalf("the refusal does not say that --restore-from is missing: %v", err)
+	}
+
+	// A recovery names the cluster by its immutable id. A display name alone
+	// never authorises adoption, so a recovery that offers only a name is
+	// refused — and tells the operator what to pass instead.
+	f = base()
+	f.RestoreFrom, f.RecoveryKit = "latest", "s3"
+	f.BackupTarget = "s3://kubenest-kit/clusters/prod-1?endpoint=minio.internal:9000&region=main"
+	f.FleetKeyFile = "/home/op/fleet-key.txt"
+	f.OldHostFenced = true
+	err = f.Validate()
+	if err == nil {
+		t.Fatal("a recovery selected by a display name was accepted: a name never authorises adoption")
+	}
+	if !strings.Contains(err.Error(), "--cluster") || !strings.Contains(err.Error(), "display name") {
+		t.Fatalf("the refusal neither names --cluster nor says why a name will not do: %v", err)
+	}
+
+	// And the workload shape refuses --name outright, because it selects
+	// nothing there and would suggest it did.
+	f = base()
+	f.RestoreFrom, f.RecoveryKit = "latest", "s3"
+	f.BackupTarget = "s3://kubenest-kit/clusters/prod-1?endpoint=minio.internal:9000&region=main"
+	f.FleetKeyFile = "/home/op/fleet-key.txt"
+	f.OldHostFenced = true
+	f.Cluster = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c17"
+	err = f.Validate()
+	if err == nil {
+		t.Fatal("a recovery accepted --name, which selects nothing in a recovery")
+	}
+	if !strings.Contains(err.Error(), "--name") {
+		t.Fatalf("the refusal does not name --name: %v", err)
 	}
 }
