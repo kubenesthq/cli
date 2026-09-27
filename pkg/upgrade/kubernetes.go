@@ -105,43 +105,77 @@ func stageKubernetes(ctx context.Context, s *Session) error {
 	}
 	if from == target {
 		s.Logf("  Kubernetes unchanged at %s", target)
+	} else {
+		s.Logf("  Kubernetes %s → %s. This is the point of no return: from here, going back means", from, target)
+		s.Logf("  restoring the datastore snapshot %s, with a service interruption.", s.Record.Snapshot)
+
+		perNode, err := s.To.Limits.Timeouts.For("upgrade-per-node")
+		if err != nil {
+			return err
+		}
+
+		plans := []struct {
+			name    string
+			servers bool
+			count   int
+		}{
+			{serverPlan, true, s.count(true)},
+			{agentPlan, false, s.count(false)},
+		}
+		for _, p := range plans {
+			if p.count == 0 {
+				continue
+			}
+			doc, err := planDoc(p.name, target, p.servers)
+			if err != nil {
+				return stages.NewComponentError("k3s", err)
+			}
+			if err := k3s.WriteManifest(ctx, server, p.name, doc); err != nil {
+				return stages.NewComponentError("k3s", err)
+			}
+			// One node, end to end, has its own deadline, so a slow loop cannot
+			// run indefinitely; the whole plan gets that per node.
+			deadline := perNode * time.Duration(p.count)
+			if err := waitForPlan(ctx, server, p.name, target, p.count, deadline, s.Reporter); err != nil {
+				return stages.NewComponentError("k3s", err)
+			}
+		}
+	}
+	// THE CLUSTER-DNS GUARANTEE GOES LAST IN THIS STAGE, and it goes here
+	// rather than in the installer alone because the k3s upgrade is the one
+	// thing that re-applies every packaged manifest: each server rewrites them
+	// at start-up and the deploy controller's first pass applies them all with
+	// the checksum comparison off (pkg/k3s/coredns.go, EnsureCoreDNSReplicas,
+	// for why that still cannot revert the two fields this sets — and for the
+	// one k3s release that could). Whatever a k3s upgrade does to the CoreDNS
+	// replica count, the upgrade that moved the Kubernetes version ends by
+	// putting it back, so the cluster is never left with DNS on one node.
+	//
+	// It runs even when the Kubernetes version does not move: this stage is
+	// where an upgrade asserts what it moved, and a run that skipped the pin
+	// change would otherwise be the one upgrade that never checks.
+	return s.ensureCoreDNS(ctx, server)
+}
+
+// ensureCoreDNS re-asserts the cluster-DNS layout the cluster's node count
+// calls for after the Kubernetes stage has restarted every node
+// (pkg/k3s.EnsureCoreDNSReplicas). A single-node cluster keeps k3s's one
+// replica; a cluster of two or more nodes runs two, one per node, so a name
+// lookup survives the loss of any one of them.
+func (s *Session) ensureCoreDNS(ctx context.Context, server k3s.Runner) error {
+	if len(s.Nodes) < 2 {
+		s.Logf("  one node: k3s's single CoreDNS replica stays — a second one has no other node to be scheduled on")
 		return nil
 	}
-
-	s.Logf("  Kubernetes %s → %s. This is the point of no return: from here, going back means", from, target)
-	s.Logf("  restoring the datastore snapshot %s, with a service interruption.", s.Record.Snapshot)
-
-	perNode, err := s.To.Limits.Timeouts.For("upgrade-per-node")
+	deadline, err := s.To.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
-
-	plans := []struct {
-		name    string
-		servers bool
-		count   int
-	}{
-		{serverPlan, true, s.count(true)},
-		{agentPlan, false, s.count(false)},
+	if err := k3s.EnsureCoreDNSReplicas(ctx, server, len(s.Nodes), deadline, s.Reporter); err != nil {
+		return stages.NewComponentError("k3s", fmt.Errorf("cluster DNS across %d nodes: %w", len(s.Nodes), err))
 	}
-	for _, p := range plans {
-		if p.count == 0 {
-			continue
-		}
-		doc, err := planDoc(p.name, target, p.servers)
-		if err != nil {
-			return stages.NewComponentError("k3s", err)
-		}
-		if err := k3s.WriteManifest(ctx, server, p.name, doc); err != nil {
-			return stages.NewComponentError("k3s", err)
-		}
-		// One node, end to end, has its own deadline, so a slow loop cannot
-		// run indefinitely; the whole plan gets that per node.
-		deadline := perNode * time.Duration(p.count)
-		if err := waitForPlan(ctx, server, p.name, target, p.count, deadline, s.Reporter); err != nil {
-			return stages.NewComponentError("k3s", err)
-		}
-	}
+	s.Logf("  CoreDNS: %d replicas across %d nodes, one per node, so a lookup survives the loss of any one of them",
+		k3s.CoreDNSReplicas(len(s.Nodes)), len(s.Nodes))
 	return nil
 }
 

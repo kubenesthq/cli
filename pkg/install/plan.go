@@ -725,42 +725,84 @@ func stageK3sServer(ctx context.Context, s *Session) error {
 	return k3s.WaitNodesReady(ctx, servers[0].Runner, s.Bundle, len(servers), s.Reporter)
 }
 
-// stageK3sAgents joins the worker nodes.
+// stageK3sAgents joins the agent nodes, and then — this being the stage whose
+// job ends the node set — asserts the cluster-DNS layout that finished node set
+// needs.
+//
+// THE DNS STEP IS OUTSIDE THE AGENT BRANCH, and that placement is the point:
+// the `ha` tier is three servers and no agents, so a step after the join loop
+// would never run on the clusters that most need it. Which replica count a
+// cluster requires is a function of how many nodes it has (pkg/k3s,
+// CoreDNSReplicas), so the one place it can be decided is after every node is
+// in and Ready, and that is here.
 func stageK3sAgents(ctx context.Context, s *Session) error {
 	agents := s.NodesWithRole(RoleAgent)
-	if len(agents) == 0 {
-		return nil
-	}
-	servers := s.NodesWithRole(RoleServer)
-	if len(servers) == 0 {
-		return fmt.Errorf("no server node to join")
-	}
-	// The token this install minted for its first server, so every agent joins
-	// with the same value the kit will carry. A resume skips the k3s stage, so
-	// fall back to the read path rather than minting a second token that no
-	// node would accept.
-	token := s.joinToken
-	if token == "" {
-		var err error
-		token, err = k3s.NodeToken(ctx, servers[0].Runner)
-		if err != nil {
+	if len(agents) > 0 {
+		servers := s.NodesWithRole(RoleServer)
+		if len(servers) == 0 {
+			return fmt.Errorf("no server node to join")
+		}
+		// The token this install minted for its first server, so every agent
+		// joins with the same value the kit will carry. A resume skips the k3s
+		// stage, so fall back to the read path rather than minting a second
+		// token that no node would accept.
+		token := s.joinToken
+		if token == "" {
+			var err error
+			token, err = k3s.NodeToken(ctx, servers[0].Runner)
+			if err != nil {
+				return err
+			}
+		}
+		joinURL := serverURL(servers[0].Address)
+		for _, node := range agents {
+			// The same host policy as the servers, before k3s lands on the
+			// host: an agent host installs security updates and reboots on the
+			// same terms as a server, and k3s-agent.service must be as
+			// unreachable to needrestart as k3s.service is (pkg/hostpolicy).
+			if err := hostpolicy.Apply(ctx, node.Runner); err != nil {
+				return fmt.Errorf("host policy on %s: %w", node.Address, err)
+			}
+			if err := k3s.InstallAgent(ctx, node.Runner, s.Bundle, joinURL, token, s.Reporter); err != nil {
+				return fmt.Errorf("joining agent %s: %w", node.Address, err)
+			}
+		}
+		if err := k3s.WaitNodesReady(ctx, servers[0].Runner, s.Bundle, len(s.Nodes), s.Reporter); err != nil {
 			return err
 		}
 	}
-	joinURL := serverURL(servers[0].Address)
-	for _, node := range agents {
-		// The same host policy as the servers, before k3s lands on the host:
-		// an agent host installs security updates and reboots on the same
-		// terms as a server, and k3s-agent.service must be as unreachable to
-		// needrestart as k3s.service is (pkg/hostpolicy).
-		if err := hostpolicy.Apply(ctx, node.Runner); err != nil {
-			return fmt.Errorf("host policy on %s: %w", node.Address, err)
-		}
-		if err := k3s.InstallAgent(ctx, node.Runner, s.Bundle, joinURL, token, s.Reporter); err != nil {
-			return fmt.Errorf("joining agent %s: %w", node.Address, err)
-		}
+	return s.ensureCoreDNS(ctx)
+}
+
+// ensureCoreDNS is the installer's half of the cluster-DNS guarantee: a name
+// lookup has to keep working when any one node stops, or everything that
+// resolves a name — a Velero restore reaching its backup target above all —
+// stops with it until Kubernetes evicts the only CoreDNS pod off the dead node
+// (kn-t43-restore-workload-s-stranded-11o7.2).
+//
+// A single-node cluster keeps k3s's one replica, deliberately: k3s's packaged
+// manifest spreads these pods one per hostname with DoNotSchedule, so a second
+// replica has no node to go to and would sit Pending for the life of the
+// cluster. Every cluster of two or more nodes runs two, one per node.
+func (s *Session) ensureCoreDNS(ctx context.Context) error {
+	if len(s.Nodes) < 2 {
+		s.Logf("  one node: k3s's single CoreDNS replica stays — a second one has no other node to be scheduled on")
+		return nil
 	}
-	return k3s.WaitNodesReady(ctx, servers[0].Runner, s.Bundle, len(s.Nodes), s.Reporter)
+	server, err := s.Server()
+	if err != nil {
+		return err
+	}
+	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return err
+	}
+	if err := k3s.EnsureCoreDNSReplicas(ctx, server, len(s.Nodes), deadline, s.Reporter); err != nil {
+		return stages.NewComponentError("k3s", fmt.Errorf("cluster DNS across %d nodes: %w", len(s.Nodes), err))
+	}
+	s.Logf("  CoreDNS: %d replicas across %d nodes, one per node, so a lookup survives the loss of any one of them",
+		k3s.CoreDNSReplicas(len(s.Nodes)), len(s.Nodes))
+	return nil
 }
 
 // serverURL is the address other nodes join through. It is the address the
