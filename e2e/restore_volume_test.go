@@ -21,14 +21,23 @@
 //	./scripts/ephemeral-env.sh up --profile host --nodes 3
 //	source lab/hetzner/.lab-env.sh          # KUBENEST_LAB_NODE1_IP/2_IP/3_IP, SSH key
 //	export KUBENEST_CONTROL_PLANE=… KUBENEST_CLI_TOKEN=…      # a control plane
+//	export KUBENEST_ADMIN_EMAIL=… KUBENEST_ADMIN_PASSWORD=…   # to create the fixture's project
+//	export KUBENEST_GATE_CLUSTER=…          # the cluster's name as the control plane knows it; the fixture's project is created on it (the default, gate-single-server, is not a three-node lab)
+//	export KUBENEST_BUNDLE=…                # the bundle the lab installed (the default is 1.0)
 //	export KUBENEST_BACKUP_ACCESS_KEY_ID=… KUBENEST_BACKUP_SECRET_ACCESS_KEY=…
 //	cd kubenest-cli && go test -tags e2e -run TestRestoreVolume -v -timeout 4h ./e2e/
+//
+// The fixture's namespace is a PROJECT this gate creates through the control
+// plane (createProjectNamespace, shared with S4), not a bare Namespace: mode 2's
+// step 2 writes its reconcile pause on the Project named after the namespace and
+// refuses when nothing can acknowledge it.
 //
 // The gate skips, naming that command, when only one node is present.
 package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -42,9 +51,21 @@ import (
 	"kubenest.io/cli/pkg/sshx"
 )
 
-// s5Namespace is the fixture namespace, and each fixture gets its own workload
-// name inside it so the two subtests cannot see each other's volumes.
-const s5Namespace = "e2e-restore-volumes"
+// s5Project is the fixture PROJECT, and each fixture gets its own workload name
+// inside its namespace so the two subtests cannot see each other's volumes.
+const s5Project = "e2e-restore-volumes"
+
+// s5Namespace is the namespace the control plane gave that project. The
+// OPERATOR creates it, not the gate: s5Open fills this in from the control
+// plane's answer, and every call both gates hanging off this fixture make names
+// it. It is deliberately not a constant — the platform, not the gate, decides a
+// project's namespace, and a name derived from the project's name would be a
+// guess about a value the control plane owns.
+var s5Namespace string
+
+// s5PendingSettle is how long the replacement pod must have been Pending before
+// the gate believes it is stranded rather than still being scheduled.
+const s5PendingSettle = 30 * time.Second
 
 // s5Lab is the gate's handle on the three-node lab. Every kubectl call goes
 // through node 1 (a server is the only node that runs kubectl), and the
@@ -83,6 +104,11 @@ func s5Open(t *testing.T, env gateEnv) *s5Lab {
 		lab.nodes[name] = runner
 		t.Cleanup(func() { _ = runner.Close() })
 	}
+	// The fixture namespace is the PROJECT's, created the way the console
+	// creates one: mode 2's pause has to land on the Project named after it, and
+	// a namespace written by hand has no Project behind it (hardware,
+	// 2026-09-27).
+	s5Namespace = createProjectNamespace(t, env, controlPlane, env.cluster, s5Project, lab)
 	return lab
 }
 
@@ -103,6 +129,13 @@ func (l *s5Lab) kubectl(args string) string {
 		l.t.Fatalf("kubectl %s: %v", args, err)
 	}
 	return out
+}
+
+// kubectlStatus runs kubectl and returns its error rather than failing the
+// test, for the callers that poll: a missing claim or namespace is an
+// observation on the way to the answer, not a failure.
+func (l *s5Lab) kubectlStatus(args string) (string, error) {
+	return k3s.Kubectl(context.Background(), l.nodes["node1"], args)
 }
 
 func (l *s5Lab) apply(doc string) {
@@ -199,7 +232,6 @@ func (l *s5Lab) serverNode() string {
 func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 	env := gateEnvironment(t)
 	lab := s5Open(t, env)
-	lab.apply(s5NamespaceDocument())
 	lab.kubectl("delete configmap kubenest-operation -n kube-system --ignore-not-found")
 
 	t.Run("dead-node", func(t *testing.T) {
@@ -215,10 +247,20 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		lab.writeClaim(workload, "/b", "dead-b-"+tag)
 
 		lab.backupNow()
-		// The node loss: k3s-agent stopped, the pods force-deleted, and the
-		// claims deleted — which is what a dead node's volumes look like from
-		// the API.
-		lab.kubectl("-n " + s5Namespace + " scale deployment " + workload + " --replicas=0")
+		replicas := lab.replicas(workload)
+
+		// THE NODE LOSS, as the API sees a node that is not coming back: its
+		// k3s-agent stops, the Pod it held goes, and the ReplicaSet's
+		// replacement mounts the claims it cannot reach.
+		//
+		// THE CLAIMS AND THE DEPLOYMENT STAY, because mode 2 does those steps
+		// itself: step 1 finds the mounting workloads through their PODS,
+		// step 3 scales those workloads to zero and step 4 deletes the stranded
+		// claims (plan 7.5 mode 2). The first version of this fixture copied
+		// probe P5's raw-Velero steps and scaled the Deployment, force-deleted
+		// the Pods and deleted the claims first, and on hardware (2026-09-27)
+		// the command refused with `claim e2e-restore-volumes/dead-a is not in
+		// the namespace, so there is nothing to refill`.
 		lab.stopAgent(agent)
 		// The node comes back when this arm ends: the next arm needs a whole
 		// cluster, and on hardware (2026-09-27) its backup could not reach the
@@ -231,17 +273,9 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 			}
 			return strings.TrimSpace(out) != "True", strings.TrimSpace(out)
 		})
-		lab.kubectl("-n " + s5Namespace + " delete pod -l app=" + workload + " --grace-period=0 --force --ignore-not-found")
-		lab.kubectl("-n " + s5Namespace + " delete pvc " + workload + "-a " + workload + "-b --wait=false")
-		lab.waitFor(3*time.Minute, "the dead node's claims to be gone", func() (bool, string) {
-			// This workload's own claims: another arm's, or a claim an earlier
-			// run left in the namespace, is not this node's loss.
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc "+workload+"-a "+workload+"-b --ignore-not-found -o name")
-			if err != nil {
-				return false, err.Error()
-			}
-			return strings.TrimSpace(out) == "", out
-		})
+		lab.kubectl("-n " + s5Namespace + " delete pod " + lab.podOnNode(workload, agent) + " --grace-period=0 --force")
+		lab.waitFor(5*time.Minute, "the ReplicaSet's replacement pod to stay Pending on the stranded claims", lab.pendingHolder(workload))
+		before := lab.claimIdentities(workload+"-a", workload+"-b")
 
 		var out strings.Builder
 		err := lab.runCLI(&out, append([]string{"backup", "restore",
@@ -251,37 +285,50 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		if err != nil {
 			t.Fatalf("the volume restore failed: %v\n%s", err, out.String())
 		}
-		for _, want := range []string{"Volume restore plan", "keeps its current contents", "restored — awaiting activation", "held at 0 replicas"} {
-			if !strings.Contains(out.String(), want) {
-				t.Errorf("the run does not say %q:\n%s", want, out.String())
-			}
-		}
 		operationID := s4OperationID(out.String())
 		if operationID == "" {
 			t.Fatalf("the run printed no operation id:\n%s", out.String())
 		}
-		// Every named claim is Bound, on a node that is Ready.
-		lab.waitFor(10*time.Minute, "both refilled claims to be Bound", func() (bool, string) {
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}'")
-			if err != nil {
-				return false, err.Error()
-			}
-			phases := strings.Fields(out)
-			if len(phases) != 2 {
-				return false, out
-			}
-			for _, phase := range phases {
-				if !strings.HasSuffix(phase, "=Bound") {
-					return false, out
+		// Step 3 of mode 2 scales the mounting workload to zero and step 7
+		// keeps it there until activation, so nothing of the workload runs
+		// before its data is back. (The fixture no longer scales it; this is
+		// the product's own postcondition.)
+		if got := lab.replicas(workload); got != "0" {
+			t.Errorf("the run left %s at %s replicas, want it held at 0 until activation (plan 7.5 mode 2, step 3)", workload, got)
+		}
+		// THE REFILL IS THE CLAIMS BEING NEW OBJECTS ON FRESH VOLUMES. The gate
+		// no longer deletes the claims, so their phase proves nothing here: they
+		// were Bound before the restore too, to the volumes the dead node held.
+		// Step 4 deletes each named claim and Velero provisions a volume that
+		// never belonged to that node, so both the claim's UID and its bound
+		// volume must change.
+		lab.waitFor(10*time.Minute, "both named claims replaced by fresh volumes", func() (bool, string) {
+			for claim, was := range before {
+				now, err := lab.claimIdentity(claim)
+				if err != nil {
+					return false, err.Error()
+				}
+				if now.uid == was.uid {
+					return false, claim + " still has uid " + was.uid + ": it was not deleted and refilled"
+				}
+				if now.volume == "" {
+					return false, claim + " is bound to no volume"
+				}
+				if now.volume == was.volume {
+					return false, claim + " kept the volume " + was.volume + " it held on the dead node"
 				}
 			}
-			return true, out
+			return true, "both claims are new objects bound to fresh volumes"
 		})
 
-		// Activation brings the workload back, and the workload's OWN pod then
-		// reads the backup's data — the same thing P5 measured.
+		// Activation brings the workload back to its recorded replica count,
+		// and the workload's OWN pod then reads the backup's data — the same
+		// thing P5 measured.
 		if err := lab.runCLI(&out, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
 			t.Fatalf("activation failed: %v\n%s", err, out.String())
+		}
+		if got := lab.replicas(workload); got != replicas {
+			t.Errorf("activation put %s at %s replicas, want the recorded %s", workload, got, replicas)
 		}
 		lab.waitFor(5*time.Minute, "the workload's own pod to run on the refilled volumes", func() (bool, string) {
 			return lab.podRunning(workload), lab.podState(workload)
@@ -289,8 +336,10 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		if got := lab.readClaims(workload); !strings.Contains(got, "dead-a-"+tag) || !strings.Contains(got, "dead-b-"+tag) {
 			t.Errorf("the workload reads %q, want the backup's dead-a-%s and dead-b-%s", got, tag, tag)
 		}
-		if node := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " -o jsonpath={.items[0].spec.nodeName}")); node == agent {
-			t.Errorf("the refilled workload landed back on the dead node %s", agent)
+		// The fresh volumes are on a LIVE node: the pod that mounts them runs,
+		// and it is not on the node that died.
+		if node := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " -o jsonpath={.items[0].spec.nodeName}")); node == agent || node == "" {
+			t.Errorf("the refilled workload runs on %q, want a live node other than the dead %s", node, agent)
 		}
 	})
 
@@ -304,7 +353,9 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		})
 		lab.writeClaim(workload, "/a", "sel-a-v1-"+tag)
 		lab.writeClaim(workload, "/b", "sel-b-v1-"+tag)
-		unnamedBefore := lab.claimUID(workload + "-b")
+		namedBefore := lab.claimIdentityOrFatal(workload + "-a")
+		unnamedBefore := lab.claimIdentityOrFatal(workload + "-b")
+		replicas := lab.replicas(workload)
 
 		lab.backupNow()
 		// NEWER data into the claim that will NOT be named.
@@ -325,11 +376,34 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		if operationID == "" {
 			t.Fatalf("the run printed no operation id:\n%s", out.String())
 		}
-		if uid := lab.claimUID(workload + "-b"); uid != unnamedBefore {
-			t.Errorf("the UNNAMED claim was replaced (uid %s -> %s): the restore disturbed a volume it was not asked to touch", unnamedBefore, uid)
+		// THE NAMED CLAIM IS THE ONE THE MODE MUST REPLACE, and the gate does
+		// not delete it: step 4 does (plan 7.5 mode 2). Without this the
+		// "reads the backup's data" check below would pass on a restore that
+		// did nothing at all, because sel-a's file has not changed since the
+		// backup was taken.
+		namedAfter := lab.claimIdentityOrFatal(workload + "-a")
+		if namedAfter.uid == namedBefore.uid {
+			t.Errorf("the NAMED claim is still uid %s: it was not deleted and refilled, so the data below is the live node's, not the backup's", namedBefore.uid)
+		}
+		if namedAfter.volume == "" || namedAfter.volume == namedBefore.volume {
+			t.Errorf("the NAMED claim is bound to %q, want a fresh volume and not the %s it held", namedAfter.volume, namedBefore.volume)
+		}
+		// The UNNAMED claim of the same Pod is the invariant this mode exists
+		// for: neither its object nor its volume may be disturbed, and its
+		// newer bytes must survive.
+		unnamedAfter := lab.claimIdentityOrFatal(workload + "-b")
+		if unnamedAfter.uid != unnamedBefore.uid || unnamedAfter.volume != unnamedBefore.volume {
+			t.Errorf("the UNNAMED claim was replaced (uid %s -> %s, volume %s -> %s): the restore disturbed a volume it was not asked to touch",
+				unnamedBefore.uid, unnamedAfter.uid, unnamedBefore.volume, unnamedAfter.volume)
+		}
+		if got := lab.replicas(workload); got != "0" {
+			t.Errorf("the run left %s at %s replicas, want it held at 0 until activation (plan 7.5 mode 2, step 3)", workload, got)
 		}
 		if err := lab.runCLI(&out, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
 			t.Fatalf("activation failed: %v\n%s", err, out.String())
+		}
+		if got := lab.replicas(workload); got != replicas {
+			t.Errorf("activation put %s at %s replicas, want the recorded %s", workload, got, replicas)
 		}
 		lab.waitFor(5*time.Minute, "the selective workload's own pod", func() (bool, string) {
 			return lab.podRunning(workload), lab.podState(workload)
@@ -349,7 +423,6 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 func TestRestoreVolumeResume(t *testing.T) {
 	env := gateEnvironment(t)
 	lab := s5Open(t, env)
-	lab.apply(s5NamespaceDocument())
 	lab.kubectl("delete configmap kubenest-operation -n kube-system --ignore-not-found")
 
 	server := lab.serverNode()
@@ -361,7 +434,12 @@ func TestRestoreVolumeResume(t *testing.T) {
 	})
 	lab.writeClaim(workload, "/a", "resume-a-"+tag)
 	lab.writeClaim(workload, "/b", "resume-b-"+tag)
+	before := lab.claimIdentities(workload+"-a", workload+"-b")
 	lab.backupNow()
+	restoresBefore, err := lab.volumeRestores()
+	if err != nil {
+		t.Fatalf("listing the velero Restores before the run: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -378,14 +456,21 @@ func TestRestoreVolumeResume(t *testing.T) {
 		done <- root.ExecuteContext(ctx)
 	}()
 	// THE KILL WINDOW: the workloads are at zero and the claims are deleted, so
-	// the next step is the restore itself.
+	// the next step is the restore itself. What must not exist yet is THIS RUN's
+	// Restore — not every Restore in the velero namespace: the command does not
+	// delete the Restore objects it creates, and the arm before this one leaves
+	// its own behind, so "velero has no Restore" is a condition that never comes
+	// back.
 	lab.waitFor(10*time.Minute, "the claims to be deleted before the Restore is created", func() (bool, string) {
-		restores := strings.TrimSpace(lab.kubectl("get restores.velero.io -n velero -o name --no-headers 2>/dev/null"))
-		claims := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pvc " + workload + "-a " + workload + "-b -o name --ignore-not-found"))
-		if restores != "" {
+		now, err := lab.volumeRestores()
+		if err != nil {
+			return false, err.Error()
+		}
+		if len(now) != len(restoresBefore) {
 			return false, "the Restore already exists; the window is gone"
 		}
-		return claims == "", "the claims are gone and no Restore exists yet"
+		claims := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pvc " + workload + "-a " + workload + "-b -o name --ignore-not-found"))
+		return claims == "", "the claims are gone and no Restore of this run exists yet"
 	})
 	cancel()
 	if err := <-done; err == nil {
@@ -395,15 +480,30 @@ func TestRestoreVolumeResume(t *testing.T) {
 	if pause == "" {
 		t.Fatal("the interrupted run left no pause behind")
 	}
-	scaledBefore := lab.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}")
+	scaledBefore := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}"))
 
 	var resumed strings.Builder
 	if err := lab.runCLI(&resumed, append([]string{"backup", "restore", "--resume", pause}, lab.verbArgs()...)...); err != nil {
 		t.Fatalf("--resume failed: %v\n%s", err, resumed.String())
 	}
-	if !strings.Contains(resumed.String(), "restored — awaiting activation") {
-		t.Errorf("the resume did not finish the data restore:\n%s", resumed.String())
-	}
+	// The resume finished the data restore: the claims the killed run deleted
+	// come back as NEW objects bound to fresh volumes. The claim is the
+	// postcondition, not the run's own wording.
+	lab.waitFor(10*time.Minute, "the resumed claims refilled and bound to fresh volumes", func() (bool, string) {
+		for claim, was := range before {
+			now, err := lab.claimIdentity(claim)
+			if err != nil {
+				return false, err.Error()
+			}
+			if now.uid == was.uid {
+				return false, claim + " is still uid " + was.uid
+			}
+			if now.volume == "" || now.volume == was.volume {
+				return false, claim + " is bound to " + now.volume
+			}
+		}
+		return true, "both claims are new objects bound to fresh volumes"
+	})
 	if got := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}")); got != scaledBefore {
 		t.Errorf("the resume changed the workload's replicas (%s -> %s): it continues a restore, it does not scale anything back", scaledBefore, got)
 	}
@@ -502,6 +602,94 @@ func (l *s5Lab) podRunning(workload string) bool {
 	return len(phases) == 1 && phases[0] == "Running"
 }
 
+// replicas is the workload's desired replica count: mode 2 records it before
+// scaling the workload to zero (step 3) and puts it back at activation (step 7),
+// so the gate reads it itself rather than trusting either run's prose.
+func (l *s5Lab) replicas(workload string) string {
+	return strings.TrimSpace(l.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}"))
+}
+
+// podOnNode names the pod a workload has on one node.
+func (l *s5Lab) podOnNode(workload, node string) string {
+	l.t.Helper()
+	pod := strings.TrimSpace(l.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " --field-selector spec.nodeName=" + node + " -o jsonpath={.items[0].metadata.name}"))
+	if pod == "" {
+		l.t.Fatalf("%s has no pod on %s, so that node's loss cannot be simulated", workload, node)
+	}
+	return pod
+}
+
+// pendingHolder is what a dead node leaves behind, and the state mode 2's step 1
+// needs to see: the pod is still there, it mounts the claims the node took away,
+// and it stays Pending because nothing can give it those volumes.
+//
+// THE REPLACEMENT POD IS WHY THE FIXTURE DOES NOT SCALE ANYTHING. The gate used
+// to delete the pod and the claims and scale the Deployment to zero, which is
+// what P5's raw-Velero probe had to do to Velero directly; through the command
+// it is step 1's input and steps 3-4's job. On hardware (2026-09-27) that
+// fixture made the command refuse with "claim .../dead-a is not in the
+// namespace, so there is nothing to refill".
+//
+// The pod list is read as JSON rather than through a path expression, the way
+// the product reads cluster state: the mounts are a list of objects, and a
+// rendering that silently yields nothing would look like a pod that mounts
+// nothing instead of failing here.
+func (l *s5Lab) pendingHolder(workload string) func() (bool, string) {
+	return func() (bool, string) {
+		out, err := l.kubectlStatus("-n " + s5Namespace + " get pods -l app=" + workload + " -o json")
+		if err != nil {
+			return false, err.Error()
+		}
+		var list struct {
+			Items []struct {
+				Metadata struct {
+					Name              string `json:"name"`
+					CreationTimestamp string `json:"creationTimestamp"`
+				} `json:"metadata"`
+				Spec struct {
+					Volumes []struct {
+						PersistentVolumeClaim *struct {
+							ClaimName string `json:"claimName"`
+						} `json:"persistentVolumeClaim"`
+					} `json:"volumes"`
+				} `json:"spec"`
+				Status struct {
+					Phase string `json:"phase"`
+				} `json:"status"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(out), &list); err != nil {
+			return false, err.Error()
+		}
+		if len(list.Items) != 1 {
+			return false, fmt.Sprintf("the workload has %d pods", len(list.Items))
+		}
+		pod := list.Items[0]
+		if pod.Status.Phase != "Pending" {
+			return false, pod.Metadata.Name + " is " + pod.Status.Phase
+		}
+		mounted := map[string]bool{}
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil {
+				mounted[volume.PersistentVolumeClaim.ClaimName] = true
+			}
+		}
+		for _, claim := range []string{workload + "-a", workload + "-b"} {
+			if !mounted[claim] {
+				return false, pod.Metadata.Name + " does not mount " + claim
+			}
+		}
+		at, err := time.Parse(time.RFC3339, pod.Metadata.CreationTimestamp)
+		if err != nil {
+			return false, pod.Metadata.Name + " was created at " + pod.Metadata.CreationTimestamp + ", which does not parse"
+		}
+		if age := time.Since(at); age < s5PendingSettle {
+			return false, fmt.Sprintf("%s has been Pending for %s of %s", pod.Metadata.Name, age.Round(time.Second), s5PendingSettle)
+		}
+		return true, fmt.Sprintf("%s has been Pending on the stranded claims for %s", pod.Metadata.Name, time.Since(at).Round(time.Second))
+	}
+}
+
 // writeClaim writes one file into the claim mounted at the given path.
 func (l *s5Lab) writeClaim(workload, path, content string) {
 	l.t.Helper()
@@ -531,22 +719,98 @@ func (l *s5Lab) readClaims(workload string) string {
 	return strings.TrimSpace(out)
 }
 
-func (l *s5Lab) claimUID(name string) string {
-	out, err := k3s.Kubectl(context.Background(), l.nodes["node1"], "-n "+s5Namespace+" get pvc "+name+" -o jsonpath={.metadata.uid}")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out)
+// claimIdentity is a claim's UID and the volume it is bound to.
+//
+// IT IS THE OBSERVABLE A REFILL HAS TO MOVE, now that the gate no longer
+// deletes the claims itself: mode 2's step 4 deletes each named claim and Velero
+// provisions a volume that never belonged to the dead node, so a claim that
+// still has its old UID or its old volume was not refilled — and its Bound
+// phase says nothing, because it was Bound before the restore too (probe P5:
+// claims that kept their volume name stayed Pending for ever).
+type claimIdentity struct {
+	uid    string
+	volume string
 }
 
+func (l *s5Lab) claimIdentity(claim string) (claimIdentity, error) {
+	out, err := l.kubectlStatus("-n " + s5Namespace + " get persistentvolumeclaim " + claim + " -o jsonpath='{.metadata.uid} {.spec.volumeName}'")
+	if err != nil {
+		return claimIdentity{}, err
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 {
+		return claimIdentity{}, fmt.Errorf("claim %s reads %q, want a uid and a volume name", claim, strings.TrimSpace(out))
+	}
+	return claimIdentity{uid: fields[0], volume: fields[1]}, nil
+}
+
+func (l *s5Lab) claimIdentities(claims ...string) map[string]claimIdentity {
+	l.t.Helper()
+	out := map[string]claimIdentity{}
+	for _, claim := range claims {
+		identity, err := l.claimIdentity(claim)
+		if err != nil {
+			l.t.Fatalf("reading %s before the restore: %v", claim, err)
+		}
+		out[claim] = identity
+	}
+	return out
+}
+
+// claimIdentityOrFatal is claimIdentity where the claim MUST be there: the
+// caller reads it to compare with one it read earlier, so a missing claim is a
+// failure rather than an observation.
+func (l *s5Lab) claimIdentityOrFatal(claim string) claimIdentity {
+	l.t.Helper()
+	identity, err := l.claimIdentity(claim)
+	if err != nil {
+		l.t.Fatalf("reading %s: %v", claim, err)
+	}
+	return identity
+}
+
+// volumeRestores names the mode-2 Restore objects in the velero namespace —
+// "kubenest-restore-volumes-<operation>" (the drill's are
+// "kubenest-restore-drill-…" and mode 1's are "kubenest-restore-<operation>",
+// so the prefix is this mode's own). The resume gate uses the count to tell
+// whether the run it killed had reached its Restore: the command never deletes
+// these, so the answer has to be a difference from a baseline.
+func (l *s5Lab) volumeRestores() ([]string, error) {
+	out, err := l.kubectlStatus("get restores.velero.io -n velero -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if name := strings.TrimSpace(line); strings.HasPrefix(name, "kubenest-restore-volumes-") {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+// s5NamespaceDocument is the bare Namespace document S5's node gate (T5.5,
+// node_lifecycle_test.go) still applies before its workloads. This gate does not
+// call it: s5Open has already made the fixture namespace a PROJECT, which is
+// what mode 2's pause needs, so applying this on top is only a merge into a
+// namespace the operator owns. It stays until that gate's fixture moves onto
+// the project too.
 func s5NamespaceDocument() string {
 	return fmt.Sprintf("apiVersion: v1\nkind: Namespace\nmetadata: {name: %s}\n", s5Namespace)
 }
 
-// s5WorkloadDocument is a Deployment with two claims, pinned to one node. The
-// second claim is labelled differently from the first ONLY in the fixture's
-// own labels, which the restore's selector uses: both carry the workload's
-// selector labels, which is what the mode checks before it deletes anything.
+// s5WorkloadDocument is a Deployment with two claims, pinned to one node. Both
+// claims carry the workload's selector labels, which the mode REQUIRES before it
+// deletes anything (Velero's selector has to match the claim for it to come
+// back), and the unnamed one of the two keeps its current contents because the
+// restore's modifier strips it from the restored pod — not because the selector
+// misses it.
+//
+// The namespace is s5Namespace, the one the control plane gave the fixture's
+// project: the operator creates it, so no caller passes a name of its own. both
+// is T5.5's node gate's argument and decides nothing here: the mode needs BOTH
+// claims to carry the workload's selector labels, so the two documents are the
+// same either way.
 func s5WorkloadDocument(name string, nodeSelector map[string]string, both bool) string {
 	selector := "app: " + name
 	nodeLine := ""

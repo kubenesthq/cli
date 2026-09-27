@@ -27,6 +27,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -199,73 +200,135 @@ func (c *s4Cluster) waitFor(within time.Duration, what string, check func() (boo
 	}
 }
 
-// createProject creates the project THROUGH THE CONTROL PLANE, which is what
-// makes the namespace the reconcilers' to create: the gate is "I deleted the
-// payments namespace", and the namespace has to be one the platform put there.
-// sessionClient signs in as the administrator for the one call that needs a
+// e2eFixtureCluster is what creating a gate's fixture project needs of that
+// gate's cluster handle: a kubectl that reports its error instead of failing
+// the test, because the creator POLLS with it, and a waitFor to poll.
+type e2eFixtureCluster interface {
+	kubectlStatus(args string) (string, error)
+	waitFor(within time.Duration, what string, check func() (bool, string))
+}
+
+// e2eAdminSession signs in as the administrator for the one call that needs a
 // user session. POST /api/v1/projects accepts no CLI token, because projects
-// belong to the console, so the fixture's project is created the way the
-// console creates one. On hardware (2026-09-27) the gate's CLI token was
-// refused there.
-func (c *s4Cluster) sessionClient() *api.Client {
-	c.t.Helper()
+// belong to the console, so a fixture's project is created the way the console
+// creates one. On hardware (2026-09-27) the gate's CLI token was refused there.
+func e2eAdminSession(t *testing.T, env gateEnv) *api.Client {
+	t.Helper()
 	email, password := os.Getenv("KUBENEST_ADMIN_EMAIL"), os.Getenv("KUBENEST_ADMIN_PASSWORD")
 	if email == "" || password == "" {
-		c.t.Skip("KUBENEST_ADMIN_EMAIL and KUBENEST_ADMIN_PASSWORD are not set: creating the fixture's project needs a user session (POST /api/v1/projects accepts no CLI token)")
+		t.Skip("KUBENEST_ADMIN_EMAIL and KUBENEST_ADMIN_PASSWORD are not set: creating the fixture's project needs a user session (POST /api/v1/projects accepts no CLI token)")
 	}
-	anonymous, err := api.New(c.env.controlPlane)
+	anonymous, err := api.New(env.controlPlane)
 	if err != nil {
-		c.t.Fatalf("building a client for the administrator's login: %v", err)
+		t.Fatalf("building a client for the administrator's login: %v", err)
 	}
 	token, err := anonymous.PasswordLogin(context.Background(), email, password)
 	if err != nil {
-		c.t.Fatalf("signing in as %s to create the fixture's project: %v", email, err)
+		t.Fatalf("signing in as %s to create the fixture's project: %v", email, err)
 	}
-	session, err := api.New(c.env.controlPlane, api.WithToken(token))
+	session, err := api.New(env.controlPlane, api.WithToken(token))
 	if err != nil {
-		c.t.Fatalf("building the administrator's session client: %v", err)
+		t.Fatalf("building the administrator's session client: %v", err)
 	}
 	return session
 }
 
-func (c *s4Cluster) createProject(name string) string {
-	c.t.Helper()
-	orgs, err := c.client.ListOrgs(context.Background())
+// createProjectNamespace creates a project THROUGH THE CONTROL PLANE and
+// returns the namespace the control plane named, waiting for the operator to
+// reconcile it into existence.
+//
+// THE PROJECT IS THE POINT, for every gate that needs one: the namespace has to
+// be one the platform put there. S4's gate is "I deleted the payments
+// namespace"; T4.3's mode 2 writes its reconcile pause on the Project named
+// after the namespace and refuses when nothing can acknowledge it, so a bare
+// Namespace object made its selective arm fail on hardware (2026-09-27) with
+// `annotate project e2e-restore-volumes -n kubenest-system ...: NotFound`. The
+// operator creates the project's namespace, so callers use the name that comes
+// back, not one they derive.
+//
+// A NAME THAT ALREADY EXISTS IS NOT A FAILURE: POST refuses a duplicate, and a
+// re-run — or the second gate in one package — must still learn the namespace,
+// so the project is read back from the list. The namespace is only ever the
+// control plane's to choose.
+func createProjectNamespace(t *testing.T, env gateEnv, control *api.Client, clusterName, name string, c e2eFixtureCluster) string {
+	t.Helper()
+	orgs, err := control.ListOrgs(context.Background())
 	if err != nil || len(orgs) == 0 {
-		c.t.Fatalf("listing organisations: %v (%d orgs)", err, len(orgs))
+		t.Fatalf("listing organisations: %v (%d orgs)", err, len(orgs))
 	}
 	var clusterID string
 	for _, org := range orgs {
-		clusters, err := c.client.ListOrgClusters(context.Background(), org.ID)
+		clusters, err := control.ListOrgClusters(context.Background(), org.ID)
 		if err != nil {
-			c.t.Fatalf("listing %s's clusters: %v", org.Name, err)
+			t.Fatalf("listing %s's clusters: %v", org.Name, err)
 		}
-		for _, cluster := range clusters {
-			if cluster.Name == c.cluster {
-				clusterID = cluster.ID
+		for _, listed := range clusters {
+			if listed.Name == clusterName {
+				clusterID = listed.ID
 			}
 		}
 	}
 	if clusterID == "" {
-		c.t.Fatalf("the control plane has no cluster named %s", c.cluster)
+		t.Fatalf("the control plane has no cluster named %s", clusterName)
 	}
-	project, err := c.sessionClient().CreateProject(context.Background(), clusterID, name)
-	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already") {
-		c.t.Fatalf("creating project %s through the control plane: %v", name, err)
+	session := e2eAdminSession(t, env)
+	project, err := session.CreateProject(context.Background(), clusterID, name)
+	if err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already") {
+			t.Fatalf("creating project %s through the control plane: %v", name, err)
+		}
+		project = findProject(t, session, clusterID, name)
 	}
 	if project == nil || project.Namespace == "" {
-		c.t.Fatalf("the control plane returned no namespace for project %s", name)
+		t.Fatalf("the control plane returned no namespace for project %s", name)
 	}
 	// The operator reconciles the Project CR into a namespace; the gate waits
 	// for the namespace the control plane named.
 	c.waitFor(10*time.Minute, "the project's namespace to appear", func() (bool, string) {
-		out, err := k3s.Kubectl(context.Background(), c.runner, "get namespace "+project.Namespace+" -o name")
+		out, err := c.kubectlStatus("get namespace " + project.Namespace + " -o name")
 		if err != nil {
 			return false, err.Error()
 		}
 		return strings.TrimSpace(out) != "", project.Namespace + " exists"
 	})
 	return project.Namespace
+}
+
+// findProject reads one project back by name, for the duplicate case above.
+func findProject(t *testing.T, session *api.Client, clusterID, name string) *api.Project {
+	t.Helper()
+	status, body, err := session.Get(context.Background(), "/api/v1/projects?cluster_id="+clusterID+"&items_per_page=100")
+	if err != nil {
+		t.Fatalf("listing the control plane's projects to read %s back: %v", name, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("listing the control plane's projects to read %s back: HTTP %d: %s", name, status, firstLineOfE2E(string(body)))
+	}
+	var page struct {
+		Data []api.Project `json:"data"`
+	}
+	if err := json.Unmarshal(body, &page); err != nil {
+		t.Fatalf("parsing the control plane's project list: %v", err)
+	}
+	for i := range page.Data {
+		if page.Data[i].Name == name {
+			return &page.Data[i]
+		}
+	}
+	t.Fatalf("the control plane refused project %s as an existing name but does not list it", name)
+	return nil
+}
+
+// createProject creates the S4 fixture's project through the shared creator.
+func (c *s4Cluster) createProject(name string) string {
+	c.t.Helper()
+	return createProjectNamespace(c.t, c.env, c.client, c.cluster, name, c)
+}
+
+// kubectlStatus runs kubectl and returns its error rather than failing the
+// test: the shared project creator polls with it.
+func (c *s4Cluster) kubectlStatus(args string) (string, error) {
+	return k3s.Kubectl(context.Background(), c.runner, args)
 }
 
 // runCLI runs the real command tree, so the gate tears nothing down and
