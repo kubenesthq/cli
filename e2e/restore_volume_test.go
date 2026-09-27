@@ -169,7 +169,7 @@ func (l *s5Lab) verbArgs(extra ...string) []string {
 // provider address — the same mapping `node replace` needs.
 func (l *s5Lab) nodeNames() map[string]string {
 	l.t.Helper()
-	out := l.kubectl("get nodes -o jsonpath={range .items[*]}{.metadata.name}{\" \"}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}")
+	out := l.kubectl("get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'")
 	names := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		fields := strings.Fields(line)
@@ -221,7 +221,7 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		lab.kubectl("scale deployment " + workload + " --replicas=0")
 		lab.stopAgent(agent)
 		lab.waitFor(5*time.Minute, "the agent to go NotReady", func() (bool, string) {
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+agent+" -o jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+agent+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
 			if err != nil {
 				return false, err.Error()
 			}
@@ -256,7 +256,7 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		}
 		// Every named claim is Bound, on a node that is Ready.
 		lab.waitFor(10*time.Minute, "both refilled claims to be Bound", func() (bool, string) {
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc -o jsonpath={range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}")
+			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}'")
 			if err != nil {
 				return false, err.Error()
 			}
@@ -466,7 +466,7 @@ func (l *s5Lab) podState(workload string) string {
 }
 
 func (l *s5Lab) podRunning(workload string) bool {
-	out, err := k3s.Kubectl(context.Background(), l.nodes["node1"], "-n "+s5Namespace+" get pods -l app="+workload+" -o jsonpath={range .items[*]}{.status.phase}{\" \"}{end}")
+	out, err := k3s.Kubectl(context.Background(), l.nodes["node1"], "-n "+s5Namespace+" get pods -l app="+workload+" -o jsonpath='{range .items[*]}{.status.phase}{\" \"}{end}'")
 	if err != nil {
 		return false
 	}

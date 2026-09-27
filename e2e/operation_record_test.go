@@ -92,7 +92,7 @@ func TestOperationLockOnARealCluster(t *testing.T) {
 			return operation.Spec{
 				Kind:          operation.ActionSSH,
 				Postcondition: "the server node is Ready",
-				Observe:       "sudo -n k3s kubectl get nodes -o jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
+				Observe:       "sudo -n k3s kubectl get nodes -o jsonpath='{.items[0].status.conditions[?(@.type==\"Ready\")].status}'",
 			}, true
 		},
 	}

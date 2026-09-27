@@ -481,7 +481,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 		lab.kubectl("-n " + s5Namespace + " scale deployment " + workload + " --replicas=0")
 		lab.stopAgent(dead)
 		lab.waitFor(5*time.Minute, "the agent to go NotReady", func() (bool, string) {
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+dead+" -o jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+dead+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
 			if err != nil {
 				return false, err.Error()
 			}
@@ -597,7 +597,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 			t.Fatalf("activating the restored namespace failed: %v\n%s", err, activateOut.String())
 		}
 		lab.waitFor(10*time.Minute, "both stranded claims refilled and Bound on a live node", func() (bool, string) {
-			out := lab.kubectl("-n " + s5Namespace + " get pvc -o jsonpath={range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}")
+			out := lab.kubectl("-n " + s5Namespace + " get pvc -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}'")
 			for _, claim := range []string{workload + "-a", workload + "-b"} {
 				if !strings.Contains(out, claim+"=Bound") {
 					return false, out
@@ -612,7 +612,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 // dies and which one has to keep serving.
 func (l *s5Lab) agents(t *testing.T) []string {
 	t.Helper()
-	out := l.kubectl("get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+	out := l.kubectl("get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'")
 	names := strings.Fields(out)
 	sort.Strings(names)
 	return names
