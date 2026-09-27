@@ -476,7 +476,7 @@ func TestRestoreVolumeResume(t *testing.T) {
 	if err := <-done; err == nil {
 		t.Fatal("the killed run reported success")
 	}
-	pause := strings.TrimSpace(lab.kubectl("get project " + s5Namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}"))
+	pause := strings.TrimSpace(lab.kubectl("get project " + s5Namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'"))
 	if pause == "" {
 		t.Fatal("the interrupted run left no pause behind")
 	}
@@ -507,7 +507,7 @@ func TestRestoreVolumeResume(t *testing.T) {
 	if got := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}")); got != scaledBefore {
 		t.Errorf("the resume changed the workload's replicas (%s -> %s): it continues a restore, it does not scale anything back", scaledBefore, got)
 	}
-	if now := strings.TrimSpace(lab.kubectl("get project " + s5Namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}")); now != pause {
+	if now := strings.TrimSpace(lab.kubectl("get project " + s5Namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); now != pause {
 		t.Errorf("--resume lifted the pause (annotation %q)", now)
 	}
 	operationID := pause

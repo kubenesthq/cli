@@ -456,7 +456,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	}
 
 	// THE PROJECT IS PAUSED and the pause names this operation.
-	pause := c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}")
+	pause := c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")
 	if strings.TrimSpace(pause) != operationID {
 		t.Errorf("the project's pause annotation is %q, want the operation %s", pause, operationID)
 	}
@@ -487,16 +487,16 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 
 	// NEITHER RECONCILER RESTART CHANGES THE HOLD: the pause is an annotation
 	// on the Project, which lives outside the namespace.
-	s4Restart(t, c, "kubenest-system", "kubenest-operator")
-	s4Restart(t, c, "argocd", "argocd-application-controller")
+	s4Restart(t, c, s4OperatorSelector)
+	s4Restart(t, c, s4ArgoControllerSelector)
 	c.waitFor(2*time.Minute, "the operator to come back", func() (bool, string) {
-		out, err := k3s.Kubectl(context.Background(), c.runner, "get deployment kubenest-operator -n kubenest-system -o jsonpath={.status.availableReplicas}")
+		out, err := k3s.Kubectl(context.Background(), c.runner, "get deployment -A -l "+s4OperatorSelector+" -o jsonpath='{.items[0].status.availableReplicas}'")
 		if err != nil {
 			return false, err.Error()
 		}
 		return strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0", strings.TrimSpace(out)
 	})
-	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}")); pause != operationID {
+	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != operationID {
 		t.Errorf("a reconciler restart lifted the pause (annotation %q)", pause)
 	}
 	if suspend := strings.TrimSpace(c.kubectl("get cronjob s4-sentinel -n " + namespace + " -o jsonpath={.spec.suspend}")); suspend != "true" {
@@ -511,7 +511,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	if !strings.Contains(activation.String(), "CronJob s4-sentinel") {
 		t.Errorf("activation does not show which scheduled work will start:\n%s", activation.String())
 	}
-	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}")); pause != "" {
+	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != "" {
 		t.Errorf("activation left the pause in place (%q)", pause)
 	}
 	if suspend := strings.TrimSpace(c.kubectl("get cronjob s4-sentinel -n " + namespace + " -o jsonpath={.spec.suspend}")); suspend != "false" {
@@ -566,7 +566,7 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 	t.Logf("the interrupted run stopped with: %v", err)
 
 	// THE PAUSE IS STILL IN PLACE, and it names the interrupted operation.
-	pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}"))
+	pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'"))
 	if pause == "" {
 		t.Fatalf("the interrupted run left no pause behind:\n%s", out.String())
 	}
@@ -574,7 +574,7 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 
 	// The record is what `kubenest health` shows the operation by, and it is
 	// the record a second laptop resumes.
-	record := c.kubectl("get configmap kubenest-operation -n kube-system -o jsonpath={.data.record\\.json}")
+	record := c.kubectl("get configmap kubenest-operation -n kube-system -o jsonpath='{.data.record\\.json}'")
 	if !strings.Contains(record, operationID) {
 		t.Errorf("the live operation record does not name %s", operationID)
 	}
@@ -587,7 +587,7 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 		t.Errorf("the resume did not finish the data restore:\n%s", resumed.String())
 	}
 	// A RESUME NEVER ACTIVATES.
-	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath={.metadata.annotations.kubenest\\.io/reconcile-paused}")); pause != operationID {
+	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != operationID {
 		t.Errorf("--resume lifted the pause (annotation %q)", pause)
 	}
 	if suspend := strings.TrimSpace(c.kubectl("get cronjob s4-sentinel -n " + namespace + " -o jsonpath={.spec.suspend}")); suspend != "true" {
@@ -598,19 +598,39 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 	}
 }
 
-// s4Restart restarts one deployment by name, if the cluster has it: an install
-// without Argo CD has no argocd namespace, and that is not a gate failure.
-func s4Restart(t *testing.T, c *s4Cluster, namespace, name string) {
+// The reconcilers the gate restarts, by label: an install names them after its
+// Helm release (operator-kubenest-operator-2-controller-manager, and Argo CD's
+// application controller is a StatefulSet), so names looked up by hand were
+// wrong on hardware (2026-09-27).
+const (
+	s4OperatorSelector       = "app.kubernetes.io/name=kubenest-operator-2,app.kubernetes.io/component=manager"
+	s4ArgoControllerSelector = "app.kubernetes.io/name=argocd-application-controller"
+)
+
+// s4Restart restarts every Deployment or StatefulSet the selector matches, in
+// any namespace. A cluster with none (an install without Argo CD) is not a gate
+// failure.
+func s4Restart(t *testing.T, c *s4Cluster, selector string) {
 	t.Helper()
-	if _, err := k3s.Kubectl(context.Background(), c.runner, "get deployment "+name+" -n "+namespace+" -o name"); err != nil {
-		t.Logf("%s/%s is not on this cluster, so there is nothing to restart", namespace, name)
+	out, err := k3s.Kubectl(context.Background(), c.runner, "get deployment,statefulset -A -l "+selector+` -o jsonpath='{range .items[*]}{.kind} {.metadata.namespace} {.metadata.name}{"\n"}{end}'`)
+	if err != nil {
+		t.Fatalf("finding the workloads labelled %s: %v", selector, err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		t.Logf("nothing labelled %s is on this cluster, so there is nothing to restart", selector)
 		return
 	}
-	if _, err := k3s.Kubectl(context.Background(), c.runner, "rollout restart deployment "+name+" -n "+namespace); err != nil {
-		t.Fatalf("restarting %s/%s: %v", namespace, name, err)
-	}
-	if _, err := k3s.Kubectl(context.Background(), c.runner, "rollout status deployment "+name+" -n "+namespace+" --timeout=5m"); err != nil {
-		t.Fatalf("waiting for %s/%s to come back: %v", namespace, name, err)
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			continue
+		}
+		kind, namespace, name := strings.ToLower(fields[0]), fields[1], fields[2]
+		if _, err := k3s.Kubectl(context.Background(), c.runner, "rollout restart "+kind+" "+name+" -n "+namespace); err != nil {
+			t.Fatalf("restarting %s %s/%s: %v", kind, namespace, name, err)
+		}
+		t.Logf("restarted %s %s/%s", kind, namespace, name)
 	}
 }
 
