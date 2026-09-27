@@ -202,6 +202,32 @@ func (c *s4Cluster) waitFor(within time.Duration, what string, check func() (boo
 // createProject creates the project THROUGH THE CONTROL PLANE, which is what
 // makes the namespace the reconcilers' to create: the gate is "I deleted the
 // payments namespace", and the namespace has to be one the platform put there.
+// sessionClient signs in as the administrator for the one call that needs a
+// user session. POST /api/v1/projects accepts no CLI token, because projects
+// belong to the console, so the fixture's project is created the way the
+// console creates one. On hardware (2026-09-27) the gate's CLI token was
+// refused there.
+func (c *s4Cluster) sessionClient() *api.Client {
+	c.t.Helper()
+	email, password := os.Getenv("KUBENEST_ADMIN_EMAIL"), os.Getenv("KUBENEST_ADMIN_PASSWORD")
+	if email == "" || password == "" {
+		c.t.Skip("KUBENEST_ADMIN_EMAIL and KUBENEST_ADMIN_PASSWORD are not set: creating the fixture's project needs a user session (POST /api/v1/projects accepts no CLI token)")
+	}
+	anonymous, err := api.New(c.env.controlPlane)
+	if err != nil {
+		c.t.Fatalf("building a client for the administrator's login: %v", err)
+	}
+	token, err := anonymous.PasswordLogin(context.Background(), email, password)
+	if err != nil {
+		c.t.Fatalf("signing in as %s to create the fixture's project: %v", email, err)
+	}
+	session, err := api.New(c.env.controlPlane, api.WithToken(token))
+	if err != nil {
+		c.t.Fatalf("building the administrator's session client: %v", err)
+	}
+	return session
+}
+
 func (c *s4Cluster) createProject(name string) string {
 	c.t.Helper()
 	orgs, err := c.client.ListOrgs(context.Background())
@@ -223,7 +249,7 @@ func (c *s4Cluster) createProject(name string) string {
 	if clusterID == "" {
 		c.t.Fatalf("the control plane has no cluster named %s", c.cluster)
 	}
-	project, err := c.client.CreateProject(context.Background(), clusterID, name)
+	project, err := c.sessionClient().CreateProject(context.Background(), clusterID, name)
 	if err != nil && !strings.Contains(strings.ToLower(err.Error()), "already") {
 		c.t.Fatalf("creating project %s through the control plane: %v", name, err)
 	}
