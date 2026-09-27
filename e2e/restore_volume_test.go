@@ -218,7 +218,7 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		// The node loss: k3s-agent stopped, the pods force-deleted, and the
 		// claims deleted — which is what a dead node's volumes look like from
 		// the API.
-		lab.kubectl("scale deployment " + workload + " --replicas=0")
+		lab.kubectl("-n " + s5Namespace + " scale deployment " + workload + " --replicas=0")
 		lab.stopAgent(agent)
 		lab.waitFor(5*time.Minute, "the agent to go NotReady", func() (bool, string) {
 			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+agent+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
