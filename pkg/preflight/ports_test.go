@@ -67,17 +67,18 @@ func (w *probeWorld) received(target string) []string {
 // rather than echoed. A host is both a target and a peer in these tests, so one
 // responder answers both roles.
 type probeHost struct {
-	addr      string
-	role      string
-	world     *probeWorld
-	specs     []string        // what preflight asks of this node ("udp:8472", ...)
-	held      map[string]bool // the ports something else already owns on this node
-	flannel   string          // flannel.1's address; empty: this host has no overlay
-	pingOK    bool            // as a peer: its overlay ping to the other node's flannel.1 answers
-	echoOK    bool            // as a peer: the echo from a port the listener bound comes back
-	capture   bool            // as a target: its packet capture sees the peer's datagram
-	from      string          // the source address the capture records
-	overrides map[string]sshx.Result
+	addr       string
+	role       string
+	world      *probeWorld
+	specs      []string        // what preflight asks of this node ("udp:8472", ...)
+	held       map[string]bool // the ports something else already owns on this node
+	flannel    string          // flannel.1's address; empty: this host has no overlay
+	pingOK     bool            // as a peer: its overlay ping to the other node's flannel.1 answers
+	echoOK     bool            // as a peer: the echo from a port the listener bound comes back
+	tcpBlocked bool            // as a peer: connecting to the target's held TCP services times out
+	capture    bool            // as a target: its packet capture sees the peer's datagram
+	from       string          // the source address the capture records
+	overrides  map[string]sshx.Result
 
 	runner *componenttest.FakeRunner
 }
@@ -167,7 +168,11 @@ func (h *probeHost) peerVerdicts(cmd string) string {
 		proto, port, marker := m[1], m[2], m[4]
 		switch {
 		case proto == "tcp":
-			out = append(out, fmt.Sprintf("tcp:%s open", port))
+			if h.tcpBlocked {
+				out = append(out, fmt.Sprintf("tcp:%s blocked", port))
+			} else {
+				out = append(out, fmt.Sprintf("tcp:%s open", port))
+			}
 		case marker == "flannel" && h.flannel == "":
 			// A peer with no overlay cannot ping: it sends and the target's
 			// capture has to see it.
@@ -425,5 +430,73 @@ func TestUnansweredDatagramToAFreeUDPPortIsRefused(t *testing.T) {
 	res := portResults(rep)
 	if len(res) == 0 || res[0].Outcome != preflight.Fail {
 		t.Fatalf("want the port check to fail, got %+v", res)
+	}
+}
+
+// entryFor returns the part of a failure summary that describes one port. The
+// summary is a "; "-joined list, one entry per peer-to-target port.
+func entryFor(summary, spec string) string {
+	for _, entry := range strings.Split(summary, "; ") {
+		if strings.Contains(entry, spec) {
+			return entry
+		}
+	}
+	return ""
+}
+
+// A held TCP port is not a Flannel fact. 6443 and 10250 are held by k3s on a
+// running node, and a held TCP port is proven by connecting to the real
+// service — so when that connect is blocked it is plain "blocked", whether or
+// not the port is held. Only a held Flannel UDP port may be blamed on Flannel.
+//
+// Seen on hardware: a node add from a host the cluster firewall blocks was
+// told "the target already runs Flannel, which holds these ports ... tcp:6443
+// (Kubernetes API): the target already holds this port", which sends the
+// operator to look for Flannel on ports k3s owns.
+func TestBlockedHeldTCPPortsAreNotBlamedOnFlannel(t *testing.T) {
+	world := newProbeWorld()
+	server := &probeHost{
+		addr: "5.75.252.113", role: "server", world: world,
+		specs:     []string{"tcp:6443", "udp:8472", "tcp:10250"},
+		held:      map[string]bool{"tcp:6443": true, "udp:8472": true, "tcp:10250": true},
+		flannel:   "10.42.0.1",
+		echoOK:    true,
+		capture:   false, // the datagram is dropped before the target's capture
+		overrides: map[string]sshx.Result{"command -v": {Stdout: "k3s\ncontainerd\n"}},
+	}
+	agent := &probeHost{
+		addr: "167.233.20.250", role: "agent", world: world,
+		specs:      []string{"udp:8472", "tcp:10250"},
+		held:       map[string]bool{},
+		flannel:    "",
+		tcpBlocked: true, // the cluster firewall drops the peer's TCP connects
+		echoOK:     true,
+	}
+
+	rep, err := preflight.Run(context.Background(), probeOptions(t, server, agent))
+	if err == nil {
+		t.Fatal("a host whose ports are all blocked must be refused")
+	}
+	res := portResults(rep)
+	if len(res) == 0 || res[0].Outcome != preflight.Fail {
+		t.Fatalf("want the port check to fail, got %+v", res)
+	}
+	detail := res[0].Detail
+	if !strings.HasPrefix(detail, "blocked:") {
+		t.Errorf("a failure that is not all Flannel-held UDP must be summarised as blocked, got %q", detail)
+	}
+	for _, spec := range []string{"tcp:6443", "tcp:10250"} {
+		entry := entryFor(detail, spec)
+		if entry == "" {
+			t.Fatalf("no entry for %s in %q", spec, detail)
+		}
+		for _, wrong := range []string{"Flannel", "holds"} {
+			if strings.Contains(entry, wrong) {
+				t.Errorf("a blocked TCP port must not be blamed on %q: %q", wrong, entry)
+			}
+		}
+	}
+	if entry := entryFor(detail, "udp:8472"); !strings.Contains(entry, "Flannel") {
+		t.Errorf("the unproven held UDP port must still name Flannel, got %q", entry)
 	}
 }

@@ -280,39 +280,41 @@ type pendingProof struct {
 // portFailure is one peer-to-target port that could not be proven open.
 type portFailure struct {
 	text string
-	held bool
+	// flannel marks a failure on the port the target's own Flannel VXLAN
+	// device holds. Only that kind may be blamed on Flannel.
+	flannel bool
 }
 
-// blockedPort names one failure. A port the target already owns is named for
-// its real cause: the operator who re-runs the install must not be told
-// "blocked" about a port the cluster itself holds.
+// blockedPort names one failure. Only a port the target's own Flannel VXLAN
+// device holds is blamed on Flannel. 6443 and 10250 are held by k3s on a
+// running node, and a held TCP port is proven by connecting to the real
+// service, so a blocked TCP port is plain "blocked" whether or not it is held.
 func blockedPort(peer, target Node, spec string, held map[string]bool, why string) portFailure {
 	msg := fmt.Sprintf("%s -> %s %s (%s)", peer.Address, target.Address, spec, purposeOf(spec))
-	switch {
-	case held[spec] && purposeOf(spec) == flannelPurpose:
+	flannel := held[spec] && purposeOf(spec) == flannelPurpose
+	if flannel {
 		msg += ": the target already runs Flannel, whose VXLAN device holds this port, so no process there can answer a probe"
-	case held[spec]:
-		msg += ": the target already holds this port"
 	}
 	if why != "" {
 		msg += " — " + why
 	}
-	return portFailure{text: msg, held: held[spec]}
+	return portFailure{text: msg, flannel: flannel}
 }
 
-// blockedSummary leads with the cause when every failure is a port the
-// cluster already owns: "blocked" alone sent an operator to look at a firewall
-// that was never the problem.
+// blockedSummary leads with the cause only when EVERY failure is a port the
+// target's Flannel holds: "blocked" alone sent an operator to look at a
+// firewall that was never the problem, and blaming Flannel for a service k3s
+// owns sends them somewhere else that is also wrong.
 func blockedSummary(failures []portFailure) string {
-	allHeld := len(failures) > 0
+	allFlannel := len(failures) > 0
 	texts := make([]string, 0, len(failures))
 	for _, f := range failures {
-		if !f.held {
-			allHeld = false
+		if !f.flannel {
+			allFlannel = false
 		}
 		texts = append(texts, f.text)
 	}
-	if allHeld {
+	if allFlannel {
 		return "the target already runs Flannel, which holds these ports, and the overlay path to them is not open: " + strings.Join(texts, "; ")
 	}
 	return "blocked: " + strings.Join(texts, "; ")
