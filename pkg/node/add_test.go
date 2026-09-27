@@ -240,6 +240,191 @@ func TestAddResumeFinishesTheInventoryWriteWithoutJoiningTwice(t *testing.T) {
 	}
 }
 
+// addedHostAt is the entry an add wrote for a machine at an address a removed
+// entry already holds: everything at that address except the removed record.
+// Exactly one is expected, and the count is the assertion that a resume did not
+// mint the machine a second identity.
+func addedHostAt(t *testing.T, f *nodeFixture, address, removedHostID string) api.HostRecord {
+	t.Helper()
+	var added []api.HostRecord
+	for _, h := range f.records.inventory() {
+		if h.SSHAddress == address && h.HostID != removedHostID {
+			added = append(added, h)
+		}
+	}
+	if len(added) != 1 {
+		t.Fatalf("%d entries exist for %s besides the removed %s, want exactly 1: %+v", len(added), address, removedHostID, added)
+	}
+	return added[0]
+}
+
+// A removed entry keeps its address, and an address is handed to the next
+// machine that asks for it: a static or elastic address moved to a replacement
+// VM, or a cloud giving a freed address to the next machine. The address alone
+// cannot tell the machine that was removed from a new one wearing its address,
+// and the host key that answers when it is dialled can.
+//
+// Hardware, 2026-09-27 (lab w3): w4 (167.233.20.250) was removed, destroyed, and
+// the next machine (w5) was given the same address; `node add --agent
+// 167.233.20.250` was refused before it connected. The advice to wipe the
+// machine cannot help, because the match is on the address — after any
+// `node remove`, no new machine at that address could be added.
+func TestAddGivesANewMachineTheAddressOfARemovedHost(t *testing.T) {
+	f := newFixture(t, serverHost(), removedAgent())
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+
+	if _, err := f.runAdd(f.newAdd(AddOptions{})); err != nil {
+		t.Fatalf("a new machine at a removed host's address was refused: %v\n%s", err, f.out.String())
+	}
+
+	// The removed record is left exactly as it was: the same host ID, the same
+	// state, the same host key and the same node it became.
+	gone, found := f.hostIn("h-gone")
+	if !found {
+		t.Fatal("the removed host's entry is gone from the inventory")
+	}
+	if gone.LifecycleState != string(StateRemoved) || gone.HostKeyFingerprint != "SHA256:gone" || gone.NodeUID != "uid-gone" {
+		t.Errorf("the address reuse changed the removed entry: %+v", gone)
+	}
+
+	// The machine that answered is a NEW host: a host ID of its own, active,
+	// carrying the host key it presented.
+	added := addedHostAt(t, f, testAgentAddr, "h-gone")
+	if added.HostID == "h-gone" {
+		t.Error("the new machine was given the removed machine's host ID")
+	}
+	if added.LifecycleState != string(StateActive) {
+		t.Errorf("the new machine is recorded as %q, want %q: %+v", added.LifecycleState, StateActive, added)
+	}
+	if added.HostKeyFingerprint != "SHA256:newagent" {
+		t.Errorf("the new host records host key %q, want the key the machine answered with", added.HostKeyFingerprint)
+	}
+	if added.NodeUID != "uid-new" {
+		t.Errorf("the new host records node uid %q, want the node that joined", added.NodeUID)
+	}
+
+	// The operator is told why this was allowed: the run names the removed
+	// record whose address the machine was given, rather than leaving them to
+	// guess which record it touched.
+	if !strings.Contains(f.out.String(), "h-gone") {
+		t.Errorf("the run does not name the removed host whose address was reused:\n%s", f.out.String())
+	}
+}
+
+// The same address where the machine is the one the removed entry describes is
+// still refused, and so is an entry that records no host key at all: the machine
+// that was removed may be the one answering, and its disks may still hold
+// another cluster's data. Neither case is proof of a DIFFERENT machine, and only
+// a different machine may take a removed host's address. Nothing is written and
+// nothing is joined.
+func TestAddStillRefusesTheMachineRecordedAsRemovedAtItsAddress(t *testing.T) {
+	cases := []struct {
+		name     string
+		recorded string
+	}{
+		{"the machine answers with the recorded host key", "SHA256:newagent"},
+		{"the entry records no host key", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gone := removedAgent()
+			gone.HostKeyFingerprint = tc.recorded
+			f := newFixture(t, serverHost(), gone)
+
+			_, err := f.runAdd(f.newAdd(AddOptions{}))
+			if err == nil {
+				t.Fatalf("the machine recorded as removed was re-added at its own address:\n%s", f.out.String())
+			}
+			if !f.dialer.dialed(testAgentAddr) {
+				t.Error("the machine at the removed host's address was never dialled, so the two host keys were never compared")
+			}
+			if !strings.Contains(err.Error(), "h-gone") {
+				t.Errorf("the refusal does not name the record it refused: %v", err)
+			}
+			if len(f.records.savedRecords()) != 0 {
+				t.Errorf("%d inventory write(s) happened, want none: a refused machine is not written anywhere", len(f.records.savedRecords()))
+			}
+			if state := f.lastState("h-gone"); state != string(StateRemoved) {
+				t.Errorf("the removed entry is now %q, want %q", state, StateRemoved)
+			}
+			if f.log.hasCommand("get.k3s.io") {
+				t.Error("the join was attempted on the machine that was removed")
+			}
+		})
+	}
+}
+
+// `--agent` naming a removed host by its HOST ID names the record and not a
+// machine, so it is refused as it always was — and nothing is dialled, because
+// there is nothing about a machine to compare.
+func TestAddRefusesARemovedHostNamedByItsHostID(t *testing.T) {
+	f := newFixture(t, serverHost(), removedAgent())
+
+	_, err := f.runAdd(f.newAdd(AddOptions{Agent: "h-gone"}))
+	if err == nil {
+		t.Fatalf("a removed host was re-added by its host ID:\n%s", f.out.String())
+	}
+	if !strings.Contains(err.Error(), "h-gone") {
+		t.Errorf("the refusal does not name the record it refused: %v", err)
+	}
+	if f.dialer.dialed(testAgentAddr) {
+		t.Error("the machine was dialled although the removed host was named by its host ID")
+	}
+	if len(f.records.savedRecords()) != 0 {
+		t.Errorf("%d inventory write(s) happened for a refused machine", len(f.records.savedRecords()))
+	}
+}
+
+// A resumed add that gave a new machine a removed host's address continues on
+// the entry IT wrote, not on the removed record that shares the address and
+// comes earlier in the inventory: taking the removed one would dial a machine
+// the journal already knows, mint it a second host ID, and leave a stale
+// joining entry at the address.
+func TestAddResumeContinuesTheNewHostGivenARemovedAddress(t *testing.T) {
+	f := newFixture(t, serverHost(), removedAgent())
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+	// The first run's ACTIVE write does not land, which is the interruption
+	// this test is about: the host joined, and the record does not say so yet.
+	f.records.failOn = 2
+
+	first := f.newAdd(AddOptions{})
+	if _, err := f.runAdd(first); err == nil {
+		t.Fatal("the planted inventory-write failure did not fail the run")
+	}
+	joiner := addedHostAt(t, f, testAgentAddr, "h-gone")
+	if joiner.LifecycleState != string(StateJoining) {
+		t.Fatalf("the interrupted run left the new host as %q, want %q", joiner.LifecycleState, StateJoining)
+	}
+
+	// A second process: the same world, the same journal, a new run id.
+	session := f.sessionFor(t, "run-2")
+	next := &Add{Session: session, Opts: AddOptions{Agent: testAgentAddr}}
+	_, resumeErr := stages.Execute(context.Background(), next, PlanAdd(next))
+	next.Finish(context.Background(), resumeErr, false)
+	if resumeErr != nil {
+		t.Fatalf("the resume failed: %v\n%s", resumeErr, f.out.String())
+	}
+
+	after := addedHostAt(t, f, testAgentAddr, "h-gone")
+	if after.HostID != joiner.HostID {
+		t.Errorf("the resume put the machine under host ID %s, want the %s the interrupted run minted: the removed entry at this address was mistaken for the machine", after.HostID, joiner.HostID)
+	}
+	if after.LifecycleState != string(StateActive) {
+		t.Errorf("the resume left the new host as %q, want %q", after.LifecycleState, StateActive)
+	}
+	if state := f.lastState("h-gone"); state != string(StateRemoved) {
+		t.Errorf("the resume changed the removed entry to %q, want %q", state, StateRemoved)
+	}
+}
+
 // A second operation against the same cluster is refused by NAME: the record
 // is the lock, and "another operation is running" without saying who is a
 // refusal an operator cannot act on.

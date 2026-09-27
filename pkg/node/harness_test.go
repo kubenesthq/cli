@@ -380,15 +380,33 @@ func (h *fakeHost) liveRecord(t *testing.T) map[string]any {
 type fakeDialer struct {
 	mu    sync.Mutex
 	hosts map[string]*fakeHost
+	// dials is every address a verb asked to dial, in order, INCLUDING one the
+	// dialer cannot reach. Dialling is how a host key is read, and it leaves no
+	// command behind, so an assertion about it needs this: "this machine was
+	// never dialled", or "the machine WAS dialled, so its key was compared".
+	dials []string
 }
 
 func (d *fakeDialer) dial(_ context.Context, host api.HostRecord) (Transport, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.dials = append(d.dials, host.SSHAddress)
 	if h, ok := d.hosts[host.SSHAddress]; ok {
 		return h, nil
 	}
 	return nil, fmt.Errorf("dial tcp %s: no route to host", host.SSHAddress)
+}
+
+// dialed reports whether a verb asked for this address.
+func (d *fakeDialer) dialed(address string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, a := range d.dials {
+		if a == address {
+			return true
+		}
+	}
+	return false
 }
 
 // fakeRecords is the cluster's record in the control plane: the bundle, the
@@ -590,6 +608,21 @@ func agentHost() api.HostRecord {
 		HostID: "h-agt", Role: "agent", SSHAddress: "10.0.3.8", SSHPort: 22, SSHUser: "ubuntu",
 		NodeUID: "uid-agt", HostKeyFingerprint: "SHA256:agent", JoinAddress: "https://" + testServerAddr + ":6443",
 		StorageDevice: "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive2", LifecycleState: "active",
+		VolumeGroupOwnership: string(storage.InstallerCreated),
+	}
+}
+
+// removedAgent is the entry `node remove` keeps of a machine it took out of the
+// cluster: its host ID, its address and its host key are kept as the record that
+// the machine was there, and its Node object is gone. The ADDRESS is the part
+// that outlives the machine — a cloud hands a freed address to the next machine
+// that asks for it — which is why the fixture puts this entry at the address the
+// tests add a new machine at.
+func removedAgent() api.HostRecord {
+	return api.HostRecord{
+		HostID: "h-gone", Role: "agent", SSHAddress: testAgentAddr, SSHPort: 22, SSHUser: "ubuntu",
+		NodeUID: "uid-gone", HostKeyFingerprint: "SHA256:gone", JoinAddress: "https://" + testServerAddr + ":6443",
+		StorageDevice: testDevice, LifecycleState: string(StateRemoved),
 		VolumeGroupOwnership: string(storage.InstallerCreated),
 	}
 }

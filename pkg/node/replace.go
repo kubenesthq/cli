@@ -728,7 +728,7 @@ func (r *Replace) finishOutstandingHold(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	if host, found := FindHost(record.Hosts, r.Opts.With); found && LifecycleState(host.LifecycleState) == StateActive {
+	if host, found := heldHost(record.Hosts, r.Opts.With); found && LifecycleState(host.LifecycleState) == StateActive {
 		return
 	}
 	r.Logf("  hold:      %s keeps %s=%s: it is not recorded as active yet, so kured must not reboot it. Re-run this command to finish the record",

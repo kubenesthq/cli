@@ -594,3 +594,47 @@ func TestReplaceRecordsTheVolumeGroupOwnershipInTheJoiningEntry(t *testing.T) {
 		})
 	}
 }
+
+// `node replace`'s add half IS `node add`'s own resolution, so a replacement
+// given an address a removed host still holds is added the same way: the machine
+// that answers is a new machine (its host key differs from the removed record's),
+// it joins under a host ID of its own, and the removed record is left alone.
+//
+// The removed entry here is a host of this cluster that was removed earlier, and
+// the address it keeps is the address the operator gives the replacement — the
+// same reuse `node add` handles. It is the add half's resolution that has to see
+// it: `--node` names the machine being replaced (a different, active host), so
+// nothing else in the verb is about that address.
+func TestReplaceAddsItsReplacementAtARemovedHostsAddress(t *testing.T) {
+	old := agentHost()
+	f := newFixture(t, serverHost(), old, removedAgent())
+	f.server.setNodes(nodesJSON(t,
+		testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+		testNode{Name: testAgentNode, UID: "uid-agt", Addresses: []string{old.SSHAddress}, Ready: true},
+	))
+	// The machine being replaced answers with the host key the inventory
+	// recorded for it, so the add half runs first.
+	f.addHost(old.SSHAddress, old.HostKeyFingerprint, nodesJSON(t))
+	f.joins(t, "prod-1-agt-2")
+
+	if _, err := f.runReplace(f.newReplace(ReplaceOptions{})); err != nil {
+		t.Fatalf("a replacement at a removed host's address was refused: %v\n%s", err, f.out.String())
+	}
+	gone, found := f.hostIn("h-gone")
+	if !found {
+		t.Fatal("the removed host's entry is gone from the inventory")
+	}
+	if gone.LifecycleState != string(StateRemoved) || gone.HostKeyFingerprint != "SHA256:gone" {
+		t.Errorf("the replace changed the removed entry that held the address: %+v", gone)
+	}
+	spare := addedHostAt(t, f, testAgentAddr, "h-gone")
+	if spare.LifecycleState != string(StateActive) {
+		t.Errorf("the replacement at the reused address is recorded as %q, want %q: %+v", spare.LifecycleState, StateActive, spare)
+	}
+	if spare.HostID == "h-gone" {
+		t.Error("the replacement was given the removed machine's host ID")
+	}
+	if f.lastState("h-agt") != string(StateRemoved) {
+		t.Errorf("the replaced host is recorded as %q, want removed", f.lastState("h-agt"))
+	}
+}

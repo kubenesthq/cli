@@ -94,10 +94,39 @@ func CheckFingerprint(host api.HostRecord, conn Transport) error {
 // it would be answering with the caller's policy.
 func FindHost(hosts []api.HostRecord, want string) (api.HostRecord, bool) {
 	for _, h := range hosts {
-		switch {
-		case h.HostID == want, h.SSHAddress == want, h.JoinAddress == want:
+		if hostMatches(h, want) {
 			return h, true
-		case h.NodeUID != "" && h.NodeUID == want:
+		}
+	}
+	return api.HostRecord{}, false
+}
+
+// hostMatches is what an operator could have typed to name ONE entry: the host
+// ID the record minted, the SSH address it reaches the host at, the address the
+// host joined through, or the Node UID the cluster's object carries.
+func hostMatches(h api.HostRecord, want string) bool {
+	switch {
+	case h.HostID == want, h.SSHAddress == want, h.JoinAddress == want:
+		return true
+	case h.NodeUID != "" && h.NodeUID == want:
+		return true
+	}
+	return false
+}
+
+// heldHost finds the entry among everything the operator's word names that the
+// cluster still HOLDS — the machine itself, not the removed record of one that
+// was there before.
+//
+// ONE ADDRESS CAN CARRY BOTH: a host that was removed keeps its address for
+// good, and an address is handed to the next machine that asks for it, so the
+// newer entry sits behind the older one and FindHost returns the removed record
+// first. A question about the machine that is there now — is it active, does
+// the join continue on it — must not be answered by the record of the machine
+// that is gone.
+func heldHost(hosts []api.HostRecord, want string) (api.HostRecord, bool) {
+	for _, h := range hosts {
+		if LifecycleState(h.LifecycleState) != StateRemoved && hostMatches(h, want) {
 			return h, true
 		}
 	}

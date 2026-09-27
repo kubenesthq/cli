@@ -156,8 +156,12 @@ func (a *Add) stageResolve(ctx context.Context) error {
 // resumed says whether this resolution continues an operation that is already
 // in flight — a `--resume`, or the half of a `node replace` that is joining its
 // replacement. A FRESH add refuses a machine this cluster already holds: an
-// active host is not how capacity grows, and a host whose entry says removed
-// needs a wipe before it joins anything. A RESUMED one finds the machine ACTIVE
+// active host is not how capacity grows, and a removed host is refused whenever
+// it is named by its HOST ID or the machine answering at its address presents
+// the host key that entry recorded. A removed entry whose ADDRESS is named,
+// where a machine answers with a DIFFERENT host key, is a new machine at a
+// reused address: it joins under a NEW host ID and the removed record is left
+// as it is. A RESUMED one finds the machine ACTIVE
 // whenever its own earlier stages reached the inventory write, and refusing
 // there would refuse the operation it is resuming. Everything else — the entry
 // a new host is given, the dial, and the Ready server — is the same work either
@@ -172,7 +176,12 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 	// interrupted join left one, and its host ID is that host's identity for
 	// the rest of its life in this cluster, so it is REUSED rather than minted
 	// again — or a brand-new host, recorded when it joins.
-	if existing, found := a.findHost(a.Opts.Agent); found {
+	//
+	// reuse is a REMOVED entry the operator named by its ADDRESS. Whether the
+	// machine answering there is the one that record describes is a fact only
+	// the dial can read, so it is decided below and this entry is left alone.
+	var reuse api.HostRecord
+	if existing, found := a.findHostForAdd(a.Opts.Agent); found {
 		switch LifecycleState(existing.LifecycleState) {
 		case StateJoining:
 			a.Host = existing
@@ -187,9 +196,21 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 			// refusing it.
 			a.Host = existing
 			a.Logf("  host:      %s is already recorded as ACTIVE (%s): this operation joined it, and this run continues that work", existing.HostID, existing.SSHAddress)
+		case StateRemoved:
+			// AN ADDRESS IS NOT AN IDENTITY. A removed entry keeps its address
+			// for good, and an address is handed to the next machine that asks
+			// for it — a static or elastic address moving to a replacement VM
+			// is routine — so the address alone cannot tell the removed
+			// machine from a new one wearing it. The host key can, and only
+			// the dial reads it. Naming the removed host by its HOST ID is a
+			// different question: that names the record, not a machine, so it
+			// is refused here, before anything is dialled.
+			if a.Opts.Agent != existing.SSHAddress {
+				return removedRefusal(existing)
+			}
+			reuse = existing
 		default:
-			return fmt.Errorf("host %s (%s) is recorded as %q: a host that was removed is not re-added by this command (its host ID is kept, and its disks may still hold another cluster's data). Wipe the machine and add it as a new host, or restore its record deliberately",
-				existing.HostID, existing.SSHAddress, existing.LifecycleState)
+			return removedRefusal(existing)
 		}
 	}
 
@@ -198,11 +219,25 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 		return fmt.Errorf("connecting to the machine to add (%s): %w", a.Opts.Agent, err)
 	}
 	a.Conn = conn
-	if a.Host.HostKeyFingerprint != "" {
+	switch {
+	case reuse.HostID != "":
+		// The machine answering at a removed host's address. Only a host key
+		// that DIFFERS from the recorded one makes it a new machine, and
+		// CheckFingerprint is that comparison — the same one every other node
+		// verb re-checks its target with. It also reports nil when either side
+		// has no key, and "the two cannot be told apart" is not a reason to
+		// put a second machine at a removed host's address, so that refuses as
+		// this command always has.
+		if CheckFingerprint(reuse, conn) == nil {
+			return removedRefusal(reuse)
+		}
+		a.Logf("  host:      %s answers on %s with host key %s, not the %s recorded for the removed host %s: the address was reused by a new machine, which joins under a new host ID and leaves %s's record as it is",
+			a.Opts.Agent, a.Opts.Agent, conn.HostKeyFingerprint(), reuse.HostKeyFingerprint, reuse.HostID, reuse.HostID)
+	case a.Host.HostKeyFingerprint != "":
 		if err := CheckFingerprint(a.Host, conn); err != nil {
 			return err
 		}
-	} else {
+	default:
 		a.Logf("  host:      %s answers on %s; the host key %s is what this operation records for it",
 			a.Opts.Agent, a.Opts.Agent, conn.HostKeyFingerprint())
 	}
@@ -255,6 +290,36 @@ func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 	}
 	a.ownership = storage.Ownership(st.Ownership)
 	return nil
+}
+
+// findHostForAdd looks the machine up in the inventory the way this verb needs
+// it: an entry the cluster still HOLDS at what the operator typed wins over a
+// removed one.
+//
+// ONE ADDRESS CAN CARRY TWO ENTRIES — a host that was removed, and the new
+// machine this command then gave that address to — and the removed entry is the
+// older one, so a plain FindHost returns it first. A resumed add that took it
+// would dial a machine already in the journal, mint it a SECOND host ID and
+// leave a stale joining entry behind; the entry that is not removed is this
+// operation's own earlier write, and it is the one that decides what joins.
+func (a *Add) findHostForAdd(want string) (api.HostRecord, bool) {
+	host, found := a.findHost(want)
+	if !found || LifecycleState(host.LifecycleState) != StateRemoved {
+		return host, found
+	}
+	if held, ok := heldHost(a.Hosts, want); ok {
+		return held, true
+	}
+	return host, found
+}
+
+// removedRefusal is this verb's word on the one thing it will not do with a
+// removed entry: re-add the machine that record describes. The host ID is kept
+// because it is that machine's identity for good, and its disks may still hold
+// another cluster's data.
+func removedRefusal(host api.HostRecord) error {
+	return fmt.Errorf("host %s (%s) is recorded as %q: a host that was removed is not re-added by this command (its host ID is kept, and its disks may still hold another cluster's data). Wipe the machine and add it as a new host, or restore its record deliberately",
+		host.HostID, host.SSHAddress, host.LifecycleState)
 }
 
 // hostToDial is the address to reach the machine being added at: the
