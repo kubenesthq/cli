@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/operation"
@@ -118,13 +119,17 @@ type fakeCluster struct {
 	cronjobs         []CronJobState
 	jobs             []JobState
 	apps             []ApplicationState
-	hold             *ProjectHold
-	drill            *DrillRestore
-	volumes          []VolumeRestoreState
-	outcome          *RestoreOutcome
-	bindings         map[string]*ClaimBinding
-	readyNodes       map[string]bool
-	selectorByPod    map[string]map[string]string
+	// operatorChart is the helm.sh/chart label the operator Deployment carries.
+	// A fixture that leaves it empty is a cluster with no such label, which the
+	// restore refuses; newRestoreFixture sets a version that carries the pause.
+	operatorChart string
+	hold          *ProjectHold
+	drill         *DrillRestore
+	volumes       []VolumeRestoreState
+	outcome       *RestoreOutcome
+	bindings      map[string]*ClaimBinding
+	readyNodes    map[string]bool
+	selectorByPod map[string]map[string]string
 	// onProjectHold runs when the operator's acknowledgement is read, which is
 	// the window between the confirmed plan and the destructive step: a test
 	// moves an identity here.
@@ -295,6 +300,14 @@ func (c *fakeCluster) RestoreOutcome(_ context.Context, name string) (*RestoreOu
 
 func (c *fakeCluster) OperatorImage(_ context.Context) (string, error) {
 	return "ghcr.io/kubenesthq/kubenest-operator:1.2", nil
+}
+
+// OperatorChart is the helm.sh/chart label the operator Deployment carries: the
+// version the fixture's cluster is running. It defaults to a version that
+// carries the reconcile pause, so only the tests that are about the gate set
+// anything else.
+func (c *fakeCluster) OperatorChart(_ context.Context) (string, error) {
+	return c.operatorChart, nil
 }
 
 func (c *fakeCluster) ClaimBinding(_ context.Context, _, claim string) (*ClaimBinding, error) {
@@ -699,6 +712,11 @@ func newRestoreFixture(t *testing.T, facts ...BackupFacts) *restoreFixture {
 		ConditionReason:  ReasonPausedByOperation,
 		ConditionMessage: "Reconciliation of project \"payments\" is paused by operation \"op-1\"",
 	}
+	// The operator this cluster runs. It is a RELEASED version, one above the
+	// minimum a restore needs, so the tests that are not about the gate restore
+	// the way an upgraded cluster does; the floor itself is asserted in
+	// TestRestoreRefusesAnOperatorThatCannotPause.
+	cluster.operatorChart = agent.ChartName + "-2.7.0"
 	cluster.outcome = &RestoreOutcome{Name: "restore", Phase: "Completed", ItemsRestored: 12, ProgressSeen: true}
 	cluster.volumes = []VolumeRestoreState{{Name: "pvr-1", Pod: "payments-1", Volume: "data-0", ClaimName: "data-0", Phase: "Completed"}}
 	cluster.bindings["data-0"] = &ClaimBinding{Claim: "data-0", Volume: "pvc-uid-data-0", Node: "lab-node-1", Phase: "Bound", Bound: true}
@@ -1763,6 +1781,236 @@ func TestNamespaceRestoreResumeRefusesClaimsTheRecordDidNotCreate(t *testing.T) 
 	}
 	if resumed.cluster.annotations[PauseAnnotationKey] != opID {
 		t.Errorf("the refusal did not leave the pause in place (annotations %v)", resumed.cluster.annotations)
+	}
+}
+
+// TestRestoreRefusesAnOperatorThatCannotPause is kn-x0wv.6: the reconcile pause
+// arrived in op3 418280a and first ships in operator chart 2.7.0-rc.1, so an
+// operator older than that never writes the condition the run waits for. On the
+// demo cluster (bundle 1.1, chart 2.6.17, 2026-09-27) the restore wrote the
+// pause, waited the bundle's whole acknowledgement deadline and failed, having
+// changed nothing.
+//
+// THE PLANTED NEGATIVE IS TODAY'S CODE, which writes the pause and waits. So
+// every refusal here is asserted to have sent NO annotate and NO suspend: the
+// gate is a read, and nothing reaches the cluster before it passes.
+func TestRestoreRefusesAnOperatorThatCannotPause(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	cases := []struct {
+		name     string
+		chart    string
+		proceeds bool
+		// names is what the refusal has to say about what it found.
+		names string
+	}{
+		{
+			name:  "the 1.1 cluster's operator is refused",
+			chart: "kubenest-operator-2-2.6.17",
+			names: "2.6.17",
+		},
+		{
+			name:  "the release candidate below the floor is refused",
+			chart: "kubenest-operator-2-2.7.0-rc.0",
+			names: "2.7.0-rc.0",
+		},
+		{
+			name:  "a missing label is refused, and saying so is the message",
+			chart: "",
+			names: "helm.sh/chart",
+		},
+		{
+			name:  "a label that is not a version is refused",
+			chart: "kubenest-operator-2-two.seven",
+			names: "two.seven",
+		},
+		{
+			name:  "a label from another chart is refused",
+			chart: "kubenest-agent-2.7.1",
+			names: "kubenest-agent-2.7.1",
+		},
+		{
+			name:     "the floor itself proceeds",
+			chart:    "kubenest-operator-2-" + MinOperatorPauseVersion,
+			proceeds: true,
+		},
+		{
+			name:     "the release the floor precedes proceeds",
+			chart:    "kubenest-operator-2-2.7.0",
+			proceeds: true,
+		},
+		{
+			name:     "a later chart proceeds",
+			chart:    "kubenest-operator-2-2.7.1",
+			proceeds: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRestoreFixture(t, facts)
+			f.cluster.operatorChart = c.chart
+			out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+			if c.proceeds {
+				if err != nil {
+					t.Fatalf("a restore whose operator can acknowledge the pause was refused: %v\n%s", err, out)
+				}
+				if !strings.Contains(out, RestoredStage) {
+					t.Errorf("the run did not finish at %q:\n%s", RestoredStage, out)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("a restore was allowed to hold the project with an operator that cannot acknowledge the pause:\n%s", out)
+			}
+			for _, want := range []string{c.names, MinOperatorPauseVersion, "Nothing has been changed", "kubenest platform upgrade"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not say %q: %v", want, err)
+				}
+			}
+			// NOTHING WAS SENT: no pause annotation and no suspension, which are
+			// the first two changes the run makes.
+			if n := f.kube.commandCount("annotate project"); n != 0 {
+				t.Errorf("the run wrote the pause (%d annotate command(s)) before knowing the operator can acknowledge it", n)
+			}
+			if n := f.kube.commandCount("patch cronjob") + f.kube.commandCount("patch job"); n != 0 {
+				t.Errorf("the run suspended work (%d patch command(s)) before knowing the operator can acknowledge the pause", n)
+			}
+			if len(f.cluster.writes) != 0 {
+				t.Errorf("the refused run changed the cluster: %v", f.cluster.writes)
+			}
+			if f.cluster.deleted {
+				t.Error("the refused run deleted the namespace")
+			}
+		})
+	}
+}
+
+// TestRestoreResumeRefusesADowngradedOperator: the gate runs on a resume too,
+// which is the run that must not re-wait on an operator that was downgraded
+// since the interruption. A resumed run continues from the record, so the
+// operator it finds now is the one that has to be able to answer.
+func TestRestoreResumeRefusesADowngradedOperator(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err == nil {
+		t.Fatal("the interrupted run must fail")
+	}
+	opID := f.kube.recordFor(operation.Name).OperationID
+
+	// The operator was DOWNGRADED between the interruption and the resume.
+	resumed := newRestoreFixture(t, facts)
+	resumed.kube = f.kube
+	resumed.cluster.deleted = f.cluster.deleted
+	resumed.cluster.namespace = f.cluster.namespace
+	resumed.cluster.annotations = f.cluster.annotations
+	resumed.cluster.operatorChart = "kubenest-operator-2-2.6.17"
+	beforeApplies := resumed.kube.commandCount("apply -f -")
+	beforeDeletes := resumed.kube.commandCount("delete namespace payments")
+
+	var out strings.Builder
+	err := RunRestore(context.Background(), &out, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps())
+	if err == nil {
+		t.Fatalf("--resume held the project for an operator that cannot acknowledge the pause:\n%s", out.String())
+	}
+	for _, want := range []string{"2.6.17", MinOperatorPauseVersion, "Nothing has been changed", "kubenest platform upgrade"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	}
+	if after := resumed.kube.commandCount("apply -f -"); after != beforeApplies {
+		t.Errorf("the refused resume submitted %d document(s) to the cluster", after-beforeApplies)
+	}
+	if after := resumed.kube.commandCount("delete namespace payments"); after != beforeDeletes {
+		t.Errorf("the refused resume deleted the namespace again (%d -> %d)", beforeDeletes, after)
+	}
+	if resumed.cluster.annotations[PauseAnnotationKey] != opID {
+		t.Errorf("the refusal lifted the pause (annotations %v)", resumed.cluster.annotations)
+	}
+}
+
+// TestChartVersionOrdering pins the semver rules the gate turns on: a
+// pre-release is LOWER than the release it precedes, so a floor of 2.7.0-rc.1
+// accepts 2.7.0 — and a numeric identifier compares NUMERICALLY, so
+// 2.7.0-rc.10 is newer than 2.7.0-rc.9 rather than older.
+func TestChartVersionOrdering(t *testing.T) {
+	floor := mustChartVersion(MinOperatorPauseVersion)
+	for _, c := range []struct {
+		version string
+		want    int
+	}{
+		{"2.6.17", -1},
+		{"2.6.999", -1},
+		{"1.9.9", -1},
+		{"2.7.0-alpha", -1},
+		{"2.7.0-0", -1}, // a numeric identifier is lower than an alphanumeric one
+		{"2.7.0-rc.0", -1},
+		{"2.7.0-rc.1", 0},
+		{"v2.7.0-rc.1", 0},
+		{"2.7.0-rc.1+build.7", 0}, // build metadata is ignored
+		{"2.7.0-rc.1-rc", 1},      // "1-rc" is alphanumeric, and alphanumeric beats numeric
+		{"2.7.0-rc.1.1", 1},
+		{"2.7.0-rc.2", 1},
+		{"2.7.0-rc.9", 1},
+		{"2.7.0-rc.10", 1}, // numerically, not lexically: "10" is after "9"
+		{"2.7.0", 1},
+		{"2.7.1", 1},
+		{"2.8.0", 1},
+		{"3.0.0", 1},
+	} {
+		version, err := parseChartVersion(c.version)
+		if err != nil {
+			t.Errorf("%s does not parse: %v", c.version, err)
+			continue
+		}
+		if got := compareChartVersions(version, floor); sign(got) != c.want {
+			t.Errorf("%s compares to %s as %d, want %d", c.version, MinOperatorPauseVersion, sign(got), c.want)
+		}
+	}
+	// A version this gate cannot read is never treated as new enough.
+	for _, unparseable := range []string{"", "2.7", "2.7.0.1", "two.seven.zero", "2.7.0-", "2.7.0-rc..1", "+2.7.0", "v", "2.7.0-rc.1 "} {
+		if _, err := parseChartVersion(unparseable); err == nil {
+			t.Errorf("%q parsed as a version, so an operator that reports it would be judged rather than refused", unparseable)
+		}
+	}
+}
+
+func sign(n int) int {
+	switch {
+	case n < 0:
+		return -1
+	case n > 0:
+		return 1
+	}
+	return 0
+}
+
+// TestOperatorChartVersionReadsTheLabel: the label is "<chart name>-<version>",
+// and the NAME IS MATCHED rather than searched for — the operator chart's name
+// carries a dash and a digit of its own, so a scan for "the first dash whose
+// remainder is a version" would read another chart's label as a version of this
+// one.
+func TestOperatorChartVersionReadsTheLabel(t *testing.T) {
+	version, text, err := operatorChartVersion("kubenest-operator-2-2.7.0-rc.1")
+	if err != nil {
+		t.Fatalf("reading the label the lab reported: %v", err)
+	}
+	if text != MinOperatorPauseVersion || compareChartVersions(version, minOperatorPause) != 0 {
+		t.Errorf("the label read as %q, want %s", text, MinOperatorPauseVersion)
+	}
+	if _, text, err := operatorChartVersion("kubenest-operator-2-2.7.1"); err != nil || text != "2.7.1" {
+		t.Errorf("a released chart read as %q (err %v), want 2.7.1", text, err)
+	}
+	for _, bad := range []string{
+		"",
+		"kubenest-operator-2",      // the chart name with no version
+		"kubenest-operator-2-2",    // the name's own digit is not a version
+		"kubenest-agent-2.7.1",     // another chart's label
+		"kubenest-operator-21-1.0", // the name is not a prefix of a longer number
+		"kubenest-operator-2-v2",   // no version after the name
+	} {
+		if _, _, err := operatorChartVersion(bad); err == nil {
+			t.Errorf("the label %q read as a version, so a restore would proceed on a guess", bad)
+		}
 	}
 }
 

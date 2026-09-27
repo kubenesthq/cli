@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -65,6 +67,212 @@ const (
 	// ReasonPausedByOperation names the operation id in PauseAnnotationKey.
 	ReasonPausedByOperation = "PausedByOperation"
 )
+
+// MinOperatorPauseVersion is the first kubenest-operator-2 chart whose operator
+// acknowledges the reconcile pause, and therefore the first an operator must be
+// running for this command to hold a project at all.
+//
+// The pause and the condition the CLI waits for arrived in op3 418280a (T4.2,
+// plan 7.5), and the first chart carrying them is 2.7.0-rc.1, which bundle 1.2
+// pins. No older operator will EVER acknowledge, so a restore against one wrote
+// the pause, waited the bundle's whole acknowledgement deadline and failed,
+// having destroyed nothing and learned nothing — measured on the demo cluster
+// (bundle 1.1, operator chart 2.6.17, 2026-09-27, kn-x0wv.6).
+//
+// THE OPERATOR'S OWN VERSION IS THE SIGNAL, NOT THE BUNDLE'S. Lab w3 runs
+// bundle 1.1 with the 2.7.0-rc.1 operator installed by hand and restores
+// correctly, and a cluster can run an operator newer than the one its bundle
+// pinned; only the chart the operator reports says what can be waited for.
+//
+// It is a MINIMUM and a pre-release, so it sorts below 2.7.0 (semver §11): a
+// 2.7.0-rc.1 cluster proceeds, and so does a 2.7.0 one.
+const MinOperatorPauseVersion = "2.7.0-rc.1"
+
+// minOperatorPause is MinOperatorPauseVersion parsed once. A constant this
+// build cannot parse is an error here and not a condition of the cluster, so it
+// is raised where it is made rather than on a customer's cluster.
+var minOperatorPause = mustChartVersion(MinOperatorPauseVersion)
+
+func mustChartVersion(raw string) chartVersion {
+	version, err := parseChartVersion(raw)
+	if err != nil {
+		panic(fmt.Sprintf("MinOperatorPauseVersion %q is not a version: %v", raw, err))
+	}
+	return version
+}
+
+// chartVersion is a chart version: the three numbers and the pre-release
+// identifiers semver orders by (§11). Build metadata is parsed and dropped,
+// which is what the spec says it is for.
+type chartVersion struct {
+	major, minor, patch int
+	pre                 []string
+}
+
+// operatorChartVersion reads the version out of a helm.sh/chart label, which
+// Helm writes as "<chart name>-<chart version>".
+//
+// THE NAME IS MATCHED, NOT SEARCHED FOR. The operator chart's name carries a
+// dash and a digit of its own ("kubenest-operator-2") and a version's
+// pre-release carries dashes ("2.7.0-rc.1"), so "the first dash whose remainder
+// parses as a version" would read a label from a DIFFERENT chart as a version
+// of this one. The prefix is the one place the chart's name is spelled for a
+// reader, in pkg/component/agent, beside the Deployment it also names.
+func operatorChartVersion(label string) (chartVersion, string, error) {
+	text, found := strings.CutPrefix(label, agent.ChartName+"-")
+	if !found {
+		return chartVersion{}, "", fmt.Errorf("the label does not name the operator chart %s", agent.ChartName)
+	}
+	version, err := parseChartVersion(text)
+	if err != nil {
+		return chartVersion{}, text, err
+	}
+	return version, text, nil
+}
+
+// parseChartVersion reads a chart version: major.minor.patch, an optional
+// pre-release, and build metadata that is parsed and ignored. A leading "v" is
+// accepted because Helm accepts one and normalizes it away, and the numbers are
+// read as the integers they are, so a padded "2.07.0" is the version it says.
+// Everything else — a missing component, a letter where a number belongs, an
+// empty pre-release identifier — is refused rather than guessed at: this gate
+// decides whether a cluster can be held, and a version it cannot read is not a
+// version it may treat as new enough.
+func parseChartVersion(raw string) (chartVersion, error) {
+	text := strings.TrimPrefix(strings.TrimPrefix(raw, "v"), "V")
+	text, _, _ = strings.Cut(text, "+")
+	numbers, pre, hasPre := strings.Cut(text, "-")
+	parts := strings.Split(numbers, ".")
+	if len(parts) != 3 {
+		return chartVersion{}, fmt.Errorf("%q is not major.minor.patch", raw)
+	}
+	version := chartVersion{}
+	fields := []*int{&version.major, &version.minor, &version.patch}
+	for i, part := range parts {
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return chartVersion{}, fmt.Errorf("%q has %q where a number belongs", raw, part)
+		}
+		*fields[i] = value
+	}
+	if !hasPre {
+		return version, nil
+	}
+	if pre == "" {
+		return chartVersion{}, fmt.Errorf("%q marks a pre-release and names none", raw)
+	}
+	version.pre = strings.Split(pre, ".")
+	for _, identifier := range version.pre {
+		if identifier == "" || strings.Trim(identifier, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") != "" {
+			return chartVersion{}, fmt.Errorf("%q has %q where a pre-release identifier belongs", raw, identifier)
+		}
+	}
+	return version, nil
+}
+
+// compareChartVersions orders two versions the way semver does.
+//
+// THE ONE RULE THAT MATTERS FOR THIS GATE is §11's: a pre-release is LOWER than
+// the release it precedes, so 2.7.0-rc.1 is older than 2.7.0 — which is what
+// makes a minimum of "2.7.0-rc.1" accept both that release candidate and the
+// release itself, while refusing 2.7.0-rc.0 and everything below it.
+//
+// Numeric identifiers compare numerically (2.7.0-rc.10 is NEWER than
+// 2.7.0-rc.9, not older), and a numeric identifier is lower than an
+// alphanumeric one.
+func compareChartVersions(left, right chartVersion) int {
+	if c := compareInts(left.major, right.major); c != 0 {
+		return c
+	}
+	if c := compareInts(left.minor, right.minor); c != 0 {
+		return c
+	}
+	if c := compareInts(left.patch, right.patch); c != 0 {
+		return c
+	}
+	// A PRE-RELEASE IS LOWER THAN THE RELEASE IT PRECEDES, so an empty
+	// pre-release outranks any list of identifiers — this is the comparison the
+	// gate turns on, and getting it backwards would refuse the release that
+	// fixes the bug.
+	switch {
+	case len(left.pre) == 0 && len(right.pre) == 0:
+		return 0
+	case len(left.pre) == 0:
+		return 1
+	case len(right.pre) == 0:
+		return -1
+	}
+	for i := 0; i < len(left.pre) && i < len(right.pre); i++ {
+		leftIdentifier, rightIdentifier := left.pre[i], right.pre[i]
+		if leftIdentifier == rightIdentifier {
+			continue
+		}
+		leftNumber, leftErr := strconv.Atoi(leftIdentifier)
+		rightNumber, rightErr := strconv.Atoi(rightIdentifier)
+		switch {
+		case leftErr == nil && rightErr == nil:
+			return compareInts(leftNumber, rightNumber)
+		case leftErr == nil:
+			return -1
+		case rightErr == nil:
+			return 1
+		default:
+			return strings.Compare(leftIdentifier, rightIdentifier)
+		}
+	}
+	// The shared identifiers are equal, so the SHORTER list is lower
+	// (2.7.0-rc.1 precedes 2.7.0-rc.1.1).
+	return compareInts(len(left.pre), len(right.pre))
+}
+
+func compareInts(left, right int) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	}
+	return 0
+}
+
+// requirePauseCapableOperator refuses a restore whose operator cannot
+// acknowledge the reconcile pause, BEFORE the pause is written.
+//
+// IT IS A READ WITH NO SIDE EFFECT, and it runs on every run that reaches for
+// the hold — mode 1's and mode 2's (both call ensurePause, restore_volumes.go),
+// and a resume, which must not re-wait on an operator that was downgraded since
+// the interruption.
+func (r *restoreRun) requirePauseCapableOperator(ctx context.Context) error {
+	label, err := r.deps.Cluster.OperatorChart(ctx)
+	if err != nil {
+		return err
+	}
+	if label == "" {
+		return pauseUnsupported(fmt.Sprintf("the operator Deployment %s/%s is not on this cluster, or carries no helm.sh/chart label, so this restore cannot tell which operator version is running", ProjectCRNamespace, agent.DeploymentName))
+	}
+	version, text, err := operatorChartVersion(label)
+	if err != nil {
+		return pauseUnsupported(fmt.Sprintf("the operator Deployment %s/%s reports %q, which names no operator chart version this command can read (%v)", ProjectCRNamespace, agent.DeploymentName, label, err))
+	}
+	if compareChartVersions(version, minOperatorPause) < 0 {
+		return pauseUnsupported(fmt.Sprintf("the operator running here is chart %s (version %s), older than the %s this restore needs", label, text, MinOperatorPauseVersion))
+	}
+	fmt.Fprintf(r.out, "  operator:      %s acknowledges the reconcile pause\n", label)
+	return nil
+}
+
+// pauseUnsupported builds the one refusal for every way an operator can fail to
+// support the pause, with what was found in front of it: the version found, the
+// version needed, that nothing was changed, and the path that fixes it.
+//
+// THE UPGRADE PATH IS PROSE, NOT A COPYABLE COMMAND LINE. The bundle whose
+// operator carries the pause may not be the one a reader can install yet, and a
+// command line naming an unreleased version is a command that fails when it is
+// pasted.
+func pauseUnsupported(found string) error {
+	return fmt.Errorf("%s. The reconcile pause this restore needs — the operator's own %s condition, which holds reconciliation for the few minutes a restore takes — first ships in operator chart %s, the one bundle 1.2 pins: an operator older than that never writes the condition, so the restore would write the pause, wait out the acknowledgement deadline and fail, with the namespace untouched. Nothing has been changed. The path is `kubenest platform upgrade`, which moves this cluster to a bundle whose operator chart carries the pause; run the restore again afterwards",
+		found, ConditionReconcilePaused, MinOperatorPauseVersion)
+}
 
 // The restore's own labels and constants.
 const (
@@ -1398,7 +1606,14 @@ func (r *restoreRun) holdTimeout() (time.Duration, error) {
 // finishing can act during it; a Job created in that window runs against the
 // namespace the restore is about to empty (measured on hardware, S4 on lab w3,
 // 2026-09-27).
+//
+// AND THE OPERATOR HAS TO BE ABLE TO ACKNOWLEDGE AT ALL before the annotation
+// is written: an operator older than the pause first shipping would leave the
+// run waiting out that deadline for a condition it never writes (kn-x0wv.6).
 func (r *restoreRun) ensurePause(ctx context.Context) error {
+	if err := r.requirePauseCapableOperator(ctx); err != nil {
+		return err
+	}
 	opID := r.handle.OperationID()
 	if err := r.stage("pause").AnnotateProject(ctx, r.opts.Namespace, PauseAnnotationKey, opID); err != nil {
 		return fmt.Errorf("%w. Without the hold, reconciliation would recreate the namespace or sync over the restore", err)

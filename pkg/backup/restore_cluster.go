@@ -11,6 +11,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/storage"
 )
@@ -43,6 +44,14 @@ type RestoreCluster interface {
 	Applications(ctx context.Context, namespace string) ([]ApplicationState, error)
 	ProjectHold(ctx context.Context, namespace string) (*ProjectHold, error)
 	DrillRestore(ctx context.Context) (*DrillRestore, error)
+	// OperatorChart reads the helm.sh/chart label the operator Deployment
+	// carries — "<chart name>-<chart version>" — which is the chart version the
+	// cluster is really running. It decides whether this operator can
+	// acknowledge the reconcile pause at all (kn-x0wv.6): an operator older
+	// than the pause first shipping never writes the condition, and the
+	// bundle's pin is not the signal, because a cluster can run an operator its
+	// bundle did not pin. Empty when the Deployment or the label is not there.
+	OperatorChart(ctx context.Context) (string, error)
 	VolumeRestores(ctx context.Context, restoreName string) ([]VolumeRestoreState, error)
 	// PodVolumeBackups reads the volumes the CHOSEN BACKUP holds: one entry per
 	// PodVolumeBackup Velero wrote, naming the pod the backup captured, the
@@ -713,6 +722,36 @@ func (c *k3sCluster) ProjectHold(ctx context.Context, namespace string) (*Projec
 		hold.ConditionMessage = condition.Message
 	}
 	return hold, nil
+}
+
+// OperatorChart reads the helm.sh/chart label the operator Deployment carries.
+//
+// THE LABEL IS THE VERSION THE CLUSTER IS RUNNING. Helm stamps it on every
+// object the chart renders, and pkg/upgrade reads it for the same reason: the
+// HelmChart's spec.version says what someone ASKED for, and the label says what
+// the helm controller actually applied.
+//
+// A MISSING DEPLOYMENT IS AN EMPTY LABEL AND NOT AN ERROR: a cluster whose
+// operator is not there cannot acknowledge the pause either, and the caller's
+// refusal says the same thing about both — a restore does not write a pause
+// nothing will answer.
+func (c *k3sCluster) OperatorChart(ctx context.Context) (string, error) {
+	out, err := c.kubectl(ctx, "get deployment "+agent.DeploymentName+" -n "+ProjectCRNamespace+" -o json")
+	if err != nil {
+		if notFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("reading the operator Deployment %s/%s: %w", ProjectCRNamespace, agent.DeploymentName, err)
+	}
+	var document struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil {
+		return "", fmt.Errorf("parsing `kubectl get deployment %s -o json`: %w", agent.DeploymentName, err)
+	}
+	return document.Metadata.Labels["helm.sh/chart"], nil
 }
 
 // DrillRestore reports the operator's restore drill if one is in progress. A

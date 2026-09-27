@@ -378,6 +378,8 @@ func (s *stubCluster) ProjectHold(context.Context, string) (*backup.ProjectHold,
 	return nil, nil
 }
 
+func (s *stubCluster) OperatorChart(context.Context) (string, error) { return "", nil }
+
 func (s *stubCluster) DrillRestore(context.Context) (*backup.DrillRestore, error) { return nil, nil }
 
 func (s *stubCluster) VolumeRestores(context.Context, string) ([]backup.VolumeRestoreState, error) {
