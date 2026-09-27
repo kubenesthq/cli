@@ -234,7 +234,9 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		lab.kubectl("-n " + s5Namespace + " delete pod -l app=" + workload + " --grace-period=0 --force --ignore-not-found")
 		lab.kubectl("-n " + s5Namespace + " delete pvc " + workload + "-a " + workload + "-b --wait=false")
 		lab.waitFor(3*time.Minute, "the dead node's claims to be gone", func() (bool, string) {
-			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc -o name")
+			// This workload's own claims: another arm's, or a claim an earlier
+			// run left in the namespace, is not this node's loss.
+			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "-n "+s5Namespace+" get pvc "+workload+"-a "+workload+"-b --ignore-not-found -o name")
 			if err != nil {
 				return false, err.Error()
 			}
