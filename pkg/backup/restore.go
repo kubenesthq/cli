@@ -20,12 +20,12 @@ import (
 //
 // Two modes, one command. Mode 1 puts a whole NAMESPACE back into the live
 // cluster: it chooses an eligible backup, prints a plan of what will change,
-// waits for the operator's confirmation, pauses the project's reconcilers,
-// stops the namespace's scheduled work and takes a safety backup of the
-// namespace as it stands, stops the writers, deletes the namespace and restores
-// it. Mode 2 (restore_volumes.go) does the node-loss path: one workload's
-// stranded claims, refilled in place while the volumes of the same workload
-// that are still fine keep their newer data.
+// waits for the operator's confirmation, pauses the project's reconcilers and
+// stops the namespace's scheduled work and any Job still running, takes a
+// safety backup of the namespace as it stands, stops the writers, deletes the
+// namespace and restores it. Mode 2 (restore_volumes.go) does the node-loss
+// path: one workload's stranded claims, refilled in place while the volumes of
+// the same workload that are still fine keep their newer data.
 //
 // THREE RULES SHAPE EVERYTHING HERE.
 //
@@ -87,16 +87,19 @@ const (
 	// RestoredStage is the stage the record holds while the data is back and
 	// nothing is allowed to run yet.
 	RestoredStage = "restored — awaiting activation"
-	// StopCronJobWrite is the record kind naming the work the stop step did on
-	// one CronJob of the namespace as it stood. It is written ALREADY
-	// DISCHARGED (operation.WriteDone): it answers "what did the stop step do",
-	// and it is not work activation owes.
+	// StopCronJobWrite and StopJobWrite are the record kinds naming the work
+	// the stop step did on one object of the namespace as it stood. They are
+	// written ALREADY DISCHARGED (operation.WriteDone): they answer "what did
+	// the stop step do", and they are not work activation owes.
 	StopCronJobWrite = "stop-cronjob"
-	// StoppedCronJobTarget is where that record entry points. It is its own
-	// target, never "cronjob/<name>", so it can never be read back as the value
-	// activation puts a restored CronJob back to — those come from the backup,
-	// in kn-x0wv.3's annotation.
+	StopJobWrite     = "stop-job"
+	// StoppedCronJobTarget and StoppedJobTarget are where those record entries
+	// point. Each is its own target — never "cronjob/<name>" or "job/<name>" —
+	// so a stop-step entry can never be read back as the value activation puts
+	// a restored object back to: those come from the backup, in kn-x0wv.3's
+	// annotation.
 	StoppedCronJobTarget = "cronjob-stop/"
+	StoppedJobTarget     = "job-stop/"
 )
 
 // The marker the operator's restore drill puts on ITS Velero Restore. Both
@@ -740,7 +743,7 @@ func (r *restoreRun) renderPlan() {
 	if p.Mode == "volumes" {
 		fmt.Fprintf(r.out, "  mode:          volumes — refilling %s in place; every other volume of the same workload keeps its current contents\n", strings.Join(p.PVCs, ", "))
 	} else {
-		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs are suspended before the safety backup, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
+		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs and any Job still running are suspended as soon as the pause is written, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
 	}
 }
 
@@ -1385,15 +1388,31 @@ func (r *restoreRun) holdTimeout() (time.Duration, error) {
 	return r.timeout("component-ready")
 }
 
-// ensurePause writes the pause annotation on the in-cluster Project and waits
-// for the operator to acknowledge it.
+// ensurePause writes the pause annotation on the in-cluster Project, stops
+// everything in the namespace that can start work, and waits for the operator
+// to acknowledge the pause.
+//
+// THE STOP COMES BEFORE THE WAIT AND IS RE-ASSERTED AFTER IT. The wait can run
+// to the bundle's component-ready deadline, and a reconciler that is still
+// finishing can act during it; a Job created in that window runs against the
+// namespace the restore is about to empty (measured on hardware, S4 on lab w3,
+// 2026-09-27).
 func (r *restoreRun) ensurePause(ctx context.Context) error {
 	opID := r.handle.OperationID()
 	if err := r.stage("pause").AnnotateProject(ctx, r.opts.Namespace, PauseAnnotationKey, opID); err != nil {
 		return fmt.Errorf("%w. Without the hold, reconciliation would recreate the namespace or sync over the restore", err)
 	}
 	fmt.Fprintf(r.out, "  pause:         %s=%s written on Project %s/%s\n", PauseAnnotationKey, opID, ProjectCRNamespace, r.opts.Namespace)
-	return r.waitPauseAcknowledged(ctx, opID)
+	if err := r.stopWork(ctx, " before the pause is acknowledged"); err != nil {
+		return err
+	}
+	if err := r.waitPauseAcknowledged(ctx, opID); err != nil {
+		return err
+	}
+	// RE-ASSERTED AFTER THE ACKNOWLEDGEMENT, because the wait is exactly the
+	// window in which a reconciler can have recreated a CronJob, or created a
+	// Job, that the annotation did not stop it from making.
+	return r.stopWork(ctx, " again after the acknowledgement")
 }
 
 // waitPauseAcknowledged waits for the operator's own acknowledgement AND for
@@ -1584,64 +1603,108 @@ func (r *restoreRun) scaleToZero(ctx context.Context) error {
 	return nil
 }
 
-// suspendCronJobs stops the namespace's SCHEDULED work as part of the stop step.
+// stopWork stops everything in the namespace that can START work: every
+// CronJob, so no schedule creates a Job, and every Job that has NOT finished,
+// so a Job already running stops its pods instead of writing into claims the
+// restore is about to empty.
 //
-// WHY IT RUNS BEFORE THE SAFETY BACKUP. A CronJob left running creates a Job
-// whenever its schedule comes due, and the namespace is not deleted until after
-// the safety backup — so a scheduled run can start against the emptied
-// namespace while the restore is under way. On hardware (S4, lab w3,
-// 2026-09-27) the recreated namespace's `s4-sentinel` fired in exactly that
-// window, and the Job it created went with the namespace, leaving no record of
-// it. Scaling the workloads to zero does not stop that: a CronJob's Job starts
-// its own pod. So the schedules are suspended first, and the workloads are
-// scaled to zero after the safety backup, because Velero's file-level copy of a
-// claim needs the pod that mounts it to be running.
+// IT RUNS TWICE, AROUND THE ACKNOWLEDGEMENT, AND THAT IS THE POINT. The first
+// run is as soon as the pause annotation is written and BEFORE the operator's
+// acknowledgement is waited for; the second re-asserts both after the
+// acknowledgement, in case a reconciler acted during that wait.
 //
-// WHAT IT RECORDS IS NOT WHAT ACTIVATION USES. Each CronJob's value before this
+// WHY IT IS NOT ENOUGH TO DO THIS AFTER THE ACKNOWLEDGEMENT. On hardware (S4,
+// lab w3, 2026-09-27, after the stop step already suspended CronJobs before the
+// safety backup) a sentinel call still arrived: the recreated namespace's live
+// CronJob created a Job at 18:30:00, its pod called the sentinel at 18:30:31,
+// and the run's stop step ran only after the acknowledgement — so suspending
+// the CronJob then could not stop a Job it had already created. A CronJob's Job
+// starts its own pod, which is why scaling the workloads to zero does not stop
+// it, and why a Job that is already running has to be suspended itself.
+//
+// SCALING THE WORKLOADS IS NOT PART OF THIS. They are scaled to zero after the
+// safety backup, because Velero's file-level copy of a claim needs the pod that
+// mounts it to be running; a Job's pod is not the workload's, and its writes
+// are what must stop now.
+//
+// WHAT IT RECORDS IS NOT WHAT ACTIVATION USES. Each object's value before this
 // step goes into the record under its own target, so "what did the stop step do"
-// is answerable; activation puts each RESTORED CronJob back to the value the
-// BACKUP held, read from the annotation the restore's own resource modifier
-// wrote (kn-x0wv.3), and never from here.
-func (r *restoreRun) suspendCronJobs(ctx context.Context) error {
-	jobs, err := r.deps.Cluster.CronJobs(ctx, r.opts.Namespace)
+// is answerable. Activation puts each RESTORED object back from the operation's
+// own restore records — a CronJob's value comes from the BACKUP, read out of
+// the annotation the restore's resource modifier wrote (kn-x0wv.3) — and never
+// from here.
+//
+// A JOB THIS SUSPENDS IS NOT ACTIVATION'S BUSINESS. The namespace deletion
+// destroys it with everything else the namespace held, and Jobs are excluded
+// from the restore unless --include-jobs brought them back, so there is no
+// object left for activation to un-suspend: the "job-stop/<name>" entry is a
+// record for the operator, not owed work. When --include-jobs DID restore a
+// Job, activation starts the RESTORED object, from its own entry
+// ("job/<name>", written by holdRestoredWork) — never from this one.
+func (r *restoreRun) stopWork(ctx context.Context, when string) error {
+	cronjobs, err := r.deps.Cluster.CronJobs(ctx, r.opts.Namespace)
 	if err != nil {
 		return err
 	}
-	if len(jobs) == 0 {
-		fmt.Fprintf(r.out, "  stop:          no CronJob in namespace %s to suspend\n", r.opts.Namespace)
-		return nil
-	}
-	for _, job := range jobs {
+	for _, job := range cronjobs {
 		was := "false"
 		if job.Suspend {
 			was = "true"
 		}
 		if err := r.stage("stop-cronjob/"+job.Name).SuspendCronJob(ctx, r.opts.Namespace, job.Name, true); err != nil {
-			return fmt.Errorf("suspending CronJob %s in namespace %s before anything is captured or destroyed: %w", job.Name, r.opts.Namespace, err)
+			return fmt.Errorf("suspending CronJob %s in namespace %s%s: %w", job.Name, r.opts.Namespace, when, err)
 		}
-		if err := r.recordStoppedCronJob(ctx, job.Name, was); err != nil {
+		if err := r.recordStoppedWork(ctx, StoppedCronJobTarget+job.Name, StopCronJobWrite, was); err != nil {
 			return err
 		}
-		fmt.Fprintf(r.out, "  stop:          CronJob %s suspended (it was suspended=%s); activation takes its value from the backup, not from this step\n", job.Name, was)
+		fmt.Fprintf(r.out, "  stop:          CronJob %s suspended%s (it was suspended=%s); activation takes its value from the backup, not from this step\n", job.Name, when, was)
+	}
+	jobs, err := r.deps.Cluster.Jobs(ctx, r.opts.Namespace)
+	if err != nil {
+		return err
+	}
+	unfinished := 0
+	for _, job := range jobs {
+		if job.Finished {
+			// A Job that completed or failed terminally creates no pod and
+			// writes nothing: suspending it would change the object's spec away
+			// from what the backup holds for no gain.
+			continue
+		}
+		unfinished++
+		was := "false"
+		if job.Suspend {
+			was = "true"
+		}
+		if err := r.stage("stop-job/"+job.Name).SuspendJob(ctx, r.opts.Namespace, job.Name, true); err != nil {
+			return fmt.Errorf("suspending Job %s in namespace %s%s: %w", job.Name, r.opts.Namespace, when, err)
+		}
+		if err := r.recordStoppedWork(ctx, StoppedJobTarget+job.Name, StopJobWrite, was); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "  stop:          Job %s suspended%s (it was suspended=%s): a suspended Job's pods stop and the object stays for the safety backup\n", job.Name, when, was)
+	}
+	if len(cronjobs) == 0 && unfinished == 0 {
+		fmt.Fprintf(r.out, "  stop:          nothing in namespace %s can start work%s (no CronJob, no Job that has not finished)\n", r.opts.Namespace, when)
 	}
 	return nil
 }
 
-// recordStoppedCronJob writes down, in the operation, that the stop step
-// suspended one CronJob and what its value was before, as a write that is
-// already DISCHARGED: it is a record of what happened rather than work
-// activation owes. It is written AFTER the patch returned, so the record never
-// claims a suspension that did not happen.
+// recordStoppedWork writes down, in the operation, that the stop step suspended
+// one object and what its value was before, as a write that is already
+// DISCHARGED: it is a record of what happened rather than work activation owes.
+// It is written AFTER the patch returned, so the record never claims a
+// suspension that did not happen.
 //
-// ITS TARGET IS ITS OWN ("cronjob-stop/<name>"). Activation reads the value it
-// puts a restored CronJob back to from "cronjob/<name>", so a record entry here
-// can never be mistaken for it.
-func (r *restoreRun) recordStoppedCronJob(ctx context.Context, name, was string) error {
-	target := StoppedCronJobTarget + name
+// ITS TARGET IS ITS OWN ("cronjob-stop/<name>", "job-stop/<name>"). Activation
+// reads the values it puts restored objects back to from "cronjob/<name>",
+// "job/<name>", "deployment/<name>" and "statefulset/<name>", so a record entry
+// here can never be mistaken for one of those.
+func (r *restoreRun) recordStoppedWork(ctx context.Context, target, kind, was string) error {
 	now := r.deps.Now()
 	return r.deps.Store.Update(ctx, r.handle, func(rec *operation.Record) error {
 		for i := range rec.Pending {
-			if rec.Pending[i].Target != target || rec.Pending[i].Kind != StopCronJobWrite {
+			if rec.Pending[i].Target != target || rec.Pending[i].Kind != kind {
 				continue
 			}
 			rec.Pending[i].Detail = was
@@ -1650,7 +1713,7 @@ func (r *restoreRun) recordStoppedCronJob(ctx context.Context, name, was string)
 			return nil
 		}
 		rec.Pending = append(rec.Pending, operation.PendingWrite{
-			Kind:   StopCronJobWrite,
+			Kind:   kind,
 			Target: target,
 			Detail: was,
 			Status: operation.WriteDone,
@@ -2468,25 +2531,20 @@ func valueOf(command, key string) string {
 //
 // The record exists before the first line of it (openRecord), and the hold is
 // the first change — a reconcile that recreated the namespace between the plan
-// and the delete would restore into objects nobody planned against.
+// and the delete would restore into objects nobody planned against. The hold's
+// own step stops everything in the namespace that can start work, before it
+// waits for the acknowledgement and again after it (ensurePause); the writers
+// themselves are scaled to zero later, because Velero's file-level copy of a
+// claim needs the pod that mounts it running.
 //
 // EVERY STEP IS "DO IT, THEN MAKE SURE IT HAPPENED", which is what makes a
 // `--resume` converge: a step whose action the record already holds is not
 // submitted again, and the wait after it re-establishes the same fact.
-//
-// THE STOP STEP STRADDLES THE SAFETY BACKUP. The namespace's CronJobs are
-// suspended BEFORE it, because a due schedule can otherwise start a Job against
-// the emptied namespace in the window between the backup and the delete; the
-// workloads are scaled to zero AFTER it, because a claim's file-level copy
-// needs the pod that mounts it running.
 func (r *restoreRun) execute(ctx context.Context) error {
 	if err := r.ensurePause(ctx); err != nil {
 		return err
 	}
 	if err := r.verifyIdentities(ctx); err != nil {
-		return err
-	}
-	if err := r.suspendCronJobs(ctx); err != nil {
 		return err
 	}
 	if err := r.safetyBackup(ctx); err != nil {

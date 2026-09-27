@@ -1344,6 +1344,102 @@ func TestNamespaceRestoreStopSuspendsCronJobsBeforeTheSafetyBackup(t *testing.T)
 	}
 }
 
+// TestNamespaceRestoreStopSuspendsWorkBeforeThePauseIsAcknowledged is the fix
+// kn-x0wv.5's second hardware run asked for: the stop comes as soon as the pause
+// annotation is written, BEFORE the operator's acknowledgement is waited for,
+// and is re-asserted after it.
+//
+// THE PLANTED NEGATIVE IS THE ORDER AS IT WAS. On lab w3 (2026-09-27) a sentinel
+// call still arrived at 18:30:31, from a Job the recreated namespace's live
+// CronJob created at 18:30:00 — while the run waited for the acknowledgement,
+// before its stop step ran. Suspending the CronJob then cannot stop a Job it has
+// already created, so a Job that is still running is suspended too.
+func TestNamespaceRestoreStopSuspendsWorkBeforeThePauseIsAcknowledged(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.cronjobs = []CronJobState{{Name: "s4-sentinel", Schedule: "* * * * *", Suspend: true, RecordedSuspend: "false"}}
+	f.cluster.jobs = []JobState{{Name: "s4-sentinel-probe", Suspend: false}}
+	// The instant the run first reads the project's hold, which is the first
+	// probe of the acknowledgement wait: everything that can start work has to
+	// be stopped by then.
+	atHold := -1
+	f.cluster.onProjectHold = func() {
+		if atHold < 0 {
+			atHold = len(f.cluster.writes)
+		}
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	if atHold < 0 {
+		t.Fatalf("the run never read the project's hold:\n%s", out)
+	}
+	for _, want := range []string{"suspend-cronjob/s4-sentinel=true", "suspend-job/s4-sentinel-probe=true"} {
+		at := f.cluster.writeIndex(want)
+		if at < 0 {
+			t.Errorf("the run never wrote %s (%v): a schedule, or a Job that is already running, can start work while the acknowledgement is waited for", want, f.cluster.writes)
+			continue
+		}
+		if at > atHold {
+			t.Errorf("%s happened at %d, after the acknowledgement was first read at %d (%v): the stop must come before the wait", want, at, atHold, f.cluster.writes)
+		}
+		// AND AGAIN AFTER THE ACKNOWLEDGEMENT, in case a reconciler acted
+		// during the wait.
+		writes := 0
+		for _, write := range f.cluster.writes {
+			if write == want {
+				writes++
+			}
+		}
+		if writes < 2 {
+			t.Errorf("%s was written %d time(s) (%v): it must be asserted before the acknowledgement and again after it", want, writes, f.cluster.writes)
+		}
+	}
+	if !f.cluster.suspended["s4-sentinel"] || !f.cluster.jobsSuspended["s4-sentinel-probe"] {
+		t.Errorf("neither the CronJob nor the running Job is left suspended (cronjobs %v, jobs %v)", f.cluster.suspended, f.cluster.jobsSuspended)
+	}
+}
+
+// TestNamespaceRestoreStopSuspendsARunningJobAndLeavesAFinishedOne: the Job half
+// of the stop step. A Job that has not finished can be writing into the
+// namespace, so it is suspended with the CronJobs; a Job that completed or
+// failed terminally creates no pod, so its spec is left as the backup holds it.
+//
+// IT ALSO PINS WHERE ACTIVATION DOES NOT READ FROM. The namespace deletion
+// destroys a Job this step suspended and Jobs are excluded from the restore, so
+// there is nothing for activation to put back: the record entry is the stop
+// step's own target, and it is not owed work.
+func TestNamespaceRestoreStopSuspendsARunningJobAndLeavesAFinishedOne(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.jobs = []JobState{
+		{Name: "s4-sentinel-probe", Suspend: false},
+		{Name: "migrate", Suspend: false, Finished: true},
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	if !f.cluster.jobsSuspended["s4-sentinel-probe"] {
+		t.Errorf("the Job that has not finished was left unsuspended (%v): it can write into the namespace while the restore runs", f.cluster.jobsSuspended)
+	}
+	if _, patched := f.cluster.jobsSuspended["migrate"]; patched {
+		t.Errorf("the finished Job was suspended (%v): it creates no pod, and its spec must stay what the backup holds", f.cluster.jobsSuspended)
+	}
+	record := f.kube.recordFor(operation.Name)
+	if got := pendingDetailOf(t, record, StoppedJobTarget+"s4-sentinel-probe"); got != "false" {
+		t.Errorf("the operation recorded %q for the Job it suspended, want the value it had before (false): the record must answer what the stop step did", got)
+	}
+	for _, target := range []string{"job/s4-sentinel-probe", "job/migrate", StoppedJobTarget + "migrate"} {
+		if got := pendingDetailOf(t, record, target); got != "" {
+			t.Errorf("the operation recorded %q for %s: a Job the stop step suspended is not activation's to put back, and a finished one was not touched", got, target)
+		}
+	}
+}
+
 // TestNamespaceRestoreActivationTakesTheBackupsCronJobValueNotTheStopSteps: the
 // stop step's record says what the namespace's CronJob was before it was
 // stopped; activation must put the RESTORED CronJob back to the value the

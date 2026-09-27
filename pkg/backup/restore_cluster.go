@@ -167,13 +167,22 @@ type CronJobState struct {
 	RecordedSuspend string
 }
 
-// JobState is one Job, and whether it was already suspended. A Job restored
-// with --include-jobs is suspended at once and started only at activation: a
-// Job object that appears unsuspended runs immediately, which is exactly the
-// surprise the flag exists to make deliberate.
+// JobState is one Job, whether it was already suspended, and whether it has
+// finished. A Job restored with --include-jobs is suspended at once and started
+// only at activation: a Job object that appears unsuspended runs immediately,
+// which is exactly the surprise the flag exists to make deliberate. Finished is
+// what the restore's stop step acts on the other way round: a Job that has NOT
+// finished can be creating writes against the namespace, so it is suspended
+// before anything is captured or destroyed.
 type JobState struct {
 	Name    string
 	Suspend bool
+	// Finished reports that the Job will not create another pod: it completed,
+	// or it failed terminally. The stop step suspends only the Jobs that have
+	// not finished; a finished one has nothing left to stop, and writing
+	// spec.suspend onto it would make its spec differ from the backup's for no
+	// reason.
+	Finished bool
 }
 
 // ApplicationState is one Argo CD Application whose destination namespace is
@@ -562,6 +571,13 @@ func (c *k3sCluster) Jobs(ctx context.Context, namespace string) ([]JobState, er
 			Spec struct {
 				Suspend *bool `json:"suspend"`
 			} `json:"spec"`
+			Status struct {
+				CompletionTime string `json:"completionTime"`
+				Conditions     []struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+				} `json:"conditions"`
+			} `json:"status"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(out), &document); err != nil {
@@ -569,7 +585,28 @@ func (c *k3sCluster) Jobs(ctx context.Context, namespace string) ([]JobState, er
 	}
 	jobs := make([]JobState, 0, len(document.Items))
 	for _, item := range document.Items {
-		jobs = append(jobs, JobState{Name: item.Metadata.Name, Suspend: item.Spec.Suspend != nil && *item.Spec.Suspend})
+		// FINISHED IS THE CONDITION, NOT THE POD COUNT. Kubernetes writes
+		// `Complete` (True) when the Job's pods finished, `Failed` (True) when
+		// its retries are exhausted, and a `completionTime` alongside the
+		// successful one. A Job whose `Complete` is False and whose `Failed` is
+		// not yet True may still create another pod, which is the Job the stop
+		// step has to suspend.
+		//
+		// AN OLDER JOB THAT EXHAUSTED ITS BACKOFF WITH NO `Failed` CONDITION
+		// READS AS UNFINISHED HERE, and that is the safe direction: suspending
+		// a Job that cannot create another pod is a no-op, and leaving one that
+		// can is the bug this read exists to prevent.
+		finished := item.Status.CompletionTime != ""
+		for _, condition := range item.Status.Conditions {
+			if condition.Status == "True" && (condition.Type == "Complete" || condition.Type == "Failed") {
+				finished = true
+			}
+		}
+		jobs = append(jobs, JobState{
+			Name:     item.Metadata.Name,
+			Suspend:  item.Spec.Suspend != nil && *item.Spec.Suspend,
+			Finished: finished,
+		})
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Name < jobs[j].Name })
 	return jobs, nil

@@ -107,3 +107,47 @@ func TestPodVolumeBackupsReadTheBackupsPodsAndVolumes(t *testing.T) {
 		t.Errorf("volumes[1] = %+v, want pod dead-b87c65446-d7vlj volume b", volumes[1])
 	}
 }
+
+// TestJobsReadWhichJobsHaveNotFinished reads the stop step's input the way the
+// API server holds it: a Job that completed (a True `Complete` condition, or a
+// completionTime alone), a Job that failed terminally (a True `Failed`
+// condition), and a Job that is still running. The stop step suspends the last
+// one only — suspending a finished Job would write spec.suspend onto an object
+// that has nothing left to stop and make its spec differ from the backup's —
+// so reading a running Job as finished is the mistake that matters, and reading
+// a finished one as running is merely wasteful.
+func TestJobsReadWhichJobsHaveNotFinished(t *testing.T) {
+	runner := veleroAPIServer(map[string]string{
+		"jobs": `{"items":[` +
+			`{"metadata":{"name":"completed"},"status":{"conditions":[{"type":"Complete","status":"True"}],"completionTime":"2026-09-27T18:00:00Z"}},` +
+			`{"metadata":{"name":"completed-older"},"status":{"completionTime":"2026-09-27T18:00:00Z"}},` +
+			`{"metadata":{"name":"exhausted"},"status":{"conditions":[{"type":"Failed","status":"True","reason":"BackoffLimitExceeded"}]}},` +
+			`{"metadata":{"name":"running"},"spec":{"suspend":false},"status":{"active":1,"conditions":[{"type":"Complete","status":"False"}]}},` +
+			`{"metadata":{"name":"suspended-but-unfinished"},"spec":{"suspend":true},"status":{}}]}`,
+	})
+	jobs, err := NewK3sCluster(runner).Jobs(context.Background(), "payments")
+	if err != nil {
+		t.Fatalf("reading the Jobs: %v", err)
+	}
+	read := map[string]JobState{}
+	for _, job := range jobs {
+		read[job.Name] = job
+	}
+	if len(read) != 5 {
+		t.Fatalf("read %d Jobs, want 5: %+v", len(read), jobs)
+	}
+	for name, finished := range map[string]bool{
+		"completed":                true,
+		"completed-older":          true,
+		"exhausted":                true,
+		"running":                  false,
+		"suspended-but-unfinished": false,
+	} {
+		if got := read[name].Finished; got != finished {
+			t.Errorf("Job %s read as Finished=%t, want %t (status %+v)", name, got, finished, read[name])
+		}
+	}
+	if !read["suspended-but-unfinished"].Suspend {
+		t.Errorf("the suspended Job's spec.suspend read as false: %+v", read["suspended-but-unfinished"])
+	}
+}
