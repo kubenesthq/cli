@@ -406,7 +406,12 @@ func (k Kind) resumeVerb() string {
 	case KindDatastoreRollback:
 		return "kubenest platform rollback"
 	case KindRestoreNamespace, KindRestoreVolume:
-		return "kubenest platform restore"
+		// `kubenest platform restore` is the DATASTORE restore (a whole-cluster
+		// disaster operation), and naming it here sent an operator to a verb
+		// that would replace cluster state instead of continuing a namespace
+		// restore. The restore of a namespace or a workload's volumes is
+		// `kubenest backup restore` (plan 7.5).
+		return "kubenest backup restore"
 	case KindNodeAdd:
 		return "kubenest node add"
 	case KindNodeRemove:

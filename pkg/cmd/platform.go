@@ -11,12 +11,6 @@ import (
 // into a settled interface; until it lands, the subcommands say so plainly
 // instead of pretending.
 
-// errNotYetImplemented marks skeleton commands. The exit code is non-zero so
-// scripts cannot mistake a skeleton for a successful run.
-func errNotYetImplemented(what string) error {
-	return fmt.Errorf("%s is not available in this build of the CLI yet — the command surface is final, the implementation is landing. Watch https://github.com/kubenesthq/cli/releases", what)
-}
-
 // AnnotationUnavailable marks a registered command that is not built yet.
 //
 // It is the machine-readable half of the skeleton rule. The metadata generator
@@ -24,8 +18,12 @@ func errNotYetImplemented(what string) error {
 // so the docs checker
 // (kubenest-docs/scripts/check_examples_against_cli.py) refuses a runnable
 // example of a stub by asking the command tree rather than by matching a
-// sentence in the help text. errNotYetImplemented remains the runtime half;
+// sentence in the help text. The runtime half is a RunE that refuses non-zero;
 // both are set together, or a path reports available and exits non-zero.
+//
+// No command carries it today (the wave-1 surface is implemented), and it stays
+// because the generator reads it: the next stub is marked with it rather than
+// by inventing a second convention.
 const AnnotationUnavailable = "kubenest.io/unavailable"
 
 // InstallFlags is the flag surface of `kubenest platform install`, exactly as

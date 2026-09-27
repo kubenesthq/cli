@@ -246,8 +246,21 @@ type Health struct {
 // HealthBackup carries the ages at which backup facts start meaning
 // something.
 type HealthBackup struct {
-	MaxBackupAge            Duration `yaml:"max-backup-age"`
-	MaxRestoreDrillAge      Duration `yaml:"max-restore-drill-age"`
+	MaxBackupAge       Duration `yaml:"max-backup-age"`
+	MaxRestoreDrillAge Duration `yaml:"max-restore-drill-age"`
+	// RecoveryPointAge is the age the newest ELIGIBLE recovery point may reach
+	// before the recovery promise is breached (T2.0's key, required from bundle
+	// 1.2). It is judged on a complete, coordinated restore point rather than on
+	// a backup object that merely exists — an interrupted or partial backup is
+	// not something anyone can restore from — which is why it is not the same
+	// threshold as max-backup-age: the backend evaluates this one, and
+	// `kubenest backup restore` refuses to restore a backup older than it
+	// without --accept-data-age.
+	//
+	// Zero means the bundle predates the key (1.0 and 1.1), and a caller must
+	// then fall back to max-backup-age and SAY which threshold it used rather
+	// than inventing a number.
+	RecoveryPointAge        Duration `yaml:"recovery-point-age"`
 	UnconfiguredTargetGrace Duration `yaml:"unconfigured-target-grace"`
 }
 

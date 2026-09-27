@@ -22,9 +22,10 @@ import (
 )
 
 // The backup command surface follows docs.kubenest.io/platform/backup-restore:
-// set-target, now, drill, restore. set-target and now are implemented (the
-// kn-mzn install half); drill and restore land with the wave-3 half of the
-// bead and say so plainly until then.
+// set-target, now, drill, restore. All four are implemented: the drill requests
+// the operator's real restore path, and restore (backup_restore.go) is the
+// everyday verb, including its three follow-on commands --resume, --activate
+// and --abort.
 
 // backupConn is how a backup command reaches its cluster in wave 1: the same
 // SSH transport as platform install. Once the installer's per-cluster record
@@ -112,8 +113,7 @@ func NewBackupCommand() *cobra.Command {
 		newBackupSetTargetCommand(),
 		newBackupNowCommand(),
 		newBackupDrillCommand(),
-		newBackupSkeletonCommand("restore", "Restore from a backup", "kubenest backup restore",
-			"workload restores need a running cluster with workloads; they land with the wave-3 half of kn-mzn"),
+		newBackupRestoreCommand(),
 	)
 	return cmd
 }
@@ -345,23 +345,6 @@ func runControlPlaneNow(cmd *cobra.Command, conn backupConn) error {
 	fmt.Fprintf(out, "control-plane checkpoint %s is eligible: job %s, %d bytes sealed at %s\n",
 		run.Checkpoint.Key, run.Job, run.Checkpoint.SizeBytes, run.Checkpoint.At)
 	return nil
-}
-
-// newBackupSkeletonCommand marks the wave-3 half of kn-mzn: the scheduled
-// verified restore drill and restores need a running cluster with workloads
-// and land with that wave. Non-zero exit, per the skeleton rule, and
-// AnnotationUnavailable so the command metadata reports the path as a stub.
-func newBackupSkeletonCommand(use, short, what, reason string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:         use,
-		Short:       short,
-		Annotations: map[string]string{AnnotationUnavailable: reason},
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotYetImplemented(what)
-		},
-	}
-	cmd.Flags().String("cluster", "", "cluster name")
-	return cmd
 }
 
 // envFirst returns the first set environment variable of the names given.

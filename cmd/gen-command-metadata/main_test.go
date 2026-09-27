@@ -106,32 +106,56 @@ func TestNewCommandsArePickedUp(t *testing.T) {
 	}
 }
 
+// The stub MECHANISM: a command carrying AnnotationUnavailable is reported
+// unavailable, with a reason, and everything else is not.
+//
+// THE STUB IS THE TEST'S OWN. This used to assert the property against
+// `kubenest backup restore`, which was a real stub at the time — so the test
+// said "the generator works" by way of "a shipped verb is unbuilt", and the day
+// that verb landed the test failed for a reason that had nothing to do with the
+// generator. A fixture command makes the property testable while nothing in the
+// tree is a stub, which is the state the surface is meant to be in.
 func TestRegisteredStubIsUnavailable(t *testing.T) {
-	got := byPath(emitted(t))
+	root := cmd.NewRootCommand()
+	stub := &cobra.Command{
+		Use:         "fixture-stub",
+		Short:       "test-local",
+		Annotations: map[string]string{cmd.AnnotationUnavailable: "the fixture command is not built yet"},
+	}
+	for _, c := range root.Commands() {
+		if c.Name() == "backup" {
+			c.AddCommand(stub)
+		}
+	}
+	got := byPath(collect(root))
 
-	stub, ok := got["kubenest backup restore"]
+	entry, ok := got["kubenest backup fixture-stub"]
 	if !ok {
-		t.Fatal("`kubenest backup restore` is missing from the metadata")
+		t.Fatalf("a command carrying %s is absent from the metadata; keys are %v",
+			cmd.AnnotationUnavailable, sortedKeys(got))
 	}
-	if stub.Available {
-		t.Error("`kubenest backup restore` is reported available: true, but running it exits with " +
-			"\"not yet implemented\": the docs check would pass a page that offers a stub")
+	if entry.Available {
+		t.Error("`kubenest backup fixture-stub` is reported available: true although it carries " +
+			cmd.AnnotationUnavailable + ": the docs check would pass a page that offers a stub")
 	}
-	if strings.TrimSpace(stub.Reason) == "" {
-		t.Error("`kubenest backup restore` is unavailable with no reason; a page cannot say why")
+	if strings.TrimSpace(entry.Reason) == "" {
+		t.Error("`kubenest backup fixture-stub` is unavailable with no reason; a page cannot say why")
 	}
 	if cmd.AnnotationUnavailable != "kubenest.io/unavailable" {
 		t.Errorf("AnnotationUnavailable is %q; the metadata key is the contract between the CLI and "+
 			"the docs check", cmd.AnnotationUnavailable)
 	}
 
-	// The implemented siblings must NOT come out unavailable, or the flag is
-	// noise a reader learns to ignore.
+	// The implemented commands must NOT come out unavailable, or the flag is
+	// noise a reader learns to ignore. The whole shipped surface is here, the
+	// restore verb included: it is the one this test used to pin as a stub.
 	for _, path := range []string{
 		"kubenest backup set-target",
 		"kubenest backup now",
 		"kubenest backup drill",
+		"kubenest backup restore",
 		"kubenest platform install",
+		"kubenest platform restore",
 	} {
 		if entry, ok := got[path]; !ok || !entry.Available {
 			t.Errorf("%s is %+v, want available: true", path, entry)
