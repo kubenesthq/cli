@@ -129,8 +129,13 @@ func startRebootWatch(ctx context.Context, t *testing.T, runner k3s.Runner, clie
 			w.note(lock, live)
 		}
 	}()
+	// THE STOP IS IDEMPOTENT. Each arm stops the watch as soon as the command
+	// returns and also defers the stop for the arm's failure paths; on
+	// hardware (2026-09-27) the second close panicked the whole gate the first
+	// time an arm failed.
+	var once sync.Once
 	return w, func() {
-		close(done)
+		once.Do(func() { close(done) })
 		<-stopped
 	}
 }
