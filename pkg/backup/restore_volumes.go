@@ -261,11 +261,19 @@ func (r *restoreRun) chooseVolumeBackup(ctx context.Context) error {
 
 // buildVolumePlan resolves the affected set and the restore's selection.
 //
+// The operator's pause capability is refused FIRST, as mode 1's buildPlan does
+// and for the same reason: this runs before the operation record is taken, so a
+// cluster whose operator cannot acknowledge the pause is refused with nothing
+// written at all (kn-x0wv.6).
+//
 // THE OWNER WALK IS THE POINT: a pod with no controller owner is refused by
 // name rather than scaled down by hand, because a pod nobody owns cannot be put
 // back, and "the restore filled the volume but the workload never came back" is
 // not a restore.
 func (r *restoreRun) buildVolumePlan(ctx context.Context) error {
+	if err := r.requirePauseCapableOperator(ctx); err != nil {
+		return err
+	}
 	plan := r.volumePlan
 	state, err := r.deps.Cluster.Namespace(ctx, plan.Namespace)
 	if err != nil {

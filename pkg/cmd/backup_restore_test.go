@@ -378,7 +378,13 @@ func (s *stubCluster) ProjectHold(context.Context, string) (*backup.ProjectHold,
 	return nil, nil
 }
 
-func (s *stubCluster) OperatorChart(context.Context) (string, error) { return "", nil }
+// OperatorChart answers with a chart version that carries the reconcile pause,
+// because the plan cannot be built at all without one: a stub that answered
+// with a missing or older label would refuse before the plan this file's tests
+// are about is ever printed (pkg/backup holds those cases).
+func (s *stubCluster) OperatorChart(context.Context) (string, error) {
+	return "kubenest-operator-2-2.7.0", nil
+}
 
 func (s *stubCluster) DrillRestore(context.Context) (*backup.DrillRestore, error) { return nil, nil }
 

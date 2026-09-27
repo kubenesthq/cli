@@ -818,7 +818,16 @@ func (r *restoreRun) chooseBackup(ctx context.Context) error {
 // pre-flight refusals that must happen BEFORE the safety backup: an over-policy
 // data age without --accept-data-age, and restoring over an existing namespace
 // without --replace.
+//
+// THE OPERATOR'S PAUSE CAPABILITY IS A PRE-FLIGHT REFUSAL TOO, and the first
+// one: a cluster whose operator cannot acknowledge the pause has no plan worth
+// reading, and refusing HERE — before the operation record is taken — is what
+// keeps a refusal from leaving a stopped record that blocks the cluster's next
+// operation until someone aborts it (measured on prod-2, kn-x0wv.6).
 func (r *restoreRun) buildPlan(ctx context.Context) error {
+	if err := r.requirePauseCapableOperator(ctx); err != nil {
+		return err
+	}
 	plan := r.plan
 	plan.Policy = r.policy
 	plan.AgeAccepted = r.opts.AcceptDataAge
@@ -1290,6 +1299,14 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 	if kind := plan.Record.Request.Kind; kind != operation.KindRestoreNamespace && kind != operation.KindRestoreVolume {
 		return fmt.Errorf("operation %s is a %s, not a restore: it cannot be resumed by this command", opID, kind)
 	}
+	// THE OPERATOR HAS TO BE ABLE TO ANSWER the pause this operation already
+	// wrote, AND THIS IS DECIDED BEFORE THE RECORD IS RE-CLAIMED: a resume whose
+	// operator was downgraded leaves the stopped record exactly as it found it,
+	// so the upgrade can resume the same operation id instead of finding a
+	// record this refusal moved (kn-x0wv.6). Nothing below this line writes.
+	if err := r.requirePauseCapableOperator(ctx); err != nil {
+		return err
+	}
 	// THE RECORD FILLS IN WHAT THE FLAGS CANNOT. `--resume` takes no
 	// `--namespace` (the CLI refuses it alongside --resume), so the namespace —
 	// and the cluster name every message uses — are the ones the interrupted
@@ -1607,13 +1624,14 @@ func (r *restoreRun) holdTimeout() (time.Duration, error) {
 // namespace the restore is about to empty (measured on hardware, S4 on lab w3,
 // 2026-09-27).
 //
-// AND THE OPERATOR HAS TO BE ABLE TO ACKNOWLEDGE AT ALL before the annotation
-// is written: an operator older than the pause first shipping would leave the
-// run waiting out that deadline for a condition it never writes (kn-x0wv.6).
+// WHETHER THE OPERATOR CAN ACKNOWLEDGE AT ALL IS DECIDED EARLIER, and
+// deliberately not here: by the time this runs the operation record exists, and
+// a refusal that leaves a stopped record behind blocks the cluster's next
+// operation until someone aborts it. The plan's pre-flight refuses instead —
+// buildPlan for mode 1, buildVolumePlan for mode 2, and resumeRecord before the
+// record is re-claimed — so a fresh run that cannot pause leaves nothing at all
+// (measured on prod-2, kn-x0wv.6).
 func (r *restoreRun) ensurePause(ctx context.Context) error {
-	if err := r.requirePauseCapableOperator(ctx); err != nil {
-		return err
-	}
 	opID := r.handle.OperationID()
 	if err := r.stage("pause").AnnotateProject(ctx, r.opts.Namespace, PauseAnnotationKey, opID); err != nil {
 		return fmt.Errorf("%w. Without the hold, reconciliation would recreate the namespace or sync over the restore", err)

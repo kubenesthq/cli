@@ -612,6 +612,20 @@ func (k *fakeOpKube) RunInput(ctx context.Context, command string, stdin io.Read
 	return sshx.Result{ExitCode: 0, Stdout: string(raw)}, nil
 }
 
+// rawRecordJSON is the record exactly as the cluster holds it. Two of them
+// being byte-identical is what "the refusal left the record as it was" means.
+func (k *fakeOpKube) rawRecordJSON(name string) string {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	obj, found := k.objects[name]
+	if !found {
+		return ""
+	}
+	data, _ := obj["data"].(map[string]any)
+	raw, _ := data["record.json"].(string)
+	return raw
+}
+
 // recordFor decodes the record the in-memory cluster holds, or nil.
 func (k *fakeOpKube) recordFor(name string) *operation.Record {
 	k.mu.Lock()
@@ -1880,6 +1894,28 @@ func TestRestoreRefusesAnOperatorThatCannotPause(t *testing.T) {
 			if f.cluster.deleted {
 				t.Error("the refused run deleted the namespace")
 			}
+			// AND NO OPERATION RECORD WAS OPENED. The record is the lock: one
+			// left behind stopped at `failed` blocks the cluster's next
+			// operation until someone runs `--abort`, which is what made the
+			// message's "Nothing has been changed" false on prod-2 (kn-x0wv.6).
+			if record := f.kube.recordFor(operation.Name); record != nil {
+				t.Errorf("the refusal left an operation record behind (%+v): the next operation on this cluster would be refused until it is aborted", record)
+			}
+			// AND THE NEXT RESTORE IS NOT BLOCKED BY IT: a capable operator
+			// opens its own record, with no --abort and no cleanup.
+			second := newRestoreFixture(t, facts)
+			second.kube = f.kube
+			secondOut, secondErr := runRestorePlan(t, second, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+			if secondErr != nil {
+				t.Errorf("the restore after the refusal was refused too, so the refusal left the cluster locked: %v\n%s", secondErr, secondOut)
+			} else {
+				if record := second.kube.recordFor(operation.Name); record == nil {
+					t.Error("the restore after the refusal opened no record")
+				}
+				if !strings.Contains(secondOut, RestoredStage) {
+					t.Errorf("the restore after the refusal did not finish:\n%s", secondOut)
+				}
+			}
 		})
 	}
 }
@@ -1906,6 +1942,11 @@ func TestRestoreResumeRefusesADowngradedOperator(t *testing.T) {
 	resumed.cluster.operatorChart = "kubenest-operator-2-2.6.17"
 	beforeApplies := resumed.kube.commandCount("apply -f -")
 	beforeDeletes := resumed.kube.commandCount("delete namespace payments")
+	beforeRecord := resumed.kube.rawRecordJSON(operation.Name)
+	beforeStored := resumed.kube.recordFor(operation.Name)
+	if beforeRecord == "" || beforeStored == nil {
+		t.Fatal("the interrupted run left no record to resume")
+	}
 
 	var out strings.Builder
 	err := RunRestore(context.Background(), &out, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps())
@@ -1925,6 +1966,18 @@ func TestRestoreResumeRefusesADowngradedOperator(t *testing.T) {
 	}
 	if resumed.cluster.annotations[PauseAnnotationKey] != opID {
 		t.Errorf("the refusal lifted the pause (annotations %v)", resumed.cluster.annotations)
+	}
+	// THE RECORD IS EXACTLY AS IT WAS, because the refusal came before it was
+	// re-claimed: the upgrade resumes the same operation id.
+	after := resumed.kube.recordFor(operation.Name)
+	if after == nil {
+		t.Fatal("the refused resume removed the record")
+	}
+	if after.Executor.State != beforeStored.Executor.State || after.Stage != beforeStored.Stage {
+		t.Errorf("the refused resume moved the record: executor %q -> %q, stage %q -> %q", beforeStored.Executor.State, after.Executor.State, beforeStored.Stage, after.Stage)
+	}
+	if got := resumed.kube.rawRecordJSON(operation.Name); got != beforeRecord {
+		t.Errorf("the refused resume rewrote the record:\nbefore %s\nafter  %s", beforeRecord, got)
 	}
 }
 
