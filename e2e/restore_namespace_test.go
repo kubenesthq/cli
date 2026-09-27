@@ -102,6 +102,18 @@ func (s *s4Sentinel) url() string {
 	return fmt.Sprintf("http://%s%s", s.address, s4SentinelPath)
 }
 
+// hitsFrom is the time of every call from the n-th on, so a failure says WHEN
+// a stray call came, which is what separates a restored CronJob from the
+// recreated namespace's live one.
+func (s *s4Sentinel) hitsFrom(n int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n >= len(s.hits) {
+		return nil
+	}
+	return append([]string(nil), s.hits[n:]...)
+}
+
 func (s *s4Sentinel) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -440,6 +452,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	})
 
 	hitsBeforeRestore := sentinel.count()
+	restoreStarted := time.Now().UTC()
 
 	var plan strings.Builder
 	if err := c.runCLI(&plan, append([]string{"backup", "restore", "--namespace", namespace, "--latest", "--replace", "--confirm"}, c.verbArgs()...)...); err != nil {
@@ -509,7 +522,8 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	// unsuspends the CronJob, which then runs at once, and on hardware
 	// (2026-09-27) those later calls were counted as a failure.
 	if got := sentinel.count(); got != hitsBeforeRestore {
-		t.Errorf("the sentinel receiver saw %d call(s) between the restore and activation, want none", got-hitsBeforeRestore)
+		t.Errorf("the sentinel receiver saw %d call(s) between the restore and activation, want none: at %v, the restore command started at %s",
+			got-hitsBeforeRestore, sentinel.hitsFrom(hitsBeforeRestore), restoreStarted.Format(time.RFC3339))
 	}
 
 	// ACTIVATION shows what may run, then lifts the pause.
