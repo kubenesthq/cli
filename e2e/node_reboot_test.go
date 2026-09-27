@@ -492,9 +492,12 @@ func serviceMonotonicStart(t *testing.T, ctx context.Context, r k3s.Runner, serv
 // assertion pass for the wrong reason.
 func leafCertificateExpiry(t *testing.T, ctx context.Context, r k3s.Runner) map[string]string {
 	t.Helper()
+	// THE LISTING RUNS UNDER sudo TOO. k3s's TLS directory is readable only by
+	// root, and a glob expanded by the SSH user's own shell matched nothing, so
+	// the --k3s-only arm skipped on hardware (2026-09-27) instead of running.
 	const script = `set -e
 dir=/var/lib/rancher/k3s/server/tls
-for f in $(ls $dir/*.crt $dir/*/*.crt 2>/dev/null); do
+for f in $(sudo -n sh -c "ls $dir/*.crt $dir/*/*.crt" 2>/dev/null); do
   if ! sudo -n openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q 'CA:TRUE'; then
     end=$(sudo -n openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2)
     echo "$f|$end"
