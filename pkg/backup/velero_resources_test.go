@@ -45,3 +45,23 @@ func TestStorageLocationsReadsVelerosBackupStorageLocations(t *testing.T) {
 		t.Errorf("locations = %v, want default Available", locations)
 	}
 }
+
+// On hardware (2026-09-27, S4 on lab w3) a restore whose PodVolumeRestore
+// completed was refused as "no Completed PodVolumeRestore" for s4-data: Velero
+// names the claim only by the label velero.io/pvc-uid, the reader looked for an
+// annotation Velero does not write, and fell back to the pod's volume name
+// ("data"), which is not the claim's.
+func TestVolumeRestoresNameTheClaimFromItsUID(t *testing.T) {
+	runner := veleroAPIServer(map[string]string{
+		"podvolumerestores.velero.io": `{"items":[{"metadata":{"name":"r-s4qml","labels":{"velero.io/pvc-uid":"u-1","velero.io/restore-name":"r"}},` +
+			`"spec":{"pod":{"name":"s4-web-1","namespace":"e2e"},"volume":"data"},"status":{"phase":"Completed"}}]}`,
+		"persistentvolumeclaims": `{"items":[{"metadata":{"name":"s4-data","uid":"u-1"}},{"metadata":{"name":"other","uid":"u-2"}}]}`,
+	})
+	restores, err := NewK3sCluster(runner).VolumeRestores(context.Background(), "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restores) != 1 || restores[0].ClaimName != "s4-data" {
+		t.Errorf("restores = %+v, want one naming claim s4-data", restores)
+	}
+}

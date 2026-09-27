@@ -674,9 +674,8 @@ func (c *k3sCluster) VolumeRestores(ctx context.Context, restoreName string) ([]
 	var document struct {
 		Items []struct {
 			Metadata struct {
-				Name        string            `json:"name"`
-				Labels      map[string]string `json:"labels"`
-				Annotations map[string]string `json:"annotations"`
+				Name   string            `json:"name"`
+				Labels map[string]string `json:"labels"`
 			} `json:"metadata"`
 			Spec struct {
 				Pod struct {
@@ -694,9 +693,23 @@ func (c *k3sCluster) VolumeRestores(ctx context.Context, restoreName string) ([]
 	if err := json.Unmarshal([]byte(out), &document); err != nil {
 		return nil, fmt.Errorf("parsing the PodVolumeRestores for restore %s: %w", restoreName, err)
 	}
+	// Velero names the restored claim only by the label velero.io/pvc-uid, so
+	// the claim's name is read from the namespace's claims, once per namespace.
+	// The pod's volume name is the fallback, for a claim that is already gone.
+	claimsByUID := map[string]map[string]string{}
 	restores := make([]VolumeRestoreState, 0, len(document.Items))
 	for _, item := range document.Items {
-		claim := item.Metadata.Annotations["velero.io/pvc-name"]
+		claim := ""
+		if uid, namespace := item.Metadata.Labels["velero.io/pvc-uid"], item.Spec.Pod.Namespace; uid != "" && namespace != "" {
+			byUID, read := claimsByUID[namespace]
+			if !read {
+				if byUID, err = c.claimNamesByUID(ctx, namespace); err != nil {
+					return nil, err
+				}
+				claimsByUID[namespace] = byUID
+			}
+			claim = byUID[uid]
+		}
 		if claim == "" {
 			claim = item.Spec.Volume
 		}
@@ -712,6 +725,30 @@ func (c *k3sCluster) VolumeRestores(ctx context.Context, restoreName string) ([]
 	}
 	sort.Slice(restores, func(i, j int) bool { return restores[i].Name < restores[j].Name })
 	return restores, nil
+}
+
+// claimNamesByUID maps each claim in a namespace from its UID to its name.
+func (c *k3sCluster) claimNamesByUID(ctx context.Context, namespace string) (map[string]string, error) {
+	out, err := c.kubectl(ctx, "get persistentvolumeclaims -n "+namespace+" -o json")
+	if err != nil {
+		return nil, fmt.Errorf("reading the claims in %s to name the PodVolumeRestores' volumes: %w", namespace, err)
+	}
+	var document struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+				UID  string `json:"uid"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil {
+		return nil, fmt.Errorf("parsing the claims in %s: %w", namespace, err)
+	}
+	byUID := make(map[string]string, len(document.Items))
+	for _, item := range document.Items {
+		byUID[item.Metadata.UID] = item.Metadata.Name
+	}
+	return byUID, nil
 }
 
 func (c *k3sCluster) RestoreOutcome(ctx context.Context, name string) (*RestoreOutcome, error) {
