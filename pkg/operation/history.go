@@ -17,7 +17,14 @@ import (
 //
 // Marking terminal is what lets the next operation acquire: Acquire replaces a
 // terminal record, and refuses a live one.
+//
+// It is written with outcomeContext: a run that ends because it was interrupted
+// ends HERE, and a completion that died with the interrupt would leave the
+// record live — refusing every later command with "another operation holds the
+// record" (kn-x0wv.7, and the same shape kn-x0wv.4 fixed for release).
 func (s *Store) Complete(ctx context.Context, h *Handle, result Result) error {
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := s.update(ctx, h, func(r *Record) error {
@@ -84,7 +91,13 @@ func (h *Handle) PendingWrite(ctx context.Context, kind, target, detail string) 
 // PendingWriteDone discharges one. A write the record does not owe is refused
 // rather than silently added as done: a ledger that can be satisfied by
 // inventing an entry records nothing.
+//
+// The write it records has LANDED, so it is written with outcomeContext: an
+// interrupt between the inventory write and this call must not leave a
+// discharged write looking outstanding (kn-x0wv.7).
 func (h *Handle) PendingWriteDone(ctx context.Context, kind, target string) error {
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
 	return h.store.Update(ctx, h, func(r *Record) error {
 		for i := range r.Pending {
 			w := &r.Pending[i]

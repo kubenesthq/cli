@@ -59,7 +59,15 @@ func (k *fakeKube) script(prefix string, res sshx.Result) {
 	k.replies = append(k.replies, fakeReply{prefix: prefix, res: res})
 }
 
-func (k *fakeKube) Run(_ context.Context, command string) (sshx.Result, error) {
+func (k *fakeKube) Run(ctx context.Context, command string) (sshx.Result, error) {
+	if err := ctx.Err(); err != nil {
+		// The real transport does this: an sshx connection and the API server
+		// behind it both refuse a request whose context is already done. A fake
+		// that ignored it would let a write succeed that cannot succeed on a
+		// host, which is how the outcome-write defect (kn-x0wv.7) would read as
+		// green.
+		return sshx.Result{}, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.calls = append(k.calls, command)
@@ -80,7 +88,10 @@ func (k *fakeKube) Run(_ context.Context, command string) (sshx.Result, error) {
 	return sshx.Result{}, nil
 }
 
-func (k *fakeKube) RunInput(_ context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+func (k *fakeKube) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return sshx.Result{}, err
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.calls = append(k.calls, command)

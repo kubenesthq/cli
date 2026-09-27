@@ -84,6 +84,35 @@ func (s *Store) now() time.Time {
 	return time.Now().UTC()
 }
 
+// outcomeTimeout bounds one write that records something that already happened.
+const outcomeTimeout = 30 * time.Second
+
+// outcomeContext detaches a write that records something that ALREADY HAPPENED
+// from the caller's cancellation, and bounds it.
+//
+// AN OUTCOME IS NOT PART OF THE WORK BEING CANCELLED. By the time this write
+// runs the action has returned and the only thing left is telling the record;
+// a write that dies with the run's context leaves the action `submitted`, which
+// is the one state a successor has to reconcile by hand. Measured on hardware
+// (kn-x0wv.7, S4 on lab w3, 2026-09-27): the interrupt landed between Velero's
+// CreateRestore returning and this write, and the record kept `submitted`
+// because the write failed with `reading the operation record
+// kube-system/kubenest-operation: context canceled`. kn-x0wv.4 fixed the same
+// shape in restoreRun.release (9b95315); doing it here covers EVERY verb,
+// because every verb writes its outcomes, its stops and its completion through
+// this package.
+//
+// IT IS BOUNDED, and not a bare WithoutCancel: the connection may be gone as
+// well, and a caller must not wait on a host that will never answer.
+//
+// It is deliberately NOT applied to the writes that come BEFORE an action:
+// RecordAction and SubmitAction must fail with the run's context, because a
+// cancelled run must not submit anything (the record-before-submit rule is what
+// makes "it was never sent" knowable).
+func outcomeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), outcomeTimeout)
+}
+
 // Stored is a record as the cluster holds it: the decoded record plus the
 // resourceVersion the compare-and-swap is anchored on.
 type Stored struct {
@@ -291,7 +320,13 @@ func (s *Store) update(ctx context.Context, h *Handle, mutate func(*Record) erro
 // Stop records that this executor has stopped. It is the second half of what a
 // take-over requires, and it is the operator's assertion — the CLI cannot see a
 // laptop that is asleep, so it never infers "stopped".
+//
+// It is written with outcomeContext: a run that is being interrupted is exactly
+// when this write happens, and a stop that died with the interrupt would leave
+// the record looking live to every later command (kn-x0wv.7).
 func (s *Store) Stop(ctx context.Context, h *Handle) error {
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
 	return s.Update(ctx, h, func(r *Record) error {
 		r.Executor.State = ExecutorStopped
 		return nil

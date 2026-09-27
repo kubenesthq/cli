@@ -235,7 +235,14 @@ func (h *Handle) SubmitAction(ctx context.Context, id string) error {
 // FinishAction marks an action's outcome. Detail is sanitized: it comes from a
 // remote shell, and the record is copied off-cluster and mirrored to the
 // control plane.
+//
+// THE ACTION HAS ALREADY RETURNED, so this write is the memory of it and not
+// part of it: it is written with outcomeContext, because an interrupt that
+// lands between the action's return and this write must not be able to leave
+// the action `submitted` (kn-x0wv.7).
 func (h *Handle) FinishAction(ctx context.Context, id string, res sshx.Result, runErr error) error {
+	ctx, cancel := outcomeContext(ctx)
+	defer cancel()
 	return h.store.Update(ctx, h, func(r *Record) error {
 		found := false
 		for i := range r.Actions {

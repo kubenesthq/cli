@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Decision is what a resume does about one action.
@@ -189,9 +190,7 @@ func (p *Plan) reconcile(ctx context.Context, s *Store, a Action) (Step, *Blocke
 	if a.Observe == "" {
 		return step, &Blocked{
 			ActionID: a.ID, Stage: a.Stage, Postcondition: a.Postcondition,
-			Reconciliation: fmt.Sprintf(
-				"the record holds no read-only command that can establish this, so inspect the cluster state for stage %s and establish %q before repeating anything",
-				a.Stage, a.Postcondition),
+			Reconciliation: establishByHand(a, "the record holds no read-only command that can establish it"),
 		}, nil
 	}
 	res, err := s.Runner.Run(ctx, a.Observe)
@@ -207,16 +206,105 @@ func (p *Plan) reconcile(ctx context.Context, s *Store, a Action) (Step, *Blocke
 	// that could not reach the cluster and a probe that looked and found
 	// nothing look identical from here, and re-submitting an action that did
 	// happen is the mistake this whole path exists to avoid.
-	why := fmt.Sprintf("exit %d: %s", res.ExitCode, firstLine(res.Stderr))
+	why := fmt.Sprintf("the recorded probe `%s` exited %d: %s", a.Observe, res.ExitCode, firstLine(res.Stderr))
 	if err != nil {
-		why = err.Error()
+		why = fmt.Sprintf("the recorded probe could not be run (%v)", err)
 	}
 	return step, &Blocked{
 		ActionID: a.ID, Stage: a.Stage, Postcondition: a.Postcondition, Observe: a.Observe,
-		Reconciliation: fmt.Sprintf(
-			"stage %s: establish %q by hand — `%s` exiting 0 — because the recorded probe did not establish it (%s) and re-submitting the action would be a guess",
-			a.Stage, a.Postcondition, a.Observe, why),
+		Reconciliation: establishByHand(a, why),
 	}, nil
+}
+
+// unsettled is an action whose outcome this build could not establish, with
+// what the attempt observed.
+type unsettled struct {
+	Action Action
+	Why    string
+}
+
+// settle splits the actions an earlier executor left outstanding into the ones
+// whose recorded postcondition HOLDS — established by the read-only probe the
+// record carries — and the ones it does not.
+//
+// THE RULE IS THE ONE A RESUME ALREADY APPLIES (PLAN 7.2): "for an action whose
+// outcome is uncertain it checks the recorded postcondition, and if the outcome
+// still cannot be established it stops and names the reconciliation step". So
+// this is the same rule, in the same words, for the claim that follows the
+// reconcile:
+//
+//   - recorded but never submitted — it never happened, so repeating it cannot
+//     double-apply anything;
+//   - failed — the recorded attempt failed, so the same is true;
+//   - submitted and the postcondition holds — it is DONE, and the caller writes
+//     it as succeeded (settleInto);
+//   - submitted and the postcondition does not hold, or cannot be probed at all
+//     — re-submitting a Plan, a Velero restore or an SSH step that may already
+//     have run is the mistake this whole record exists to avoid.
+func (s *Store) settle(ctx context.Context, rec *Record) (settled []Action, unresolved []unsettled) {
+	for _, a := range rec.Actions {
+		if a.Status != ActionSubmitted {
+			// succeeded, recorded, failed, or a status this build does not
+			// understand: the first is settled, the next two are safe to
+			// repeat, and the last is what Resume stops on.
+			continue
+		}
+		if a.Observe == "" {
+			unresolved = append(unresolved, unsettled{Action: a, Why: "the record holds no read-only command that can establish it"})
+			continue
+		}
+		res, err := s.Runner.Run(ctx, a.Observe)
+		switch {
+		case err == nil && res.ExitCode == 0:
+			settled = append(settled, a)
+		case err != nil:
+			unresolved = append(unresolved, unsettled{Action: a, Why: fmt.Sprintf("the recorded probe could not be run (%v)", err)})
+		default:
+			unresolved = append(unresolved, unsettled{Action: a, Why: fmt.Sprintf("the recorded probe `%s` exited %d: %s", a.Observe, res.ExitCode, firstLine(res.Stderr))})
+		}
+	}
+	return settled, unresolved
+}
+
+// settleInto is the record with the actions the probe established written as
+// succeeded, so the claim that takes ownership records what it established in
+// the same compare-and-swap — one write, no window in which the record says
+// "submitted" and its owner says otherwise.
+func settleInto(rec Record, settled []Action, now time.Time) Record {
+	if len(settled) == 0 {
+		return rec
+	}
+	established := make(map[string]bool, len(settled))
+	for _, a := range settled {
+		established[a.ID] = true
+	}
+	next := rec
+	next.Actions = slices.Clone(rec.Actions)
+	for i := range next.Actions {
+		if !established[next.Actions[i].ID] {
+			continue
+		}
+		next.Actions[i].Status = ActionSucceeded
+		finished := now
+		next.Actions[i].FinishedAt = &finished
+	}
+	return next
+}
+
+// establishByHand names the step that settles an action whose outcome this
+// build cannot establish, in the operator's terms.
+//
+// IT IS ONE SENTENCE IN ONE PLACE. The reconcile that stops and the claim that
+// refuses have to name the same step, because an operator who is told to "go
+// and establish it" by two different commands, in two different words, is being
+// told nothing (kn-x0wv.7).
+func establishByHand(a Action, why string) string {
+	if a.Observe == "" {
+		return fmt.Sprintf("stage %s: the record holds no read-only command that can establish %q, so inspect the cluster state for stage %s and establish it by hand before anything is repeated",
+			a.Stage, a.Postcondition, a.Stage)
+	}
+	return fmt.Sprintf("stage %s: establish %q by hand — `%s` exiting 0 — because %s, and repeating the action would be a guess",
+		a.Stage, a.Postcondition, a.Observe, why)
 }
 
 // TakeOver hands an interrupted operation to this executor.
@@ -229,6 +317,15 @@ func (p *Plan) reconcile(ctx context.Context, s *Store, a Action) (Step, *Blocke
 // can see a heartbeat stop but it cannot see a laptop that is asleep, and a
 // network partition is a reason to do nothing rather than a reason to proceed.
 // Elapsed time never releases ownership.
+//
+// THE ACTIONS IT SETTLES, AND THE ONE IT REFUSES. A record that says its
+// executor stopped is one the executor itself closed, so the outstanding
+// actions are settled by their recorded postconditions (settle) and written as
+// succeeded in the same compare-and-swap that takes ownership. An action that
+// was submitted and whose postcondition cannot be established is refused, with
+// the reconciliation step named — the one thing this must never do is adopt an
+// action that may already have happened, and it must never send the operator
+// back to the command that just refused them (kn-x0wv.7).
 //
 // THIS IS THE CLAIM A --resume MAKES, and it is the reason a record whose
 // executor died without recording its stop is not resumable: the record says
@@ -274,16 +371,23 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 			"%w: operation %s is still %s (held by %s, last heartbeat %s), and this command continues an operation whose record says its executor stopped. An executor that died could not record that, and this CLI cannot see a laptop that is off: if you know the previous executor and its outstanding actions have stopped, assert it — --take-over %s --confirm — which reconciles the recorded actions and continues the operation",
 			ErrTakeOverRefused, opID, rec.Executor.State, holder(rec), rec.Executor.Heartbeat.UTC().Format("2006-01-02T15:04:05Z"), opID)
 	}
-	for _, a := range rec.Actions {
-		if a.Status == ActionRecorded || a.Status == ActionSubmitted {
-			return nil, fmt.Errorf(
-				"%w: action %s in stage %s is %s and its outcome has not been reconciled. A take-over does not fence a Plan or an SSH session the old executor already submitted, so reconcile it first (--resume %s names the step)",
-				ErrTakeOverRefused, a.ID, a.Stage, a.Status, opID)
-		}
+	// THE ACTIONS THE PREVIOUS EXECUTOR LEFT OUTSTANDING ARE SETTLED, NOT
+	// REFUSED ON. This refusal used to read "… so reconcile it first (--resume
+	// %s names the step)" — from inside the command the operator had just run,
+	// which is a loop no operator can get out of (kn-x0wv.7, hardware
+	// 2026-09-27). A record that says its executor STOPPED is a record the
+	// executor itself closed, so what is left is the standard rule: establish
+	// each uncertain outcome from its recorded postcondition, or refuse naming
+	// the step that establishes it.
+	settled, unresolved := s.settle(ctx, rec)
+	if len(unresolved) > 0 {
+		first := unresolved[0]
+		return nil, fmt.Errorf("%w: operation %s is stopped (held by %s), and action %s in stage %s was submitted with its outcome still unknown. Nothing was written and nothing was repeated: %s. Then run this command again",
+			ErrTakeOverRefused, opID, holder(rec), first.Action.ID, first.Action.Stage, establishByHand(first.Action, first.Why))
 	}
 
 	now := s.now()
-	next := *rec
+	next := settleInto(*rec, settled, now)
 	next.Executor = Executor{
 		Token:     NewToken(),
 		Operator:  s.Operator,
@@ -323,8 +427,11 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 // OUTCOMES. The outcomes are the reconciliation's business, and the caller runs
 // one (Resume) before this: an action whose postcondition cannot be established
 // stops the resume with the reconciliation step named, and so stops the
-// take-over before it claims anything. This is why the outstanding actions are
-// not re-checked here — the reconcile that just ran is what established them.
+// take-over before it claims anything. So this claim does not REFUSE on an
+// outstanding action the way the resume claim does — the assertion covers them
+// — but it does write down every outcome the recorded postcondition establishes
+// (settle), because a record that keeps saying `submitted` about an action that
+// is provably done is a record that lies.
 //
 // A record whose executor is already `stopped` needs no assertion, so it is
 // refused and names --resume as the verb that continues it; a paused executor
@@ -360,8 +467,16 @@ func TakeOverAsserted(ctx context.Context, s *Store, opID string) (*Handle, erro
 			ErrTakeOverRefused, opID, rec.Executor.State, holder(rec), rec.Executor.Heartbeat.UTC().Format("2006-01-02T15:04:05Z"))
 	}
 
+	// WHAT THE PROBE ESTABLISHES IS WRITTEN; WHAT IT CANNOT IS NOT A REFUSAL
+	// HERE. The assertion covers the executor AND its outstanding actions, so
+	// an outcome this build cannot establish is the caller's reconcile's
+	// business (it stops and names the step) — not something the operator's
+	// assertion is overruled by. What the probe DOES establish is written, so
+	// the record does not keep saying `submitted` about an action that is done.
+	settled, _ := s.settle(ctx, rec)
+
 	now := s.now()
-	next := *rec
+	next := settleInto(*rec, settled, now)
 	// THE ASSERTION IS WRITTEN WITH THE CLAIM, in the one compare-and-swap that
 	// changes hands: a record that changed ownership without saying who said the
 	// previous executor was gone would be indistinguishable from theft, and a
