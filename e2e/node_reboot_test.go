@@ -343,9 +343,19 @@ func TestNodeRebootGate(t *testing.T) {
 		defer restoreHostClock(t, ctx, host, realEpoch)
 
 		// The renewal window is measured against the host's own clock, so the
-		// clock is advanced — never the certificate — and given back below. 130
-		// days is past the ~120-day threshold k3s rotates at.
-		advanceHostClock(t, ctx, host, realEpoch+130*24*3600)
+		// clock is advanced — never the certificate — and given back below. k3s
+		// renews a leaf certificate within about 120 days of its expiry, so the
+		// clock goes to 30 days before the EARLIEST leaf expiry: inside the
+		// window, with every certificate still valid. A fixed jump from today
+		// was wrong for certificates issued recently (hardware, 2026-09-27: 130
+		// days ahead left 235 days on a cluster installed that morning).
+		earliest := earliestExpiry(t, certsBefore)
+		target := earliest.Add(-30 * 24 * time.Hour).Unix()
+		if target < realEpoch {
+			target = realEpoch
+		}
+		shiftDays := (target - realEpoch) / (24 * 3600)
+		advanceHostClock(t, ctx, host, target)
 
 		// The window is in UTC and covers every day, so the shifted instant is
 		// still inside it: the shift is this test's, and it must not turn into a
@@ -375,7 +385,7 @@ func TestNodeRebootGate(t *testing.T) {
 			}
 		}
 		if len(renewed) == 0 {
-			t.Errorf("no k3s leaf certificate was renewed while the clock was %d days ahead: %v", 130, certsBefore)
+			t.Errorf("no k3s leaf certificate was renewed while the clock was %d days ahead (30 days before the earliest expiry, %s): %v", shiftDays, earliest.UTC().Format(time.RFC3339), certsBefore)
 		} else {
 			t.Logf("renewed: %s", strings.Join(renewed, "; "))
 		}
@@ -483,6 +493,23 @@ func serviceMonotonicStart(t *testing.T, ctx context.Context, r k3s.Runner, serv
 		t.Fatalf("parsing the monotonic start %q: %v", res.Stdout, err)
 	}
 	return v
+}
+
+// earliestExpiry is the soonest notAfter among the leaf certificates read by
+// leafCertificateExpiry, whose values are openssl's "Sep 27 03:32:50 2027 GMT".
+func earliestExpiry(t *testing.T, certs map[string]string) time.Time {
+	t.Helper()
+	var earliest time.Time
+	for name, raw := range certs {
+		at, err := time.Parse("Jan _2 15:04:05 2006 MST", strings.Join(strings.Fields(raw), " "))
+		if err != nil {
+			t.Fatalf("reading %s's expiry %q: %v", name, raw, err)
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	return earliest
 }
 
 // leafCertificateExpiry reads every leaf certificate k3s keeps for a server:
