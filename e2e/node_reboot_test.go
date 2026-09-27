@@ -340,7 +340,15 @@ func TestNodeRebootGate(t *testing.T) {
 			t.Skip("no k3s leaf certificate is readable under /var/lib/rancher/k3s/server/tls: this step asserts the renewal --k3s-only exists for, and cannot be run without one")
 		}
 		realEpoch := time.Now().Unix()
-		defer restoreHostClock(t, ctx, host, realEpoch)
+		// Certificates k3s renews while the clock is ahead start in the future,
+		// so once the clock is back they are not yet valid and every client of
+		// the API fails TLS (hardware, 2026-09-27: the next gate's kubectl was
+		// refused). The clock is restored first, then k3s reissues them at the
+		// real time.
+		defer func() {
+			restoreHostClock(t, ctx, host, realEpoch)
+			reissueK3sCertificates(t, ctx, host)
+		}()
 
 		// The renewal window is measured against the host's own clock, so the
 		// clock is advanced — never the certificate — and given back below. k3s
@@ -478,6 +486,18 @@ func restoreHostClock(t *testing.T, ctx context.Context, r k3s.Runner, epoch int
 	}
 	if skew := hostEpoch(t, r) - time.Now().Unix(); skew > 10 || skew < -10 {
 		t.Errorf("the host's clock is %d s away from this machine's after the restore", skew)
+	}
+}
+
+// reissueK3sCertificates has k3s issue its certificates again at the host's
+// current time, by k3s's own procedure: stop the server, `k3s certificate
+// rotate`, start it, and wait for the API to answer ready.
+func reissueK3sCertificates(t *testing.T, ctx context.Context, r k3s.Runner) {
+	t.Helper()
+	const script = `sudo -n systemctl stop k3s && sudo -n k3s certificate rotate >/dev/null && sudo -n systemctl start k3s && for i in $(seq 1 100); do sudo -n k3s kubectl get --raw /readyz >/dev/null 2>&1 && exit 0; sleep 3; done; exit 1`
+	res, err := r.Run(ctx, script)
+	if err != nil || res.ExitCode != 0 {
+		t.Errorf("reissuing k3s's certificates at the real time: %v (exit %d, %s)", err, res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 }
 
