@@ -236,9 +236,10 @@ func (c *Client) do(req *http.Request, out any) error {
 		fenced := resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(FenceHeader) == FenceHeaderUp
 		err := &Error{
 			Method: req.Method, Path: req.URL.Path, Status: resp.StatusCode,
-			Code:   apiErrorCode(body),
-			Detail: detail,
-			msg:    fmt.Sprintf("%s %s: %s", req.Method, req.URL.Path, detail),
+			Code:          apiErrorCode(body),
+			RequiredScope: apiErrorRequiredScope(body),
+			Detail:        detail,
+			msg:           fmt.Sprintf("%s %s: %s", req.Method, req.URL.Path, detail),
 		}
 		if fenced {
 			// A 503 the FENCE gave is not a failure to reach the control
@@ -298,9 +299,15 @@ type Error struct {
 	Status int
 	// Code is the contract's machine-readable error code when the body carries
 	// one — token_expired, token_revoked, insufficient_scope. Empty otherwise.
-	Code   string
-	Detail string
-	msg    string
+	Code string
+	// RequiredScope is the scope the caller is missing, from a CLI-auth 403's
+	// {"detail": {"details": {"required_scope": ...}}}. Empty for every other
+	// refusal, including the org-binding one that shares the
+	// insufficient_scope code — which is what lets a caller key a remedy on the
+	// scope being present rather than on the status alone.
+	RequiredScope string
+	Detail        string
+	msg           string
 }
 
 func (e *Error) Error() string { return e.msg }
@@ -316,6 +323,23 @@ func apiErrorCode(body []byte) string {
 	}
 	if json.Unmarshal(body, &e) == nil {
 		return e.Detail.Error
+	}
+	return ""
+}
+
+// apiErrorRequiredScope extracts {"detail": {"details": {"required_scope": ...}}}
+// from a CLI-auth 403, so the caller can name the scope the credential is
+// missing instead of only the status it got.
+func apiErrorRequiredScope(body []byte) string {
+	var e struct {
+		Detail struct {
+			Details struct {
+				RequiredScope string `json:"required_scope"`
+			} `json:"details"`
+		} `json:"detail"`
+	}
+	if json.Unmarshal(body, &e) == nil {
+		return e.Detail.Details.RequiredScope
 	}
 	return ""
 }

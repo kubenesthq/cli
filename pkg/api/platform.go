@@ -446,7 +446,7 @@ func (c *Client) RotateAgentToken(ctx context.Context, clusterID string) (AgentT
 	}
 	var out AgentTokenRotation
 	if err := c.do(req, &out); err != nil {
-		return AgentTokenRotation{}, err
+		return AgentTokenRotation{}, rotateRefusal(err, c.BaseURL(), clusterID)
 	}
 	if out.AgentJWT.Token.IsZero() {
 		// The floor has already been raised by the time a response is written,
@@ -456,6 +456,39 @@ func (c *Client) RotateAgentToken(ctx context.Context, clusterID string) (AgentT
 			"the control plane rotated %s but returned no token: the cluster is now disconnected and the new token is not recoverable — re-run to rotate again", clusterID)
 	}
 	return out, nil
+}
+
+// rotateRefusal turns a refusal to ROTATE into the one command that grants the
+// right to do it.
+//
+// A MISSING SCOPE IS NOT A MISSING LOGIN (kn-t48). Rotation needs a CLI token
+// carrying `clusters:rotate`, which no default `kubenest login` requests, and
+// the control plane answers 403 insufficient_scope naming it. That used to
+// reach the operator as "not authenticated" — over a credential that worked on
+// every other route — with no hint that a different login is what fixes it, so
+// the command was unrunnable by anyone who did not already know the scope
+// existed. The refusal is keyed on the SCOPE the body names, never on the
+// status alone: the org-binding refusal shares the 403 and the same error code
+// and means something else entirely.
+//
+// NOTHING HAS BEEN ROTATED is part of the message, not decoration. The command
+// prints that the cluster is going offline before it calls this route, and past
+// a genuine rotation the cluster is down until the new token is delivered — so
+// a refusal that did not say the rotation never happened would leave the
+// operator waiting for a disconnection that is not coming.
+func rotateRefusal(err error, controlPlaneURL, clusterID string) error {
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "insufficient_scope" || apiErr.RequiredScope == "" {
+		return err
+	}
+	return fmt.Errorf(
+		"rotating %s's agent token needs a CLI credential carrying the %s scope, and the stored one does not "+
+			"carry it — the default `kubenest login` does not request it. NOTHING HAS BEEN ROTATED.\n"+
+			"Get a login that carries it:\n"+
+			"    kubenest login --control-plane %s --scope %s\n"+
+			"or store a console-created token that carries it:\n"+
+			"    kubenest login --control-plane %s --token-stdin",
+		clusterID, apiErr.RequiredScope, controlPlaneURL, apiErr.RequiredScope, controlPlaneURL)
 }
 
 // Cluster reads one cluster's record, including the status the hub maintains.

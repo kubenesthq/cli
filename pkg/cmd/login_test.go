@@ -220,3 +220,129 @@ func TestLoginCACertFileRefusesAFileWithNoCertificate(t *testing.T) {
 		t.Errorf("the refused file was stored anyway: %q", cfg.ControlPlaneCA)
 	}
 }
+
+// deviceScopesServer answers the device flow and records the scopes the login
+// asked for, so a test can read the request the control plane would act on.
+// Every other path 404s, which the login path reads as "this control plane
+// reports no contract era" (see requireControlPlane) rather than a failure.
+func deviceScopesServer(t *testing.T) (*httptest.Server, *[]string) {
+	t.Helper()
+	var scopes []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/auth/cli/device":
+			var req struct {
+				RequestedScopes []string `json:"requested_scopes"`
+				ClientName      string   `json:"client_name"`
+			}
+			json.NewDecoder(r.Body).Decode(&req)
+			scopes = req.RequestedScopes
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{
+				"device_code":      "dev-1",
+				"user_code":        "ABCD-EFGH",
+				"verification_uri": "https://console.example.com/cli-authorize",
+				"expires_in":       900,
+				"interval":         1,
+			})
+		case "/api/v1/auth/cli/device/token":
+			json.NewEncoder(w).Encode(map[string]string{"token": "knp_scoped"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &scopes
+}
+
+// --scope is how an operator opts in to a scope the default login does not ask
+// for (kn-t48): `clusters:rotate` is what makes `kubenest cluster rotate-token`
+// runnable at all, and it must be requested BY NAME — a default login that
+// carried it would hand every bastion the ability to disconnect clusters.
+func TestLoginScopeAddsToTheDeviceRequest(t *testing.T) {
+	isolateHome(t)
+	srv, scopes := deviceScopesServer(t)
+
+	root := NewRootCommand()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"login", "--control-plane", srv.URL, "--scope", "clusters:rotate"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	got := strings.Join(*scopes, " ")
+	for _, want := range []string{
+		"clusters:read", "clusters:register", "bundles:read", "install:report", "clusters:rotate",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("requested scopes %v are missing %s", *scopes, want)
+		}
+	}
+	if !strings.Contains(out.String(), "Logged in to") {
+		t.Errorf("the login did not report success:\n%s", out.String())
+	}
+}
+
+// THE DEFAULT REQUEST IS UNCHANGED, and this is the half that matters for
+// safety: the installer's four scopes, and nothing that can disconnect a
+// cluster.
+func TestLoginDefaultRequestDoesNotAskForTheRotateScope(t *testing.T) {
+	isolateHome(t)
+	srv, scopes := deviceScopesServer(t)
+
+	root := NewRootCommand()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"login", "--control-plane", srv.URL})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	got := strings.Join(*scopes, " ")
+	for _, want := range []string{"clusters:read", "clusters:register", "bundles:read", "install:report"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("requested scopes %v are missing the default %s", *scopes, want)
+		}
+	}
+	if strings.Contains(got, "clusters:rotate") {
+		t.Errorf("a default login requested clusters:rotate: %v", *scopes)
+	}
+	if len(*scopes) != 4 {
+		t.Errorf("a default login requested %d scopes, want the four installer scopes: %v", len(*scopes), *scopes)
+	}
+}
+
+// A scope the contract does not carry is refused HERE, before the device flow
+// starts. The alternative — the control plane rejecting the request — is a
+// failure the human has already been asked to approve, and the message would
+// name a scope they never typed.
+func TestLoginUnknownScopeIsRefusedBeforeContactingTheControlPlane(t *testing.T) {
+	isolateHome(t)
+
+	contacted := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacted = true
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	root := NewRootCommand()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs([]string{"login", "--control-plane", srv.URL, "--scope", "clusters:destroy"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("login accepted a scope the contract does not carry")
+	}
+	if !strings.Contains(err.Error(), "clusters:destroy") {
+		t.Errorf("the refusal does not name the rejected scope: %v", err)
+	}
+	if contacted {
+		t.Error("the control plane was contacted despite an unknown scope")
+	}
+	if strings.Contains(out.String(), "Logged in") {
+		t.Errorf("a refused scope must stop before the login is reported:\n%s", out.String())
+	}
+}

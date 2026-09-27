@@ -15,12 +15,63 @@ import (
 // console from any browser, and the CLI polls until it receives the knp_*
 // token — exactly once; the plaintext is never retrievable again.
 
-// Scopes the installer needs, nothing else (CliTokenScope in the contract).
+// CliTokenScopes are the scopes a plain `kubenest login` requests: what the
+// installer needs, nothing else (CliTokenScope in the contract). This request
+// is unchanged by --scope, which ADDS to it.
 var CliTokenScopes = []string{
 	"clusters:read",
 	"clusters:register",
 	"bundles:read",
 	"install:report",
+}
+
+// CliTokenScopeRotate is the one scope that can disconnect a cluster, so it is
+// deliberately NOT in CliTokenScopes: `kubenest login --scope clusters:rotate`
+// asks for it by name, and that login is what makes
+// `kubenest cluster rotate-token` runnable. The control plane names it in the
+// 403 insufficient_scope body when a token lacks it.
+const CliTokenScopeRotate = "clusters:rotate"
+
+// IsKnownCliTokenScope reports whether the contract's CliTokenScope enum
+// carries `scope`. `kubenest login --scope` refuses anything else before the
+// device flow starts, so a typo is an error on this machine naming the flag
+// rather than a rejection of an authorization the human has already approved.
+func IsKnownCliTokenScope(scope string) bool {
+	if scope == CliTokenScopeRotate {
+		return true
+	}
+	for _, known := range CliTokenScopes {
+		if scope == known {
+			return true
+		}
+	}
+	return false
+}
+
+// KnownCliTokenScopes is every scope the contract's CliTokenScope enum carries:
+// the default request followed by the opt-in ones. A caller naming the choices
+// (a refusal in `kubenest login --scope`) reads them from here rather than
+// keeping a second list that can fall behind the contract.
+func KnownCliTokenScopes() []string {
+	return append(append([]string{}, CliTokenScopes...), CliTokenScopeRotate)
+}
+
+// requestedScopes is the default request with `extra` folded in: the defaults
+// in their own order, then anything new, no value repeated.
+func requestedScopes(extra []string) []string {
+	scopes := append([]string{}, CliTokenScopes...)
+	seen := make(map[string]bool, len(scopes)+len(extra))
+	for _, scope := range scopes {
+		seen[scope] = true
+	}
+	for _, scope := range extra {
+		if scope == "" || seen[scope] {
+			continue
+		}
+		seen[scope] = true
+		scopes = append(scopes, scope)
+	}
+	return scopes
 }
 
 // DeviceAuth is the response of POST /auth/cli/device.
@@ -34,9 +85,14 @@ type DeviceAuth struct {
 }
 
 // StartDeviceAuth begins a device authorization.
-func (c *Client) StartDeviceAuth(ctx context.Context, clientName string) (DeviceAuth, error) {
+//
+// extraScopes are added to the default request (CliTokenScopes), in order,
+// ignoring duplicates — `kubenest login --scope clusters:rotate` is how a
+// credential gets a scope a default login does not ask for. Passing none is the
+// default request, unchanged.
+func (c *Client) StartDeviceAuth(ctx context.Context, clientName string, extraScopes ...string) (DeviceAuth, error) {
 	body, err := json.Marshal(map[string]any{
-		"requested_scopes": CliTokenScopes,
+		"requested_scopes": requestedScopes(extraScopes),
 		"client_name":      clientName,
 	})
 	if err != nil {

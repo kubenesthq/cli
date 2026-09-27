@@ -25,6 +25,11 @@ import (
 // installer needs (clusters:read, clusters:register, bundles:read,
 // install:report), nothing else.
 //
+// --scope ADDS a scope to that request, repeatably. It exists for
+// clusters:rotate — the one scope that lets `kubenest cluster rotate-token` run
+// and the one a default login must never carry, because a leaked install token
+// that could rotate would disconnect every cluster it reached.
+//
 // --token-stdin is the manual fallback for a token created in the console
 // under CLI tokens.
 //
@@ -37,6 +42,7 @@ func NewLoginCommand() *cobra.Command {
 		controlPlane string
 		tokenStdin   bool
 		caFile       string
+		scopes       []string
 	)
 
 	cmd := &cobra.Command{
@@ -49,12 +55,31 @@ By default this starts a device authorization: approve the printed code in
 your console from any browser, and the CLI receives a token scoped to what
 the installer needs. Your password never passes through the CLI.
 
+Pass --scope to ask for a scope on top of those defaults, repeatably. The
+one that matters today is clusters:rotate, which is what
+` + "`kubenest cluster rotate-token`" + ` needs: a default login does not
+request it, because a credential that can rotate can disconnect a cluster.
+
 For automation, create a token in the console and pipe it to --token-stdin.
+A console token carries the scopes it was created with, so --scope changes
+nothing on that path.
 
 Pass --ca-file when the control plane serves a certificate no public root
 signed: the PEM file is trusted for this login and remembered, so later
 commands (adding a cluster to this control plane among them) verify it too.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// A scope the contract does not carry is refused before anything is
+			// asked of the control plane: the device flow would otherwise have
+			// the human approve an authorization this CLI cannot honour, and
+			// the server's rejection would arrive long after they consented.
+			for _, scope := range scopes {
+				if !api.IsKnownCliTokenScope(scope) {
+					return fmt.Errorf(
+						"--scope %s: not a scope this CLI knows. The contract's CLI token scopes are: %s",
+						scope, strings.Join(api.KnownCliTokenScopes(), ", "))
+				}
+			}
+
 			cfg, err := config.Load()
 			if err != nil {
 				return err
@@ -96,7 +121,7 @@ commands (adding a cluster to this control plane among them) verify it too.`,
 					return fmt.Errorf("--token-stdin: no token on stdin (create one in the console under CLI tokens)")
 				}
 			} else {
-				auth, err := client.StartDeviceAuth(cmd.Context(), "kubenest-cli "+version.Version)
+				auth, err := client.StartDeviceAuth(cmd.Context(), "kubenest-cli "+version.Version, scopes...)
 				if err != nil {
 					return err
 				}
@@ -159,6 +184,7 @@ commands (adding a cluster to this control plane among them) verify it too.`,
 	cmd.Flags().StringVar(&controlPlane, "control-plane", "", "control plane URL, e.g. https://api.your-domain.com")
 	cmd.Flags().BoolVar(&tokenStdin, "token-stdin", false, "read a console-created CLI token from stdin instead of the device flow")
 	cmd.Flags().StringVar(&caFile, "ca-file", "", "PEM file of the control plane's own CA, when its certificate is not signed by a public root")
+	cmd.Flags().StringArrayVar(&scopes, "scope", nil, "add a scope to the device request, repeatable (e.g. clusters:rotate); the device flow only")
 	return cmd
 }
 

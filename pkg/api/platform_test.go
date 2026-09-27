@@ -230,3 +230,72 @@ func TestMaintenanceWindowReadsStateAndBackupWarning(t *testing.T) {
 		})
 	}
 }
+
+// A MISSING SCOPE IS NOT A MISSING LOGIN (kn-t48).
+//
+// POST /clusters/{id}/rotate-token needs a CLI token carrying
+// `clusters:rotate` — a scope no default `kubenest login` requests. Before
+// this, a token without it was refused as an unauthenticated caller (a 401
+// through the JWT-only route), and the CLI reported "not authenticated" over a
+// credential that worked on every other route, naming neither the real reason
+// nor a remedy. The control plane now answers 403 insufficient_scope with the
+// scope it wants, and the client has to turn that into the command that grants
+// it.
+func TestRotateTokenWithoutTheScopeNamesTheScopeAndTheRemedy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"detail":{"error":"insufficient_scope",`+
+			`"message":"This action requires the clusters:rotate scope.",`+
+			`"details":{"required_scope":"clusters:rotate"}}}`)
+	}))
+	defer srv.Close()
+
+	c, err := New(srv.URL, WithToken("knp_tok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.RotateAgentToken(context.Background(), "lab-w3")
+	if err == nil {
+		t.Fatal("a 403 insufficient_scope was accepted as a rotation")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"clusters:rotate",         // the missing scope
+		"--scope clusters:rotate", // how to ask for it
+		"kubenest login",          // whose command grants it
+		srv.URL,                   // against which control plane
+		"--token-stdin",           // the console-token alternative
+		"NOTHING HAS BEEN ROTATED",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal does not name %q:\n%s", want, msg)
+		}
+	}
+}
+
+// THE TAILORED MESSAGE IS KEYED ON THE SCOPE, NOT ON THE STATUS. An
+// org-bound token is refused with the same 403 insufficient_scope and no
+// required_scope, and telling that operator to get a login with
+// `--scope clusters:rotate` would send them to fix the wrong thing.
+func TestAnOrgBindingRefusalIsNotReportedAsAMissingScope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"detail":{"error":"insufficient_scope",`+
+			`"message":"This CLI token is bound to a different organization."}}`)
+	}))
+	defer srv.Close()
+
+	c, _ := New(srv.URL, WithToken("knp_tok"))
+	_, err := c.RotateAgentToken(context.Background(), "lab-w3")
+	if err == nil {
+		t.Fatal("a 403 was accepted as a rotation")
+	}
+	if strings.Contains(err.Error(), "--scope") {
+		t.Errorf("an org-binding refusal was reported as a missing scope:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "different organization") {
+		t.Errorf("the control plane's own reason was lost:\n%s", err)
+	}
+}
