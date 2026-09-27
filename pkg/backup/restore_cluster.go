@@ -126,12 +126,23 @@ type OwnerRef struct {
 	Controller bool
 }
 
-// CronJobState is one CronJob, and whether it was already suspended when the
-// restore found it — activation puts back exactly the prior state.
+// CronJobState is one CronJob: its live spec.suspend, and — on a CronJob the
+// restore has already brought back — the value the BACKUP held, which is what
+// activation puts back.
+//
+// The two are not the same field. The restore's resource modifier suspends
+// every CronJob as Velero creates it, so by the time anything can read the
+// object Suspend is true for all of them; RecordedSuspend is the annotation
+// that same modifier wrote out of the backup, and it is the only surviving
+// record of what the CronJob's own state was.
 type CronJobState struct {
 	Name     string
 	Schedule string
 	Suspend  bool
+	// RecordedSuspend is the value CronJobSuspendedAnnotationKey carries:
+	// "true", "false", or "" when the CronJob has no such annotation (the
+	// restore did not put it there, so the backup's value is unknown).
+	RecordedSuspend string
 }
 
 // JobState is one Job, and whether it was already suspended. A Job restored
@@ -487,7 +498,8 @@ func (c *k3sCluster) CronJobs(ctx context.Context, namespace string) ([]CronJobS
 	var document struct {
 		Items []struct {
 			Metadata struct {
-				Name string `json:"name"`
+				Name        string            `json:"name"`
+				Annotations map[string]string `json:"annotations"`
 			} `json:"metadata"`
 			Spec struct {
 				Schedule string `json:"schedule"`
@@ -501,7 +513,12 @@ func (c *k3sCluster) CronJobs(ctx context.Context, namespace string) ([]CronJobS
 	jobs := make([]CronJobState, 0, len(document.Items))
 	for _, item := range document.Items {
 		suspended := item.Spec.Suspend != nil && *item.Spec.Suspend
-		jobs = append(jobs, CronJobState{Name: item.Metadata.Name, Schedule: item.Spec.Schedule, Suspend: suspended})
+		jobs = append(jobs, CronJobState{
+			Name:            item.Metadata.Name,
+			Schedule:        item.Spec.Schedule,
+			Suspend:         suspended,
+			RecordedSuspend: item.Metadata.Annotations[CronJobSuspendedAnnotationKey],
+		})
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Name < jobs[j].Name })
 	return jobs, nil
@@ -1599,7 +1616,11 @@ func restoreDocument(spec restoreRequest) ([]byte, error) {
 	}
 	// JOBS ARE EXCLUDED so nothing runs by surprise; --include-jobs restores
 	// them deliberately, to run at activation. CronJobs are restored (as
-	// objects) and suspended by the run itself.
+	// objects) and mode 1 hands the restore a resource modifier that suspends
+	// each one AS VELERO CREATES IT and records the value the backup held —
+	// see cronJobModifierDocument, which is what the request's
+	// ResourceModifier is for. A Job restored with --include-jobs is suspended
+	// by the run afterwards, which is the one window this design still has.
 	//
 	// Only mode 1 needs to say so: a mode-2 request carries an explicit type
 	// filter, and an exclusion beside it would name a resource the filter
@@ -1645,4 +1666,35 @@ type restoreRequest struct {
 type modifierConfigMap struct {
 	Name string
 	Doc  []byte
+}
+
+// modifierName is the resource-modifier ConfigMap's name. Both restore modes
+// carry one; the operation id keeps two runs, and two modes, apart.
+func modifierName(operationID string) string { return "kubenest-restore-modifier-" + operationID }
+
+// modifierDocument wraps a set of resourceModifierRules in the ConfigMap a
+// Velero Restore reads them from. Both modes build their rules and hand them
+// here, so the envelope — version v1, the ConfigMap's name, namespace and
+// operation label, and the data key Velero looks under — exists once.
+func modifierDocument(operationID string, rules []any) (*modifierConfigMap, error) {
+	body, err := yaml.Marshal(map[string]any{"version": "v1", "resourceModifierRules": rules})
+	if err != nil {
+		return nil, err
+	}
+	doc, err := yaml.Marshal(map[string]any{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]any{
+			"name":      modifierName(operationID),
+			"namespace": Namespace,
+			"labels": map[string]any{
+				OperationIDLabel: operationID,
+			},
+		},
+		"data": map[string]string{"resource-modifier.yaml": string(body)},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &modifierConfigMap{Name: modifierName(operationID), Doc: doc}, nil
 }

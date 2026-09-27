@@ -200,7 +200,11 @@ identities, the workloads it will stop, what will be discarded, and the
 recovery-point verdict), waits for confirmation, pauses the project's
 reconcilers, waits for the operator to acknowledge the pause, takes a safety
 backup, stops the writers, deletes the namespace and restores it. Jobs are
-excluded unless --include-jobs, and CronJobs come back suspended.
+excluded unless --include-jobs. Every CronJob the restore creates is suspended
+by the restore itself — a Velero resource modifier sets spec.suspend as the
+object is created, and records the value the backup held — so no CronJob can
+fire between the restore and --activate, which puts each one back to the value
+the backup had.
 
 MODE 2 — one workload's stranded volumes, after a node loss:
 --namespace N --pvc P [--pvc P...]. The claims are deleted and refilled on live

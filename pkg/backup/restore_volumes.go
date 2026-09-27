@@ -8,8 +8,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Mode 2: restore one workload's stranded volumes IN PLACE (plan 7.5, kn-t43).
@@ -474,9 +472,6 @@ func (r *restoreRun) volumeRestoreSpec() (restoreRequest, error) {
 	return spec, nil
 }
 
-// volumeModifierName is the modifier ConfigMap's name.
-func volumeModifierName(operationID string) string { return "kubenest-restore-modifier-" + operationID }
-
 // volumeModifierDocument renders the two rules probe P5 settled.
 //
 // RULE 1 takes the restored pods out of their owner's selector by changing
@@ -532,27 +527,7 @@ func volumeModifierDocument(operationID string, plan *volumePlan) (*modifierConf
 			},
 		})
 	}
-	document := map[string]any{"version": "v1", "resourceModifierRules": rules}
-	body, err := yaml.Marshal(document)
-	if err != nil {
-		return nil, err
-	}
-	doc, err := yaml.Marshal(map[string]any{
-		"apiVersion": "v1",
-		"kind":       "ConfigMap",
-		"metadata": map[string]any{
-			"name":      volumeModifierName(operationID),
-			"namespace": Namespace,
-			"labels": map[string]any{
-				OperationIDLabel: operationID,
-			},
-		},
-		"data": map[string]string{"resource-modifier.yaml": string(body)},
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &modifierConfigMap{Name: volumeModifierName(operationID), Doc: doc}, nil
+	return modifierDocument(operationID, rules)
 }
 
 // volumeStripPatch builds the strategic merge patch that removes every volume

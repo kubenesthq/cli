@@ -400,6 +400,13 @@ func (c *fakeCluster) CreateRestore(ctx context.Context, name string, doc []byte
 		if len(parsed.Spec.IncludedNamespaces) > 0 {
 			spec.Namespace = parsed.Spec.IncludedNamespaces[0]
 		}
+		// The Restore's resource modifier is recorded by name: what it SAYS is
+		// the modifier ConfigMap's own document, which the run applies as a
+		// separate step and a test reads out of restoreDocs.
+		if parsed.Spec.ResourceModifier != nil {
+			name, _ := parsed.Spec.ResourceModifier["name"].(string)
+			spec.ResourceModifier = &modifierConfigMap{Name: name}
+		}
 	}
 	c.restoresMade = append(c.restoresMade, spec)
 	// THE RESTORE PUTS THE NAMESPACE AND ITS CLAIMS BACK, as new objects: a
@@ -585,7 +592,13 @@ func newRestoreFixture(t *testing.T, facts ...BackupFacts) *restoreFixture {
 	cluster.claims = []VolumeRef{{Namespace: "payments", Name: "data-0", UID: "uid-data-0"}}
 	cluster.claimLabels["data-0"] = map[string]string{"app": "payments"}
 	cluster.workloads = []WorkloadState{{Kind: "deployment", Name: "payments", Replicas: 2, Selector: map[string]string{"app": "payments"}}}
-	cluster.cronjobs = []CronJobState{{Name: "nightly", Schedule: "0 2 * * *", Suspend: false}}
+	// THE CRONJOB IS WHAT THE RUN READS IN THE NAMESPACE, which after a restore
+	// is the state the restore left: suspended by the restore's own resource
+	// modifier, carrying the value the BACKUP held in the annotation that same
+	// modifier wrote. The run never sees the backup's CronJob as the backup
+	// holds it, so a fixture cannot either — the modifier's document is
+	// asserted on its own (modifierRules).
+	cluster.cronjobs = []CronJobState{{Name: "nightly", Schedule: "0 2 * * *", Suspend: true, RecordedSuspend: "false"}}
 	cluster.hold = &ProjectHold{
 		ConditionStatus:  "True",
 		ConditionReason:  ReasonPausedByOperation,
@@ -712,8 +725,15 @@ func TestNamespaceRestorePlan(t *testing.T) {
 	if len(f.cluster.scaled) == 0 || f.cluster.scaled[0] != "deployment/payments=0" {
 		t.Errorf("the writers were not stopped before the delete: %v", f.cluster.scaled)
 	}
-	if got := f.cluster.suspended["nightly"]; !got {
-		t.Error("the restored CronJob was not suspended: it would run before activation")
+	// THE CRONJOB IS SUSPENDED BY THE RESTORE, NOT BY THE RUN, and the value
+	// activation will put back is the one the BACKUP held — read from the
+	// annotation the restore's modifier wrote, not from the object, which the
+	// modifier has already suspended.
+	if f.cluster.restoresMade[0].ResourceModifier == nil {
+		t.Error("the restore carries no resource modifier: a restored CronJob exists unsuspended until something patches it, and it can create a Job in that window")
+	}
+	if was := pendingDetailOf(t, f.kube.recordFor(operation.Name), "cronjob/nightly"); was != "false" {
+		t.Errorf("the operation recorded %q for CronJob nightly, want the backup's own value false: reading spec.suspend off the restored object would record true and activation would never start the namespace's schedule", was)
 	}
 	if !f.kube.sawCommand("kubenest-operation") {
 		t.Error("no operation record was written")
@@ -960,6 +980,235 @@ func TestNamespaceRestoreIncludeJobsSuspendsThemUntilActivation(t *testing.T) {
 	}
 }
 
+// pendingDetailOf reads one pending write out of the operation record: the
+// value activation will put back.
+func pendingDetailOf(t *testing.T, record *operation.Record, target string) string {
+	t.Helper()
+	if record == nil {
+		t.Fatalf("no operation record to read %s out of", target)
+	}
+	for _, pending := range record.Pending {
+		if pending.Target == target {
+			return pending.Detail
+		}
+	}
+	return ""
+}
+
+// cronJobRuleTargets reads one resource-modifier rule as the JSON types the
+// restored object would carry: the value it sets spec.suspend to (nil when it
+// does not write it) and the value it records in the annotation.
+//
+// As JSON, because "false" and false are different things in a CronJob and in
+// an annotation map, and the whole point of the mechanism is which one lands.
+func cronJobRuleTargets(t *testing.T, rule map[string]any) (suspend, recorded any) {
+	t.Helper()
+	patches, _ := rule["mergePatches"].([]any)
+	if len(patches) == 0 {
+		t.Fatalf("the rule carries no merge patches: %v", rule)
+	}
+	for _, patch := range patches {
+		entry, _ := patch.(map[string]any)
+		data, _ := entry["patchData"].(string)
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(data), &doc); err != nil {
+			t.Fatalf("the rule's patchData is not JSON (%v): %s", err, data)
+		}
+		if spec, ok := doc["spec"].(map[string]any); ok {
+			if value, ok := spec["suspend"]; ok {
+				suspend = value
+			}
+		}
+		if meta, ok := doc["metadata"].(map[string]any); ok {
+			if annotations, ok := meta["annotations"].(map[string]any); ok {
+				if value, ok := annotations[CronJobSuspendedAnnotationKey]; ok {
+					recorded = value
+				}
+			}
+		}
+	}
+	return suspend, recorded
+}
+
+// TestNamespaceRestoreSuspendsCronJobsThroughTheRestoreModifier: mode 1's
+// Velero Restore carries a resource modifier that suspends every CronJob as
+// Velero creates it and records the value the backup held.
+//
+// THE PLANTED NEGATIVE IS THE RESTORE WITHOUT IT — the one S4 caught on
+// hardware (lab w3, 2026-09-27): `s4-sentinel` came back unsuspended and
+// created its Job two seconds later, before the run's own patch could land.
+// So the Restore must name a modifier, and the rules must suspend and record,
+// both stated as the JSON types the object ends up with.
+func TestNamespaceRestoreSuspendsCronJobsThroughTheRestoreModifier(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	if len(f.cluster.restoresMade) != 1 {
+		t.Fatalf("Velero restores = %d, want one", len(f.cluster.restoresMade))
+	}
+	modifier := f.cluster.restoresMade[0].ResourceModifier
+	if modifier == nil {
+		t.Fatal("the Restore carries no resource modifier: Velero creates the CronJob as the backup held it, and between that and the run's own patch nothing stops it creating a Job")
+	}
+	if want := "kubenest-restore-modifier-" + f.kube.recordFor(operation.Name).OperationID; modifier.Name != want {
+		t.Errorf("the Restore names resource modifier %q, want %q", modifier.Name, want)
+	}
+
+	rules := modifierRules(t, f)
+	if len(rules) != 2 {
+		t.Fatalf("the modifier holds %d rule(s), want the unconditional rule that suspends and records, and then the rule that corrects a CronJob the backup had suspended: %v", len(rules), rules)
+	}
+	for i, rule := range rules {
+		conditions, _ := rule["conditions"].(map[string]any)
+		if conditions["groupResource"] != "cronjobs.batch" {
+			t.Errorf("rule %d targets groupResource %v, want cronjobs.batch: a CronJob is in the batch group, and the resource part alone matches nothing", i, conditions["groupResource"])
+		}
+	}
+
+	// The first rule runs for EVERY CronJob, suspended or not: `spec.suspend`
+	// unset and `spec.suspend: false` are the same state, and a match on a path
+	// the object does not carry is not a match, so a rule conditional on
+	// suspend=false would leave the ordinary CronJob — the one that never set
+	// the field — running.
+	suspend, recorded := cronJobRuleTargets(t, rules[0])
+	if suspend != true {
+		t.Errorf("the first rule sets spec.suspend to %#v, want the boolean true", suspend)
+	}
+	if recorded != "false" {
+		t.Errorf("the first rule records %#v, want the string \"false\": the annotation says what the backup held, and it is a string there", recorded)
+	}
+	if matches, _ := rules[0]["conditions"].(map[string]any)["matches"]; matches != nil {
+		t.Errorf("the first rule is conditional (%v): it must match every CronJob, including one whose spec.suspend is absent", matches)
+	}
+
+	// The second rule corrects the record for a CronJob the BACKUP had
+	// suspended, matched against the object as the backup holds it.
+	suspend, recorded = cronJobRuleTargets(t, rules[1])
+	if recorded != "true" {
+		t.Errorf("the second rule records %#v, want the string \"true\": a CronJob suspended in the backup must stay suspended at activation", recorded)
+	}
+	if suspend != nil {
+		t.Errorf("the second rule writes spec.suspend=%v of its own: it exists to correct the record the first rule wrote, and the first rule has already suspended the object", suspend)
+	}
+	matches, _ := rules[1]["conditions"].(map[string]any)["matches"].([]any)
+	if len(matches) != 1 {
+		t.Fatalf("the second rule's matches = %v, want the one condition on spec.suspend", matches)
+	}
+	entry, _ := matches[0].(map[string]any)
+	if entry["path"] != "/spec/suspend" || entry["value"] != "true" {
+		t.Errorf("the second rule matches %v, want spec.suspend true — the value the BACKUP held, which is what `matches` is read against", entry)
+	}
+	if _, patched := f.cluster.suspended["nightly"]; patched {
+		t.Error("the run patched a restored CronJob to suspend it: the suspension must travel with the Restore, because a write from here is the window it exists to close")
+	}
+}
+
+// TestNamespaceRestoreRefusesACronJobTheRestoreLeftRunning is the refusal half
+// of the check: a CronJob the restore left unsuspended is the S4 state, and the
+// run names it and stops instead of patching it afterwards.
+func TestNamespaceRestoreRefusesACronJobTheRestoreLeftRunning(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.cronjobs = []CronJobState{
+		{Name: "s4-sentinel", Schedule: "* * * * *", Suspend: false},
+		{Name: "nightly", Schedule: "0 2 * * *", Suspend: false},
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatalf("the restore accepted CronJobs left unsuspended: they can create Jobs before activation\n%s", out)
+	}
+	for _, name := range []string{"s4-sentinel", "nightly"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("the refusal does not name %s, so an operator cannot tell which schedule is still armed: %v", name, err)
+		}
+	}
+	if strings.Contains(out, RestoredStage) {
+		t.Errorf("the run reported the namespace as %q with a CronJob still able to run:\n%s", RestoredStage, out)
+	}
+	if len(f.cluster.suspended) != 0 {
+		t.Errorf("the run suspended the CronJobs itself (%v): that write is the window this restore exists to close, and a Job may already have run", f.cluster.suspended)
+	}
+	if got := pendingDetailOf(t, f.kube.recordFor(operation.Name), "cronjob/s4-sentinel"); got != "" {
+		t.Errorf("the run recorded %q for a CronJob it refused on: nothing is established about it", got)
+	}
+}
+
+// TestNamespaceRestoreRefusesACronJobWithNoRecordedValue: the other half of the
+// check. A CronJob that is suspended but carries no annotation did not come back
+// through the restore's modifier, so the value the backup held for it is
+// unknown; the run says so by name instead of recording a guess that activation
+// would act on.
+func TestNamespaceRestoreRefusesACronJobWithNoRecordedValue(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.cronjobs = []CronJobState{{Name: "nightly", Schedule: "0 2 * * *", Suspend: true, RecordedSuspend: ""}}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatalf("the restore accepted a CronJob it cannot put back: what the backup held for it is not on the object\n%s", out)
+	}
+	for _, want := range []string{"nightly", CronJobSuspendedAnnotationKey} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %s: %v", want, err)
+		}
+	}
+	if got := pendingDetailOf(t, f.kube.recordFor(operation.Name), "cronjob/nightly"); got != "" {
+		t.Errorf("the run recorded %q for a CronJob whose backup state is unknown: activation would act on a guess", got)
+	}
+	if strings.Contains(out, RestoredStage) {
+		t.Errorf("the run reported the namespace as %q:\n%s", RestoredStage, out)
+	}
+}
+
+// TestNamespaceRestoreActivationPutsBackTheBackupsSuspendValue: activation puts
+// each CronJob back to the value the BACKUP held, read from the annotation the
+// restore's modifier wrote. One the backup had suspended stays suspended.
+//
+// The object's own spec.suspend is useless as that record — the modifier
+// suspended it — so a run that read there would record "true" for both and
+// leave the namespace's schedule switched off after activation.
+func TestNamespaceRestoreActivationPutsBackTheBackupsSuspendValue(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// What the restore left: both suspended by the modifier, and the annotation
+	// is the only record of what the backup held. `nightly` ran in the backup;
+	// `quarterly` was suspended there and must stay that way.
+	f.cluster.cronjobs = []CronJobState{
+		{Name: "nightly", Schedule: "0 2 * * *", Suspend: true, RecordedSuspend: "false"},
+		{Name: "quarterly", Schedule: "0 0 1 */3 *", Suspend: true, RecordedSuspend: "true"},
+	}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	record := f.kube.recordFor(operation.Name)
+	for name, want := range map[string]string{"nightly": "false", "quarterly": "true"} {
+		if got := pendingDetailOf(t, record, "cronjob/"+name); got != want {
+			t.Errorf("the operation recorded %q for CronJob %s, want the backup's own value %s", got, name, want)
+		}
+	}
+
+	var activated strings.Builder
+	if err := RunRestore(context.Background(), &activated, strings.NewReader(""), f.options(t, RestoreOptions{
+		Namespace: "payments",
+		Activate:  record.OperationID,
+	}), f.deps()); err != nil {
+		t.Fatalf("activation failed: %v\n%s", err, activated.String())
+	}
+	if f.cluster.suspended["nightly"] {
+		t.Error("activation left CronJob nightly suspended: the backup held it running, and the namespace's schedule stays off")
+	}
+	if !f.cluster.suspended["quarterly"] {
+		t.Error("activation un-suspended CronJob quarterly: the backup held it suspended, so it must stay suspended")
+	}
+}
+
 // TestNamespaceRestoreResume: after an interrupted run the record is released,
 // the pause is still in place, and --resume finishes the restore without
 // repeating a step whose postcondition holds and without activating anything.
@@ -1148,7 +1397,6 @@ func TestRestoreSpecsRecordsEveryAction(t *testing.T) {
 		{"restore/kubenest-restore-abc123", "sudo -n k3s kubectl apply -f -", "Velero Restore kubenest-restore-abc123 exists"},
 		{"scale/deployment/payments", "sudo -n k3s kubectl scale deployment payments -n payments --replicas=0", "has 0 replicas"},
 		{"delete-namespace/payments", "sudo -n k3s kubectl delete namespace payments --wait=false", "namespace payments is gone"},
-		{"suspend/nightly", "sudo -n k3s kubectl patch cronjob nightly -n payments --type=merge -p '{\"spec\":{\"suspend\":true}}'", "CronJob payments/nightly is suspended"},
 		{"delete-claim/payments/data-0", "sudo -n k3s kubectl delete persistentvolumeclaim data-0 -n payments --wait=false", "claim payments/data-0 is gone"},
 		{"modifier/kubenest-restore-modifier-abc123", "sudo -n k3s kubectl apply -f -", "resource modifier kubenest-restore-modifier-abc123 exists"},
 	}

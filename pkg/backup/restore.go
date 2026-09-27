@@ -36,8 +36,8 @@ import (
 //     proof that a volume holds no newer data.
 //   - The operation record (pkg/operation) is the lock. It is written before
 //     the first change, it is what a second laptop's `--resume` reads, and it
-//     is what holds the identities, the prior replica counts and the CronJobs
-//     this run suspended.
+//     is what holds the identities, the prior replica counts and the suspend
+//     value the backup had for each CronJob this restore suspended.
 //   - A non-Completed Velero Restore is never reported as done, and Velero's
 //     own "Completed with 0 errors" is not proof that a volume was filled:
 //     every PodVolumeRestore this restore created must be Completed, which is
@@ -77,6 +77,12 @@ const (
 	SafetyBackupPurpose = "safety-backup"
 	// OperationIDLabel records the operation a produced object belongs to.
 	OperationIDLabel = "kubenest.io/operation-id"
+	// CronJobSuspendedAnnotationKey records, on a restored CronJob, whether
+	// spec.suspend was true in the BACKUP. A restore's resource modifier writes
+	// it while it suspends the CronJob, because by the time anything else can
+	// read the object the object is already suspended and the backup's own
+	// value is gone (see cronJobModifierDocument).
+	CronJobSuspendedAnnotationKey = "kubenest.io/restore-cronjob-was-suspended"
 	// RestoredStage is the stage the record holds while the data is back and
 	// nothing is allowed to run yet.
 	RestoredStage = "restored — awaiting activation"
@@ -717,7 +723,7 @@ func (r *restoreRun) renderPlan() {
 	if p.Mode == "volumes" {
 		fmt.Fprintf(r.out, "  mode:          volumes — refilling %s in place; every other volume of the same workload keeps its current contents\n", strings.Join(p.PVCs, ", "))
 	} else {
-		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; Jobs are %s and CronJobs come back suspended\n", includeJobsWord(r.opts.IncludeJobs))
+		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; Jobs are %s and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
 	}
 }
 
@@ -1361,8 +1367,10 @@ func (r *restoreRun) runner() k3s.Runner {
 }
 
 // recordPending records work this operation still owes activation: putting the
-// workloads back to their prior replica counts, and restoring the CronJobs that
-// were not suspended before the restore.
+// workloads back to their prior replica counts, and putting each CronJob back
+// to the suspend value the BACKUP held (read out of the annotation the
+// restore's resource modifier wrote, because the object itself is suspended by
+// then).
 //
 // It is a PendingWrite rather than a version, because the version map is part
 // of the request identity a resume compares: the replica counts legitimately
@@ -1583,35 +1591,130 @@ func checkVolumeRestores(outcome *RestoreOutcome, restores []VolumeRestoreState,
 	return nil
 }
 
-// suspendCronJobs patches every restored CronJob to spec.suspend=true, so
-// nothing runs by surprise before activation.
-func (r *restoreRun) suspendCronJobs(ctx context.Context) error {
+// cronJobModifierDocument renders the resource modifier mode 1's restore
+// carries: it suspends every CronJob AS VELERO CREATES IT, and records on the
+// object the value the backup held.
+//
+// WHY IN THE RESTORE AND NOT AFTER IT. The suspension used to be a
+// `kubectl patch` this command applied once the restore had finished, and a
+// CronJob restored unsuspended can create a Job in that window — measured on
+// hardware, 2026-09-27, S4 on lab w3: `s4-sentinel` came back at 16:27:58 and
+// created its Job at 16:28:00, before the patch landed. A resource modifier is
+// applied to the object BEFORE Velero creates it, so the CronJob never exists
+// unsuspended. There is only one mechanism: the shapes below are the ones mode
+// 2 already uses (restore_volumes.go), and runVeleroRestore applies both the
+// same way.
+//
+// TWO RULES, AND THE ORDER IS LOAD-BEARING. Velero applies every rule whose
+// conditions match, in the order the ConfigMap lists them, and — when the
+// ConfigMap holds more than one rule — it matches each rule's conditions
+// against the ORIGINAL object, so a later rule's condition cannot see an
+// earlier rule's patch (internal/resourcemodifiers/resource_modifiers.go,
+// ApplyResourceModifierRules, v1.18.1 — the version chart 12.1.0 in
+// pkg/bundles/manifests/platform-1.1.yaml ships):
+//
+//   - the FIRST rule matches every CronJob, suspends it and records "false".
+//     A rule conditional on `suspend: false` cannot do this job: `spec.suspend`
+//     unset and `spec.suspend: false` are the same state to Kubernetes, the
+//     field is optional with no default, and a `matches` entry for a path the
+//     object does not carry is simply not a match — matchConditions runs the
+//     entries as JSON Patch `test` operations and reads ErrTestFailed and
+//     ErrMissing as "no match".
+//   - the SECOND rule matches only a CronJob the BACKUP had suspended and
+//     overwrites that record with "true". It is matched against the object as
+//     the backup holds it, which is what makes the recorded value the BACKUP's
+//     own and not the value the rule above just wrote.
+//
+// The patch type is a JSON merge patch, not a JSON patch. A JSON patch's
+// `value` is a string unless it is escaped or looks like a number, boolean,
+// null, object or array (json_patch.go, addQuotes), and adding
+// `/metadata/annotations/<key>` to an object with no annotations at all — an
+// ordinary CronJob, since `suspend` is not the only field absent by default —
+// fails. Merge patches carry JSON types and create the missing intermediate
+// objects.
+func cronJobModifierDocument(operationID string) (*modifierConfigMap, error) {
+	// recorded is the merge patch that writes, on the CronJob, the value the
+	// backup held for spec.suspend. It is a real JSON string in the object,
+	// not the boolean spec.suspend is.
+	recorded := func(wasSuspended string) string {
+		return `{"metadata":{"annotations":{"` + CronJobSuspendedAnnotationKey + `":"` + wasSuspended + `"}}}`
+	}
+	rules := []any{
+		map[string]any{
+			"conditions": map[string]any{"groupResource": "cronjobs.batch"},
+			"mergePatches": []any{
+				map[string]any{"patchData": `{"spec":{"suspend":true}}`},
+				map[string]any{"patchData": recorded("false")},
+			},
+		},
+		map[string]any{
+			"conditions": map[string]any{
+				"groupResource": "cronjobs.batch",
+				"matches":       []any{map[string]any{"path": "/spec/suspend", "value": "true"}},
+			},
+			"mergePatches": []any{
+				map[string]any{"patchData": recorded("true")},
+			},
+		},
+	}
+	return modifierDocument(operationID, rules)
+}
+
+// recordSuspendedCronJobs reads the CronJobs the restore brought back, records
+// what activation must put back, and refuses — naming them — any that are not
+// suspended.
+//
+// THE OBJECT'S OWN VALUE IS NOT THE RECORD. The restore's resource modifier
+// suspended every CronJob as Velero created it, so reading spec.suspend here
+// would record "true" for all of them and activation would leave the
+// namespace's scheduled work switched off. The backup's value is the annotation
+// that same modifier wrote.
+//
+// THE REFUSAL IS THE POINT, and the run does not patch its way out of it. A
+// CronJob that is unsuspended can create a Job before activation, which is the
+// bug this restore was changed to close; a write from here is exactly the
+// window the modifier exists to remove, and by the time it is noticed a Job may
+// already have run. So the CronJobs are named, the project stays paused, and
+// the operator — not this run — decides what the namespace's state should be.
+func (r *restoreRun) recordSuspendedCronJobs(ctx context.Context) error {
 	jobs, err := r.deps.Cluster.CronJobs(ctx, r.opts.Namespace)
 	if err != nil {
 		return err
 	}
+	var unsuspended, unrecorded []string
 	for _, job := range jobs {
-		was := "false"
-		if job.Suspend {
-			was = "true"
+		switch {
+		case !job.Suspend:
+			unsuspended = append(unsuspended, job.Name)
+		case job.RecordedSuspend != "true" && job.RecordedSuspend != "false":
+			unrecorded = append(unrecorded, job.Name)
 		}
-		if err := r.recordPending(ctx, "cronjob/"+job.Name, "restore-cronjob", was); err != nil {
+	}
+	if len(unsuspended) > 0 {
+		return fmt.Errorf("the restore left CronJob(s) %s in namespace %s unsuspended, so nothing stops them creating Jobs before activation. The restore's resource modifier is what suspends every CronJob as Velero creates it, and this operation does not patch them afterwards: that write is the window the modifier exists to close, and a Job these CronJobs created may already have run. Nothing has been activated and the namespace stays paused, so suspend them by hand and check what they created; if the namespace should not be in this state at all, `kubenest backup restore --abort %s` gives up on the operation and leaves the project paused",
+			strings.Join(unsuspended, ", "), r.opts.Namespace, r.handle.OperationID())
+	}
+	if len(unrecorded) > 0 {
+		return fmt.Errorf("CronJob(s) %s in namespace %s are suspended but carry no %s annotation, so the value the backup held for them is unknown and this operation cannot put them back at activation. The restore's resource modifier writes that annotation as it suspends each CronJob, so these did not come back through it; `kubenest backup restore --abort %s` gives up on the operation if that is not the state the backup should have brought back. Nothing has been activated and the namespace stays paused",
+			strings.Join(unrecorded, ", "), r.opts.Namespace, CronJobSuspendedAnnotationKey, r.handle.OperationID())
+	}
+	for _, job := range jobs {
+		if err := r.recordPending(ctx, "cronjob/"+job.Name, "restore-cronjob", job.RecordedSuspend); err != nil {
 			return err
 		}
-		if err := r.stage("suspend/"+job.Name).SuspendCronJob(ctx, r.opts.Namespace, job.Name, true); err != nil {
-			return err
-		}
-		fmt.Fprintf(r.out, "  cronjob:       %s suspended (it was suspended=%s before)\n", job.Name, was)
+		fmt.Fprintf(r.out, "  cronjob:       %s is suspended by the restore (the backup had it suspended=%s)\n", job.Name, job.RecordedSuspend)
 	}
 	return nil
 }
 
-// suspendRestoredWork suspends what must not run before activation: every
-// CronJob the restore brought back, and — when --include-jobs restored them on
-// purpose — every Job, because a Job object that appears unsuspended starts its
-// pod at once.
-func (r *restoreRun) suspendRestoredWork(ctx context.Context) error {
-	if err := r.suspendCronJobs(ctx); err != nil {
+// holdRestoredWork holds what must not run before activation: every CronJob the
+// restore brought back — already suspended by the restore's own resource
+// modifier, whose record of the backup's value is checked and kept here — and,
+// when --include-jobs restored them on purpose, every Job, because a Job object
+// that appears unsuspended starts its pod at once and Velero has no modifier
+// step of ours in the way for it.
+func (r *restoreRun) holdRestoredWork(ctx context.Context) error {
+	if err := r.recordSuspendedCronJobs(ctx); err != nil {
 		return err
 	}
 	if !r.opts.IncludeJobs {
@@ -2036,15 +2139,6 @@ func restoreSpecs(stage, command string) (operation.Spec, bool) {
 			Observe: fmt.Sprintf(`test -z "$(sudo -n k3s kubectl get persistentvolumeclaim %s -n %s -o name 2>/dev/null)"`,
 				name, namespace),
 		}, true
-	case strings.HasPrefix(stage, "suspend/"):
-		name := strings.TrimPrefix(stage, "suspend/")
-		namespace := wordAfter(command, "-n")
-		return operation.Spec{
-			Kind:          operation.ActionSSH,
-			Postcondition: "CronJob " + namespace + "/" + name + " is suspended",
-			Observe: fmt.Sprintf(`test "$(sudo -n k3s kubectl get cronjob %s -n %s -o jsonpath='{.spec.suspend}')" = true`,
-				name, namespace),
-		}, true
 	case strings.HasPrefix(stage, "suspend-job/"):
 		name := strings.TrimPrefix(stage, "suspend-job/")
 		namespace := wordAfter(command, "-n")
@@ -2122,6 +2216,10 @@ func (r *restoreRun) execute(ctx context.Context) error {
 	if err := r.deleteNamespace(ctx); err != nil {
 		return err
 	}
+	modifier, err := cronJobModifierDocument(r.handle.OperationID())
+	if err != nil {
+		return err
+	}
 	if _, err := r.runVeleroRestore(ctx, "kubenest-restore-"+r.handle.OperationID(), restoreRequest{
 		Backup:      r.plan.Backup.Name,
 		Namespace:   r.opts.Namespace,
@@ -2130,10 +2228,15 @@ func (r *restoreRun) execute(ctx context.Context) error {
 		// the backup holds it. The claims are what this restore is asked to
 		// fill, and every one of them must have a Completed PodVolumeRestore.
 		NamedVolumes: r.plan.Claims,
+		// THE SUSPENSION TRAVELS WITH THE RESTORE (cronJobModifierDocument):
+		// Velero suspends every CronJob as it creates it, so there is no
+		// instant in which a restored CronJob can fire between the restore and
+		// activation.
+		ResourceModifier: modifier,
 	}); err != nil {
 		return err
 	}
-	if err := r.suspendRestoredWork(ctx); err != nil {
+	if err := r.holdRestoredWork(ctx); err != nil {
 		return err
 	}
 	return r.markAwaitingActivation(ctx)
