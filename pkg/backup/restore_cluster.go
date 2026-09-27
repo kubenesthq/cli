@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // The cluster side of `kubenest backup restore`: every read the plan and its
@@ -941,6 +942,11 @@ func (c *k3sCluster) RestoreOutcome(ctx context.Context, name string) (*RestoreO
 // local volume records its node in the PV's nodeAffinity, which is what makes
 // "a live node" checkable rather than assumed: a volume provisioned for the
 // node that died would carry that node's name here.
+//
+// WHICH KEY THAT IS IS THE DRIVER'S (storage.NodesOf): the LVM volumes this
+// platform provisions record it as openebs.io/nodename and not under the
+// hostname label, so a reader that knew only the label could not place a single
+// volume of the storage class the platform installs.
 func (c *k3sCluster) ClaimBinding(ctx context.Context, namespace, claim string) (*ClaimBinding, error) {
 	out, err := c.kubectl(ctx, "get persistentvolumeclaim "+claim+" -n "+namespace+" -o json")
 	if err != nil {
@@ -980,30 +986,14 @@ func (c *k3sCluster) ClaimBinding(ctx context.Context, namespace, claim string) 
 	}
 	var pv struct {
 		Spec struct {
-			NodeAffinity *struct {
-				Required *struct {
-					NodeSelectorTerms []struct {
-						MatchExpressions []struct {
-							Key      string   `json:"key"`
-							Operator string   `json:"operator"`
-							Values   []string `json:"values"`
-						} `json:"matchExpressions"`
-					} `json:"nodeSelectorTerms"`
-				} `json:"required"`
-			} `json:"nodeAffinity"`
+			NodeAffinity *storage.NodeAffinity `json:"nodeAffinity"`
 		} `json:"spec"`
 	}
 	if err := json.Unmarshal([]byte(pvOut), &pv); err != nil {
 		return nil, fmt.Errorf("parsing volume %s: %w", binding.Volume, err)
 	}
-	if pv.Spec.NodeAffinity != nil && pv.Spec.NodeAffinity.Required != nil {
-		for _, term := range pv.Spec.NodeAffinity.Required.NodeSelectorTerms {
-			for _, expression := range term.MatchExpressions {
-				if expression.Key == "kubernetes.io/hostname" && len(expression.Values) > 0 {
-					binding.Node = expression.Values[0]
-				}
-			}
-		}
+	if nodes := storage.NodesOf(pv.Spec.NodeAffinity); len(nodes) > 0 {
+		binding.Node = nodes[0]
 	}
 	return binding, nil
 }

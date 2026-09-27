@@ -124,6 +124,44 @@ func TestRemoveRefusesWhileABoundLocalVolumeRemains(t *testing.T) {
 	}
 }
 
+// THE DISPOSITION READS A VOLUME'S NODE UNDER THE KEY THE DRIVER WROTE, and
+// that reading is the whole of "which data goes with this machine". Lab w3
+// (2026-09-27): `kubenest-local` is local.csi.openebs.io and its volumes record
+// the node as openebs.io/nodename, so a reader that knew only the hostname
+// label saw a node holding no local volumes at all — this gate would have
+// removed the machine, taken the data with it, and never asked the operator
+// about it.
+func TestBoundLocalVolumesSeesTheKeyTheLocalDriverWrites(t *testing.T) {
+	f := removeFixture(t)
+	f.server.on("get pv -o json", ok(`{"items":[`+
+		`{"metadata":{"name":"pv-here"},"spec":{"claimRef":{"namespace":"db","name":"data-pg-0"},`+
+		`"csi":{"driver":"local.csi.openebs.io"},`+
+		`"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"openebs.io/nodename","operator":"In","values":["`+testAgentNode+`"]}]}]}}},`+
+		`"status":{"phase":"Bound"}},`+
+		// The same driver on ANOTHER node: a reader that matched any local
+		// volume would report this one too, and the gate would name data the
+		// removal does not touch.
+		`{"metadata":{"name":"pv-elsewhere"},"spec":{"claimRef":{"namespace":"db","name":"data-pg-1"},`+
+		`"csi":{"driver":"local.csi.openebs.io"},`+
+		`"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"openebs.io/nodename","operator":"In","values":["some-other-node"]}]}]}}},`+
+		`"status":{"phase":"Bound"}}]}`))
+	f.server.on("get pods --all-namespaces -o json", ok(`{"items":[{"metadata":{"namespace":"db",`+
+		`"ownerReferences":[{"kind":"StatefulSet","name":"pg"}]},`+
+		`"spec":{"volumes":[{"persistentVolumeClaim":{"claimName":"data-pg-0"}}]}}]}`))
+
+	volumes, err := BoundLocalVolumes(context.Background(), f.server, testAgentNode)
+	if err != nil {
+		t.Fatalf("reading the bound local volumes: %v", err)
+	}
+	if len(volumes) != 1 {
+		t.Fatalf("read %d bound local volume(s), want 1: only the volume recorded on this node is this node's loss", len(volumes))
+	}
+	got := volumes[0]
+	if got.PV != "pv-here" || got.PVC != "data-pg-0" || got.Namespace != "db" || got.Workload != "StatefulSet/pg" {
+		t.Errorf("read %+v, want pv-here/db/data-pg-0 held by StatefulSet/pg", got)
+	}
+}
+
 // --abandon-volumes proceeds, and says in as many words what that means: the
 // data is gone, and nothing here certifies that a backup of it exists.
 func TestRemoveProceedsWithAbandonVolumesAndStatesTheDataLoss(t *testing.T) {

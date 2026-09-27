@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // BoundLocalVolume is one PersistentVolume that lives on ONE node's disk and
@@ -52,7 +53,7 @@ func BoundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]B
 				CSI      *struct {
 					Driver string `json:"driver"`
 				} `json:"csi"`
-				NodeAffinity *pvNodeAffinity `json:"nodeAffinity"`
+				NodeAffinity *storage.NodeAffinity `json:"nodeAffinity"`
 			} `json:"spec"`
 			Status struct {
 				Phase string `json:"phase"`
@@ -96,54 +97,23 @@ func BoundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]B
 	return found, nil
 }
 
-// pvNodeAffinity is the little of a PersistentVolume's affinity this package
-// reads: the selector that says which machines the volume may live on.
-type pvNodeAffinity struct {
-	Required *struct {
-		NodeSelectorTerms []struct {
-			MatchExpressions []struct {
-				Key      string   `json:"key"`
-				Operator string   `json:"operator"`
-				Values   []string `json:"values"`
-			} `json:"matchExpressions"`
-		} `json:"nodeSelectorTerms"`
-	} `json:"required"`
-}
-
 // claimRef is the claim a volume is bound to.
 type claimRef struct {
 	Namespace string `json:"namespace"`
 	Name      string `json:"name"`
 }
 
-// pinnedTo reports whether a volume's node affinity requires exactly this
-// node. A term whose key is the hostname label and whose operator is In (or
-// the single-value form of it) is the shape every CSI driver uses to say "this
-// volume lives on that machine".
-func pinnedTo(affinity *pvNodeAffinity, node string) bool {
-	if affinity == nil || affinity.Required == nil {
-		return false
-	}
-	for _, term := range affinity.Required.NodeSelectorTerms {
-		for _, expr := range term.MatchExpressions {
-			if expr.Key != "kubernetes.io/hostname" {
-				continue
-			}
-			switch expr.Operator {
-			case "In":
-				for _, v := range expr.Values {
-					if v == node {
-						return true
-					}
-				}
-			case "Equals":
-				if len(expr.Values) == 1 && expr.Values[0] == node {
-					return true
-				}
-			}
-		}
-	}
-	return false
+// pinnedTo reports whether a volume's node affinity requires exactly this node,
+// which is what makes removing that node a data loss.
+//
+// WHICH KEY COUNTS IS storage's TO SAY (storage.NodesOf), and it is not only the
+// hostname label: the LVM volumes this platform provisions record their node as
+// openebs.io/nodename, so a volume of the platform's own storage class used to
+// look like a volume pinned to no node at all — `node remove` would take the
+// machine away without ever telling the operator which data went with it
+// (measured on lab w3, 2026-09-27).
+func pinnedTo(affinity *storage.NodeAffinity, node string) bool {
+	return storage.Requires(affinity, node)
 }
 
 // claimKey identifies a claim inside one namespace.
