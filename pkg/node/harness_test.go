@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -675,13 +676,10 @@ func newFixture(t *testing.T, hosts ...api.HostRecord) *nodeFixture {
 	f.agentNodes = nodesJSON(t)
 
 	// A journal in a temporary directory, so a test never reads or writes the
-	// operator's own state.
-	journal, err := stages.OpenJournal(t.TempDir()+"/journal.json", stages.Identity{Kind: "node-test", Cluster: "prod-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.journal = journal
-	f.journalPath = journal.Path()
+	// operator's own state. It is opened the way the command layer opens it,
+	// including the one line a replaced FINISHED journal is worth.
+	f.journal = f.openJournal(t, t.TempDir()+"/journal.json")
+	f.journalPath = f.journal.Path()
 
 	slept := []time.Duration{}
 	f.slept = &slept
@@ -693,7 +691,7 @@ func newFixture(t *testing.T, hosts ...api.HostRecord) *nodeFixture {
 		Catalog: fakeCatalog{entries: []preflight.BundleEntry{
 			{Version: "1.1", HATiers: []string{"single-server", "ha"}, Profiles: []string{"observability"}},
 		}},
-		Jnl:  journal,
+		Jnl:  f.journal,
 		Emit: stages.NopEmitter{},
 		Out:  f.out,
 		Now:  func() time.Time { return f.now },
@@ -732,18 +730,71 @@ func openWindow() *window.Window {
 	return &window.Window{Days: days, Start: 0, End: 24 * 60, Location: time.UTC}
 }
 
+// fixtureJournalIdentity is what the fixture opens its journal with. A node
+// verb's journal is per (kind, cluster); the real identity also carries the
+// machine, the bundle and the storage flag, which is what a leftover journal
+// from another run differs on.
+func fixtureJournalIdentity() stages.Identity {
+	return stages.Identity{Kind: "node-test", Cluster: "prod-1"}
+}
+
+// openJournal opens the journal the way the command layer does, printing the
+// one line a replaced FINISHED journal is worth, and failing the test when the
+// journal is refused.
+func (f *nodeFixture) openJournal(t *testing.T, path string) *stages.Journal {
+	t.Helper()
+	journal, note, err := OpenJournal(path, fixtureJournalIdentity())
+	if err != nil {
+		t.Fatalf("opening the journal: %v", err)
+	}
+	if note != "" {
+		fmt.Fprintln(f.out, note)
+	}
+	return journal
+}
+
+// reopen is a second CLI invocation over the same world and the same HOME: the
+// same machines and the same record, a new run id, and the journal read from
+// the same path the way the command reads it. It RETURNS the open error instead
+// of failing, so a test can assert on the refusal.
+func (f *nodeFixture) reopen(t *testing.T, id string) (*Session, string, error) {
+	t.Helper()
+	journal, note, err := OpenJournal(f.journalPath, fixtureJournalIdentity())
+	if err != nil {
+		return nil, "", err
+	}
+	if note != "" {
+		fmt.Fprintln(f.out, note)
+	}
+	next := *f.session
+	next.ID = id
+	next.Jnl = journal
+	next.Window = openWindow()
+	return &next, note, nil
+}
+
+// seedJournal lays down a journal file the way a previous process left it. It
+// deliberately does not go through OpenJournal: the point is to hand the next
+// run an identity and a set of entries that are already on disk.
+func (f *nodeFixture) seedJournal(t *testing.T, identity stages.Identity, entries ...stages.Entry) {
+	t.Helper()
+	raw, err := json.Marshal(stages.Journal{Identity: identity, Entries: entries})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.journalPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // sessionFor returns a second session over the SAME world, which is what a
 // resume from another process looks like: the record, the machines and the
 // journal are the ones the first run left.
 func (f *nodeFixture) sessionFor(t *testing.T, id string) *Session {
 	t.Helper()
-	journal, err := stages.OpenJournal(f.journalPath, stages.Identity{Kind: "node-test", Cluster: "prod-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	next := *f.session
 	next.ID = id
-	next.Jnl = journal
+	next.Jnl = f.openJournal(t, f.journalPath)
 	next.Window = openWindow()
 	return &next
 }

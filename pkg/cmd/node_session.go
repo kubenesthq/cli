@@ -104,9 +104,12 @@ func prepareNodeSession(ctx context.Context, out io.Writer, client *api.Client, 
 	if err != nil {
 		return nil, err
 	}
-	journal, err := stages.OpenJournal(journalPath, identity)
+	journal, note, err := node.OpenJournal(journalPath, identity)
 	if err != nil {
 		return nil, err
+	}
+	if note != "" {
+		fmt.Fprintln(out, note)
 	}
 
 	return &node.Session{

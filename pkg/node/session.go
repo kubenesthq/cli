@@ -536,6 +536,79 @@ func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request o
 	return nil
 }
 
+// OpenJournal opens the journal for one node operation.
+//
+// The engine's OpenJournal refuses a journal recorded for a DIFFERENT operation,
+// which is right for a half-finished one: resume re-runs the identical command,
+// and resuming onto changed arguments is how a cluster stops matching its own
+// record. It is wrong for a journal whose operation FINISHED — that journal is
+// not a resume, it is a leftover — and a node verb that completed used to leave
+// one, so every verb worked exactly once per cluster from one laptop.
+//
+// So a journal whose stages all ran to the end is replaced, and the returned
+// note says so in one line; the caller prints it. A journal with any stage
+// unfinished is left to the engine, which refuses a different operation and
+// resumes an identical one. The engine's other refusal — a journal it cannot
+// read at all — is never overridden: a corrupt file is a state nobody here can
+// reason about.
+func OpenJournal(path string, want stages.Identity) (*stages.Journal, string, error) {
+	journal, err := stages.OpenJournal(path, want)
+	if err == nil {
+		return journal, "", nil
+	}
+	stale, readErr := stages.ReadJournal(path)
+	if readErr != nil || !finishedJournal(stale) {
+		return nil, "", err
+	}
+	if removeErr := stale.Remove(); removeErr != nil {
+		return nil, "", err
+	}
+	journal, err = stages.OpenJournal(path, want)
+	if err != nil {
+		return nil, "", err
+	}
+	return journal, fmt.Sprintf("note: %s is from a finished %s, so this run starts a new one", path, stale.Identity.Kind), nil
+}
+
+// finishedJournal reports whether every stage this journal recorded ran to its
+// end: at least one stage completed, and no stage's last word is `started` or
+// `failed`.
+//
+// Its evidence is the journal's own entries, which are all there is on disk, so
+// it cannot tell a finished operation from one interrupted BETWEEN two stages —
+// both leave the last word `completed`. That is why the replacement happens only
+// when the arguments differ: the identical command is answered by the identity
+// check first, and still resumes.
+func finishedJournal(j *stages.Journal) bool {
+	if j == nil || len(j.Entries) == 0 {
+		return false
+	}
+	completed := false
+	for i := range j.Entries {
+		if _, ok := j.Completed(j.Entries[i].Stage); !ok {
+			return false
+		}
+		completed = true
+	}
+	return completed
+}
+
+// removeJournal drops the journal of a finished operation.
+//
+// A journal that outlives its operation is read as a half-finished resume by the
+// next run of the same verb on the cluster — the next `node add` of another host
+// is refused as a different resume — so uninstall and the upgrades drop theirs
+// when they finish. A failed run keeps it, and so does an interrupted one: that
+// journal IS the record to resume from.
+func (s *Session) removeJournal() {
+	if s.Jnl == nil {
+		return
+	}
+	if err := s.Jnl.Remove(); err != nil {
+		s.Logf("warning: the journal %s could not be removed: %v", s.Jnl.Path(), err)
+	}
+}
+
 // finishRecord closes the operation record the way the run ended. An
 // interrupted run is marked stopped rather than finished, so a successor may
 // take it over (a terminal record cannot be resumed by anyone).
@@ -559,6 +632,11 @@ func (s *Session) finishRecord(ctx context.Context, runErr error, interrupted bo
 		return
 	}
 	s.Logf("  record:    %s marked %s", s.handle.OperationID(), result)
+	if result == operation.ResultSucceeded {
+		// The operation is over and terminal: its journal is a leftover, and
+		// the next run of this verb on the cluster must not read it as a resume.
+		s.removeJournal()
+	}
 }
 
 // guard wraps a runner so that what it submits is written down before it is
