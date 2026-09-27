@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"time"
@@ -159,6 +160,45 @@ func (s *Session) Logf(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(s.Out, format+"\n", args...)
+}
+
+// mergeState overlays v's JSON fields on the journal's state document and saves
+// it.
+//
+// A JOURNAL HAS ONE STATE FIELD, and an operation that composes two verbs needs
+// both of them in it: `node replace` records the order it committed to and the
+// machine it is replacing, while the `node add` half it composes records the
+// node that joined. A write that replaced the whole document would erase the
+// other half's facts exactly when a resume needs them, so writes MERGE — every
+// field of v is set, and a field this caller does not name is left as it was.
+func (s *Session) mergeState(v any) error {
+	if s.Jnl == nil {
+		return nil
+	}
+	fields := map[string]json.RawMessage{}
+	if len(s.Jnl.State) > 0 {
+		// A document that cannot be decoded is replaced rather than merged: it
+		// is not this operation's, and refusing here would refuse work that has
+		// not happened.
+		_ = json.Unmarshal(s.Jnl.State, &fields)
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	mine := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &mine); err != nil {
+		return err
+	}
+	for key, value := range mine {
+		fields[key] = value
+	}
+	merged, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	s.Jnl.State = merged
+	return s.Jnl.Save()
 }
 
 // now is the session's clock.
@@ -393,6 +433,16 @@ func (s *Session) waitForWindow(ctx context.Context) error {
 // longest operation that holds it, and only the manifest knows how long that
 // is.
 func (s *Session) takeInterlock(ctx context.Context, node string, ttl time.Duration) error {
+	// ONE OPERATION HOLDS KURED'S LOCK ONCE. The lock is a single document
+	// naming one node, and an operation that acts on two machines — a replace
+	// takes one node down while it brings another up — would otherwise have its
+	// second take refused by the lock its own first take wrote. For a verb with
+	// one machine this changes nothing: the second take named the same node,
+	// and kured's own rule already made that a re-take.
+	if s.interlockHeld {
+		s.Logf("  interlock: kured's lock is already held by this operation (for %s), so %s is covered by it too", s.interlockNode, node)
+		return nil
+	}
 	held, holder, err := interlock.Acquire(ctx, s.ServerConn, node, ttl)
 	if err != nil {
 		return fmt.Errorf("kured's lock could not be taken: %w", err)

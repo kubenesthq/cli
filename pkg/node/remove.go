@@ -92,13 +92,33 @@ func PlanRemove(r *Remove) []stages.Stage {
 	}
 }
 
-// stageResolve finds the machine and checks that it may be removed at all.
-//
-// Both refusals here are about the MACHINE, not about the request, and they
-// come from the INVENTORY: a role taken from a command-line flag would be an
-// assumption about which machines matter, and that is the assumption that
-// removes a control-plane node.
+// stageResolve finds the machine and checks that it may be removed at all, then
+// opens the connection the removal's own steps need.
 func (r *Remove) stageResolve(ctx context.Context) error {
+	if err := r.ResolveOldHost(ctx); err != nil {
+		return err
+	}
+	if err := r.CheckRemovable(); err != nil {
+		return err
+	}
+	conn, err := r.Dial(ctx, r.Host)
+	if err != nil {
+		return fmt.Errorf("connecting to %s: %w", r.Host.SSHAddress, err)
+	}
+	return r.ResolveAccess(ctx, conn)
+}
+
+// ResolveOldHost finds the machine this removal is about: by the inventory's
+// host ID, its SSH address or its Node UID, or — when the operator named a Node
+// the cluster knows and the inventory does not — through the cluster's own Node
+// object, so a Node name and a host ID cannot disagree about which machine this
+// is. It changes nothing.
+//
+// It is separate from CheckRemovable and from the dial because a composed
+// `node replace` resolves the machine a resume already knows by the host ID it
+// recorded: the Node object may be gone (the replacement deleted it), and the
+// gates belong to a request that has already been made.
+func (r *Remove) ResolveOldHost(ctx context.Context) error {
 	if err := r.resolveCluster(ctx); err != nil {
 		return err
 	}
@@ -114,21 +134,45 @@ func (r *Remove) stageResolve(ctx context.Context) error {
 		}
 	}
 	r.Host = host
-	if state := LifecycleState(host.LifecycleState); state == StateRemoved {
-		return fmt.Errorf("host %s (%s) is already recorded as %q, so there is nothing to remove", host.HostID, host.SSHAddress, host.LifecycleState)
-	}
-	if Role(host.Role) == RoleServer {
-		return fmt.Errorf("host %s (%s) is a SERVER of this cluster, and removing it is not this command. On a single-server cluster the only server is recovered by S6 (`kubenest platform restore` from the recovery kit and an off-host backup); on the ha tier, adding and removing servers arrives with its promotion (T6.1, bundle 1.3). Nothing was changed",
-			host.HostID, host.SSHAddress)
-	}
 	r.Logf("Removing agent %s (%s) from cluster %s.", host.HostID, host.SSHAddress, r.Cluster)
+	return nil
+}
 
-	conn, err := r.Dial(ctx, host)
-	if err != nil {
-		return fmt.Errorf("connecting to %s: %w", host.SSHAddress, err)
+// CheckRemovable refuses a machine this verb may not remove: one the inventory
+// already records as removed, and a SERVER, because a single-server cluster's
+// only server is recovered by S6 (`kubenest platform restore` from the recovery
+// kit and an off-host backup) and the ha tier's server operations arrive with
+// its promotion.
+//
+// It is separate from ResolveOldHost because a replace resumes a removal THIS
+// operation performed: there the host is marked removed because of its own
+// work, and asking the fresh question again would refuse the operation it is
+// resuming.
+func (r *Remove) CheckRemovable() error {
+	if state := LifecycleState(r.Host.LifecycleState); state == StateRemoved {
+		return fmt.Errorf("host %s (%s) is already recorded as %q, so there is nothing to remove", r.Host.HostID, r.Host.SSHAddress, r.Host.LifecycleState)
 	}
+	if Role(r.Host.Role) == RoleServer {
+		return fmt.Errorf("host %s (%s) is a SERVER of this cluster, and removing it is not this command. On a single-server cluster the only server is recovered by S6: `kubenest platform install --cluster <cluster-id> --restore-from latest --recovery-kit s3` onto a fresh host, from the recovery kit and the off-host backup; on the ha tier, adding and removing servers arrives with its promotion (T6.1, bundle 1.3). Nothing was changed",
+			r.Host.HostID, r.Host.SSHAddress)
+	}
+	return nil
+}
+
+// ResolveAccess attaches the connection to the machine and reads the facts
+// every later stage goes through: the host key the inventory recorded, the
+// Ready server every cluster read and every kubectl write goes through, the
+// cluster's nodes, and the Node object this machine is.
+//
+// The CONNECTION IS THE CALLER'S: `node remove` dials the machine itself, and a
+// composed `node replace` passes the connection its own reachability step
+// opened — or a runner that reports the machine unreachable, which is the
+// premise of the order that removes first. An unreachable runner reports no
+// host key, which is not a mismatch this function can claim to have checked:
+// there was nothing to compare, and the reachability step has already said so.
+func (r *Remove) ResolveAccess(ctx context.Context, conn Transport) error {
 	r.Conn = conn
-	if err := CheckFingerprint(host, conn); err != nil {
+	if err := CheckFingerprint(r.Host, conn); err != nil {
 		return err
 	}
 	server, serverConn, err := ReadyServer(ctx, r.Hosts, r.Dial)
@@ -141,7 +185,7 @@ func (r *Remove) stageResolve(ctx context.Context) error {
 		return err
 	}
 	r.Nodes = nodes
-	node, err := NodeFor(nodes, host)
+	node, err := NodeFor(nodes, r.Host)
 	if err != nil {
 		return err
 	}

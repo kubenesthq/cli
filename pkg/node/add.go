@@ -118,20 +118,38 @@ func (a *Add) stageState() addState {
 }
 
 // saveState writes the state a resume needs.
+//
+// It MERGES into the journal's state document: a `node replace` composes this
+// half and keeps the order it committed to — and the machine it is replacing —
+// in the same document, and a write that replaced the whole document would
+// erase facts the same operation's other half needs to resume.
 func (a *Add) saveState(st addState) error {
-	if a.Jnl == nil {
-		return nil
-	}
-	return a.Jnl.SetState(st)
+	return a.mergeState(st)
 }
 
 // stageResolve answers what this cluster IS and which machine joins it.
+func (a *Add) stageResolve(ctx context.Context) error {
+	return a.ResolveNewHost(ctx, a.Opts.Resume != "")
+}
+
+// ResolveNewHost answers what this cluster IS and which machine joins it, and
+// opens the connection to that machine.
 //
 // The server is a READY one chosen from the inventory, never the first one
 // installed: a join through a server that is down or NotReady fails in a way
 // that looks like a fault in the NEW host. The new machine is dialled, and its
 // host key is what the inventory will record for it.
-func (a *Add) stageResolve(ctx context.Context) error {
+//
+// resumed says whether this resolution continues an operation that is already
+// in flight — a `--resume`, or the half of a `node replace` that is joining its
+// replacement. A FRESH add refuses a machine this cluster already holds: an
+// active host is not how capacity grows, and a host whose entry says removed
+// needs a wipe before it joins anything. A RESUMED one finds the machine ACTIVE
+// whenever its own earlier stages reached the inventory write, and refusing
+// there would refuse the operation it is resuming. Everything else — the entry
+// a new host is given, the dial, and the Ready server — is the same work either
+// way, which is why it is one function rather than two.
+func (a *Add) ResolveNewHost(ctx context.Context, resumed bool) error {
 	if err := a.resolveCluster(ctx); err != nil {
 		return err
 	}
@@ -147,8 +165,15 @@ func (a *Add) stageResolve(ctx context.Context) error {
 			a.Host = existing
 			a.Logf("  host:      %s is already recorded as joining (%s); continuing that entry", existing.HostID, existing.SSHAddress)
 		case StateActive:
-			return fmt.Errorf("host %s (%s) is already an ACTIVE host of this cluster, so there is nothing to add. A machine that is in the cluster is not how capacity grows: run `kubenest node remove` if this host's entry is wrong",
-				existing.HostID, existing.SSHAddress)
+			if !resumed {
+				return fmt.Errorf("host %s (%s) is already an ACTIVE host of this cluster, so there is nothing to add. A machine that is in the cluster is not how capacity grows: run `kubenest node remove` if this host's entry is wrong",
+					existing.HostID, existing.SSHAddress)
+			}
+			// The entry says active because THIS operation is what joined the
+			// machine and wrote it: a resume continues that work rather than
+			// refusing it.
+			a.Host = existing
+			a.Logf("  host:      %s is already recorded as ACTIVE (%s): this operation joined it, and this run continues that work", existing.HostID, existing.SSHAddress)
 		default:
 			return fmt.Errorf("host %s (%s) is recorded as %q: a host that was removed is not re-added by this command (its host ID is kept, and its disks may still hold another cluster's data). Wipe the machine and add it as a new host, or restore its record deliberately",
 				existing.HostID, existing.SSHAddress, existing.LifecycleState)

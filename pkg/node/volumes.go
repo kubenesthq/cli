@@ -237,6 +237,14 @@ func workloadName(owners []struct {
 // which is a restore that has to be run twice rather than a restore. Claims no
 // running pod mounts are grouped by namespace, because that is the scope the
 // restore command works in.
+//
+// The command is one an operator can RUN AS PRINTED, which is why it ends in
+// --latest: a restore names the backup it restores, and after a node loss the
+// only honest answer is the newest ELIGIBLE one — a newer backup that is not
+// eligible is passed over with the reason, which is exactly what the operator
+// has to see before accepting an older one. The environment flags a restore
+// also needs (the server, the bundle manifest, the SSH key) are the operator's
+// own, already in their shell.
 func RestoreCommands(cluster string, volumes []BoundLocalVolume) []string {
 	groups := map[string][]BoundLocalVolume{}
 	var keys []string
@@ -257,6 +265,7 @@ func RestoreCommands(cluster string, volumes []BoundLocalVolume) []string {
 		for _, c := range claims {
 			b.WriteString(" --pvc " + c.PVC)
 		}
+		b.WriteString(" --latest")
 		what := claims[0].Workload
 		if what == "" {
 			what = "no running pod"

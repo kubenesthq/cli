@@ -17,7 +17,7 @@ func NewNodeCommand() *cobra.Command {
 		Use:   "node",
 		Short: "Operate one node of a cluster",
 	}
-	cmd.AddCommand(newNodeRebootCommand(), newNodeAddCommand(), newNodeRemoveCommand())
+	cmd.AddCommand(newNodeRebootCommand(), newNodeAddCommand(), newNodeRemoveCommand(), newNodeReplaceCommand())
 	return cmd
 }
 
