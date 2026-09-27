@@ -536,63 +536,6 @@ func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request o
 	return nil
 }
 
-// OpenJournal opens the journal for one node operation.
-//
-// The engine's OpenJournal refuses a journal recorded for a DIFFERENT operation,
-// which is right for a half-finished one: resume re-runs the identical command,
-// and resuming onto changed arguments is how a cluster stops matching its own
-// record. It is wrong for a journal whose operation FINISHED — that journal is
-// not a resume, it is a leftover — and a node verb that completed used to leave
-// one, so every verb worked exactly once per cluster from one laptop.
-//
-// So a journal whose stages all ran to the end is replaced, and the returned
-// note says so in one line; the caller prints it. A journal with any stage
-// unfinished is left to the engine, which refuses a different operation and
-// resumes an identical one. The engine's other refusal — a journal it cannot
-// read at all — is never overridden: a corrupt file is a state nobody here can
-// reason about.
-func OpenJournal(path string, want stages.Identity) (*stages.Journal, string, error) {
-	journal, err := stages.OpenJournal(path, want)
-	if err == nil {
-		return journal, "", nil
-	}
-	stale, readErr := stages.ReadJournal(path)
-	if readErr != nil || !finishedJournal(stale) {
-		return nil, "", err
-	}
-	if removeErr := stale.Remove(); removeErr != nil {
-		return nil, "", err
-	}
-	journal, err = stages.OpenJournal(path, want)
-	if err != nil {
-		return nil, "", err
-	}
-	return journal, fmt.Sprintf("note: %s is from a finished %s, so this run starts a new one", path, stale.Identity.Kind), nil
-}
-
-// finishedJournal reports whether every stage this journal recorded ran to its
-// end: at least one stage completed, and no stage's last word is `started` or
-// `failed`.
-//
-// Its evidence is the journal's own entries, which are all there is on disk, so
-// it cannot tell a finished operation from one interrupted BETWEEN two stages —
-// both leave the last word `completed`. That is why the replacement happens only
-// when the arguments differ: the identical command is answered by the identity
-// check first, and still resumes.
-func finishedJournal(j *stages.Journal) bool {
-	if j == nil || len(j.Entries) == 0 {
-		return false
-	}
-	completed := false
-	for i := range j.Entries {
-		if _, ok := j.Completed(j.Entries[i].Stage); !ok {
-			return false
-		}
-		completed = true
-	}
-	return completed
-}
-
 // removeJournal drops the journal of a finished operation.
 //
 // A journal that outlives its operation is read as a half-finished resume by the

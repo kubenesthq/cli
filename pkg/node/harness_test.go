@@ -743,7 +743,7 @@ func fixtureJournalIdentity() stages.Identity {
 // journal is refused.
 func (f *nodeFixture) openJournal(t *testing.T, path string) *stages.Journal {
 	t.Helper()
-	journal, note, err := OpenJournal(path, fixtureJournalIdentity())
+	journal, note, err := stages.OpenJournalReplacingFinished(path, fixtureJournalIdentity())
 	if err != nil {
 		t.Fatalf("opening the journal: %v", err)
 	}
@@ -759,7 +759,7 @@ func (f *nodeFixture) openJournal(t *testing.T, path string) *stages.Journal {
 // of failing, so a test can assert on the refusal.
 func (f *nodeFixture) reopen(t *testing.T, id string) (*Session, string, error) {
 	t.Helper()
-	journal, note, err := OpenJournal(f.journalPath, fixtureJournalIdentity())
+	journal, note, err := stages.OpenJournalReplacingFinished(f.journalPath, fixtureJournalIdentity())
 	if err != nil {
 		return nil, "", err
 	}

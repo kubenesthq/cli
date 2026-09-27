@@ -244,7 +244,7 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	if runErr != nil {
 		return runErr
 	}
-	if err := finishControlPlaneJournal(out, journal, nil); err != nil {
+	if err := finishUpgradeJournal(out, journal, nil); err != nil {
 		// Reported, never fatal: the upgrade succeeded, and a warning about a
 		// file is not a reason to report it as failed.
 		_ = err
@@ -253,8 +253,10 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 	return nil
 }
 
-// finishControlPlaneJournal removes the journal of a control-plane upgrade that
-// COMPLETED, and keeps the one of a run that did not.
+// finishUpgradeJournal removes the journal of an upgrade that COMPLETED, and
+// keeps the one of a run that did not. It finishes BOTH upgrades: the
+// control-plane one calls it directly, and the workload one through
+// finishUpgradeRun.
 //
 // THE JOURNAL HAS SERVED ITS PURPOSE ONCE THE RUN SUCCEEDED, as the workload
 // upgrade's does after a rollback. Kept, it would make the next upgrade to the
@@ -262,12 +264,14 @@ func runControlPlaneUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) 
 // success over a control plane that has moved since — measured on hardware
 // (2026-09-25): after the control plane was put back on the previous candidate,
 // a second run printed "Upgraded the control plane to 1.1 in 14s" having
-// changed nothing at all.
+// changed nothing at all. The workload upgrade has the same class of defect for
+// a different transition (kn-t73-upgrade-host-step-apt-jp0a.1): 1.1 → 1.2 after
+// 1.0 → 1.1 was refused as a different resume.
 //
 // A RUN THAT DID NOT COMPLETE KEEPS ITS JOURNAL, and that is the other half:
 // the journal is where an interrupted or failed attempt stopped, and the
 // identical command is meant to continue it rather than start over.
-func finishControlPlaneJournal(out io.Writer, journal *stages.Journal, runErr error) error {
+func finishUpgradeJournal(out io.Writer, journal *stages.Journal, runErr error) error {
 	if journal == nil || runErr != nil {
 		return nil
 	}

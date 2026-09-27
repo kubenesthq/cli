@@ -213,6 +213,64 @@ func OpenJournal(path string, want Identity) (*Journal, error) {
 	return &j, nil
 }
 
+// OpenJournalReplacingFinished opens the journal for an operation that may be
+// re-run, replacing one left by an operation that FINISHED.
+//
+// OpenJournal refuses a journal recorded for a DIFFERENT operation, which is
+// right for a half-finished one: resume re-runs the identical command, and
+// resuming onto changed arguments is how a cluster stops matching its own
+// record. It is wrong for a journal whose operation FINISHED — that journal is
+// not a resume, it is a leftover. Operations that do not drop their journal at
+// the end (the node verbs, the workload upgrade) used to leave one, so the next
+// run of the same verb on the cluster was refused as a different resume.
+//
+// So a journal whose stages all ran to the end is replaced, and the returned
+// note says so in one line; the caller prints it. A journal with any stage
+// unfinished goes to OpenJournal, which refuses a different operation and
+// resumes an identical one. OpenJournal's other refusal — a journal it cannot
+// read at all — is never overridden: a corrupt file is a state nobody here can
+// reason about.
+func OpenJournalReplacingFinished(path string, want Identity) (*Journal, string, error) {
+	journal, err := OpenJournal(path, want)
+	if err == nil {
+		return journal, "", nil
+	}
+	stale, readErr := ReadJournal(path)
+	if readErr != nil || !finished(stale) {
+		return nil, "", err
+	}
+	if removeErr := stale.Remove(); removeErr != nil {
+		return nil, "", err
+	}
+	journal, err = OpenJournal(path, want)
+	if err != nil {
+		return nil, "", err
+	}
+	return journal, fmt.Sprintf("note: %s is from a finished %s, so this run starts a new one", path, stale.Identity.Kind), nil
+}
+
+// finished reports whether every stage a journal recorded ran to its end: at
+// least one stage completed, and no stage's last word is `started` or `failed`.
+//
+// Its evidence is the journal's own entries, which are all there is on disk, so
+// it cannot tell a finished operation from one interrupted BETWEEN two stages —
+// both leave the last word `completed`. That is why the replacement happens only
+// when the operations differ: the identical command is answered by the identity
+// check first, and still resumes.
+func finished(j *Journal) bool {
+	if j == nil || len(j.Entries) == 0 {
+		return false
+	}
+	completed := false
+	for i := range j.Entries {
+		if _, ok := j.Completed(j.Entries[i].Stage); !ok {
+			return false
+		}
+		completed = true
+	}
+	return completed
+}
+
 // hasCompletedStage reports whether any stage in the journal has a completed
 // last word — the same notion of completion Completed reads. A journal with
 // one is the record of a cluster that changed; a journal without one is the

@@ -57,7 +57,7 @@ func TestASucceededControlPlaneUpgradeLeavesNoJournalForTheNextOneToSkipInto(t *
 
 	// THE COMPLETED RUN REMOVES IT.
 	var out bytes.Buffer
-	if err := finishControlPlaneJournal(&out, journal, nil); err != nil {
+	if err := finishUpgradeJournal(&out, journal, nil); err != nil {
 		t.Fatalf("finishing a completed upgrade: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -78,7 +78,7 @@ func TestASucceededControlPlaneUpgradeLeavesNoJournalForTheNextOneToSkipInto(t *
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := finishControlPlaneJournal(&out, failed, errors.New("the migration Job failed")); err != nil {
+	if err := finishUpgradeJournal(&out, failed, errors.New("the migration Job failed")); err != nil {
 		t.Fatalf("finishing a failed upgrade: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {

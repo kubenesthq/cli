@@ -133,9 +133,12 @@ func buildUpgradeSessionWith(ctx context.Context, out io.Writer, f UpgradeFlags,
 	if err != nil {
 		return nil, err
 	}
-	journal, err := stages.OpenJournal(journalPath, opts.Identity(recorded.BundleVersion))
+	journal, note, err := stages.OpenJournalReplacingFinished(journalPath, opts.Identity(recorded.BundleVersion))
 	if err != nil {
 		return nil, err
+	}
+	if note != "" {
+		fmt.Fprintln(out, note)
 	}
 	journal.ClusterID = clusterID
 
@@ -274,7 +277,7 @@ func runUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
 	fmt.Fprintf(out, "Components first, Kubernetes last: everything before the kubernetes stage reverts\nin seconds. That stage is the point of no return.\n\n")
 
 	result, err := stages.Execute(ctx, session, upgrade.Plan(session))
-	endOperation(ctx, out, lockStore, lockHandle, err)
+	finishUpgradeRun(ctx, out, lockStore, lockHandle, session.Jnl, err)
 	if err != nil {
 		return err
 	}
@@ -284,6 +287,24 @@ func runUpgrade(ctx context.Context, out io.Writer, f UpgradeFlags) error {
 			len(result.Skipped), strings.Join(result.Skipped, ", "))
 	}
 	return nil
+}
+
+// finishUpgradeRun is the whole tail of a workload upgrade in one place: the
+// record is closed the way the run ended, and the journal is dropped once the
+// upgrade has FINISHED.
+//
+// The two are one thing to read and one thing to test, and the ORDER is the
+// point: the record first (it is the lock and the resume path), then the
+// journal, and only when the run succeeded. A run that failed or was paused is
+// mid-upgrade — there is no record to take in the common case, because a plain
+// run takes none until a stage needs one — so its journal stays exactly where
+// the attempt stopped, for the identical command to continue.
+func finishUpgradeRun(ctx context.Context, out io.Writer, store *operation.Store, handle *operation.Handle, journal *stages.Journal, runErr error) {
+	endOperation(ctx, out, store, handle, runErr)
+	if runErr != nil {
+		return
+	}
+	finishUpgradeJournal(out, journal, nil)
 }
 
 // upgradeLock takes the operation record for a workload upgrade.
