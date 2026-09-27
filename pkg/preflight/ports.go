@@ -410,9 +410,10 @@ func settle(ctx context.Context) {
 // probeNonce makes one probe run's evidence distinguishable from any other's.
 func probeNonce() string {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
+	// crypto/rand.Read never returns an error (Go 1.24+): it stops the process
+	// instead. The nonce names files a root capture writes under /tmp, so it
+	// must stay unpredictable.
+	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("%x", b)
 }
 
