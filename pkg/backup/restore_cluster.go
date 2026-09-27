@@ -1233,7 +1233,7 @@ func copyDetail(kind, phase, message string) string {
 // backup whose location is not Available is not off-cluster: "Completed" says
 // Velero wrote what it could, not that the data is in the bucket.
 func (v *veleroBackups) storageLocations(ctx context.Context) (map[string]string, error) {
-	out, err := k3s.Kubectl(ctx, v.runner, "get backupsstoragelocations.velero.io -n "+Namespace+" -o json")
+	out, err := k3s.Kubectl(ctx, v.runner, "get backupstoragelocations.velero.io -n "+Namespace+" -o json")
 	if err != nil {
 		return nil, fmt.Errorf("reading the BackupStorageLocations: %w", err)
 	}
