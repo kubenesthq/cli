@@ -198,6 +198,72 @@ func (l *s5Lab) verbArgs(extra ...string) []string {
 	return append(args, extra...)
 }
 
+// s5Record is one arm's handle on the restore it is about to submit, plus the
+// cleanup that gives the operation's record up when the arm does not get as far
+// as activating it.
+//
+// THE RECORD IS THE LOCK, and a failed arm leaves it held. A restore's record is
+// the cluster's single operation lock from the moment it is opened, and a run
+// that fails leaves it STOPPED — a record the next run refuses to start behind.
+// On hardware (2026-09-27) the dead-node arm failed and the selective arm could
+// not begin at all: "another operation holds the record: operation 999f…
+// (restore-volume) is stopped … at stage failed".
+//
+// `--abort` IS THE ONE COMMAND THAT GIVES IT UP, and it is safe here. It marks
+// the record aborted and releases the lock, and it changes NOTHING on the
+// cluster: no scale-back, no claim, no Velero object, and no pause (pkg/backup's
+// abort: "IT LEAVES THE PROJECT PAUSED. Aborting is not activating, and a
+// namespace left half-restored must not be reconciled over"). Leaving a failed
+// arm's namespace paused and its workload stopped is what its state needs; the
+// next arm submits its own operation and writes its own pause over it.
+//
+// THE ID IS READ OFF THE CLUSTER, NOT OUT OF THE RUN'S OUTPUT. An arm can fail
+// BEFORE its run prints the follow-on commands — inside the pause, the scale,
+// the claim delete or the Velero restore — and a run that fails never reaches
+// the line that names `--activate <id>`. The record that is holding the lock is
+// the one to give up either way, so the cleanup asks the cluster which operation
+// that is (cpOperationID, which reads the record as JSON for the same reason it
+// documents: a path expression into `record.json` silently answers nothing).
+//
+// AN ABORT CAN ITSELF BE REFUSED (a record whose actions are still recorded or
+// submitted refuses a take-over until they are reconciled), so its failure is
+// REPORTED and never fatal: an arm that has already failed must not be turned
+// into a crash on the way out.
+type s5Record struct {
+	lab *s5Lab
+	t   *testing.T
+	// activated is set once `--activate` has succeeded, after which there is
+	// nothing left to give up.
+	activated bool
+}
+
+// keepRecord registers the cleanup for one arm's restore. It is registered
+// BEFORE the arm submits anything, because the failure it exists for can happen
+// in the middle of the run.
+func (l *s5Lab) keepRecord(t *testing.T) *s5Record {
+	r := &s5Record{lab: l, t: t}
+	t.Cleanup(r.release)
+	return r
+}
+
+// release gives the operation record up, unless the arm activated it.
+func (r *s5Record) release() {
+	if r.activated {
+		return
+	}
+	id := cpOperationID(r.t, context.Background(), r.lab.nodes["node1"])
+	if id == "" {
+		r.t.Logf("the arm did not activate a restore and no operation record is on the cluster, so there is nothing to give up")
+		return
+	}
+	var out strings.Builder
+	err := r.lab.runCLI(&out, append([]string{"backup", "restore", "--abort", id, "--namespace", s5Namespace}, r.lab.verbArgs()...)...)
+	r.t.Logf("the arm did not activate operation %s, so its record is given up:\n%s", id, out.String())
+	if err != nil {
+		r.t.Errorf("operation %s is left holding the operation record and the next arm will be refused (\"another operation holds the record\"); it needs aborted by hand: %v\n%s", id, err, out.String())
+	}
+}
+
 // s5NodeNames maps the lab's three addresses to their cluster node names, by
 // provider address — the same mapping `node replace` needs.
 func (l *s5Lab) nodeNames() map[string]string {
@@ -291,6 +357,10 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		lab.kubectl("-n " + s5Namespace + " delete pod " + lab.podOnNode(workload, agent) + " --grace-period=0 --force")
 		lab.waitFor(5*time.Minute, "the ReplicaSet's replacement pod to stay Pending on the stranded claims", lab.pendingHolder(workload))
 		before := lab.claimIdentities(workload+"-a", workload+"-b")
+		// WHATEVER THIS ARM LEAVES, THE NEXT ARM MUST BE ABLE TO START: the
+		// restore below takes the cluster's operation record, and a failure at
+		// any point after that leaves it held.
+		record := lab.keepRecord(t)
 
 		var out strings.Builder
 		err := lab.runCLI(&out, append([]string{"backup", "restore",
@@ -342,6 +412,7 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		if err := lab.runCLI(&out, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
 			t.Fatalf("activation failed: %v\n%s", err, out.String())
 		}
+		record.activated = true
 		if got := lab.replicas(workload); got != replicas {
 			t.Errorf("activation put %s at %s replicas, want the recorded %s", workload, got, replicas)
 		}
@@ -375,6 +446,10 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		lab.backupNow()
 		// NEWER data into the claim that will NOT be named.
 		lab.writeClaim(workload, "/b", "sel-b-v2-NEWER-"+tag)
+
+		// The same lock as the arm above: a failure here would refuse the NEXT
+		// test its record, so this one is given up too.
+		record := lab.keepRecord(t)
 
 		var out strings.Builder
 		err := lab.runCLI(&out, append([]string{"backup", "restore",
@@ -417,6 +492,7 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		if err := lab.runCLI(&out, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
 			t.Fatalf("activation failed: %v\n%s", err, out.String())
 		}
+		record.activated = true
 		if got := lab.replicas(workload); got != replicas {
 			t.Errorf("activation put %s at %s replicas, want the recorded %s", workload, got, replicas)
 		}
@@ -495,6 +571,10 @@ func TestRestoreVolumeResume(t *testing.T) {
 	if pause == "" {
 		t.Fatal("the interrupted run left no pause behind")
 	}
+	// The killed run's record is this test's to give up unless the resume AND
+	// the activation succeed: leaving it STOPPED refuses every later run its
+	// record, and the resume is the first thing that can fail here.
+	record := lab.keepRecord(t)
 	scaledBefore := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get deployment " + workload + " -o jsonpath={.spec.replicas}"))
 
 	var resumed strings.Builder
@@ -529,6 +609,7 @@ func TestRestoreVolumeResume(t *testing.T) {
 	if err := lab.runCLI(&resumed, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
 		t.Fatalf("activation failed: %v\n%s", err, resumed.String())
 	}
+	record.activated = true
 	lab.waitFor(5*time.Minute, "the resumed workload's own pod", func() (bool, string) {
 		return lab.podRunning(workload), lab.podState(workload)
 	})

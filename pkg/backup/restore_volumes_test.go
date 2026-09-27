@@ -509,6 +509,60 @@ func TestVolumeRestoreResumeDoesNotRepeatACompletedStep(t *testing.T) {
 	}
 }
 
+// ABORTING A VOLUME OPERATION IS WHAT FREES ITS RECORD, and S5's gate depends
+// on exactly that: an arm whose restore fails leaves the cluster's SINGLE
+// operation record STOPPED, and the next restore refuses to start behind it
+// ("another operation holds the record"). On hardware (2026-09-27) the dead-node
+// arm failed and the selective arm could not begin. The gate aborts such an arm
+// on its way out, so this pins the behaviour it relies on for a VOLUME record —
+// whose shape differs from a namespace record's (it names claims, not a
+// namespace, and an abort has to work out the namespace from that).
+func TestVolumeRestoreAbortFreesTheRecordAndLeavesThePause(t *testing.T) {
+	f := volumeFixture(t)
+	// The run's Velero restore never reaches a terminal phase, which is the
+	// failure the gate hit for a different reason: either way the record is
+	// left stopped and holding the lock.
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	if out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, ""); err == nil {
+		t.Fatalf("a restore that never completes must fail:\n%s", out)
+	}
+	record := f.kube.recordFor(operation.Name)
+	if record == nil || record.Terminal {
+		t.Fatalf("the interrupted run must leave a stopped record, got %+v", record)
+	}
+	opID := record.OperationID
+
+	var out strings.Builder
+	// NO --namespace: a volume record names its claims and no namespace, so
+	// abort has to read the namespace off the record. The gate passes one
+	// anyway; this proves the command does not need it.
+	if err := RunRestore(context.Background(), &out, strings.NewReader(""), f.options(t, RestoreOptions{Abort: opID}), f.deps()); err != nil {
+		t.Fatalf("--abort failed: %v\n%s", err, out.String())
+	}
+	after := f.kube.recordFor(operation.Name)
+	if after == nil || !after.Terminal || !strings.HasPrefix(after.Result, "aborted") {
+		t.Fatalf("the record is %+v, want a terminal aborted record", after)
+	}
+	if f.cluster.annotations[PauseAnnotationKey] != opID {
+		t.Error("--abort lifted the pause: aborting is not activating")
+	}
+	if len(f.cluster.deletedClaims) != 1 {
+		t.Errorf("aborting touched the cluster: deleted claims %v", f.cluster.deletedClaims)
+	}
+
+	// AND THE NEXT RESTORE CAN START, which is the whole point of the cleanup:
+	// it opens its own record instead of being refused the one the aborted run
+	// held.
+	next := volumeFixture(t)
+	next.kube = f.kube
+	if out, err := runRestorePlan(t, next, RestoreOptions{Namespace: "payments", PVCs: []string{"a"}, Latest: true, Confirm: true}, ""); err != nil {
+		t.Fatalf("a restore after an abort was refused the record: %v\n%s", err, out)
+	}
+	if fresh := next.kube.recordFor(operation.Name); fresh == nil || fresh.OperationID == opID {
+		t.Errorf("the restore after the abort did not open its own record: %+v", fresh)
+	}
+}
+
 // TestVolumeStripPatchLeavesAnUnnamedVolumeAlone is the selective rule at the
 // patch level, with no cluster in the way: the backup's pod holds a (named) and
 // b (not named), so the patch removes b's volume, b's mount and restore-wait's
