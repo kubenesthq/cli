@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -54,17 +55,33 @@ const s4SentinelPath = "/sentinel"
 type s4Sentinel struct {
 	listener net.Listener
 	server   *http.Server
+	address  string
 	mu       sync.Mutex
 	hits     []string
 }
 
-func s4StartSentinel(t *testing.T) *s4Sentinel {
+// s4StartSentinel starts the receiver the cluster's workloads call. advertised
+// is KUBENEST_E2E_SENTINEL_HOST, the address the LAB reaches this workstation
+// at. When it names a port, the receiver listens on that port, because the
+// tunnel or firewall rule the lab uses was opened for it before the run;
+// without one it takes any free port and the URL carries it. The receiver used
+// to take a random port while the URL named only the host, so no pod could
+// ever reach it.
+func s4StartSentinel(t *testing.T, advertised string) *s4Sentinel {
 	t.Helper()
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("binding the sentinel receiver: %v", err)
+	listen := "0.0.0.0:0"
+	_, port, splitErr := net.SplitHostPort(advertised)
+	if splitErr == nil {
+		listen = net.JoinHostPort("0.0.0.0", port)
 	}
-	s := &s4Sentinel{listener: listener}
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		t.Fatalf("binding the sentinel receiver on %s: %v", listen, err)
+	}
+	s := &s4Sentinel{listener: listener, address: advertised}
+	if splitErr != nil {
+		s.address = net.JoinHostPort(advertised, strconv.Itoa(listener.Addr().(*net.TCPAddr).Port))
+	}
 	s.server = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != s4SentinelPath {
 			http.NotFound(w, r)
@@ -80,8 +97,8 @@ func s4StartSentinel(t *testing.T) *s4Sentinel {
 	return s
 }
 
-func (s *s4Sentinel) url(host string) string {
-	return fmt.Sprintf("http://%s%s", host, s4SentinelPath)
+func (s *s4Sentinel) url() string {
+	return fmt.Sprintf("http://%s%s", s.address, s4SentinelPath)
 }
 
 func (s *s4Sentinel) count() int {
@@ -266,7 +283,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	if sentinelHost == "" {
 		t.Skip("KUBENEST_E2E_SENTINEL_HOST is not set: the due CronJob and the positive-control Job have to reach an HTTP receiver on this workstation, so a run without it cannot prove that nothing ran before activation")
 	}
-	sentinel := s4StartSentinel(t)
+	sentinel := s4StartSentinel(t, sentinelHost)
 	c := s4Open(t, env)
 
 	namespace := c.createProject(s4Project)
@@ -291,7 +308,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	// THE POSITIVE CONTROL: the sentinel path is proven to work BEFORE the
 	// assertion that it stays silent means anything.
 	before := sentinel.count()
-	c.apply(s4SentinelProbeJob(namespace, sentinel.url(sentinelHost)))
+	c.apply(s4SentinelProbeJob(namespace, sentinel.url()))
 	c.waitFor(5*time.Minute, "the sentinel positive control", func() (bool, string) {
 		if sentinel.count() > before {
 			return true, "the receiver saw the probe Job's call"
@@ -300,8 +317,8 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	})
 
 	// A due CronJob and a Job that WOULD call the sentinel if they ran.
-	c.apply(s4CronJobDocument(namespace, sentinel.url(sentinelHost)))
-	c.apply(s4JobDocument(namespace, sentinel.url(sentinelHost)))
+	c.apply(s4CronJobDocument(namespace, sentinel.url()))
+	c.apply(s4JobDocument(namespace, sentinel.url()))
 
 	var backupOut strings.Builder
 	if err := c.runCLI(&backupOut, append([]string{"backup", "now"}, c.verbArgs()...)...); err != nil {

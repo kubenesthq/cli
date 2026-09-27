@@ -220,6 +220,10 @@ func TestRestoreVolumeDeadNodeFixture(t *testing.T) {
 		// the API.
 		lab.kubectl("-n " + s5Namespace + " scale deployment " + workload + " --replicas=0")
 		lab.stopAgent(agent)
+		// The node comes back when this arm ends: the next arm needs a whole
+		// cluster, and on hardware (2026-09-27) its backup could not reach the
+		// store while this agent was still down.
+		t.Cleanup(func() { lab.startAgent(agent) })
 		lab.waitFor(5*time.Minute, "the agent to go NotReady", func() (bool, string) {
 			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+agent+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
 			if err != nil {
@@ -444,6 +448,28 @@ func (l *s5Lab) stopAgent(node string) {
 		return
 	}
 	l.t.Fatalf("no lab node's SSH session reports the hostname %s, so the agent could not be taken away", node)
+}
+
+// startAgent starts k3s-agent again on the node stopAgent took away.
+func (l *s5Lab) startAgent(node string) {
+	l.t.Helper()
+	for name, runner := range l.nodes {
+		if name == "node1" {
+			continue
+		}
+		out, err := runner.Run(context.Background(), "hostname")
+		if err != nil || strings.TrimSpace(out.Stdout) != node {
+			continue
+		}
+		res, err := runner.Run(context.Background(), "sudo -n systemctl start k3s-agent")
+		if err != nil || res.ExitCode != 0 {
+			l.t.Errorf("starting k3s-agent on %s (%s) again: %v exit %d", node, name, err, res.ExitCode)
+			return
+		}
+		l.t.Logf("k3s-agent started on %s (%s) again", node, name)
+		return
+	}
+	l.t.Errorf("no lab node's SSH session reports the hostname %s, so its agent was not started again", node)
 }
 
 func (l *s5Lab) backupNow() {

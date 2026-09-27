@@ -254,7 +254,9 @@ func mustEndpoint(t *testing.T, address string, env recoveryEnv) *sshx.Endpoint 
 // recoverySentinel is the receiver the workload's sentinel calls. It is the
 // s4 gate's receiver, reused: one implementation of "an external observer that
 // cannot be fooled by cluster-side bookkeeping".
-func recoverySentinel(t *testing.T) *s4Sentinel { return s4StartSentinel(t) }
+func recoverySentinel(t *testing.T, env recoveryEnv) *s4Sentinel {
+	return s4StartSentinel(t, env.sentinelHost)
+}
 
 // openRecordedKit reads the cluster's newest kit FROM THE BUCKET with the
 // fleet key, which is what a fresh laptop can do and all it can do. The kit
@@ -384,7 +386,7 @@ func hubRefuses(t *testing.T, hubURL, token string) int {
 func TestLostSingleServerRecovery(t *testing.T) {
 	env := recoveryEnvironment(t)
 	client := controlPlane(t, env)
-	sentinel := recoverySentinel(t)
+	sentinel := recoverySentinel(t, env)
 
 	// ── the fixture: a single-server workload cluster with data, a completed
 	// backup, and a recovery set that names it.
@@ -531,7 +533,7 @@ func TestAllInOneHostRecovery(t *testing.T) {
 	if env.domain == "" || env.adminPassword == "" {
 		t.Skip("KUBENEST_DOMAIN and KUBENEST_ADMIN_PASSWORD are not set: the all-in-one recovery reinstalls the control plane under its own domain and signs in as an administrator that already exists in the restored database")
 	}
-	sentinel := recoverySentinel(t)
+	sentinel := recoverySentinel(t, env)
 
 	// ── the fixture: the all-in-one host is the control plane's home, so it is
 	// destroyed LAST and the fleet's records come from it.
