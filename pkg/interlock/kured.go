@@ -40,12 +40,29 @@ const (
 	DaemonSetNamespace = "kube-system"
 )
 
+// HolderCLI is what the CLI stamps into every lock it writes, in
+// metadata.holder, so a reader can tell the CLI's interlock from kured's own
+// lock. THE ONE SPELLING IS SHARED: op3's
+// internal/controller/rebootpolicy_controller.go carries the same string as
+// cliLockHolder, and that controller refuses to release or uncordon for a lock
+// that carries it (the bead: the operator released the CLI's lock mid-reboot
+// and then kured could reboot another node while the CLI's reboot was in
+// flight). kured itself is unaffected: it reads only metadata.unschedulable
+// (upstream pkg/daemonsetlock, NodeMeta at 1.23.0), and Go's json.Unmarshal
+// ignores the extra key.
+const HolderCLI = "kubenest-cli"
+
 // NodeMeta is the metadata kured records beside the lock: whether the node was
 // ALREADY unschedulable when the lock was taken. It is what a release consults
 // before uncordoning (kured 1.23.0 does exactly this), so a node cordoned for
 // some other reason is not silently made schedulable again.
+//
+// Holder is the CLI's own addition — kured does not read it, and a lock kured
+// wrote carries none — and it is what op3's releaseKuredLock checks before it
+// takes the lock away (the CLI's spelling lives in HolderCLI above).
 type NodeMeta struct {
-	Unschedulable bool `json:"unschedulable"`
+	Unschedulable bool   `json:"unschedulable"`
+	Holder        string `json:"holder,omitempty"`
 }
 
 // Value is the lock document in kured's own JSON shape — a wire format, not an
@@ -122,7 +139,10 @@ func ValidNodeName(name string) bool {
 //
 // The node's current schedulability is recorded in the lock's metadata, the
 // way kured records it, so whoever releases the lock knows whether the node
-// was schedulable before this operation cordoned it.
+// was schedulable before this operation cordoned it. Beside it the lock names
+// the CLI as its holder (metadata.holder = HolderCLI): kured ignores the key,
+// and the operator reads it to tell this interlock from a kured lock and leave
+// it in place while the CLI reboots.
 func Acquire(ctx context.Context, r k3s.Runner, nodeID string, ttl time.Duration) (held bool, holder string, err error) {
 	if !ValidNodeName(nodeID) {
 		return false, "", fmt.Errorf("interlock: %q is not a node name", nodeID)
@@ -148,7 +168,7 @@ func Acquire(ctx context.Context, r k3s.Runner, nodeID string, ttl time.Duration
 		}
 		mine := Value{
 			NodeID:   nodeID,
-			Metadata: NodeMeta{Unschedulable: unschedulable},
+			Metadata: NodeMeta{Unschedulable: unschedulable, Holder: HolderCLI},
 			Created:  time.Now().UTC(),
 			TTL:      ttl,
 		}

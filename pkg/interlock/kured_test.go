@@ -410,3 +410,86 @@ func TestExpiredLockIsTakenOver(t *testing.T) {
 		t.Error("lock records the node as schedulable; it was cordoned before the lock was taken over")
 	}
 }
+
+// Acquire stamps the CLI's holder marker into the lock's metadata, beside the
+// unschedulable field kured reads. That marker is what lets the operator tell
+// the CLI's interlock from kured's own lock and leave it in place while the
+// CLI is rebooting (op3 internal/controller/rebootpolicy_controller.go,
+// cliLockHolder): before it, a window applying while the CLI held the lock
+// deleted the lock and uncordoned the node mid-drain.
+//
+// kured is unaffected — upstream pkg/daemonsetlock at the pinned 1.23.0
+// decodes metadata into a NodeMeta with only unschedulable, and Go's
+// json.Unmarshal ignores the extra key — so the lock still stops kured.
+//
+// Planted negative: revert the HolderCLI stamp in Acquire (the field and the
+// constant stay, so this file still compiles) and the marker assertions below
+// fail while the DaemonSet write itself still succeeds.
+func TestAcquireStampsTheCLIHolderMarkerOnTheLockItWrites(t *testing.T) {
+	api, r := newKuredAPI(t, 100, "")
+
+	held, _, err := Acquire(context.Background(), r, "n1", lockTTL)
+	if err != nil || !held {
+		t.Fatalf("Acquire = held %v, err %v, want the free lock taken", held, err)
+	}
+
+	lock := singleWrite(t, api).lockOf(t)
+	if lock.Metadata.Holder != HolderCLI {
+		t.Errorf("lock metadata.holder = %q, want %q: without it the operator cannot tell the CLI's interlock from kured's own lock", lock.Metadata.Holder, HolderCLI)
+	}
+	if lock.Metadata.Unschedulable {
+		t.Error("lock records the node as unschedulable; it was schedulable when the lock was taken")
+	}
+
+	// The document kured reads back from the DaemonSet carries both fields:
+	// the CLI's marker and the unschedulable flag kured consults.
+	var onServer struct {
+		Metadata struct {
+			Unschedulable bool   `json:"unschedulable"`
+			Holder        string `json:"holder"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(api.lock), &onServer); err != nil {
+		t.Fatalf("DaemonSet annotation is not the lock document: %v", err)
+	}
+	if onServer.Metadata.Holder != HolderCLI {
+		t.Errorf("the annotation kured reads carries holder %q, want %q", onServer.Metadata.Holder, HolderCLI)
+	}
+	if onServer.Metadata.Unschedulable {
+		t.Error("the annotation kured reads dropped unschedulable, and kured decides whether to uncordon on it")
+	}
+}
+
+// Holding and Release still recognise the CLI's own lock once it carries the
+// marker: the marker names the holder, it does not become part of the "is this
+// mine" test — the node ID is that test, exactly as before. The lock a CLI
+// wrote is the lock a later CLI process can read back and remove.
+//
+// Planted negative: revert the HolderCLI stamp in Acquire and the marker the
+// returned document must still carry is gone, failing this test.
+func TestHoldingAndReleaseRecogniseTheCLIsMarkedLock(t *testing.T) {
+	api, r := newKuredAPI(t, 100, "")
+	if held, _, err := Acquire(context.Background(), r, "n1", lockTTL); err != nil || !held {
+		t.Fatalf("Acquire = held %v, err %v, want the free lock taken", held, err)
+	}
+	// A later process finds the document the CLI wrote on the DaemonSet.
+	mine, r2 := newKuredAPI(t, 200, api.lock)
+
+	held, lock, err := Holding(context.Background(), r2, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !held {
+		t.Fatal("Holding did not recognise the CLI's own lock because it carries the holder marker")
+	}
+	if lock.Metadata.Holder != HolderCLI {
+		t.Errorf("Holding returned the lock with holder %q, want %q", lock.Metadata.Holder, HolderCLI)
+	}
+
+	if err := Release(context.Background(), r2, "n1"); err != nil {
+		t.Fatalf("Release of the CLI's own marked lock: %v", err)
+	}
+	if mine.lock != "" {
+		t.Errorf("the marked lock survived the release: %q", mine.lock)
+	}
+}
