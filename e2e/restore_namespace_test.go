@@ -503,6 +503,15 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 		t.Errorf("a reconciler restart un-suspended the CronJob (%q)", suspend)
 	}
 
+	// THE SENTINEL MUST STILL BE SILENT UNTIL ACTIVATION: a Job restored by
+	// --include-jobs (not used here) or a CronJob that ran before activation
+	// would have called it. The count is taken BEFORE --activate: activation
+	// unsuspends the CronJob, which then runs at once, and on hardware
+	// (2026-09-27) those later calls were counted as a failure.
+	if got := sentinel.count(); got != hitsBeforeRestore {
+		t.Errorf("the sentinel receiver saw %d call(s) between the restore and activation, want none", got-hitsBeforeRestore)
+	}
+
 	// ACTIVATION shows what may run, then lifts the pause.
 	var activation strings.Builder
 	if err := c.runCLI(&activation, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, c.verbArgs()...)...); err != nil {
@@ -516,13 +525,6 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	}
 	if suspend := strings.TrimSpace(c.kubectl("get cronjob s4-sentinel -n " + namespace + " -o jsonpath={.spec.suspend}")); suspend != "false" {
 		t.Errorf("activation left the CronJob suspended (%q)", suspend)
-	}
-	// THE SENTINEL MUST STILL BE SILENT: a Job restored by --include-jobs (not
-	// used here) or a CronJob that ran before activation would have called it.
-	if got := sentinel.count(); got != hitsBeforeRestore {
-		// A positive control is one hit; anything more is a Job or CronJob that
-		// ran when it should not have.
-		t.Errorf("the sentinel receiver saw %d call(s) between the restore and activation, want none", got-hitsBeforeRestore)
 	}
 
 	t.Run("an interrupted restore resumes without activating", func(t *testing.T) {
@@ -545,6 +547,14 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 		return strings.TrimSpace(out) != "", "the namespace is back"
 	})
 
+	// The Restores that exist before this run, so the wait below is for the one
+	// THIS run creates: the main arm's own Restore already exists, and on
+	// hardware the wait matched it and cancelled the run before it paused.
+	existing := map[string]bool{}
+	for _, name := range strings.Fields(c.kubectl("get restores.velero.io -n velero -o name")) {
+		existing[name] = true
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out strings.Builder
@@ -555,8 +565,12 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 	// KILLED MID-RESTORE, once the Velero Restore exists: that is the window
 	// between "the namespace is gone" and "the data is back".
 	c.waitFor(20*time.Minute, "the Velero Restore to be created", func() (bool, string) {
-		restores := strings.TrimSpace(c.kubectl("get restores.velero.io -n velero -o name"))
-		return restores != "", restores
+		for _, name := range strings.Fields(c.kubectl("get restores.velero.io -n velero -o name")) {
+			if !existing[name] {
+				return true, name
+			}
+		}
+		return false, "no Restore this run created yet"
 	})
 	cancel()
 	err := <-done
