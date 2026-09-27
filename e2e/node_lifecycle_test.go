@@ -52,6 +52,7 @@ import (
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // nodeVerb runs the REAL command tree, so the flags, the refusals and the
@@ -205,17 +206,10 @@ func agentHoldingLocalVolumes(t *testing.T, ctx context.Context, server k3s.Runn
 					Namespace string `json:"namespace"`
 					Name      string `json:"name"`
 				} `json:"claimRef"`
-				NodeAffinity *struct {
-					Required *struct {
-						NodeSelectorTerms []struct {
-							MatchExpressions []struct {
-								Key      string   `json:"key"`
-								Operator string   `json:"operator"`
-								Values   []string `json:"values"`
-							} `json:"matchExpressions"`
-						} `json:"nodeSelectorTerms"`
-					} `json:"required"`
-				} `json:"nodeAffinity"`
+				// The shared reader, not a copy: this gate's own hostname-only
+				// parse never saw the bundle's LVM volumes (they record their
+				// node as openebs.io/nodename), so the arm always skipped.
+				NodeAffinity *storage.NodeAffinity `json:"nodeAffinity"`
 			} `json:"spec"`
 			Status struct {
 				Phase string `json:"phase"`
@@ -226,17 +220,10 @@ func agentHoldingLocalVolumes(t *testing.T, ctx context.Context, server k3s.Runn
 		t.Fatalf("parsing `kubectl get pv -o json`: %v", err)
 	}
 	for _, item := range list.Items {
-		if item.Status.Phase != "Bound" || item.Spec.ClaimRef == nil || item.Spec.NodeAffinity == nil || item.Spec.NodeAffinity.Required == nil {
+		if item.Status.Phase != "Bound" || item.Spec.ClaimRef == nil {
 			continue
 		}
-		var nodeNames []string
-		for _, term := range item.Spec.NodeAffinity.Required.NodeSelectorTerms {
-			for _, expr := range term.MatchExpressions {
-				if expr.Key == "kubernetes.io/hostname" {
-					nodeNames = append(nodeNames, expr.Values...)
-				}
-			}
-		}
+		nodeNames := storage.NodesOf(item.Spec.NodeAffinity)
 		if len(nodeNames) == 0 {
 			continue
 		}
