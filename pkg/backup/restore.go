@@ -744,6 +744,7 @@ func (r *restoreRun) renderPlan() {
 		fmt.Fprintf(r.out, "  mode:          volumes — refilling %s in place; every other volume of the same workload keeps its current contents\n", strings.Join(p.PVCs, ", "))
 	} else {
 		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs and any Job still running are suspended as soon as the pause is written, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
+		fmt.Fprintf(r.out, "  job pods:      excluded (pods carrying %s), so the pod of a Job that was running when the backup was taken is not restored and its work does not run again before activation\n", JobPodLabelKey)
 	}
 }
 
@@ -2564,6 +2565,12 @@ func (r *restoreRun) execute(ctx context.Context) error {
 		Backup:      r.plan.Backup.Name,
 		Namespace:   r.opts.Namespace,
 		IncludeJobs: r.opts.IncludeJobs,
+		// THE POD A JOB CREATED IS NEVER RESTORED, with or without
+		// --include-jobs (JobPodsExcluded): Velero skips only Succeeded or
+		// Failed pods when it takes the backup, so a Job that was running then
+		// has its pod in the backup, and excludedResources drops the Job and not
+		// its pod — the orphan pod runs the Job's work again before activation.
+		LabelExpressions: JobPodsExcluded(),
 		// Mode 1's type filter is the DEFAULT one: the namespace comes back as
 		// the backup holds it. The claims are what this restore is asked to
 		// fill, and every one of them must have a Completed PodVolumeRestore.

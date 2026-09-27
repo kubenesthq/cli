@@ -638,6 +638,84 @@ func TestRestoreDocumentCarriesProbesConditions(t *testing.T) {
 	}
 }
 
+// restoreDocSelector is the labelSelector half of a rendered Restore, parsed
+// the way the API server holds it.
+type restoreDocSelector struct {
+	MatchLabels      map[string]string `yaml:"matchLabels"`
+	MatchExpressions []struct {
+		Key      string   `yaml:"key"`
+		Operator string   `yaml:"operator"`
+		Values   []string `yaml:"values"`
+	} `yaml:"matchExpressions"`
+}
+
+// TestRestoreDocumentCarriesLabelsAndExpressionsInOneSelector pins the shape of
+// the restore's narrowing: matchLabels and matchExpressions are two halves of
+// ONE labelSelector, which is what lets mode 1 keep the pod a Job created out
+// of the restore while mode 2 narrows the restore by a workload's labels.
+func TestRestoreDocumentCarriesLabelsAndExpressionsInOneSelector(t *testing.T) {
+	doc, err := restoreDocument(restoreRequest{
+		Name: "r", Backup: "b", Namespace: "payments", OperationID: "abc123",
+		LabelSelector:    map[string]string{"app": "payments"},
+		LabelExpressions: JobPodsExcluded(),
+	})
+	if err != nil {
+		t.Fatalf("rendering a restore with both halves of a labelSelector: %v", err)
+	}
+	var parsed struct {
+		Spec struct {
+			LabelSelector *restoreDocSelector `yaml:"labelSelector"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(doc, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Spec.LabelSelector == nil {
+		t.Fatalf("the restore carries no labelSelector:\n%s", doc)
+	}
+	if parsed.Spec.LabelSelector.MatchLabels["app"] != "payments" {
+		t.Errorf("matchLabels = %v, want the app label the request named", parsed.Spec.LabelSelector.MatchLabels)
+	}
+	if len(parsed.Spec.LabelSelector.MatchExpressions) != 1 {
+		t.Fatalf("matchExpressions = %+v, want the one requirement the request named — in the SAME labelSelector, not a second one the API server would reject", parsed.Spec.LabelSelector.MatchExpressions)
+	}
+	expression := parsed.Spec.LabelSelector.MatchExpressions[0]
+	if expression.Key != JobPodLabelKey || expression.Operator != "DoesNotExist" {
+		t.Errorf("matchExpressions[0] = %+v, want %s DoesNotExist", expression, JobPodLabelKey)
+	}
+	// Kubernetes rejects `values` on DoesNotExist, so the renderer must not
+	// write it.
+	if len(expression.Values) != 0 {
+		t.Errorf("the requirement carries values %v: DoesNotExist takes none", expression.Values)
+	}
+}
+
+// TestRestoreDocumentRefusesASelectorAndOrSelectors together: Velero treats
+// labelSelector and orLabelSelectors as contradictory, so the renderer refuses
+// the pair rather than writing a Restore the API server would reject. Neither
+// mode produces it today — mode 1 sets no orLabelSelectors, and mode 2 sets one
+// shape or the other — which is exactly why the refusal has to be written down
+// here rather than discovered on a cluster.
+func TestRestoreDocumentRefusesASelectorAndOrSelectors(t *testing.T) {
+	cases := map[string]restoreRequest{
+		"matchLabels and orLabelSelectors": {
+			Name: "r", Backup: "b", Namespace: "payments", OperationID: "abc123",
+			LabelSelector:    map[string]string{"app": "payments"},
+			OrLabelSelectors: []map[string]string{{"app": "storefront"}},
+		},
+		"matchExpressions and orLabelSelectors": {
+			Name: "r", Backup: "b", Namespace: "payments", OperationID: "abc123",
+			LabelExpressions: JobPodsExcluded(),
+			OrLabelSelectors: []map[string]string{{"app": "storefront"}},
+		},
+	}
+	for name, request := range cases {
+		if _, err := restoreDocument(request); err == nil {
+			t.Errorf("%s: the renderer wrote a Restore with both selector shapes, which Velero refuses", name)
+		}
+	}
+}
+
 // On hardware (2026-09-27, S4 on lab w3) a namespace restore sat InProgress
 // for 48 minutes: the restored claim kept the volumeName of a PersistentVolume
 // that went with the deleted namespace, so its Pod never started and no

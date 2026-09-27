@@ -1756,26 +1756,100 @@ func restoreDocument(spec restoreRequest) ([]byte, error) {
 	// ResourceModifier is for. A Job restored with --include-jobs is suspended
 	// by the run afterwards, which is the one window this design still has.
 	//
+	// EXCLUDING THE JOB DOES NOT EXCLUDE ITS POD, which is why a namespace
+	// restore ALSO carries JobPodsExcluded in its labelSelector: a Job that was
+	// running when the backup was taken has its pod in the backup, and Velero
+	// restores it as an orphan that runs the Job's work again. See
+	// JobPodsExcluded for the measurement.
+	//
 	// Only mode 1 needs to say so: a mode-2 request carries an explicit type
 	// filter, and an exclusion beside it would name a resource the filter
 	// already leaves out.
 	if len(spec.IncludedResources) == 0 && !spec.IncludeJobs {
 		m["excludedResources"] = []string{"jobs"}
 	}
-	if spec.LabelSelector != nil {
-		m["labelSelector"] = map[string]any{"matchLabels": spec.LabelSelector}
-	}
 	if len(spec.OrLabelSelectors) > 0 {
+		if spec.LabelSelector != nil || len(spec.LabelExpressions) > 0 {
+			// VELERO TREATS THE PAIR AS CONTRADICTORY and refuses a Restore that
+			// carries labelSelector and orLabelSelectors at once, so a request
+			// that would produce both is refused here rather than submitted and
+			// rejected by the API server. Neither mode can reach it today — mode
+			// 1 sets no orLabelSelectors, and mode 2 sets one or the other
+			// (restore_volumes.go, volumeRestoreSpec) — and the check is what
+			// keeps a later caller from writing a Restore Velero will not take.
+			return nil, fmt.Errorf("a Velero Restore cannot carry labelSelector and orLabelSelectors at once: labelSelector holds the matchLabels and matchExpressions this request has, and orLabelSelectors is a different narrowing. Use one of the two")
+		}
 		selectors := make([]any, 0, len(spec.OrLabelSelectors))
 		for _, selector := range spec.OrLabelSelectors {
 			selectors = append(selectors, map[string]any{"matchLabels": selector})
 		}
 		m["orLabelSelectors"] = selectors
 	}
+	// THE TWO HALVES GO INTO ONE labelSelector: matchLabels for the exact labels
+	// a selector names, and matchExpressions for a requirement a label map
+	// cannot express — mode 1's exclusion of the pods a Job created is the
+	// DoesNotExist case. A requirement's `values` is emitted only when it has
+	// them, because Kubernetes rejects values on Exists and DoesNotExist.
+	if spec.LabelSelector != nil || len(spec.LabelExpressions) > 0 {
+		selector := map[string]any{}
+		if spec.LabelSelector != nil {
+			selector["matchLabels"] = spec.LabelSelector
+		}
+		if len(spec.LabelExpressions) > 0 {
+			expressions := make([]any, 0, len(spec.LabelExpressions))
+			for _, expression := range spec.LabelExpressions {
+				entry := map[string]any{"key": expression.Key, "operator": expression.Operator}
+				if len(expression.Values) > 0 {
+					entry["values"] = expression.Values
+				}
+				expressions = append(expressions, entry)
+			}
+			selector["matchExpressions"] = expressions
+		}
+		m["labelSelector"] = selector
+	}
 	if spec.ResourceModifier != nil {
 		m["resourceModifier"] = map[string]any{"kind": "ConfigMap", "name": spec.ResourceModifier.Name}
 	}
 	return yaml.Marshal(body)
+}
+
+// labelExpression is one requirement of a Velero label selector: a key, an
+// operator (In, NotIn, Exists, DoesNotExist) and the values the operator
+// compares against. It is a type rather than a map because the renderer has to
+// emit a requirement's `values` only when it has them, and because a caller
+// that misspells an operator should not be able to write a Restore that means
+// something else.
+type labelExpression struct {
+	Key      string
+	Operator string
+	Values   []string
+}
+
+// JobPodLabelKey is the label the Job controller puts on every pod it creates
+// for a Job — and NOT on the Job object itself. Measured on lab w3 (k3s 1.35),
+// which is what lets `--include-jobs` restore Jobs while no Job's pod is ever
+// restored.
+const JobPodLabelKey = "batch.kubernetes.io/job-name"
+
+// JobPodsExcluded is the label requirement a namespace restore always carries:
+// the pod a Job created is not restored, whether or not --include-jobs restored
+// the Job.
+//
+// WHY IT IS ALWAYS THERE. Velero skips only the pods it knows are Succeeded or
+// Failed when it takes a backup, so a Job that was PENDING or RUNNING at backup
+// time has its pod IN the backup, and `excludedResources: [jobs]` drops the Job
+// and not its pod. The restore then creates an orphan pod that runs the Job's
+// work again — measured on hardware (S4 on lab w3, 2026-09-27): the stray
+// sentinel call arrived about a second after the Velero Restore started, in two
+// separate runs, from the pod of a Job that was running when the backup was
+// taken.
+//
+// The Job itself still comes back with --include-jobs, because the label is on
+// the pod: Velero restores the Job object, and its controller creates fresh
+// pods — at activation, which is what the flag is for.
+func JobPodsExcluded() []labelExpression {
+	return []labelExpression{{Key: JobPodLabelKey, Operator: "DoesNotExist"}}
 }
 
 // restoreRequest is one Velero Restore the command asks for.
@@ -1787,8 +1861,12 @@ type restoreRequest struct {
 	IncludedResources []string
 	IncludeJobs       bool
 	LabelSelector     map[string]string
-	OrLabelSelectors  []map[string]string
-	ResourceModifier  *modifierConfigMap
+	// LabelExpressions is the matchExpressions half of the SAME labelSelector
+	// LabelSelector fills, and it is what mode 1 uses to keep the pod a Job
+	// created out of the restore (JobPodsExcluded).
+	LabelExpressions []labelExpression
+	OrLabelSelectors []map[string]string
+	ResourceModifier *modifierConfigMap
 	// NamedVolumes are the claims this restore is asked to FILL. They are what
 	// a non-Completed verdict is judged against: "Completed with 0 errors" is
 	// not proof that a volume was restored (probe P5, run 4).

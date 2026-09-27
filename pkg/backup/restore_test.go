@@ -421,6 +421,31 @@ func (c *fakeCluster) CreateRestore(ctx context.Context, name string, doc []byte
 		if len(parsed.Spec.IncludedNamespaces) > 0 {
 			spec.Namespace = parsed.Spec.IncludedNamespaces[0]
 		}
+		// THE SELECTOR IS READ AS ITS TWO HALVES, so a test can assert what a
+		// restore actually excludes rather than that a document was submitted.
+		// matchExpressions is the half mode 1 uses to keep the pods a Job
+		// created out of the restore.
+		if parsed.Spec.LabelSelector != nil {
+			if labels, ok := parsed.Spec.LabelSelector["matchLabels"].(map[string]any); ok {
+				spec.LabelSelector = map[string]string{}
+				for key, value := range labels {
+					spec.LabelSelector[key] = fmt.Sprint(value)
+				}
+			}
+			expressions, _ := parsed.Spec.LabelSelector["matchExpressions"].([]any)
+			for _, raw := range expressions {
+				entry, _ := raw.(map[string]any)
+				expression := labelExpression{}
+				expression.Key, _ = entry["key"].(string)
+				expression.Operator, _ = entry["operator"].(string)
+				if values, ok := entry["values"].([]any); ok {
+					for _, value := range values {
+						expression.Values = append(expression.Values, fmt.Sprint(value))
+					}
+				}
+				spec.LabelExpressions = append(spec.LabelExpressions, expression)
+			}
+		}
 		// The Restore's resource modifier is recorded by name: what it SAYS is
 		// the modifier ConfigMap's own document, which the run applies as a
 		// separate step and a test reads out of restoreDocs.
@@ -1342,6 +1367,56 @@ func TestNamespaceRestoreStopSuspendsCronJobsBeforeTheSafetyBackup(t *testing.T)
 	if got := pendingDetailOf(t, record, "cronjob/s4-sentinel"); got != "false" {
 		t.Errorf("the operation recorded %q for the restored CronJob, want the backup's own value false", got)
 	}
+}
+
+// TestNamespaceRestoreExcludesThePodsJobsCreated is the defect kn-x0wv.5's
+// third hardware run found: Velero skips only the pods it knows are Succeeded or
+// Failed when it takes a backup, so a Job that was PENDING or RUNNING at backup
+// time has its pod IN the backup; `excludedResources: [jobs]` drops the Job and
+// not its pod, and the restore creates an orphan pod that runs the Job's work
+// again. On lab w3 (2026-09-27) the stray sentinel call arrived about a second
+// after the Velero Restore started, in two separate runs, from the pod of a Job
+// that was running when the backup was taken.
+//
+// So mode 1's Restore ALWAYS excludes the pods a Job created — and only those:
+// the label is on the pod and not on the Job object, so --include-jobs still
+// restores Jobs, and their controller makes fresh pods at activation.
+func TestNamespaceRestoreExcludesThePodsJobsCreated(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	for _, includeJobs := range []bool{false, true} {
+		name := "Jobs excluded"
+		if includeJobs {
+			name = "--include-jobs restores the Jobs themselves"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newRestoreFixture(t, facts)
+			out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true, IncludeJobs: includeJobs}, "")
+			if err != nil {
+				t.Fatalf("the restore failed: %v\n%s", err, out)
+			}
+			if len(f.cluster.restoresMade) != 1 {
+				t.Fatalf("Velero restores = %d, want one", len(f.cluster.restoresMade))
+			}
+			made := f.cluster.restoresMade[0]
+			if !excludesThePodsJobsCreated(made.LabelExpressions) {
+				t.Errorf("the Restore does not exclude the pods a Job created (%+v): a Job that was running when the backup was taken comes back as a pod with no Job above it, and runs its work again before activation", made.LabelExpressions)
+			}
+			if made.Namespace == "" {
+				t.Error("this fake read no namespace off the Restore, so the assertions above are about the wrong request")
+			}
+		})
+	}
+}
+
+// excludesThePodsJobsCreated reports whether a restore request carries the
+// requirement that keeps the pod a Job created out of the restore.
+func excludesThePodsJobsCreated(expressions []labelExpression) bool {
+	for _, expression := range expressions {
+		if expression.Key == JobPodLabelKey && expression.Operator == "DoesNotExist" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestNamespaceRestoreStopSuspendsWorkBeforeThePauseIsAcknowledged is the fix
