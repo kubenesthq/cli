@@ -201,10 +201,32 @@ func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
 		// successful restore because it terminates the server it just
 		// reset; the message is what distinguishes the two.
 		if res.ExitCode != 0 && !strings.Contains(res.Stdout+res.Stderr, "has been reset") {
-			return fmt.Errorf("%s: exit %d: %s", step.what, res.ExitCode, firstLine(res.Stderr))
+			return fmt.Errorf("%s: exit %d: %s", step.what, res.ExitCode, k3sReason(res.Stdout+"\n"+res.Stderr))
 		}
 	}
 	return nil
+}
+
+// k3sReason picks the line of k3s's log that says why it stopped. k3s logs
+// "Starting k3s" first and its reason last, so the first line of a failed
+// cluster-reset tells an operator nothing: the last fatal or error line does,
+// and without one the last line is the closest thing to a reason.
+func k3sReason(output string) string {
+	var last, reason string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		last = line
+		if strings.Contains(line, "level=fatal") || strings.Contains(line, "level=error") {
+			reason = line
+		}
+	}
+	if reason != "" {
+		return reason
+	}
+	return last
 }
 
 // OrphanedVolumes finds PersistentVolumes whose claim no longer exists, which

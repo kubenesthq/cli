@@ -240,7 +240,7 @@ func stageComponents(ctx context.Context, s *Session) error {
 // version. Release-manifest components have no chart to check and are proven
 // by their own readiness.
 func confirmVersion(ctx context.Context, r k3s.Runner, key, want string, s *Session) error {
-	resource := chartResource(key)
+	resource := ChartResource(key)
 	if resource == "" {
 		return nil
 	}

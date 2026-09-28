@@ -1,9 +1,12 @@
 package upgrade
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 )
 
@@ -95,5 +98,28 @@ func TestRestoringWithoutASnapshotIsRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "nothing to restore to") {
 		t.Errorf("the refusal must say why: %v", err)
+	}
+}
+
+// A failed cluster-reset must report k3s's own reason. k3s logs "Starting k3s"
+// first and its fatal line last, and lab up (2026-09-28) showed an operator
+// nothing but "Starting k3s v1.35.7+k3s1" from a restore that had failed.
+func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "--cluster-reset") {
+			return sshx.Result{ExitCode: 1, Stderr: strings.Join([]string{
+				`time="2026-09-28T09:27:29Z" level=info msg="Starting k3s v1.35.7+k3s1 (cd43afc7)"`,
+				`time="2026-09-28T09:27:29Z" level=info msg="Managed etcd cluster bootstrap already complete and initialized"`,
+				`time="2026-09-28T09:27:30Z" level=fatal msg="starting kubernetes: preparing server: bootstrap data already found and encrypted with different token"`,
+			}, "\n")}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t092620")
+	if err == nil {
+		t.Fatal("a cluster-reset that exited 1 without resetting was reported as a success")
+	}
+	if !strings.Contains(err.Error(), "encrypted with different token") {
+		t.Errorf("the error does not carry k3s's reason, only: %v", err)
 	}
 }

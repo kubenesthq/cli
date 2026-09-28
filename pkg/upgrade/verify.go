@@ -195,7 +195,7 @@ func verifyVersions(ctx context.Context, s *Session, server k3s.Runner) error {
 		if err != nil {
 			return err
 		}
-		resource := chartResource(c.key)
+		resource := ChartResource(c.key)
 		if resource == "" {
 			// Release-manifest components (gateway-api,
 			// system-upgrade-controller) have no HelmChart resource to
@@ -219,9 +219,9 @@ func verifyVersions(ctx context.Context, s *Session, server k3s.Runner) error {
 	return nil
 }
 
-// chartResource maps a manifest key to the HelmChart resource name the
+// ChartResource maps a manifest key to the HelmChart resource name the
 // installer created. The names come from the packages that write them.
-func chartResource(key string) string {
+func ChartResource(key string) string {
 	switch key {
 	case "traefik":
 		return "kubenest-traefik"

@@ -328,7 +328,11 @@ func w12LiveRecord(t *testing.T, ctx context.Context, r k3s.Runner) *operation.S
 // cluster, which is where "the starting bundle's pins are back" is observable.
 func w12HelmChartVersion(t *testing.T, ctx context.Context, r k3s.Runner, component string) string {
 	t.Helper()
-	out, err := k3s.Kubectl(ctx, r, fmt.Sprintf(`get helmchart %s -n kube-system -o jsonpath='{.spec.version}'`, component))
+	resource := upgrade.ChartResource(component)
+	if resource == "" {
+		t.Fatalf("%s is not installed from a HelmChart, so it has no chart version to read", component)
+	}
+	out, err := k3s.Kubectl(ctx, r, fmt.Sprintf(`get helmchart %s -n kube-system -o jsonpath='{.spec.version}'`, resource))
 	if err != nil {
 		t.Fatalf("reading the %s HelmChart: %v", component, err)
 	}
