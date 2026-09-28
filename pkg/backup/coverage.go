@@ -300,3 +300,22 @@ func create(ctx context.Context, r k3s.Runner, what string, doc []byte) error {
 	}
 	return nil
 }
+
+// CoveredNamespaces names, sorted, the namespaces backup's expected-coverage
+// record says it covers. That record is the only thing that can say what a
+// backup holds, so a backup without one covers nothing a recovery could
+// restore, and this returns none rather than an error.
+func CoveredNamespaces(ctx context.Context, r k3s.Runner, backup string) ([]string, error) {
+	record, err := (&veleroBackups{runner: r}).coverageRecord(ctx, backup)
+	if err != nil || record == nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(record.Namespaces))
+	for _, ns := range record.Namespaces {
+		if ns.Name != "" {
+			names = append(names, ns.Name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}

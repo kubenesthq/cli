@@ -297,7 +297,13 @@ the control plane runs in the management cluster that --server addresses.`,
 			// The backup is in the bucket; now it has to be FINDABLE. A
 			// completed backup that no recovery set names is a backup nobody
 			// can select on the day it matters.
-			if err := recordRecoverySet(cmd.Context(), out, conn.Cluster, name); err != nil {
+			// What the backup covers is what makes it restorable: a recovery
+			// restores exactly the namespaces the set records for its backup.
+			coverage, err := backup.CoveredNamespaces(cmd.Context(), client, name)
+			if err != nil {
+				return err
+			}
+			if err := recordRecoverySet(cmd.Context(), out, conn.Cluster, name, coverage); err != nil {
 				return err
 			}
 			fmt.Fprintf(out, "backup %s completed on %s\n", name, conn.Cluster)
@@ -369,7 +375,7 @@ func envFirst(names ...string) string {
 // than failing: the backup itself succeeded, and the honest report is that
 // nothing will be able to find it. That report is loud, because a bucket full
 // of unselectable backups is the failure this is meant to prevent.
-func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupName string) error {
+func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupName string, coverage []string) error {
 	journalPath, err := install.JournalPath(clusterName)
 	if err != nil {
 		return err
@@ -426,11 +432,13 @@ func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupNa
 	default:
 		return fmt.Errorf("reading the recovery set at %s: %w", key, err)
 	}
-	set, err = set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: time.Now().UTC()})
+	set, err = withRecordedBackup(set, backupName, coverage, time.Now().UTC())
 	if err != nil {
 		return err
 	}
-	set.Complete = true
+	if len(coverage) == 0 {
+		fmt.Fprintf(out, "warning: backup %s has no expected-coverage record, so the recovery set names it without coverage and a recovery will not restore any namespace from it\n", backupName)
+	}
 	body, err := set.Document()
 	if err != nil {
 		return err
@@ -440,6 +448,19 @@ func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupNa
 	}
 	fmt.Fprintf(out, "recovery set updated: %s now names %d completed backup(s)\n", key, len(set.Backups))
 	return nil
+}
+
+// withRecordedBackup is the set once backupName, covering the namespaces in
+// coverage, is recorded in it as completed. The coverage is not decoration: a
+// recovery restores exactly the namespaces its chosen backup covers, and a
+// backup recorded without any is one it selects and then restores nothing from.
+func withRecordedBackup(set *recoverykit.Set, backupName string, coverage []string, at time.Time) (*recoverykit.Set, error) {
+	set, err := set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: at, Coverage: coverage})
+	if err != nil {
+		return nil, err
+	}
+	set.Complete = true
+	return set, nil
 }
 
 // versionsOf reads the versions a recovery needs out of the install journal's
