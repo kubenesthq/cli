@@ -470,7 +470,7 @@ func SelectControlPlaneCheckpoint(ctx context.Context, list func(ctx context.Con
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading the dump at %s: %w", cp.DumpKey, err)
 	}
-	if got := DigestOf(sealed); got != cp.Envelope.SHA256 {
+	if got := DigestOf(sealed); !SameDigest(got, cp.Envelope.SHA256) {
 		return nil, nil, fmt.Errorf("the dump at %s digests %s and its manifest records %s: the object is not the one this checkpoint measured, so it is not the one to load", cp.DumpKey, got, cp.Envelope.SHA256)
 	}
 	if cp.Envelope.SizeBytes != 0 && int64(len(sealed)) != cp.Envelope.SizeBytes {
@@ -482,6 +482,16 @@ func SelectControlPlaneCheckpoint(ctx context.Context, list func(ctx context.Con
 // DigestOf is the sha256 a checkpoint manifest records, in the same
 // "sha256:…" form recoverykit uses, so a manifest and a kit digest read alike.
 func DigestOf(doc []byte) string { return recoverykit.Digest(doc) }
+
+// SameDigest reports whether two sha256 digests name the same bytes, whether
+// or not each carries the "sha256:" prefix. The chart's checkpoint Job records
+// the bare hex sha256sum prints; recoverykit writes the prefixed form. On lab
+// demo (2026-09-28) the recovery compared the two as strings and refused a
+// checkpoint whose digests were equal.
+func SameDigest(a, b string) bool {
+	a, b = strings.TrimPrefix(a, "sha256:"), strings.TrimPrefix(b, "sha256:")
+	return a != "" && strings.EqualFold(a, b)
+}
 
 // ChartPinnedPostgres is the PostgreSQL this CLI's bundled chart runs: its
 // major, and the image the chart pins, so a refusal can name what a checkpoint

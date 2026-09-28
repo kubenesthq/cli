@@ -2,6 +2,8 @@ package recovery
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -309,3 +311,58 @@ func TestTheCheckpointIsTheControlPlaneStartingPoint(t *testing.T) {
 // digestOf mirrors the manifest's digest field, which is what the bucket's
 // checkpoint manifests carry (sha256:…).
 func digestOf(doc []byte) string { return recoverykit.Digest(doc) }
+
+// TestACheckpointWrittenByTheChartIsSelected: the manifest the chart's
+// checkpoint Job really writes (read from lab demo's bucket, 2026-09-28)
+// records the envelope digest as bare hex, the chart version as the control
+// plane's, and no management cluster id. The recovery must select it, and must
+// still refuse a dump whose bytes are not the ones the manifest measured.
+func TestACheckpointWrittenByTheChartIsSelected(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(sealed []byte) []byte
+		wantOK bool
+	}{
+		{"the measured dump", func(b []byte) []byte { return b }, true},
+		{"a dump that is not the measured one", func(b []byte) []byte { return append(append([]byte{}, b...), 'x') }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPublished(t)
+			sealed, err := recoverykit.SealTo(p.fleet.Recipient(), []byte("the dump"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum := sha256.Sum256(sealed)
+			body, err := json.Marshal(map[string]any{
+				"at":                    "2026-09-28T00:31:49Z",
+				"complete":              true,
+				"control_plane_version": "3.0.0",
+				"key":                   "control-plane/2026-09-28T003149Z-nightly",
+				"management_cluster_id": "",
+				"envelope":              map[string]any{"sha256": hex.EncodeToString(sum[:]), "size_bytes": len(sealed)},
+				"dump":                  map[string]any{"postgres_major": 18, "postgres_image": "bitnami/postgresql@sha256:7d77"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := "control-plane/2026-09-28T003149Z-nightly"
+			p.store.objects[dir+"/manifest.json"] = body
+			stored := tc.mutate(sealed)
+			if !tc.wantOK {
+				// The size check would refuse a longer object first; keep the
+				// size the manifest records so the digest is what decides.
+				stored = stored[:len(sealed)]
+				stored[len(stored)-1] ^= 0xff
+			}
+			p.store.objects[dir+"/control-plane.dump.age"] = stored
+
+			_, _, err = controlplane.SelectControlPlaneCheckpoint(context.Background(), p.store.List, p.store.Get, "control-plane")
+			if tc.wantOK && err != nil {
+				t.Fatalf("the chart's own checkpoint was refused: %v", err)
+			}
+			if !tc.wantOK && (err == nil || !strings.Contains(err.Error(), "not the one this checkpoint measured")) {
+				t.Fatalf("a dump whose bytes differ from the manifest's digest was not refused for its digest: %v", err)
+			}
+		})
+	}
+}
