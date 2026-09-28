@@ -19,8 +19,9 @@ import (
 type ClusterIncarnation struct {
 	ID        string `json:"id"`
 	ClusterID string `json:"cluster_id"`
-	// Ordinal counts incarnations of one cluster from 1. It is what makes "the
-	// third machine to run this cluster" a fact the control plane can state.
+	// Ordinal counts the rebuilds recorded for one cluster, from 1. The host
+	// the cluster was first installed on has no row, so ordinal 1 is the
+	// second machine to run the cluster.
 	Ordinal int `json:"ordinal"`
 	// Reason is why the incarnation was recorded, e.g. "recovery".
 	Reason     string `json:"reason"`

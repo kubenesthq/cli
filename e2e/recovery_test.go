@@ -394,6 +394,10 @@ func TestLostSingleServerRecovery(t *testing.T) {
 	// backup, and a recovery set that names it.
 	record := clusterRecord(t, client, env.cluster)
 	_, set := openRecordedKit(t, env, record.ID)
+	before, err := client.ListIncarnations(context.Background(), record.ID)
+	if err != nil {
+		t.Fatalf("reading the cluster's incarnations before the recovery: %v", err)
+	}
 	latest, ok := set.Latest()
 	if !ok {
 		t.Fatalf("cluster %s's recovery set names no completed backup, so there is nothing to restore: take one (`kubenest backup now`) and re-run", record.ID)
@@ -476,12 +480,16 @@ func TestLostSingleServerRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the cluster's incarnations: %v", err)
 	}
-	if len(incarnations) < 2 {
-		t.Fatalf("cluster %s recorded %d incarnation(s): the rebuilt host is not a new machine to the control plane", record.ID, len(incarnations))
+	// The control plane records a row per REBUILD (the host the cluster was
+	// first installed on has none), so the claim is one more row than before,
+	// recorded for this recovery, carrying the floor that retires the dead
+	// host's token.
+	if len(incarnations) != len(before)+1 {
+		t.Fatalf("cluster %s had %d incarnation(s) before the recovery and %d after: the rebuilt host is not a new machine to the control plane", record.ID, len(before), len(incarnations))
 	}
 	rebuilt := incarnations[len(incarnations)-1]
-	if rebuilt.Ordinal < 2 || rebuilt.TokenFloor == nil {
-		t.Fatalf("the new incarnation is ordinal %d with floor %v: the old host's token was not retired", rebuilt.Ordinal, rebuilt.TokenFloor)
+	if rebuilt.Reason != "recovery" || rebuilt.TokenFloor == nil {
+		t.Fatalf("the new incarnation (ordinal %d) was recorded for %q with floor %v: the old host's token was not retired by a recovery", rebuilt.Ordinal, rebuilt.Reason, rebuilt.TokenFloor)
 	}
 
 	// ── the token the dead host was using is REFUSED at the hub, checked by
