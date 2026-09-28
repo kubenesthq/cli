@@ -406,6 +406,10 @@ func (s *stubCluster) ClaimBinding(context.Context, string, string) (*backup.Cla
 
 func (s *stubCluster) NodeReady(context.Context, string) (bool, error) { return false, nil }
 
+func (s *stubCluster) ReplicaSets(context.Context, string) ([]backup.ReplicaSetState, error) {
+	return nil, nil
+}
+
 func (s *stubCluster) ControllerOwner(context.Context, string, string, string) (*backup.OwnerRef, error) {
 	return nil, nil
 }

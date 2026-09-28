@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -113,6 +114,10 @@ type fakeCluster struct {
 	claimLabels map[string]map[string]string
 	workloads   []WorkloadState
 	pods        []PodState
+	// replicasets is what the namespace has, for the hang guard: a ReplicaSet
+	// at 0 replicas deletes the pod it adopts, which is what makes a restored
+	// pod's PodVolumeRestore unfillable.
+	replicasets []ReplicaSetState
 	// podVolumeBackups is what each backup holds, by backup name: the
 	// PodVolumeBackups' pods, volumes and claim UIDs.
 	podVolumeBackups map[string][]BackupVolumeState
@@ -243,10 +248,13 @@ func (c *fakeCluster) Pods(_ context.Context, namespace string) ([]PodState, err
 	return out, nil
 }
 
+// PodVolumeBackups is what the chosen BACKUP holds, and it does NOT depend on
+// the target namespace: these objects live in the velero namespace and outlive
+// the namespace a restore deletes. A fake that returned nothing once the
+// namespace was deleted would make a resumed run derive a different modifier
+// from the same backup — the real read does not, which is what lets a resume
+// skip the modifier it already applied.
 func (c *fakeCluster) PodVolumeBackups(_ context.Context, backup string) ([]BackupVolumeState, error) {
-	if c.deleted {
-		return nil, nil
-	}
 	return append([]BackupVolumeState(nil), c.podVolumeBackups[backup]...), nil
 }
 
@@ -319,6 +327,12 @@ func (c *fakeCluster) ClaimBinding(_ context.Context, _, claim string) (*ClaimBi
 
 func (c *fakeCluster) NodeReady(_ context.Context, node string) (bool, error) {
 	return c.readyNodes[node], nil
+}
+
+// ReplicaSets is what the hang guard reads: the ReplicaSets the namespace has,
+// with the desired count that decides whether one deletes the pod it adopts.
+func (c *fakeCluster) ReplicaSets(_ context.Context, _ string) ([]ReplicaSetState, error) {
+	return c.replicasets, nil
 }
 
 func (c *fakeCluster) ControllerOwner(_ context.Context, _, kind, _ string) (*OwnerRef, error) {
@@ -2064,6 +2078,187 @@ func TestOperatorChartVersionReadsTheLabel(t *testing.T) {
 		if _, _, err := operatorChartVersion(bad); err == nil {
 			t.Errorf("the label %q read as a version, so a restore would proceed on a guess", bad)
 		}
+	}
+}
+
+// TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled is
+// kn-x0wv.2's first half. A Velero Restore waits for every PodVolumeRestore it
+// created, and one whose pod the cluster no longer has waits for ever: Velero's
+// own itemOperationTimeout is four hours and it holds Velero's only restore
+// worker the whole time, while the CLI waits its own restore timeout (measured
+// on lab w3, 2026-09-27). The wait must end within a poll or two, naming the pod
+// and the ReplicaSet that took it.
+//
+// THE PLANTED NEGATIVE IS TODAY'S WAIT, which returns the timeout error after
+// the whole restore deadline.
+func TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// The Restore never reaches a terminal phase, and its PodVolumeRestore names
+	// the pod of the OLD ReplicaSet — the one the backup holds at zero, which
+	// adopted the restored pod and deleted it.
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-rg84r", Pod: "s4-web-5df4c559-qcqqp", Volume: "data-0", ClaimName: "data-0", Phase: "New"}}
+	f.cluster.pods = nil
+	f.cluster.replicasets = []ReplicaSetState{{
+		Name:     "s4-web-5df4c559",
+		Replicas: 0,
+		Owner:    &OwnerRef{Kind: "Deployment", Name: "s4-web", Controller: true},
+	}}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatalf("a restore whose PodVolumeRestore can never run was waited out:\n%s", out)
+	}
+	for _, want := range []string{"s4-web-5df4c559-qcqqp", "s4-web-5df4c559", "Deployment s4-web", "--abort"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q, so an operator cannot see what deleted the pod: %v", want, err)
+		}
+	}
+	// WITHIN A POLL OR TWO, not after the restore deadline: the fixture's clock
+	// advances one poll per wait, and the whole run is a few seconds of its time
+	// — the timeout path would be tens of minutes.
+	if elapsed := f.clock.now.Sub(restoreNow); elapsed > 5*time.Second {
+		t.Errorf("the run spent %s of its own clock before refusing, so it waited instead of noticing", elapsed)
+	}
+	// AND THE OPERATION IS LEFT RESUMABLE OR ABORTABLE, as every mode-1 refusal
+	// leaves it.
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("the run left no record")
+	}
+	if record.Terminal {
+		t.Errorf("the record is terminal (%s): a refusal must leave the operation restartable", record.Result)
+	}
+	if record.Executor.State != operation.ExecutorStopped {
+		t.Errorf("the record was not released: %+v", record.Executor)
+	}
+}
+
+// TestNamespaceRestoreRenamesTheRestoredPodOutOfItsReplicaSetsSelector is
+// kn-x0wv.2's second half: the decision for a backup taken mid-rollout.
+//
+// MODE 1 RENAMES, IT DOES NOT REFUSE. The backup holds the old pod and the old
+// ReplicaSet at zero; a restored pod is adopted by its ReplicaSet's SELECTOR, so
+// the rename is what stops the adoption, and it is the same answer mode 2
+// already carries (probe P5). Refusing instead was rejected: the CLI cannot see
+// what a backup holds — Velero keeps the items in the bucket, not in the CR — so
+// a plan-time refusal could only guess from the LIVE namespace, and a rollout
+// that finished after the backup would be refused for a state its restore would
+// have handled.
+//
+// THE PLANTED NEGATIVE IS TODAY'S REQUEST, which carries the CronJob rules and
+// no pod rule.
+func TestNamespaceRestoreRenamesTheRestoredPodOutOfItsReplicaSetsSelector(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.podVolumeBackups = map[string][]BackupVolumeState{
+		"daily-good": {{Pod: "s4-web-5df4c559-qcqqp", Namespace: "payments", Volume: "data-0", ClaimUID: "uid-data-0"}},
+	}
+	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-1", Pod: "s4-web-5df4c559-qcqqp", Volume: "data-0", ClaimName: "data-0", Phase: "Completed"}}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err != nil {
+		t.Fatalf("the restore failed: %v\n%s", err, out)
+	}
+	rules := modifierRules(t, f)
+	var rename map[string]any
+	for _, rule := range rules {
+		conditions, _ := rule["conditions"].(map[string]any)
+		if conditions["groupResource"] == "pods" {
+			rename = rule
+		}
+	}
+	if rename == nil {
+		t.Fatalf("the modifier carries no pod rule (%v): the restored pod is adopted by its zero-replica ReplicaSet and deleted, and its PodVolumeRestore never runs", rules)
+	}
+	conditions, _ := rename["conditions"].(map[string]any)
+	pattern, _ := conditions["resourceNameRegex"].(string)
+	matched, err := regexp.MatchString(pattern, "s4-web-5df4c559-qcqqp")
+	if err != nil || !matched {
+		t.Errorf("the pod rule matches %q for the backup's own pod (%v): %v", pattern, err, rename)
+	}
+	// ONLY THE BACKUP'S PODS: a rule that matched every pod would rename pods
+	// the restore did not need to protect, including the workload's own.
+	if matched, _ := regexp.MatchString(pattern, "s4-web-6b4c7c8567-zzzzz"); matched {
+		t.Errorf("the pod rule matches a pod the backup holds no volume copy for: %v", rename)
+	}
+	// A MERGE PATCH, because the pods a namespace restore names are not all
+	// ReplicaSet pods: a StatefulSet's pod carries no pod-template-hash for a
+	// JSON `replace` to overwrite.
+	patches, _ := rename["mergePatches"].([]any)
+	if len(patches) != 1 {
+		t.Fatalf("the pod rule carries %d merge patch(es), want the one that renames the hash: %v", len(patches), rename)
+	}
+	entry, _ := patches[0].(map[string]any)
+	raw, _ := entry["patchData"].(string)
+	var patch struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
+		t.Fatalf("the pod rule's patch is not JSON (%v): %s", err, raw)
+	}
+	if patch.Metadata.Labels["pod-template-hash"] != RestoredPodHash {
+		t.Errorf("the pod rule sets pod-template-hash=%q, want %q: a ReplicaSet selects on the hash, so anything else is adopted and deleted", patch.Metadata.Labels["pod-template-hash"], RestoredPodHash)
+	}
+	// AND THE CRONJOB RULES ARE STILL THERE: mode 1's modifier carries both.
+	if len(rules) != 3 {
+		t.Errorf("the modifier holds %d rule(s), want the two CronJob rules and the pod rename: %v", len(rules), rules)
+	}
+
+	// THE RESTORED POD IS OWED WORK. It carries the restored data and mounts the
+	// claim, and the workload's own controller creates the pod that takes over,
+	// so activation deletes it — mode 2's answer, mirrored.
+	record := f.kube.recordFor(operation.Name)
+	if got := pendingDetailOf(t, record, "pod/s4-web-5df4c559-qcqqp"); got == "" {
+		t.Errorf("the operation recorded no restored pod to clean up (%+v): it would stay mounted on the claim beside the workload's own pod", record.Pending)
+	}
+	var activated strings.Builder
+	if err := RunRestore(context.Background(), &activated, strings.NewReader(""), f.options(t, RestoreOptions{
+		Namespace: "payments",
+		Activate:  record.OperationID,
+	}), f.deps()); err != nil {
+		t.Fatalf("activation failed: %v\n%s", err, activated.String())
+	}
+	if !f.kube.sawCommand("delete pod s4-web-5df4c559-qcqqp -n payments") {
+		t.Errorf("activation did not delete the restored pod, so the claim is left mounted twice and a pod the workload never asked for keeps running:\n%s", activated.String())
+	}
+}
+
+// TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed: the modifier's pod list
+// is derived from the BACKUP, which outlives the namespace a restore deletes, so
+// a resumed run builds the same modifier and does not re-apply a weaker one over
+// the ConfigMap the running Restore reads its rules from.
+func TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.podVolumeBackups = map[string][]BackupVolumeState{
+		"daily-good": {{Pod: "s4-web-5df4c559-qcqqp", Namespace: "payments", Volume: "data-0", ClaimUID: "uid-data-0"}},
+	}
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err == nil {
+		t.Fatal("the interrupted run must fail")
+	}
+	opID := f.kube.recordFor(operation.Name).OperationID
+
+	// The same cluster, the same backup, and a Restore that now completes.
+	resumed := newRestoreFixture(t, facts)
+	resumed.kube = f.kube
+	resumed.cluster.deleted = f.cluster.deleted
+	resumed.cluster.namespace = f.cluster.namespace
+	resumed.cluster.annotations = f.cluster.annotations
+	resumed.cluster.volumes = f.cluster.volumes
+	resumed.cluster.podVolumeBackups = f.cluster.podVolumeBackups
+	beforeApplies := resumed.kube.commandCount("apply -f -")
+
+	var out strings.Builder
+	if err := RunRestore(context.Background(), &out, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps()); err != nil {
+		t.Fatalf("--resume failed: %v\n%s", err, out.String())
+	}
+	if after := resumed.kube.commandCount("apply -f -"); after != beforeApplies {
+		t.Errorf("--resume applied %d document(s): the modifier it already applied holds the rename, and re-applying a different one would change the rules the running Restore reads", after-beforeApplies)
 	}
 }
 

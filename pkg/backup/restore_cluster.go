@@ -66,6 +66,13 @@ type RestoreCluster interface {
 	// on a LIVE node rather than on the one that is gone.
 	ClaimBinding(ctx context.Context, namespace, claim string) (*ClaimBinding, error)
 	NodeReady(ctx context.Context, node string) (bool, error)
+	// ReplicaSets reads the namespace's ReplicaSets with their desired replica
+	// count and the controller that owns each. It exists for the hang guard:
+	// a namespace restore hangs when the pod Velero restored is adopted and
+	// deleted by a ReplicaSet whose desired count is zero (kn-x0wv.2), and the
+	// ReplicaSet is the only object left that can say which rollout the pod
+	// belonged to — Velero strips the pod's own owner references as it restores.
+	ReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetState, error)
 	// ControllerOwner reads one object's controller owner reference. Mode 2
 	// needs it to get from a pod's ReplicaSet to the Deployment that actually
 	// has the replica count to put back.
@@ -274,6 +281,24 @@ func (o RestoreOutcome) Terminal() bool {
 		}
 	}
 	return false
+}
+
+// ReplicaSetState is one ReplicaSet of the namespace, and the controller that
+// owns it.
+//
+// IT EXISTS FOR THE HANG GUARD and for nothing else. A namespace restore hangs
+// when the pod Velero restored is adopted by a ReplicaSet whose desired count
+// is zero, which deletes it at once, so the PodVolumeRestore that targets that
+// pod never runs (kn-x0wv.2, lab w3, 2026-09-27). The pod is gone by then and
+// its own owner reference went with it, so the ReplicaSet — matched by the
+// name the pod carries — is the only object that can still say which rollout
+// the pod belonged to.
+type ReplicaSetState struct {
+	Name     string
+	Replicas int32
+	// Owner is the ReplicaSet's controller owner: the Deployment of a rollout,
+	// or nothing for one helm or a test made by hand.
+	Owner *OwnerRef
 }
 
 // ClaimBinding is what a claim is bound to: the volume, and the node that
@@ -1102,6 +1127,56 @@ func (c *k3sCluster) ControllerOwner(ctx context.Context, namespace, kind, name 
 		}
 	}
 	return nil, nil
+}
+
+// ReplicaSets reads the namespace's ReplicaSets.
+//
+// The reader is deliberately narrow: the name (which is what a pod's name is
+// built from), the desired replica count (a ReplicaSet at zero deletes the pods
+// it adopts) and the controller that owns it. Nothing here is used to CHANGE
+// anything — mode 1 never scales a ReplicaSet.
+func (c *k3sCluster) ReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetState, error) {
+	out, err := c.kubectl(ctx, "get replicasets -n "+namespace+" -o json")
+	if err != nil {
+		if notFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the ReplicaSets in %s: %w", namespace, err)
+	}
+	var document struct {
+		Items []struct {
+			Metadata struct {
+				Name            string `json:"name"`
+				OwnerReferences []struct {
+					Kind       string `json:"kind"`
+					Name       string `json:"name"`
+					Controller *bool  `json:"controller"`
+				} `json:"ownerReferences"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil {
+		return nil, fmt.Errorf("parsing the ReplicaSets in %s: %w", namespace, err)
+	}
+	sets := make([]ReplicaSetState, 0, len(document.Items))
+	for _, item := range document.Items {
+		var replicas int32 = 1
+		if item.Spec.Replicas != nil {
+			replicas = *item.Spec.Replicas
+		}
+		set := ReplicaSetState{Name: item.Metadata.Name, Replicas: replicas}
+		for _, owner := range item.Metadata.OwnerReferences {
+			if owner.Controller != nil && *owner.Controller {
+				set.Owner = &OwnerRef{Kind: owner.Kind, Name: owner.Name, Controller: true}
+			}
+		}
+		sets = append(sets, set)
+	}
+	sort.Slice(sets, func(i, j int) bool { return sets[i].Name < sets[j].Name })
+	return sets, nil
 }
 
 func (c *k3sCluster) AnnotateProject(ctx context.Context, namespace, key, value string) error {
