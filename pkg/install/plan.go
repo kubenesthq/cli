@@ -1410,7 +1410,15 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 	// run that fails before that leaves no stale key in an operator's notes.
 	//
 	// Every later install holds only the recipient it reads back here.
+	//
+	// AND THE OPERATOR IS TOLD THE INSTANCE ID ON THIS PATH TOO, on both the
+	// install that minted the key and every run after it. The id is not a
+	// secret — every kit carries it in the clear — but it is the one thing a
+	// recovery run from a machine that has never seen this one's config cannot
+	// do without (--instance-id, which the command refuses without), and
+	// nothing used to print it at all.
 	inst, _, err := controlplane.EnsureInstance(ctx, server, s.Opts.FleetRecipient)
+	keyPrinted := false
 	if errors.Is(err, controlplane.ErrNoInstance) {
 		key, keyErr := recoverykit.GenerateFleetKey()
 		if keyErr != nil {
@@ -1431,12 +1439,32 @@ func stageControlPlane(ctx context.Context, s *Session) error {
 				"  Write it down and keep at least two offline copies apart from each other. It is not\n"+
 				"  stored on this machine, on any host, or in the control plane: losing every copy means\n"+
 				"  no recovery kit ever opens, and nothing can recreate it. Every kit and every\n"+
-				"  checkpoint is encrypted to this key's public half.", key.SecretKeyString())
+				"  checkpoint is encrypted to this key's public half.\n"+
+				"\n"+
+				"  Keep this instance's id with the key. Every kit and every recovery set is bound to it,\n"+
+				"  and a recovery run from a machine that does not have this one's config is asked for\n"+
+				"  it, as --instance-id:\n"+
+				"\n"+
+				"    %s", key.SecretKeyString(), inst.ID)
+			keyPrinted = true
 		}
 	} else if err != nil {
 		return err
 	}
 	s.instanceID = inst.ID
+	// A RE-RUN PRINTS THE ID AND NOTHING ELSE. There is no key to print — the
+	// only copy has been in the operator's hands since the first install, and
+	// this process never has it — but the machine that runs the install is
+	// where the command tells an operator to read the id from, and the first
+	// install's output may be long gone.
+	if !keyPrinted {
+		s.Logf(""+
+			"  This cluster already has its instance identity, so no fleet recovery key is printed.\n"+
+			"  The instance id every kit and every recovery set is bound to, and which a recovery run\n"+
+			"  from a machine that does not have this one's config is asked for, as --instance-id:\n"+
+			"\n"+
+			"    %s", inst.ID)
+	}
 	sec, created, err := controlplane.EnsureSecrets(ctx, server)
 	if err != nil {
 		return err
