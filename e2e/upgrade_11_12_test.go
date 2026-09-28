@@ -395,8 +395,14 @@ func w12StartHoldWatch(ctx context.Context, client *api.Client, runner k3s.Runne
 			}
 		}
 	}()
+	// The stop function is called twice on the ordinary path: once explicitly,
+	// so the watch ends before its evidence is read, and once by the deferred
+	// call that covers a subtest which fails first. Closing the channel twice
+	// panics, and on lab up (2026-09-28) that panic replaced the arm's real
+	// verdict, so the close happens once.
+	var once sync.Once
 	return w, func() {
-		close(w.stop)
+		once.Do(func() { close(w.stop) })
 		<-w.done
 	}
 }

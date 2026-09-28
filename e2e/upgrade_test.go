@@ -61,6 +61,17 @@ import (
 // the server and stayed there), and without a budget the server's own drain
 // then evicts both at once. With minAvailable 1 the drain evicts one, waits
 // until its replacement is Ready elsewhere, and only then takes the other.
+//
+// The preStop sleep is what keeps an evicted replica serving while the
+// cluster stops routing to it. An eviction marks the pod terminating at once,
+// but each node's kube-proxy drops it from the Service only after the
+// EndpointSlice update reaches it. A replica that exits on SIGTERM leaves
+// that gap as dead routes: lab up, 2026-09-28, the agent's drain evicted the
+// second replica at 10:55:18 (grace period 1s, no delay), and at 10:55:22 one
+// probe failed through BOTH nodes while its replacement was already Ready.
+// Kubernetes documents this delay as what a workload needs to be drained
+// without dropping traffic; the gate measures the upgrade, so its workload
+// has it.
 const availabilityWorkload = `apiVersion: v1
 kind: Namespace
 metadata:
@@ -79,7 +90,7 @@ spec:
     metadata:
       labels: {app: always-up}
     spec:
-      terminationGracePeriodSeconds: 1
+      terminationGracePeriodSeconds: 15
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
@@ -90,6 +101,9 @@ spec:
         - name: whoami
           image: traefik/whoami:v1.10.2
           ports: [{containerPort: 80}]
+          lifecycle:
+            preStop:
+              sleep: {seconds: 5}
           readinessProbe:
             httpGet: {path: /, port: 80}
             periodSeconds: 2
