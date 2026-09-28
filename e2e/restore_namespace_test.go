@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"kubenest.io/cli/pkg/api"
+	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/sshx"
@@ -544,6 +545,13 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	t.Run("an interrupted restore resumes without activating", func(t *testing.T) {
 		s4InterruptedResume(t, c, namespace, proof, proofPath)
 	})
+
+	// kn-x0wv.2: the backup taken while a rollout was in progress, whose volume
+	// copy belongs to a pod whose ReplicaSet is at 0 replicas. It runs last
+	// because it builds its own fixture and removes it again.
+	t.Run("a backup taken mid-rollout restores the data", func(t *testing.T) {
+		s4MidRollout(t, c, namespace, proof, proofPath)
+	})
 }
 
 // s4InterruptedResume kills the CLI mid-restore and finishes with --resume.
@@ -624,6 +632,512 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 	if restored := c.sha256OfProof(namespace, proofPath); restored != "" {
 		t.Logf("restored proof file after the resume: %s (%s)", restored, proof)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// kn-x0wv.2: the restore of a backup taken mid-rollout.
+//
+// WHAT THE BACKUP HELD ON HARDWARE. On lab w3 (2026-09-27) the gate re-applied
+// its Deployment while an earlier run's workload was still there, so a rollout
+// from s4-web-5df4c559 to s4-web-6b4c7c8567 was in progress when the backup was
+// taken. The backup held ONE PodVolumeBackup of the claim, and it named the OLD
+// pod (s4-web-5df4c559-qcqqp), while the old ReplicaSet (s4-web-5df4c559) was
+// held at 0 replicas. Velero restored that pod, stripped its owner references
+// (pkg/restore/restore.go, resetMetadata), the ReplicaSet adopted it BY ITS
+// SELECTOR and deleted it, and the PodVolumeRestore created for it never ran:
+// the Restore stayed InProgress until Velero's itemOperationTimeout (4h) while
+// the CLI waited its own restore timeout (2h).
+//
+// WHY THE FIXTURE CANNOT SIMPLY RACE A ROLLOUT FOR THAT STATE. Three rules of
+// Velero and Kubernetes leave the live cluster almost no window in which to
+// catch it:
+//
+//   - Velero does not back up an item that is being deleted (pkg/backup/
+//     item_backupper.go, itemInclusionChecks: a deletionTimestamp fails the
+//     item), so a pod held in termination has NO PodVolumeBackup and produces no
+//     danger at all — a fixture that "held the old pod in termination" would
+//     fail its own precondition;
+//   - a PodVolumeBackup is created only for a pod whose phase is Running
+//     (pkg/podvolume/backupper.go, kube.IsPodRunning);
+//   - and the ReplicaSet controller claims pods and then deletes what it has
+//     above its desired count in the same sync (pkg/controller/replicaset,
+//     claimPods then manageReplicas), so "ReplicaSet at 0 AND its own pod still
+//     Running and not yet deleted" lasts milliseconds — Velero's lists of the
+//     two objects are not even atomic.
+//
+// So the fixture BUILDS that state and holds it. The pod's controller owner
+// reference names the workload's Deployment (which manages no pods) instead of
+// the ReplicaSet, and a ReplicaSet ignores an object whose controller reference
+// is not its own (client-go, controller_ref_manager.ClaimObject: "Owned by
+// someone else. Ignore."), so the pod stays Running beside the ReplicaSet at 0 —
+// which is what w3's backup caught in the instant before that pod's own deletion
+// landed. The garbage collector keeps it because the Deployment is really there,
+// and the ReplicaSet still selects the pod by its labels. What the RESTORE sees
+// is indistinguishable from w3's backup, because Velero strips owner references
+// on restore anyway: a pod with a PodVolumeBackup, carrying the ReplicaSet's
+// selector labels, and a ReplicaSet at 0 replicas that selects it.
+//
+// The fixture's claim (s4-hold-data) is deliberately separate from the S4
+// workload's, because Velero copies a claim ONCE and skips every other pod that
+// mounts it (pkg/podvolume/snapshot_tracker.go, TakenForPodVolume): a claim with
+// two pods would make this arm a race, and this arm has to FAIL LOUDLY rather
+// than pass without exercising the fix.
+// ---------------------------------------------------------------------------
+const (
+	// s4HoldRS is the ReplicaSet at zero replicas; the pod's name is built from
+	// it the way a ReplicaSet names its pods.
+	s4HoldRS = "s4-hold-rs"
+	// s4HoldPod is that pod. The fixture writes it out by hand (see the document
+	// below) because no sequence of ReplicaSet operations leaves one of its own
+	// pods Running beside it at zero replicas.
+	s4HoldPod = "s4-hold-rs-carry"
+	// s4HoldClaim is the claim whose copy the backup holds, and s4HoldVolume is
+	// the pod's volume name for it, as the PodVolumeBackup and the
+	// PodVolumeRestore name it.
+	s4HoldClaim  = "s4-hold-data"
+	s4HoldVolume = "data"
+	// s4HoldHash is the pod-template-hash the ReplicaSet selects: the label the
+	// restore's rename rule overwrites (backup.RestoredPodHash), and the reason
+	// the restored pod would be adopted and deleted without it.
+	s4HoldHash = "kubenest-hold"
+	// s4HoldMarker is written into the fixture's claim BY THE TEST, through the
+	// pod, before the backup: the fixture's container never writes that name, so
+	// its digest after the restore is a fact about the volume restore rather
+	// than about a container that wrote the same bytes again.
+	s4HoldMarker = "/data/restored-only.txt"
+	// s4ProofMarker is the same idea on the S4 workload's own claim.
+	s4ProofMarker = "/data/s4-mid-rollout-marker.txt"
+)
+
+// s4MidRolloutBound is how long the mid-rollout restore may take here. It is far
+// below Velero's own answer to a PodVolumeRestore that cannot run
+// (itemOperationTimeout, 4h) and below the CLI's own restore timeout: this arm's
+// backup is a namespace-sized one, so anything near this bound is the hang
+// kn-x0wv.2 describes rather than the work.
+const s4MidRolloutBound = 20 * time.Minute
+
+// s4MidRollout is kn-x0wv.2's hardware arm: the namespace is restored from a
+// backup taken in the state a rollout leaves between "the old ReplicaSet is at 0"
+// and "the old pod is gone".
+//
+// It runs after the arms above — it needs a live namespace and a workload — and
+// it leaves the namespace as it found it: it clears what the interrupt arm left
+// pending, adds its own fixture (claim, ReplicaSet at 0, held pod), and removes
+// that fixture again whatever happens.
+func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string) {
+	t.Helper()
+	t.Logf("mid-rollout restore of %s (the workload's proof is %s)", namespace, proof)
+
+	// THE STATE THE ARMS ABOVE LEFT. The interrupt arm finishes with a pending
+	// operation: its record makes the restore verb refuse to start, and its
+	// pause keeps the reconcilers from recreating the namespace this arm deletes
+	// (which is the scenario's premise). A pod carrying the rename hash is a
+	// restored pod that arm owed activation; leaving it would put a second
+	// restored pod into this arm's backup and blur the assertion that activation
+	// leaves none. The gate's own body clears the record the same way.
+	c.kubectl("delete configmap kubenest-operation -n kube-system --ignore-not-found")
+	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != "" {
+		c.kubectl("annotate project " + namespace + " -n kubenest-system " + backup.PauseAnnotationKey + "-")
+		t.Logf("cleared the pause %q the arm above left on project %s", pause, namespace)
+	}
+	c.kubectl("delete pods -n " + namespace + " -l pod-template-hash=" + backup.RestoredPodHash + " --ignore-not-found")
+
+	// readRunningWorkloadPod finds the S4 workload's OWN Running pod: not a
+	// restored one, whose pod-template-hash is the rename value and whose
+	// container is on its way out. What is read through it is what the claim
+	// holds.
+	readRunningWorkloadPod := func() (string, string) {
+		out, err := c.kubectlStatus("get pods -n " + namespace + " -l app=s4-web -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.pod-template-hash} {.status.phase}{\"\\n\"}{end}'")
+		if err != nil {
+			return "", firstLineOfE2E(err.Error())
+		}
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 3 && fields[1] != backup.RestoredPodHash && fields[2] == "Running" {
+				return fields[0], ""
+			}
+		}
+		return "", "no Running pod of the S4 workload: " + strings.TrimSpace(out)
+	}
+	waitForWorkloadPod := func(what string) string {
+		var pod string
+		c.waitFor(5*time.Minute, what, func() (bool, string) {
+			got, detail := readRunningWorkloadPod()
+			pod = got
+			return got != "", detail
+		})
+		return pod
+	}
+
+	// THE DANGEROUS STATE, and its removal whatever happens next, so a failed
+	// run does not leave it behind for the arms and gates that follow.
+	if at := strings.LastIndexByte(s4HoldPod, '-'); at <= 0 || s4HoldPod[:at] != s4HoldRS {
+		t.Fatalf("the fixture's pod %s is not named after its ReplicaSet %s: a pod's name is what it is walked back from to the ReplicaSet that selects it (the CLI's replicaSetOfPodName), and this arm's claim is about that ReplicaSet's recorded count", s4HoldPod, s4HoldRS)
+	}
+	deploymentUID := strings.TrimSpace(c.kubectl("get deployment s4-web -n " + namespace + " -o jsonpath={.metadata.uid}"))
+	if deploymentUID == "" {
+		t.Fatalf("deployment s4-web has no uid in %s, so the fixture cannot hold its pod out of its ReplicaSet's reach", namespace)
+	}
+	c.apply(s4MidRolloutHoldDocument(namespace, deploymentUID, fmt.Sprintf("s4-hold-%d", time.Now().UnixNano())))
+	t.Cleanup(func() {
+		for _, what := range []string{"replicaset " + s4HoldRS, "pod " + s4HoldPod, "persistentvolumeclaim " + s4HoldClaim} {
+			if out, err := k3s.Kubectl(context.Background(), c.runner, "delete "+what+" -n "+namespace+" --ignore-not-found"); err != nil {
+				t.Logf("removing the mid-rollout fixture's %s: %v (%s)", what, err, firstLineOfE2E(out))
+			}
+		}
+	})
+
+	// THE FIXTURE'S STATE, READ FROM THE CLUSTER, so the same reading can be
+	// taken before and after the backup: the state must not move while the
+	// backup is taken, because a backup holds one instant and a state that only
+	// existed outside it proves nothing.
+	const (
+		holdPodShape = `{.status.phase}|{.metadata.deletionTimestamp}|{.metadata.uid}|{.metadata.labels.pod-template-hash}|{.metadata.labels.app}|{.metadata.ownerReferences[0].kind}|{.metadata.ownerReferences[0].name}`
+		holdSetShape = `{.spec.replicas}|{.metadata.uid}|{.spec.selector.matchLabels.pod-template-hash}|{.spec.selector.matchLabels.app}`
+	)
+	type holdState struct {
+		podPhase, podDeleting, podUID, podHash, podApp string
+		podOwnerKind, podOwnerName                     string
+		replicas, setUID, setHash, setApp              string
+	}
+	readHold := func() (holdState, error) {
+		podOut, err := c.kubectlStatus("get pod " + s4HoldPod + " -n " + namespace + " -o jsonpath='" + holdPodShape + "'")
+		if err != nil {
+			return holdState{}, err
+		}
+		setOut, err := c.kubectlStatus("get rs " + s4HoldRS + " -n " + namespace + " -o jsonpath='" + holdSetShape + "'")
+		if err != nil {
+			return holdState{}, err
+		}
+		pod := strings.Split(strings.TrimSpace(podOut), "|")
+		set := strings.Split(strings.TrimSpace(setOut), "|")
+		for len(pod) < 7 {
+			pod = append(pod, "")
+		}
+		for len(set) < 4 {
+			set = append(set, "")
+		}
+		return holdState{pod[0], pod[1], pod[2], pod[3], pod[4], pod[5], pod[6], set[0], set[1], set[2], set[3]}, nil
+	}
+	assertHold := func(when string) holdState {
+		s, err := readHold()
+		if err != nil {
+			t.Fatalf("reading the fixture's state %s: %v", when, err)
+		}
+		if s.podPhase != "Running" {
+			t.Fatalf("the fixture's pod %s is %q %s, not Running: Velero creates a PodVolumeBackup only for a Running pod (pkg/podvolume/backupper.go), so the backup would hold no copy of its claim and this arm would prove nothing about kn-x0wv.2", s4HoldPod, s.podPhase, when)
+		}
+		if s.podDeleting != "" {
+			t.Fatalf("the fixture's pod %s carries a deletionTimestamp %s: Velero does not back up an item that is being deleted (pkg/backup/item_backupper.go), so the backup would hold no copy of it and this arm would prove nothing", s4HoldPod, when)
+		}
+		if s.podHash != s4HoldHash || s.setHash != s4HoldHash || s.podApp == "" || s.podApp != s.setApp {
+			t.Fatalf("ReplicaSet %s selects app=%q pod-template-hash=%q while the pod carries app=%q pod-template-hash=%q %s: the ReplicaSet would not adopt the restored pod by its selector, so the danger this arm restores into would not exist", s4HoldRS, s.setApp, s.setHash, s.podApp, s.podHash, when)
+		}
+		// WHY THE POD IS STILL THERE. A ReplicaSet ignores an object whose
+		// controller reference is not its own, so the fixture holds the pod by
+		// pointing its ownerReference at the workload's Deployment; a pod that is
+		// owned by this ReplicaSet, or owned by nothing, is deleted by it as soon
+		// as it is at zero (claimPods, then manageReplicas).
+		if s.podOwnerKind == "" || s.podOwnerName == "" {
+			t.Fatalf("the fixture's pod has no controller owner %s: a pod with the ReplicaSet's labels and no owner is adopted and deleted by ReplicaSet %s at 0 replicas, so the state would not hold long enough to be backed up", when, s4HoldRS)
+		}
+		if strings.EqualFold(s.podOwnerKind, "ReplicaSet") && s.podOwnerName == s4HoldRS {
+			t.Fatalf("the fixture's pod %s is owned by ReplicaSet %s itself %s, which is at 0 replicas: that controller deletes what it owns in the same sync it is scaled down, so the pod would not survive to be backed up", s4HoldPod, s4HoldRS, when)
+		}
+		if s.replicas != "0" {
+			t.Fatalf("ReplicaSet %s is at %q replica(s) %s, want 0: with the pod counted as its own, this would not be the zero-replica case the backup has to hold", s4HoldRS, s.replicas, when)
+		}
+		return s
+	}
+	c.waitFor(5*time.Minute, "the fixture's held pod to run on its claim", func() (bool, string) {
+		s, err := readHold()
+		if err != nil {
+			return false, firstLineOfE2E(err.Error())
+		}
+		if s.podPhase != "Running" {
+			return false, s4HoldPod + " is " + s.podPhase
+		}
+		return true, s4HoldPod + " is Running with pod-template-hash " + s.podHash
+	})
+	before := assertHold("before the backup")
+
+	// The two markers, one per claim, written through the pods that mount them:
+	// each with a value from this run, and a name no fixture container writes.
+	holdMarker := fmt.Sprintf("s4-hold-volume-%d", time.Now().UnixNano())
+	c.execIn(namespace, s4HoldPod, "echo "+holdMarker+" > "+s4HoldMarker+" && sync")
+	holdMarkerDigest := c.waitForDigestIn(namespace, s4HoldPod, s4HoldMarker)
+	proofPod := waitForWorkloadPod("the workload's own pod before the backup")
+	proofMarker := fmt.Sprintf("s4-mid-rollout-volume-%d", time.Now().UnixNano())
+	c.execIn(namespace, proofPod, "echo "+proofMarker+" > "+s4ProofMarker+" && sync")
+	proofMarkerDigest := c.waitForDigestIn(namespace, proofPod, s4ProofMarker)
+	written := c.waitForProof(namespace, proofPath)
+	holdClaimUID := strings.TrimSpace(c.kubectl("get persistentvolumeclaim " + s4HoldClaim + " -n " + namespace + " -o jsonpath={.metadata.uid}"))
+	if holdClaimUID == "" {
+		t.Fatalf("the fixture's claim %s has no uid, so the backup's copy of it could not be told from another claim's", s4HoldClaim)
+	}
+
+	// THE BACKUP.
+	var backupOut strings.Builder
+	if err := c.runCLI(&backupOut, append([]string{"backup", "now"}, c.verbArgs()...)...); err != nil {
+		t.Fatalf("backup now failed: %v\n%s", err, backupOut.String())
+	}
+	midBackup := s4BackupName(backupOut.String())
+	if midBackup == "" {
+		t.Fatalf("backup now did not name the backup it took:\n%s", backupOut.String())
+	}
+	t.Logf("mid-rollout backup %s taken", midBackup)
+	after := assertHold("after the backup")
+	if before.podUID != after.podUID || before.setUID != after.setUID {
+		t.Fatalf("the fixture was replaced while the backup was taken (pod uid %s then %s, ReplicaSet uid %s then %s): the backup does not hold the pod and ReplicaSet this arm checked", before.podUID, after.podUID, before.setUID, after.setUID)
+	}
+
+	// THE BACKUP HAS TO HOLD THE DANGER. The backup's PodVolumeBackups are the
+	// only place outside the object store that says which pods' volumes it
+	// copied — they are what the restore derives its rename rule from
+	// (pkg/backup, restoredPodsWithVolumeCopies) — so a backup that does not
+	// name this pod and this claim is not a run of kn-x0wv.2's case, and the arm
+	// fails here rather than going green on a state it never produced.
+	pvbs := c.kubectl(fmt.Sprintf(
+		`get podvolumebackups.velero.io -n velero -l velero.io/backup-name=%s -o jsonpath='{range .items[*]}{.spec.pod.namespace}/{.spec.pod.name} {.spec.volume} {.metadata.labels.velero\.io/pvc-uid}{"\n"}{end}'`,
+		midBackup))
+	wantCopy := namespace + "/" + s4HoldPod + " " + s4HoldVolume + " " + holdClaimUID
+	if !strings.Contains(pvbs, wantCopy) {
+		t.Fatalf("backup %s does not hold a copy of the fixture's claim: want %q among\n%s\n\nThis arm restores a backup taken while a pod whose ReplicaSet is at 0 replicas still held a volume copy, which is what kn-x0wv.2 is about, and a backup without that copy proves nothing. Velero skips a pod that is being deleted and copies the volume only of a Running one, so the fixture's pod must be Running and not terminating at backup time.",
+			midBackup, wantCopy, strings.TrimSpace(pvbs))
+	}
+	t.Logf("backup %s holds a PodVolumeBackup for %s (volume %s of claim %s/%s), whose ReplicaSet %s is on the cluster at 0 replicas",
+		midBackup, s4HoldPod, s4HoldVolume, namespace, s4HoldClaim, s4HoldRS)
+
+	// THE SCENARIO'S PREMISE, the same one the arms above use: the namespace is
+	// deleted and the reconcilers recreate it empty, which is the state
+	// --replace exists for.
+	c.kubectl("delete namespace " + namespace + " --wait=false")
+	c.waitFor(10*time.Minute, "the reconcilers to recreate the namespace", func() (bool, string) {
+		out, err := k3s.Kubectl(context.Background(), c.runner, "get namespace "+namespace+" -o name")
+		if err != nil {
+			return false, err.Error()
+		}
+		return strings.TrimSpace(out) != "", "the namespace is back"
+	})
+	c.waitFor(10*time.Minute, "the recreated namespace to hold a claim", func() (bool, string) {
+		out, err := k3s.Kubectl(context.Background(), c.runner, "get persistentvolumeclaim -n "+namespace+" -o jsonpath={.items[*].status.phase}")
+		if err != nil {
+			return false, err.Error()
+		}
+		phases := strings.Fields(out)
+		return len(phases) > 0, strings.Join(phases, ",")
+	})
+
+	// THE RESTORE, NAMED AND BOUNDED. Naming the backup matters: the arms above
+	// and this one leave newer backups behind, and --latest would restore
+	// whichever of them is newest rather than the one this arm's state is in. A
+	// restore that waits out a PodVolumeRestore whose pod a zero-replica
+	// ReplicaSet adopted and deleted blocks here until the deadline; the bound is
+	// far below Velero's own itemOperationTimeout (4h), so the failure says what
+	// happened instead of tying up the lab for hours.
+	ctx, cancel := context.WithTimeout(context.Background(), s4MidRolloutBound)
+	defer cancel()
+	var plan strings.Builder
+	began := time.Now()
+	restoreErr := c.runCLIWithContext(ctx, &plan, append([]string{"backup", "restore", "--namespace", namespace, "--from", midBackup, "--replace", "--confirm"}, c.verbArgs()...)...)
+	took := time.Since(began)
+	if restoreErr != nil || !strings.Contains(plan.String(), "restored — awaiting activation") {
+		t.Fatalf("the mid-rollout backup %s did not restore within %s: %v\n%s\n\nA PodVolumeRestore whose pod a zero-replica ReplicaSet adopted and deleted makes Velero wait its itemOperationTimeout (4h) and the CLI wait its own restore timeout, which is kn-x0wv.2; the rename rule (backup.RestoredPodHash) is what stops it, and the state the backup must hold is checked above.",
+			midBackup, s4MidRolloutBound, restoreErr, plan.String())
+	}
+	t.Logf("the mid-rollout backup restored in %s, inside the %s bound", took.Round(time.Second), s4MidRolloutBound)
+	operationID := s4OperationID(plan.String())
+	if operationID == "" {
+		t.Fatalf("the run printed no operation id, so nothing can be activated:\n%s", plan.String())
+	}
+
+	// THE RESTORED STATE, BEFORE ACTIVATION. THIS IS THE FIX.
+	//
+	// The ReplicaSet is read from the RESTORED namespace, which is the backup:
+	// its being at zero is the proof that the backup held the danger.
+	if replicas := strings.TrimSpace(c.kubectl("get rs " + s4HoldRS + " -n " + namespace + " -o jsonpath={.spec.replicas}")); replicas != "0" {
+		t.Errorf("the restored ReplicaSet %s is at %q replica(s), want 0: the backup did not hold it at zero, so this restore did not run kn-x0wv.2's case", s4HoldRS, replicas)
+	}
+	// The pod Velero restored for that volume copy is ALIVE and carries the
+	// rename hash. Without the rename its pod-template-hash would still be
+	// kubenest-hold, the ReplicaSet at 0 would adopt it by its selector and
+	// delete it, and its PodVolumeRestore would never run.
+	c.waitFor(5*time.Minute, "the restored pod to be alive with its volume filled", func() (bool, string) {
+		out, err := c.kubectlStatus("get pod " + s4HoldPod + " -n " + namespace + " -o jsonpath='{.metadata.labels.pod-template-hash}|{.status.phase}|{.metadata.deletionTimestamp}'")
+		if err != nil {
+			return false, firstLineOfE2E(err.Error())
+		}
+		fields := strings.Split(strings.TrimSpace(out), "|")
+		if len(fields) < 3 {
+			return false, strings.TrimSpace(out)
+		}
+		if fields[0] != backup.RestoredPodHash {
+			return false, "the restored pod carries pod-template-hash " + fields[0] + ", not " + backup.RestoredPodHash
+		}
+		if fields[2] != "" {
+			return false, "the restored pod is being deleted"
+		}
+		return fields[1] == "Running", "pod-template-hash " + fields[0] + ", phase " + fields[1]
+	})
+	// Its PodVolumeRestore COMPLETED: the volume the danger threatened was
+	// filled. (The marker's digest below is the stronger form of the same fact,
+	// because no container writes that file.)
+	pvrs := c.kubectl(fmt.Sprintf(`get podvolumerestores.velero.io -n velero -l velero.io/restore-name=kubenest-restore-%s -o jsonpath='{range .items[*]}{.spec.pod.name} {.spec.volume} {.status.phase}{"\n"}{end}'`, operationID))
+	if want := s4HoldPod + " " + s4HoldVolume + " Completed"; !strings.Contains(pvrs, want) {
+		t.Errorf("the restore's PodVolumeRestores do not include %q, so the volume copied for the pod whose ReplicaSet is at zero was not shown to be filled:\n%s", want, strings.TrimSpace(pvrs))
+	}
+	if got := c.waitForDigestIn(namespace, s4HoldPod, s4HoldMarker); got != holdMarkerDigest {
+		t.Errorf("the restored claim's %s is %s, want the %s written before the backup: the volume the danger threatened does not hold the bytes the backup copied", s4HoldMarker, got, holdMarkerDigest)
+	}
+	// The workload's own pod and its claim: the ordinary half of the restore,
+	// which the danger must not have disturbed.
+	proofPod = waitForWorkloadPod("the workload's own pod on the restored claim")
+	if got := c.waitForDigestIn(namespace, proofPod, s4ProofMarker); got != proofMarkerDigest {
+		t.Errorf("the restored claim's %s is %s, want the %s written before the backup", s4ProofMarker, got, proofMarkerDigest)
+	}
+	if got := c.waitForDigestIn(namespace, proofPod, proofPath); got != written {
+		t.Errorf("the restored %s is %s, want the %s written before the backup", proofPath, got, written)
+	}
+
+	// ACTIVATION: the pause is lifted, the restored pod — which existed only to
+	// fill the volumes — is deleted, and the workload's own controller's pods
+	// take the claims over.
+	var activation strings.Builder
+	if err := c.runCLI(&activation, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, c.verbArgs()...)...); err != nil {
+		t.Fatalf("activation failed: %v\n%s", err, activation.String())
+	}
+	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != "" {
+		t.Errorf("activation left the pause in place (%q)", pause)
+	}
+	// No pod carrying the rename hash is left.
+	if left := strings.TrimSpace(c.kubectl("get pods -n " + namespace + " -l pod-template-hash=" + backup.RestoredPodHash + " -o name")); left != "" {
+		t.Errorf("activation left %s: a restored pod carried the restored data and mounted the claim, and the workload's own controller creates the pod that takes it over", left)
+	}
+	// The Deployment's OWN pod — a pod whose pod-template-hash matches a
+	// ReplicaSet with replicas > 0 — is Running on the restored claim.
+	ownPod := waitForWorkloadPod("the workload's own pod after activation")
+	at := strings.LastIndexByte(ownPod, '-')
+	if at <= 0 {
+		t.Fatalf("the workload's pod %q carries no ReplicaSet name, so its ReplicaSet cannot be checked", ownPod)
+	}
+	ownSet := ownPod[:at]
+	ownHash := strings.TrimSpace(c.kubectl("get pod " + ownPod + " -n " + namespace + " -o jsonpath={.metadata.labels.pod-template-hash}"))
+	ownReplicas := strings.TrimSpace(c.kubectl("get rs " + ownSet + " -n " + namespace + " -o jsonpath={.spec.replicas}"))
+	if ownHash == backup.RestoredPodHash || ownHash == "" || ownReplicas == "" || ownReplicas == "0" {
+		t.Errorf("the workload's pod %s carries pod-template-hash %q and ReplicaSet %s is at %q replica(s): want the workload's own pod, whose ReplicaSet has replicas", ownPod, ownHash, ownSet, ownReplicas)
+	}
+	if got := c.waitForDigestIn(namespace, ownPod, proofPath); got != written {
+		t.Errorf("the workload's own pod %s reads %s = %s, want the %s written before the backup: the restored data did not survive activation", ownPod, proofPath, got, written)
+	}
+	if got := c.waitForDigestIn(namespace, ownPod, s4ProofMarker); got != proofMarkerDigest {
+		t.Errorf("the workload's own pod %s reads %s = %s, want the %s written before the backup", ownPod, s4ProofMarker, got, proofMarkerDigest)
+	}
+	// WHAT IS PUT BACK: the fixture's claim, ReplicaSet and held pod are removed
+	// by the cleanup above, and the S4 workload's own spec is never touched by
+	// this arm — the dangerous state is this arm's own objects, so the arms and
+	// gates that follow find the namespace as they left it.
+	t.Logf("after activation the workload's own pod %s (pod-template-hash %s, ReplicaSet %s at %s replica(s)) is Running on the restored claim", ownPod, ownHash, ownSet, ownReplicas)
+}
+
+// s4MidRolloutHoldDocument is the dangerous state written out: the claim, the
+// ReplicaSet at zero replicas that selects the pod, and the pod itself —
+// Running, mounted on the claim, carrying the ReplicaSet's selector labels, and
+// held out of the ReplicaSet's reach by an ownerReference to the workload's
+// Deployment (deploymentUID), which manages no pods.
+//
+// THE POD IS WRITTEN OUT BY HAND. There is no sequence of ReplicaSet operations
+// that leaves a Running pod beside its own ReplicaSet at zero replicas: the
+// controller claims the pod and deletes it in the same sync, which is the
+// milliseconds-wide window w3's backup caught (see the comment on s4MidRollout).
+// Its name still follows the naming convention a ReplicaSet uses
+// (<replicaset>-<suffix>), which is what lets a pod's name be walked back to its
+// ReplicaSet (the CLI's replicaSetOfPodName), and its labels are the
+// ReplicaSet's selector, which is what the restore's danger is made of.
+//
+// The verbs are: %[1]s namespace, %[2]s pod, %[3]s ReplicaSet, %[4]s claim,
+// %[5]s pod-template-hash, %[6]s the value the fixture's container writes,
+// %[7]s the pod's volume name, %[8]s the workload Deployment's uid.
+func s4MidRolloutHoldDocument(namespace, deploymentUID, started string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: %[4]s, namespace: %[1]s}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata: {name: %[3]s, namespace: %[1]s}
+spec:
+  replicas: 0
+  selector: {matchLabels: {app: s4-hold, pod-template-hash: %[5]s}}
+  template:
+    metadata: {labels: {app: s4-hold, pod-template-hash: %[5]s}}
+    spec:
+      containers:
+        - name: hold
+          image: busybox:1.36
+          command: [sh, -c, "echo %[6]s > /data/started.txt && sync && sleep 1000000"]
+          volumeMounts: [{name: %[7]s, mountPath: /data}]
+      volumes:
+        - {name: %[7]s, persistentVolumeClaim: {claimName: %[4]s}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: %[2]s
+  namespace: %[1]s
+  labels: {app: s4-hold, pod-template-hash: %[5]s}
+  ownerReferences:
+    - {apiVersion: apps/v1, kind: Deployment, name: s4-web, uid: %[8]s, controller: true}
+spec:
+  containers:
+    - name: hold
+      image: busybox:1.36
+      command: [sh, -c, "echo %[6]s > /data/started.txt && sync && sleep 1000000"]
+      volumeMounts: [{name: %[7]s, mountPath: /data}]
+  volumes:
+    - {name: %[7]s, persistentVolumeClaim: {claimName: %[4]s}}
+`, namespace, s4HoldPod, s4HoldRS, s4HoldClaim, s4HoldHash, started, s4HoldVolume, deploymentUID)
+}
+
+// execIn runs one shell command inside a pod. The gate writes the markers into
+// claims with it. The command is built from fixture-safe values (letters,
+// digits, dashes, dots, slashes), so it is quoted as a whole and needs no
+// escaping of its own.
+func (c *s4Cluster) execIn(namespace, pod, command string) string {
+	c.t.Helper()
+	return c.kubectl(fmt.Sprintf("-n %s exec %s -- sh -c '%s'", namespace, pod, command))
+}
+
+// sha256InPod reads a file's digest through one NAMED pod.
+func (c *s4Cluster) sha256InPod(namespace, pod, path string) string {
+	c.t.Helper()
+	out, err := k3s.Kubectl(context.Background(), c.runner, fmt.Sprintf("-n %s exec %s -- sha256sum %s", namespace, pod, path))
+	if err != nil {
+		c.t.Logf("reading %s through pod %s/%s: %v", path, namespace, pod, err)
+		return ""
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// waitForDigestIn is waitForProof for a named pod: for a file on a claim whose
+// pods do not carry the workload's labels.
+func (c *s4Cluster) waitForDigestIn(namespace, pod, path string) string {
+	c.t.Helper()
+	var digest string
+	c.waitFor(5*time.Minute, "the file "+path+" of pod "+pod, func() (bool, string) {
+		digest = c.sha256InPod(namespace, pod, path)
+		if digest == "" {
+			return false, "no digest yet (the pod may still be starting)"
+		}
+		return true, digest
+	})
+	return digest
 }
 
 // The reconcilers the gate restarts, by label: an install names them after its
@@ -801,15 +1315,5 @@ func (c *s4Cluster) sha256OfProof(namespace, path string) string {
 	if pod == "" {
 		return ""
 	}
-	out, err = k3s.Kubectl(context.Background(), c.runner,
-		fmt.Sprintf("-n %s exec %s -- sha256sum %s", namespace, pod, path))
-	if err != nil {
-		c.t.Logf("reading %s through pod %s/%s: %v", path, namespace, pod, err)
-		return ""
-	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[0]
+	return c.sha256InPod(namespace, pod, path)
 }
