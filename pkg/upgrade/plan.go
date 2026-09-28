@@ -233,7 +233,7 @@ func stageComponents(ctx context.Context, s *Session) error {
 		// so a stage that only waited for health would report success for an
 		// upgrade that changed nothing. Observed on a real cluster with a
 		// deliberately poisoned pin, which sailed through this stage.
-		if err := stages.NewComponentError(c.key, confirmVersion(ctx, server, c.key, to, s)); err != nil {
+		if err := stages.NewComponentError(c.key, confirmVersion(ctx, server, c.key, to, s.To, s.Reporter)); err != nil {
 			return err
 		}
 	}
@@ -244,12 +244,12 @@ func stageComponents(ctx context.Context, s *Session) error {
 // version the bundle pins AND that its release actually deployed at that
 // version. Release-manifest components have no chart to check and are proven
 // by their own readiness.
-func confirmVersion(ctx context.Context, r k3s.Runner, key, want string, s *Session) error {
+func confirmVersion(ctx context.Context, r k3s.Runner, key, want string, bundle *manifest.Manifest, rep converge.Reporter) error {
 	resource := ChartResource(key)
 	if resource == "" {
 		return nil
 	}
-	deadline, err := s.To.Limits.Timeouts.For("component-ready")
+	deadline, err := bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return err
 	}
@@ -289,7 +289,7 @@ func confirmVersion(ctx context.Context, r k3s.Runner, key, want string, s *Sess
 		return true, converge.State{Object: object, Status: "deployed at " + want}, nil
 	}
 	res, err := converge.Wait(ctx, probe, converge.Options{
-		Name: key + "-at-" + want, Deadline: deadline, Reporter: s.Reporter,
+		Name: key + "-at-" + want, Deadline: deadline, Reporter: rep,
 	})
 	if err != nil {
 		return err

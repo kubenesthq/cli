@@ -2,10 +2,14 @@ package upgrade
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
 	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 )
@@ -124,5 +128,35 @@ func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "encrypted with different token") {
 		t.Errorf("the error does not carry k3s's reason, only: %v", err)
+	}
+}
+
+// A revert is done when the chart REPORTS the starting bundle's version and its
+// apply job succeeded, not when the component's pods are Ready: after a failed
+// upgrade the previous release never stopped serving, so its pods are Ready
+// before the reverted chart is even applied. Lab up, 2026-09-28: the rollback
+// returned while kubenest-traefik still read 0.0.0-does-not-exist.
+func TestARevertIsNotDoneUntilTheChartReportsTheStartingVersion(t *testing.T) {
+	from := parseManifest(t, "bundle: \"1.1\"\ncore:\n  traefik: 41.4.0\nlimits:\n  timeouts:\n    component-ready: 2s\n")
+	chartAt := func(version string) *componenttest.FakeRunner {
+		return &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, "get helmchart kubenest-traefik"):
+				return sshx.Result{Stdout: version + " helm-install-kubenest-traefik"}, nil
+			case strings.Contains(command, "get job helm-install-kubenest-traefik"):
+				return sshx.Result{Stdout: "1"}, nil
+			}
+			return sshx.Result{}, nil
+		}}
+	}
+	healthyAlready := coreComponent{key: "traefik", install: func(context.Context, k3s.Runner, *manifest.Manifest, converge.Reporter) error {
+		return nil
+	}}
+	rep := converge.NewTextReporter(io.Discard)
+	if err := revertComponent(context.Background(), chartAt("0.0.0-does-not-exist"), healthyAlready, "41.4.0", from, rep); err == nil {
+		t.Fatal("the revert reported done while the chart still pins the failed version")
+	}
+	if err := revertComponent(context.Background(), chartAt("41.4.0"), healthyAlready, "41.4.0", from, rep); err != nil {
+		t.Fatalf("the chart reports 41.4.0 and its job succeeded, yet the revert failed: %v", err)
 	}
 }

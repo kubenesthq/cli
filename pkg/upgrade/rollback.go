@@ -169,11 +169,23 @@ func RevertComponents(ctx context.Context, r k3s.Runner, from *manifest.Manifest
 			continue
 		}
 		log("  reverting %s to %s", c.key, version)
-		if err := stages.NewComponentError(c.key, c.install(ctx, r, from, rep)); err != nil {
+		if err := revertComponent(ctx, r, c, version, from, rep); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// revertComponent reinstalls one component at the starting bundle's pin AND
+// PROVES IT MOVED BACK, exactly as the upgrade proves it moved forward: after a
+// failed upgrade the previous release never stopped serving, so the component's
+// pods are Ready before the reverted chart is even applied, and waiting for
+// health alone reports a revert that has not happened.
+func revertComponent(ctx context.Context, r k3s.Runner, c coreComponent, version string, from *manifest.Manifest, rep converge.Reporter) error {
+	if err := stages.NewComponentError(c.key, c.install(ctx, r, from, rep)); err != nil {
+		return err
+	}
+	return stages.NewComponentError(c.key, confirmVersion(ctx, r, c.key, version, from, rep))
 }
 
 // snapshotDir is where k3s keeps its local datastore snapshots.
