@@ -148,5 +148,32 @@ func TestTheSingleFormIsRefusedOnNodesThatDoNotHaveThatVolume(t *testing.T) {
 		if !strings.Contains(err.Error(), node) {
 			t.Errorf("the aggregate refusal %q does not name %s", err, node)
 		}
+		// The refusal must also offer the way through: on a multi-node install
+		// the remedy is this node's own device, named for this node.
+		if want := "--storage-device " + node + "="; !strings.Contains(res.Fix, want) {
+			t.Errorf("%s: the remedy %q does not show the per-node form %q, so it offers no way through", node, res.Fix, want)
+		}
+	}
+}
+
+// `node add` hands preflight the existing server as a port peer beside the one
+// agent it installs, and it takes one device for that one host. A refusal there
+// must not offer the per-node form, which `node add` does not accept.
+func TestANodeAddRefusalDoesNotOfferThePerNodeForm(t *testing.T) {
+	opts := threeNodeLabOptions(t)
+	opts.Nodes = opts.Nodes[:2]
+	opts.Nodes[0].PortPeer = true
+	opts.StorageDevices = storage.Devices{All: labVolumeA}
+
+	rep, err := preflight.Run(context.Background(), opts)
+	if err == nil {
+		t.Fatalf("%s does not have %s and was accepted", labNodeB, labVolumeA)
+	}
+	res, ok := volumeGroupResult(rep, labNodeB)
+	if !ok || res.Outcome != preflight.Fail {
+		t.Fatalf("%s must be refused for a device it does not have, got %+v", labNodeB, res)
+	}
+	if strings.Contains(res.Fix, labNodeB+"=") {
+		t.Errorf("the node add remedy %q offers the per-node form, which node add does not take", res.Fix)
 	}
 }

@@ -291,6 +291,13 @@ func checkVolumeGroup(ctx context.Context, opts Options, node Node, rep *Report)
 		fix := "create it before installing: `sudo vgcreate " + storage.VolumeGroup + " <device>` (lvm2 ships on the stock Ubuntu 24.04 cloud image), or pass --storage-device with a blank device for the installer to create it"
 		if device != "" {
 			fix = "--storage-device must name a device with no partition table, filesystem or existing volume group; use the stable /dev/disk/by-id/... path"
+			// One device for every node of a multi-node install: that path
+			// carries the volume's serial, so it differs on every host, and the
+			// way through is this node's own device, named for this node.
+			if len(opts.StorageDevices.PerHost) == 0 && installedNodes(opts) > 1 {
+				fix += ". On a multi-node install that path differs on every host, so name each node's own device, once per node: --storage-device " +
+					node.Address + "=<this node's device> (ls /dev/disk/by-id/ on the node)"
+			}
 		}
 		rep.add(Result{Check: CheckVolumeGroup, Node: node.Address, Outcome: Fail, Detail: err.Error(), Fix: fix})
 		return
@@ -300,6 +307,19 @@ func checkVolumeGroup(ctx context.Context, opts Options, node Node, rep *Report)
 		detail = device + " is blank; the installer will create " + storage.VolumeGroup + " on it"
 	}
 	rep.add(Result{Check: CheckVolumeGroup, Node: node.Address, Outcome: Pass, Detail: detail})
+}
+
+// installedNodes counts the nodes this run installs. A port peer (the existing
+// server during `node add`) is only the other end of the port checks, so a
+// `node add` with its one device is not a multi-node install.
+func installedNodes(opts Options) int {
+	n := 0
+	for _, node := range opts.Nodes {
+		if !node.PortPeer {
+			n++
+		}
+	}
+	return n
 }
 
 // checkEgress proves the node can reach the registries and chart repositories
