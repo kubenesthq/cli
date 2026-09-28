@@ -11,6 +11,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/controlplane"
+	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/recovery"
 	"kubenest.io/cli/pkg/recoverykit"
@@ -386,6 +387,25 @@ func stageRecoveryCheckpoint(ctx context.Context, s *Session) error {
 	if s.recoveryCheckpoint == nil || len(s.recoveryCheckpointDump) == 0 {
 		return errors.New("the recovery pre-flight did not select a checkpoint, so there is nothing to load into the database")
 	}
+	// THE DATABASE POD IS WAITED FOR, IN THIS ONE PLACE, AND NOT IN THE STAGE
+	// THAT APPLIED THE CHART. `recovery-control-plane` writes the HelmChart and
+	// returns; k3s's Helm controller installs the release afterwards, so at this
+	// point the pod may be seconds from existing. Waiting here rather than there
+	// is the single place to wait: the chart apply is deliberately HOLDING the
+	// backend, so a readiness wait over the whole release would wait for
+	// something that will not be ready until this stage starts it, while the
+	// database is a dependency of exactly what this stage does next.
+	//
+	// A RESUME RE-RUNS THIS STAGE, which is why the wait is inside it: the
+	// journal skips completed stages, this one failed, and on the second attempt
+	// the pod is there and the wait returns immediately.
+	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return fmt.Errorf("the bundle declares no component-ready timeout, so waiting for the database pod has no deadline and this stage will not guess one: %w", err)
+	}
+	if err := s.waitForDatabasePod(ctx, server, deadline, 5*time.Second); err != nil {
+		return err
+	}
 	if err := controlplane.RestoreCheckpoint(ctx, server, s.recoveryCheckpoint.DumpKey, s.recoveryCheckpointDump, s.Opts.Recovery.FleetKey, s.Reporter); err != nil {
 		return err
 	}
@@ -465,6 +485,34 @@ func (s *Session) openControlPlaneTunnel(ctx context.Context, server k3s.Runner)
 		return nil, err
 	}
 	return open(api.WithToken(token))
+}
+
+// waitForDatabasePod waits until the control plane's database pod exists and is
+// Ready, bounded by the deadline its caller took from the bundle manifest, and
+// reports what the pod is doing while it waits.
+func (s *Session) waitForDatabasePod(ctx context.Context, r k3s.Runner, deadline, interval time.Duration) error {
+	if deadline <= 0 {
+		return errors.New("waiting for the database pod was given no deadline: every wait in this CLI is bounded by the bundle's limits, and a default here would be an unbounded one")
+	}
+	// WAIT'S RESULT IS THE VERDICT, and its error is only the transport. A
+	// deadline that expires returns a Fail with a nil error, so a caller that
+	// checked only `err` would carry on with an observation it had just
+	// refused — which is what this stage did before the hardware run.
+	result, err := converge.Wait(ctx, func(ctx context.Context) (bool, converge.State, error) {
+		return controlplane.DatabasePodState(ctx, r)
+	}, converge.Options{
+		Name:     "control-plane database",
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: s.Reporter,
+	})
+	if err != nil {
+		return fmt.Errorf("waiting for the control plane's database pod before restoring the checkpoint into it: %w", err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("the control plane's database is not serving, so the checkpoint is not loaded into it: %w. The chart is applied and its Postgres is not Ready; a resume re-runs this stage and waits again", err)
+	}
+	return nil
 }
 
 // stageRecoveryProvisional compares the desired state the restored database

@@ -646,12 +646,20 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 			}
 			return true, converge.State{Object: "project " + ns, Status: "present"}, nil
 		}
-		if _, err := converge.Wait(ctx, probe, converge.Options{
+		// The RESULT is the verdict and the error is only the transport: a
+		// deadline that expires returns a Fail with a nil error, and activating
+		// a project whose wait failed is exactly the ordering this stage exists
+		// to prevent.
+		result, err := converge.Wait(ctx, probe, converge.Options{
 			Name:     "project/" + ns,
 			Deadline: deadline,
 			Reporter: s.Reporter,
-		}); err != nil {
-			return fmt.Errorf("waiting for the project of restored namespace %s: %w. Its data is restored and its project is still held; the cluster is safe, and re-running this install resumes here", ns, err)
+		})
+		if err != nil {
+			return fmt.Errorf("waiting for the project of restored namespace %s: %w", ns, err)
+		}
+		if err := result.Err(); err != nil {
+			return fmt.Errorf("the project of restored namespace %s is not there, so it is not activated: %w. Its data is restored and the cluster is safe; re-running this install resumes here", ns, err)
 		}
 		if err := cluster.AnnotateProject(ctx, ns, backup.ActivateAnnotationKey, s.recoveryOpID); err != nil {
 			return stages.NewComponentError("kubenest-agent", fmt.Errorf("activating project %s: %w", ns, err))

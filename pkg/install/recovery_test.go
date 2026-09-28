@@ -1099,3 +1099,70 @@ func (b *scopedBucket) List(_ context.Context, prefix string) ([]string, bool, e
 	sort.Strings(keys)
 	return keys, false, nil
 }
+
+// TestTheCheckpointStageWaitsForTheDatabasePod is the hardware defect of
+// 2026-09-28: `recovery-control-plane` writes the HelmChart and returns, k3s's
+// Helm controller installs it asynchronously, and the checkpoint stage looked
+// for the database pod at once and refused — three seconds before it existed.
+func TestTheCheckpointStageWaitsForTheDatabasePod(t *testing.T) {
+	const podLookup = "app.kubernetes.io/instance=kubenest-cp,app.kubernetes.io/name=postgresql"
+	const statefulset = `{"spec":{"replicas":1},"status":{"readyReplicas":%d}}`
+
+	// The pod does not exist for the first two observations, and the
+	// StatefulSet reports no ready replica until the third.
+	podLookups, stsLookups := 0, 0
+	runner := &recordingRunner{respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.Contains(command, "get pods") && strings.Contains(command, podLookup):
+			podLookups++
+			if podLookups < 3 {
+				return sshx.Result{Stdout: ""}, nil
+			}
+			return sshx.Result{Stdout: "kubenest-cp-postgresql-0"}, nil
+		case strings.Contains(command, "get statefulset"):
+			stsLookups++
+			ready := 0
+			if stsLookups >= 3 {
+				ready = 1
+			}
+			return sshx.Result{Stdout: fmt.Sprintf(statefulset, ready)}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	s, _ := recoverySession(t, Options{Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server"})
+	if err := s.waitForDatabasePod(context.Background(), runner, 10*time.Second, 20*time.Millisecond); err != nil {
+		t.Fatalf("the database pod appeared after two polls and the stage gave up: %v", err)
+	}
+	if podLookups < 3 {
+		t.Fatalf("the pod was looked up %d time(s): a single look is what refused a pod that existed three seconds later", podLookups)
+	}
+
+	// A pod that never becomes Ready fails at the deadline, and the failure
+	// names the last state rather than "timed out".
+	stuck := &recordingRunner{respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.Contains(command, "get pods") && strings.Contains(command, podLookup):
+			return sshx.Result{Stdout: "kubenest-cp-postgresql-0"}, nil
+		case strings.Contains(command, "get statefulset"):
+			return sshx.Result{Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":0}}`}, nil
+		case strings.Contains(command, "get pod kubenest-cp-postgresql-0"):
+			return sshx.Result{Stdout: `{"status":{"phase":"Pending","conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":"0/1 nodes are available: 1 Insufficient storage"}],"containerStatuses":[{"state":{"waiting":{"reason":"ContainerCreating"}}}]}}`}, nil
+		}
+		return sshx.Result{}, nil
+	}}
+	err := s.waitForDatabasePod(context.Background(), stuck, 200*time.Millisecond, 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("a database pod that never became Ready let the restore run")
+	}
+	for _, want := range []string{"0/1 Ready", "Unschedulable"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the failure does not name %q, so a stuck claim reads as an unexplained timeout: %v", want, err)
+		}
+	}
+
+	// And a wait with no deadline is refused rather than defaulted: every wait
+	// in this CLI is bounded by the bundle's limits.
+	if err := s.waitForDatabasePod(context.Background(), runner, 0, time.Second); err == nil {
+		t.Fatal("waiting for the database pod with no deadline was accepted")
+	}
+}

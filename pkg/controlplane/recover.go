@@ -171,6 +171,95 @@ func StartBackend(valuesYAML string, replicas int32) (string, error) {
 	return FenceValues(valuesYAML, FenceOptions{Up: false, BackendReplicas: int32Ptr(replicas)})
 }
 
+// DatabasePodState observes whether the database pod EXISTS and is READY, and
+// says what it is doing when it is not.
+//
+// IT IS A CONVERGE PROBE, NOT A CHECK, because the chart goes on asynchronously:
+// `recovery-control-plane` writes the HelmChart and returns, k3s's Helm
+// controller installs it afterwards, and three seconds later the pod is there
+// (found on hardware 2026-09-28 — the restore looked for it immediately and
+// refused). The state it reports while waiting is the point: "Pending" with the
+// scheduler's reason names a stuck claim or an unpullable image, where "not
+// found yet" names nothing.
+func DatabasePodState(ctx context.Context, r k3s.Runner) (bool, converge.State, error) {
+	pod, err := DatabasePod(ctx, r)
+	if err != nil {
+		return false, converge.State{
+			Object: "the database pod in " + Namespace,
+			Status: "absent",
+			Detail: "the chart's install Job has not created it yet (looked for " + postgresSelector() + ")",
+		}, nil
+	}
+	ready, state, err := postgresReady(ctx, r)
+	if err != nil {
+		return false, converge.State{Object: "pod " + pod, Status: "not observed yet", Detail: err.Error()}, nil
+	}
+	state.Object = "pod " + pod
+	if ready {
+		return true, state, nil
+	}
+	if reason := podWaitingReason(ctx, r, pod); reason != "" {
+		state.Detail = reason
+	}
+	return false, state, nil
+}
+
+// podWaitingReason reads why a pod that exists is not Ready: its phase, and the
+// first container's waiting reason and message.
+func podWaitingReason(ctx context.Context, r k3s.Runner, pod string) string {
+	out, err := k3s.Kubectl(ctx, r, "get pod "+pod+" -n "+Namespace+" -o json")
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		Status struct {
+			Phase      string `json:"phase"`
+			Reason     string `json:"reason"`
+			Message    string `json:"message"`
+			Conditions []struct {
+				Type    string `json:"type"`
+				Status  string `json:"status"`
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+			} `json:"conditions"`
+			ContainerStatuses []struct {
+				State struct {
+					Waiting *struct {
+						Reason  string `json:"reason"`
+						Message string `json:"message"`
+					} `json:"waiting"`
+				} `json:"state"`
+			} `json:"containerStatuses"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		return ""
+	}
+	var parts []string
+	if doc.Status.Phase != "" {
+		parts = append(parts, doc.Status.Phase)
+	}
+	if doc.Status.Reason != "" || doc.Status.Message != "" {
+		parts = append(parts, strings.TrimSpace(doc.Status.Reason+" "+doc.Status.Message))
+	}
+	for _, condition := range doc.Status.Conditions {
+		if condition.Status == "False" {
+			parts = append(parts, condition.Type+": "+strings.TrimSpace(condition.Reason+" "+condition.Message))
+		}
+	}
+	for _, container := range doc.Status.ContainerStatuses {
+		if container.State.Waiting != nil {
+			parts = append(parts, strings.TrimSpace(container.State.Waiting.Reason+" "+container.State.Waiting.Message))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// postgresSelector is the label selector the chart's Postgres subchart sets.
+func postgresSelector() string {
+	return "app.kubernetes.io/instance=" + ReleaseName + ",app.kubernetes.io/name=postgresql"
+}
+
 // RestoreCheckpoint loads one checkpoint's dump into the control plane's
 // database.
 //
@@ -194,7 +283,7 @@ func RestoreCheckpoint(ctx context.Context, r k3s.Runner, checkpointKey string, 
 	if err != nil {
 		return fmt.Errorf("opening the checkpoint at %s with the fleet key supplied: %w. A checkpoint that does not open is not restored by retrying it: this key is not the one the checkpoint was sealed to, or it was mistyped", checkpointKey, err)
 	}
-	pod, err := postgresPod(ctx, r)
+	pod, err := DatabasePod(ctx, r)
 	if err != nil {
 		return err
 	}
@@ -209,9 +298,9 @@ func RestoreCheckpoint(ctx context.Context, r k3s.Runner, checkpointKey string, 
 	return nil
 }
 
-// postgresPod finds the database pod the restore runs inside, by the labels the
-// chart's Postgres subchart sets, and falls back to the release's own name.
-func postgresPod(ctx context.Context, r k3s.Runner) (string, error) {
+// DatabasePod finds the database pod the recovery works inside, by the labels
+// the chart's Postgres subchart sets, and falls back to the release's own name.
+func DatabasePod(ctx context.Context, r k3s.Runner) (string, error) {
 	selector := "app.kubernetes.io/instance=" + ReleaseName + ",app.kubernetes.io/name=postgresql"
 	out, err := k3s.Kubectl(ctx, r, "get pods -n "+Namespace+" -l "+selector+" -o jsonpath={.items[0].metadata.name}")
 	if err == nil {
