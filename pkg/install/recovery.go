@@ -511,6 +511,16 @@ func stageRecoveryRegister(ctx context.Context, s *Session) error {
 	s.orgID = cluster.OrgID
 	s.Record.Adopted = true
 
+	// A RESUME DOES NOT RECORD A SECOND INCARNATION. The operator is already
+	// installed and holding credentials from the earlier attempt, so minting
+	// again would bump the token version a second time and raise the floor
+	// above the token that machine is using — the same reason the ordinary
+	// register stage re-mints only when the agent stage is still ahead of it.
+	if _, agentInstalled := s.Jnl.Completed(StageAgent); agentInstalled {
+		s.Logf("  the incarnation was already recorded and the agent installed by an earlier attempt; not recording another or re-minting")
+		return s.saveRecord()
+	}
+
 	incarnation, err := client.RecordIncarnation(ctx, cluster.ID, "recovery",
 		fmt.Sprintf("rebuilt from recovery set %s on host %s", s.recoverySel.SetKey, s.Opts.Servers[0]))
 	if err != nil {
@@ -588,6 +598,10 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		Runner:  server,
 	}
 	for _, namespace := range namespaces {
+		if containsString(s.Record.RecoveryNamespacesRestored, namespace) {
+			s.Logf("  namespace %s was already restored by this recovery: not restoring it again over its own data", namespace)
+			continue
+		}
 		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
 		opts := backup.RestoreOptions{
 			Cluster:   s.recoveryName(),
@@ -604,8 +618,23 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
 			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
 		}
+		s.Record.RecoveryNamespacesRestored = append(s.Record.RecoveryNamespacesRestored, namespace)
+		if err := s.saveRecord(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// containsString is the membership test the recovery's journalled "already
+// done" lists use.
+func containsString(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
+		}
+	}
+	return false
 }
 
 // stageRecoveryActivate releases the projects recovery mode held, once their
@@ -635,6 +664,10 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 		return fmt.Errorf("the bundle declares no component-ready timeout, so waiting for a project to appear has no deadline and this stage will not guess one: %w", err)
 	}
 	for _, namespace := range s.workloadSelection().Backup.Coverage {
+		if containsString(s.Record.RecoveryNamespacesActivated, namespace) {
+			s.Logf("  %s was already activated by this recovery", namespace)
+			continue
+		}
 		ns := namespace
 		probe := func(ctx context.Context) (bool, converge.State, error) {
 			hold, err := cluster.ProjectHold(ctx, ns)
@@ -665,6 +698,10 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 			return stages.NewComponentError("kubenest-agent", fmt.Errorf("activating project %s: %w", ns, err))
 		}
 		s.Logf("  activated %s: %s=%s on project %s/%s", ns, backup.ActivateAnnotationKey, s.recoveryOpID, backup.ProjectCRNamespace, ns)
+		s.Record.RecoveryNamespacesActivated = append(s.Record.RecoveryNamespacesActivated, ns)
+		if err := s.saveRecord(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

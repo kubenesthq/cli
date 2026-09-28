@@ -19,6 +19,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -127,15 +128,30 @@ func RecoverySecrets(kitSecrets map[string]string) (Secrets, error) {
 }
 
 // EnsureRecoverySecrets writes the recovery's Secret material to the fresh
-// management cluster, and refuses to write over an install Secret that is
-// already there.
+// management cluster, and is IDEMPOTENT AGAINST ITS OWN EARLIER WRITE.
 //
-// A PRESENT SECRET MEANS THIS IS NOT A FRESH HOST: some control plane's
-// install Secret is on it, and overwriting that with a kit's material would
-// point a running control plane at another instance's database — or at the same
-// one twice. `kubectl create` (never `apply`) fails instead, and the refusal is
-// the answer.
+// A RESUME RE-RUNS THE STAGE THAT CALLS IT. `recovery-control-plane` is
+// AlwaysRun — the checkpoint stage needs the chart values it holds in memory,
+// and a journal cannot carry them — so on a resume it applies its objects
+// again. A first run's `kubectl create` refused the Secret the first run had
+// written, and a recovery that stopped anywhere after it could never be
+// resumed (found on hardware 2026-09-28).
+//
+// SO THE RULE IS: create when absent; ACCEPT when present with the content this
+// recovery would write; REFUSE when present with different content, naming the
+// key names that differ and never their values. The refusal covers both a
+// foreign Secret found on a first run and a Secret that has drifted since — in
+// either case this is not our object, and overwriting it would point a running
+// control plane at another instance's database or silently change the keys that
+// read its stored configuration.
 func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets) error {
+	present, err := readInstallSecret(ctx, r)
+	if err != nil {
+		return err
+	}
+	if present != nil {
+		return compareInstallSecret(present, sec)
+	}
 	nsDoc := []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + Namespace + "\n")
 	if res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(nsDoc)); err != nil {
 		return fmt.Errorf("creating namespace %s: %w", Namespace, err)
@@ -151,12 +167,118 @@ func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets) error
 		return fmt.Errorf("writing secret %s/%s: %w", Namespace, SecretName, err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("secret %s/%s already exists on this host (exit %d: %s). A recovery installs onto a FRESH machine: a present install Secret belongs to some control plane already running here, and writing another instance's key material over it is not something this command will do", Namespace, SecretName, res.ExitCode, firstLineOf(res.Stderr))
+		// Losing a race with ourselves (a concurrent second recovery) lands
+		// here: re-read and compare rather than reporting an unknown failure.
+		if again, readErr := readInstallSecret(ctx, r); readErr == nil && again != nil {
+			return compareInstallSecret(again, sec)
+		}
+		return fmt.Errorf("creating secret %s/%s: exit %d: %s", Namespace, SecretName, res.ExitCode, firstLineOf(res.Stderr))
 	}
 	return nil
 }
 
-// HoldBackend returns the chart values with the backend held at zero replicas.
+// readInstallSecret reads the control plane's install Secret, or nil when it is
+// not there yet.
+func readInstallSecret(ctx context.Context, r k3s.Runner) (map[string]string, error) {
+	out, err := k3s.Kubectl(ctx, r, "get secret "+SecretName+" -n "+Namespace+" -o json")
+	if err != nil {
+		text := err.Error()
+		if strings.Contains(text, "NotFound") || strings.Contains(text, "not found") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading secret %s/%s: %w", Namespace, SecretName, err)
+	}
+	var doc struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		return nil, fmt.Errorf("secret %s/%s is unparsable: %w", Namespace, SecretName, err)
+	}
+	values := make(map[string]string, len(doc.Data))
+	for key, encoded := range doc.Data {
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("secret %s/%s key %q is not base64: %w", Namespace, SecretName, key, err)
+		}
+		values[key] = string(raw)
+	}
+	return values, nil
+}
+
+// compareInstallSecret reports whether a present Secret is the one this
+// recovery would write, naming the KEYS that differ and never their values.
+func compareInstallSecret(present map[string]string, want Secrets) error {
+	expected := map[string]string{
+		keyJWTSecret:            want.JWTSecret,
+		keyAgentJWTSecret:       want.AgentJWTSecret,
+		keyEncryptionKey:        want.EncryptionKey,
+		keyPostgresPassword:     want.PostgresPassword,
+		keyAdminPassword:        want.AdminPassword,
+		keyGatewayCACertificate: want.GatewayCACertificate,
+		keyGatewayCAPrivateKey:  want.GatewayCAPrivateKey,
+	}
+	var differs []string
+	for key, value := range expected {
+		got, ok := present[key]
+		switch {
+		case !ok:
+			differs = append(differs, key+" (absent)")
+		case got != value:
+			differs = append(differs, key)
+		}
+	}
+	if len(differs) == 0 {
+		return nil
+	}
+	sort.Strings(differs)
+	return fmt.Errorf("secret %s/%s already exists on this host and is NOT the one this recovery writes: %s differ (values are never printed). A recovery writes only its own key material onto a fresh machine — this Secret belongs to a control plane that is already running here, or to a different kit, and overwriting it would point that control plane at a different database or change the keys that read its stored configuration. Nothing was changed",
+		Namespace, SecretName, strings.Join(differs, ", "))
+}
+
+// DatabaseHasControlPlaneData reports whether the database already holds a
+// restored control plane, and says what it observed.
+//
+// IT IS WHAT MAKES THE CHECKPOINT STAGE RESUMABLE. `pg_restore
+// --exit-on-error` into a database that already has the schema fails at its
+// first table, so a resume that had loaded the checkpoint and then failed
+// before starting the backend would never get past the load. The marker is the
+// `organization` table: absent means a database nothing has ever been loaded
+// into, which is the state the restore needs; present with rows means the load
+// happened; present with no rows is neither, and is refused rather than guessed
+// at.
+func DatabaseHasControlPlaneData(ctx context.Context, r k3s.Runner) (bool, string, error) {
+	pod, err := DatabasePod(ctx, r)
+	if err != nil {
+		return false, "", err
+	}
+	// PGPASSWORD comes from the pod's own container environment: the chart's
+	// credential is there, and this command never carries it in its argv.
+	query := "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -U " + postgresUser + " -d " + postgresDatabase + " -tAc \"SELECT count(*) FROM organization\""
+	res, err := r.RunInput(ctx, "sudo -n k3s kubectl exec -i -n "+Namespace+" "+pod+" -- bash -c '"+query+"'", strings.NewReader(""))
+	if err != nil {
+		return false, "", fmt.Errorf("asking the control plane's database whether it already holds a restored control plane: %w", err)
+	}
+	if res.ExitCode != 0 {
+		text := res.Stderr + res.Stdout
+		if strings.Contains(text, "does not exist") || strings.Contains(text, "relation") {
+			return false, "the database has no control-plane schema yet", nil
+		}
+		return false, "", fmt.Errorf("asking the control plane's database whether it already holds a restored control plane: exit %d: %s", res.ExitCode, firstLineOf(text))
+	}
+	trimmed := strings.TrimSpace(res.Stdout)
+	rows, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return false, "", fmt.Errorf("the database's row count came back as %q, which is not a number", trimmed)
+	}
+	switch {
+	case rows > 0:
+		return true, fmt.Sprintf("the database already holds %d organisation(s)", rows), nil
+	default:
+		return false, "", fmt.Errorf("the database has the control-plane schema and no organisations in it, which is neither an empty database nor a restored one: a previous restore did not finish, and this recovery will not load a checkpoint over it. Look at the database before choosing how to continue")
+	}
+}
+
+// HoldBackend returns the chart values with the backend held// HoldBackend returns the chart values with the backend held at zero replicas.
 //
 // IT IS NOT A NICETY. The backend builds the schema from its models when the
 // database is empty and stamps head; a restore that starts after that fails at

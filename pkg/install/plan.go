@@ -186,6 +186,16 @@ type Record struct {
 	// says whether the schema was brought forward or the database was simply
 	// never behind. No credential fits into it — it names a Job and a hash.
 	ControlPlaneMigration string `json:"control_plane_migration,omitempty"`
+	// RecoveryNamespacesRestored and RecoveryNamespacesActivated are the
+	// namespaces this recovery has already restored and already activated.
+	//
+	// THEY ARE JOURNALLED BECAUSE BOTH STEPS ARE EXPENSIVE AND NOT IDEMPOTENT:
+	// a second `backup restore` over a namespace that is already back would
+	// overwrite the data it just recovered, and a second activation is at best
+	// a no-op and at worst a second wave of Jobs. A resume reads this list and
+	// does not repeat work it has already done.
+	RecoveryNamespacesRestored  []string `json:"recovery_namespaces_restored,omitempty"`
+	RecoveryNamespacesActivated []string `json:"recovery_namespaces_activated,omitempty"`
 }
 
 // Session is one install run's state.

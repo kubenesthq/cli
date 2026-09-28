@@ -406,10 +406,23 @@ func stageRecoveryCheckpoint(ctx context.Context, s *Session) error {
 	if err := s.waitForDatabasePod(ctx, server, deadline, 5*time.Second); err != nil {
 		return err
 	}
-	if err := controlplane.RestoreCheckpoint(ctx, server, s.recoveryCheckpoint.DumpKey, s.recoveryCheckpointDump, s.Opts.Recovery.FleetKey, s.Reporter); err != nil {
+	// A RESUME DOES NOT LOAD THE CHECKPOINT TWICE. `pg_restore --exit-on-error`
+	// into a database that already has the schema fails at its first table, so
+	// a run that loaded the checkpoint and then failed before starting the
+	// backend would never get past this point again.
+	loaded, detail, err := controlplane.DatabaseHasControlPlaneData(ctx, server)
+	if err != nil {
 		return err
 	}
-	s.Logf("  checkpoint %s loaded into the held database", s.recoveryCheckpoint.Key)
+	if loaded {
+		s.Logf("  the checkpoint was already loaded by an earlier attempt (%s): not loading it again over its own rows", detail)
+	} else {
+		s.Logf("  the database is empty (%s): loading %s", detail, s.recoveryCheckpoint.Key)
+		if err := controlplane.RestoreCheckpoint(ctx, server, s.recoveryCheckpoint.DumpKey, s.recoveryCheckpointDump, s.Opts.Recovery.FleetKey, s.Reporter); err != nil {
+			return err
+		}
+		s.Logf("  checkpoint %s loaded into the held database", s.recoveryCheckpoint.Key)
+	}
 
 	revision, migrated, err := controlplane.MigrateIfNewer(ctx, server, s.recoveryValues, s.Bundle,
 		controlplane.ControlPlaneVersion{Version: s.recoveryCheckpoint.ControlPlaneVersion}, s.Reporter)
