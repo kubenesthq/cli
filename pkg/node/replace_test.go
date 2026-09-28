@@ -277,6 +277,168 @@ func TestReplaceUnreachableRemovesBeforeItAdds(t *testing.T) {
 	}
 }
 
+// boundPod is one pod of a scripted pod list: its namespace and name, the kind
+// of controller that owns it, and the node its spec.nodeName names. The node is
+// not always the node the read asked about, because the fixture answers a fixed
+// list: it is then the verb's own reading of spec.nodeName that has to keep a
+// pod of another node out of the deletion.
+type boundPod struct {
+	Namespace string
+	Name      string
+	Owner     string
+	Node      string
+}
+
+// podsOn makes the cluster report the pods bound to node, the way
+// `kubectl get pods --all-namespaces --field-selector spec.nodeName=<node>` does.
+func (f *nodeFixture) podsOn(t *testing.T, node string, pods ...boundPod) {
+	t.Helper()
+	items := make([]string, 0, len(pods))
+	for _, p := range pods {
+		owner := p.Owner
+		if owner == "" {
+			owner = "ReplicaSet"
+		}
+		bound := p.Node
+		if bound == "" {
+			bound = node
+		}
+		items = append(items, `{"metadata":{"namespace":"`+p.Namespace+`","name":"`+p.Name+`",`+
+			`"ownerReferences":[{"kind":"`+owner+`","name":"`+p.Name+`"}]},`+
+			`"spec":{"nodeName":"`+bound+`"}}`)
+	}
+	f.server.on("get pods --all-namespaces --field-selector spec.nodeName="+node+" -o json",
+		ok(`{"items":[`+strings.Join(items, ",")+`]}`))
+}
+
+// A replace that takes the machine out first FORCE-DELETES the pods bound to it,
+// because there is no kubelet left to complete an eviction: an eviction on a
+// node whose kubelet is gone only marks the pod terminating, so an evicting
+// drain there waits out its whole timeout and fails (lab w3, 2026-09-28: exit 1
+// after the full fifteen minutes, over the DaemonSet pods). The pods are named,
+// and the reason the deletion is safe is stated.
+func TestReplaceRemoveFirstForceDeletesThePodsOfTheDeadNode(t *testing.T) {
+	f := replaceFixture(t, false, false)
+	const newNode = "prod-1-agt-2"
+	f.joins(t, newNode)
+	f.podsOn(t, testAgentNode,
+		boundPod{Namespace: "db", Name: "pg-0"},
+		// A DaemonSet's pod is deleted with the rest: the Node object goes two
+		// stages later, so no controller may recreate it here.
+		boundPod{Namespace: "kube-system", Name: "kured-abc", Owner: "DaemonSet"},
+		// A pod another node runs is NOT this node's loss and is left alone.
+		boundPod{Namespace: "db", Name: "pg-1", Node: testServerNode},
+	)
+	// One of those pods holds a claim that exists only on the dead machine. Its
+	// pod goes like the others — the data is already stranded — and the restore
+	// command for the claim is still printed once the replacement has joined.
+	f.strands(t, testAgentNode, strandedClaim{Namespace: "db", Workload: "pg", PVCs: []string{"data-pg-0"}})
+
+	if _, err := f.runReplace(f.newReplace(ReplaceOptions{ConfirmIsolated: true})); err != nil {
+		t.Fatalf("the replace of an unreachable machine failed: %v\n%s", err, f.out.String())
+	}
+	if f.log.hasCommand("kubectl drain ") {
+		t.Errorf("an evicting drain ran for a node whose kubelet is gone, and it can only time out:\n%s", f.log.commands(testServerAddr))
+	}
+	for _, deleted := range []string{
+		"delete pod -n db pg-0 --force --grace-period=0",
+		"delete pod -n kube-system kured-abc --force --grace-period=0",
+	} {
+		if !f.log.hasCommand(deleted) {
+			t.Errorf("the pod bound to the dead node was not force-deleted (%q):\n%s", deleted, f.log.commands(testServerAddr))
+		}
+	}
+	if f.log.hasCommand("pg-1") {
+		t.Error("a pod bound to another node was deleted")
+	}
+	out := f.out.String()
+	for _, want := range []string{"db/pg-0", "kube-system/kured-abc"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the run does not name the pod it deleted (%q):\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "kubenest backup restore --cluster prod-1 --namespace db --pvc data-pg-0") {
+		t.Errorf("the restore command for the stranded claim is gone:\n%s", out)
+	}
+	if !strings.Contains(out, "kubelet") || !strings.Contains(out, "confirm-isolated") {
+		t.Errorf("the run does not say why deleting these pods is safe (the isolation that was confirmed, and that no kubelet will run them again):\n%s", out)
+	}
+}
+
+// The ADD-FIRST branch and a plain `node remove` keep the evicting drain: there
+// the machine answers, so its kubelet completes an eviction, and force-deleting
+// its pods would delete running workloads.
+func TestAddFirstReplaceAndPlainRemoveStillEvict(t *testing.T) {
+	t.Run("add-first replace", func(t *testing.T) {
+		f := replaceFixture(t, true, true)
+		f.joins(t, "prod-1-agt-2")
+
+		if _, err := f.runReplace(f.newReplace(ReplaceOptions{})); err != nil {
+			t.Fatalf("the replace of a reachable machine failed: %v\n%s", err, f.out.String())
+		}
+		if !f.log.hasCommand("kubectl drain " + testAgentNode) {
+			t.Errorf("the reachable machine was not drained by eviction:\n%s", f.log.commands(testServerAddr))
+		}
+		if f.log.hasCommand("--force --grace-period=0") || f.log.hasCommand("delete pod ") {
+			t.Errorf("a pod of a machine that answers was force-deleted:\n%s", f.log.commands(testServerAddr))
+		}
+	})
+
+	t.Run("node remove", func(t *testing.T) {
+		f := removeFixture(t)
+
+		if _, err := f.runRemove(f.newRemove(RemoveOptions{})); err != nil {
+			t.Fatalf("the removal failed: %v\n%s", err, f.out.String())
+		}
+		if !f.log.hasCommand("kubectl drain " + testAgentNode) {
+			t.Errorf("the node was not drained by eviction:\n%s", f.log.commands(testServerAddr))
+		}
+		if f.log.hasCommand("--force --grace-period=0") || f.log.hasCommand("delete pod ") {
+			t.Errorf("`node remove` force-deleted a pod:\n%s", f.log.commands(testServerAddr))
+		}
+	})
+}
+
+// The remove-first drain re-checks that the node is still NOT Ready, and REFUSES
+// when it answers again: the operator confirmed the isolation of a machine that
+// was not answering, and a machine the cluster reports Ready has a kubelet that
+// is running its pods. Force-deleting then would delete running workloads, so
+// nothing is deleted at all.
+func TestReplaceRemoveFirstRefusesWhenTheNodeComesBackBeforeTheDrain(t *testing.T) {
+	f := replaceFixture(t, false, false)
+	const newNode = "prod-1-agt-2"
+	f.joins(t, newNode)
+	f.podsOn(t, testAgentNode, boundPod{Namespace: "db", Name: "pg-0"})
+	// The machine comes back between the reachability read and the drain: the
+	// CORDON, the stage just before the drain, is where the cluster starts
+	// reporting it Ready again.
+	f.server.on("cordon ", func(_ *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(nodesJSON(t,
+			testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+			testNode{Name: testAgentNode, UID: "uid-agt", Addresses: []string{agentHost().SSHAddress}, Ready: true},
+		))
+		return sshx.Result{}, nil
+	})
+
+	_, err := f.runReplace(f.newReplace(ReplaceOptions{ConfirmIsolated: true}))
+	if err == nil {
+		t.Fatalf("the pods of a node that answers again were force-deleted:\n%s", f.out.String())
+	}
+	for _, want := range []string{testAgentNode, "--confirm-isolated"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q:\n%v", want, err)
+		}
+	}
+	if f.log.hasCommand("delete pod") {
+		t.Errorf("a pod was force-deleted on a node the cluster reports Ready:\n%s", f.log.commands(testServerAddr))
+	}
+	for _, later := range []string{"kubectl drain ", "delete node ", "get.k3s.io"} {
+		if f.log.hasCommand(later) {
+			t.Errorf("the replace went on after refusing its drain (%q):\n%s", later, f.log.commands(testServerAddr))
+		}
+	}
+}
+
 // The order that removes first is the operator's decision, not the command's:
 // without --confirm-isolated it refuses, naming the machine by host ID and
 // address, and NOTHING is removed, added or even locked.
@@ -345,17 +507,22 @@ func TestReplacePrintsOneRestoreCommandPerWorkloadWithEveryStrandedClaimGrouped(
 // A resume continues the order the operation STARTED in, even when the machine
 // has answered since — the order is part of the operation's immutable request —
 // and a resume that names a different machine is refused rather than performed.
+// A machine that answers does not let the remove-first order run either: its
+// drain refuses, rather than force-deleting the pods of a node whose kubelet is
+// running, and the operation continues only once the machine is gone again.
 func TestReplaceResumeKeepsItsBranchAndTargets(t *testing.T) {
 	f := replaceFixture(t, false, false)
 	const newNode = "prod-1-agt-2"
 	f.joins(t, newNode)
 	// The removal gets as far as the drain and the run is INTERRUPTED there: a
 	// stopped operation, which is what a resume continues (a failed one is
-	// finished, and nobody may take it over).
+	// finished, and nobody may take it over). The read of the dead node's pods
+	// is what fails here, because on this order that read is the drain's own
+	// first act.
 	ctx, stop := context.WithCancel(context.Background())
-	f.server.on("drain ", func(_ *fakeHost, _ string) (sshx.Result, error) {
+	f.server.on("get pods --all-namespaces --field-selector", func(_ *fakeHost, _ string) (sshx.Result, error) {
 		stop()
-		return fail(1, "error: unable to drain node")(nil, "")
+		return fail(1, "error: unable to read the pods of the node")(nil, "")
 	})
 	first := f.newReplace(ReplaceOptions{ConfirmIsolated: true})
 	_, err := RunReplace(ctx, first)
@@ -404,17 +571,48 @@ func TestReplaceResumeKeepsItsBranchAndTargets(t *testing.T) {
 		}
 	}
 
-	// The identical resume continues, and it continues REMOVE FIRST: the
-	// removal's remaining stages run before the replacement joins.
-	resume := NewReplace(f.sessionFor(t, "run-2b"), ReplaceOptions{ConfirmIsolated: true, Resume: operationID, Node: "h-agt", With: testAgentAddr})
+	// The identical resume continues REMOVE FIRST — the order is the
+	// operation's own and the machine is not asked again — and the machine,
+	// which answers the cluster again by now, stops it exactly where it must:
+	// at the drain, which refuses to force-delete the pods of a node whose
+	// kubelet is running. What it does NOT do is quietly take the add-first
+	// order: the replacement is never joined.
+	blocked := NewReplace(f.sessionFor(t, "run-2b"), ReplaceOptions{ConfirmIsolated: true, Resume: operationID, Node: "h-agt", With: testAgentAddr})
 	start := len(f.log.entries)
+	_, err = RunReplace(context.Background(), blocked)
+	if err == nil {
+		t.Fatalf("the resumed remove-first drain force-deleted the pods of a node that answers again:\n%s", f.out.String())
+	}
+	if !strings.Contains(err.Error(), "--confirm-isolated") {
+		t.Errorf("the refusal does not say which confirmation the cluster has invalidated: %v", err)
+	}
+	stillRemoveFirst := f.log.entries[start:]
+	if indexIn(stillRemoveFirst, "get.k3s.io") >= 0 {
+		t.Error("the resume joined the replacement before its removal finished: the branch flipped to add-first")
+	}
+	if indexIn(stillRemoveFirst, "delete pod") >= 0 {
+		t.Error("a pod was force-deleted on a node the cluster reports Ready")
+	}
+
+	// THE MACHINE GOES AWAY AGAIN, which is what the operator's confirmation was
+	// about. The refused run above left the record claimed by a process that is
+	// gone — the CLI cannot tell that from a laptop that is asleep — so
+	// continuing is the operator's assertion, --take-over <id> --confirm, and
+	// from there the identical resume finishes the operation REMOVE FIRST: the
+	// removal's remaining stages run before the replacement joins.
+	f.server.setNodes(nodesJSON(t,
+		testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+		testNode{Name: testAgentNode, UID: "uid-agt", Addresses: []string{old.SSHAddress}, Ready: false},
+	))
+	resume := NewReplace(f.sessionFor(t, "run-2c"), ReplaceOptions{ConfirmIsolated: true, TakeOver: operationID, Confirm: true, Node: "h-agt", With: testAgentAddr})
+	start = len(f.log.entries)
 	result, err := RunReplace(context.Background(), resume)
 	resume.Finish(context.Background(), err, false)
 	if err != nil {
 		t.Fatalf("the resume failed: %v\n%s", err, f.out.String())
 	}
 	rest := f.log.entries[start:]
-	drain, joined := indexIn(rest, "drain "), indexIn(rest, "get.k3s.io")
+	drain, joined := indexIn(rest, "get pods --all-namespaces --field-selector"), indexIn(rest, "get.k3s.io")
 	if drain < 0 || joined < 0 || drain > joined {
 		t.Errorf("the resume did not continue remove-first: drain at %d, join at %d", drain, joined)
 	}

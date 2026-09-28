@@ -2,12 +2,14 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/day2"
+	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
@@ -605,6 +607,120 @@ func (r *Replace) stageRemoveHold(ctx context.Context) error {
 	return r.remove.stageHold(ctx)
 }
 
+// deadNodePod is one pod bound to the machine a remove-first replace is taking
+// out: what `kubectl delete pod` needs to name it, and nothing else.
+type deadNodePod struct {
+	Namespace string
+	Name      string
+}
+
+// podsBoundToDeadNode reads the pods whose spec.nodeName is the machine that is
+// gone, narrowed by the API server's own `--field-selector spec.nodeName=`.
+//
+// THE NODE NAME IS READ AGAIN IN THE ANSWER rather than trusted to the selector,
+// because what this feeds is a force-deletion: a pod the cluster still reports
+// on another node must never be in it.
+func podsBoundToDeadNode(ctx context.Context, server k3s.Runner, node string) ([]deadNodePod, error) {
+	read := "get pods --all-namespaces --field-selector spec.nodeName=" + node + " -o json"
+	out, err := k3s.Kubectl(ctx, server, read)
+	if err != nil {
+		return nil, fmt.Errorf("reading the pods bound to %s: %w", node, err)
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Namespace string `json:"namespace"`
+				Name      string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				NodeName string `json:"nodeName"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, fmt.Errorf("parsing `kubectl %s`: %w", read, err)
+	}
+	pods := make([]deadNodePod, 0, len(list.Items))
+	for _, item := range list.Items {
+		if item.Spec.NodeName != node {
+			continue
+		}
+		pods = append(pods, deadNodePod{Namespace: item.Metadata.Namespace, Name: item.Metadata.Name})
+	}
+	return pods, nil
+}
+
+// stageDeletePodsOfDeadNode is the drain of the order that REMOVES FIRST: the
+// machine being replaced does not answer, so the pods bound to it are
+// force-deleted instead of evicted.
+//
+// WHY EVICTION CANNOT WORK HERE. An eviction is a request the node's kubelet
+// completes: the API server marks the pod terminating and waits for the agent on
+// that node to stop the containers and confirm. The kubelet on this machine is
+// gone, so nobody confirms, every pod the drain asks about stays terminating,
+// and an evicting drain can only run out its timeout and fail — measured on lab
+// w3 (2026-09-28), where `kubectl drain` exited 1 after the full fifteen minutes
+// and named the DaemonSet pods as the reason it was still waiting. Force-deleting
+// removes the API objects directly, which is what a machine that is about to be
+// wiped needs.
+//
+// THE READINESS RE-CHECK COMES FIRST, and it is the whole safety of this stage.
+// --confirm-isolated is the operator's answer about a machine that was NOT
+// answering; a machine the cluster reports Ready again has a kubelet that is
+// running its pods, and force-deleting those would delete running workloads.
+// The re-check therefore refuses, naming the flag whose meaning was invalidated,
+// and deletes nothing.
+//
+// THE DISRUPTION-BUDGET GATE OF THE EVICTING DRAIN IS NOT APPLIED, and it would
+// mean nothing here: a budget bounds how many pods may be taken down at once, and
+// these pods are already down — their node is gone and nothing on it is serving.
+// Deleting them is what lets their controllers create replacements elsewhere,
+// which is exactly what the budget would otherwise be delaying.
+//
+// THE NODE OBJECT IS DELETED TWO STAGES LATER, in this same operation, so
+// DaemonSet pods are deleted with the rest rather than skipped: a controller
+// recreates its pod only on a node the cluster still holds, and this node is
+// going away. Pods whose claims are local volumes on this machine go too — their
+// data is already stranded, and the restore commands this operation prints once
+// the replacement has joined are what brings it back.
+//
+// THE STAGE NAME STAYS remove:drain. It is the journal's word for this position
+// in the order, and a resume reads the journal by name.
+func (r *Replace) stageDeletePodsOfDeadNode(ctx context.Context) error {
+	nodes, err := ReadClusterNodes(ctx, r.ServerConn)
+	if err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		if n.Name != r.node.Name || !n.Ready {
+			continue
+		}
+		return fmt.Errorf(`%s ANSWERS AGAIN: the cluster reports its Node object Ready, and this replace takes that machine out FIRST because it did not answer when the operation started. Force-deleting the pods of a node whose kubelet is running would delete running workloads, so NOTHING was deleted.
+
+--confirm-isolated confirmed that %s (%s) is POWERED OFF or ISOLATED, and the cluster now says otherwise. Take the machine down again and confirm that it stays down before continuing this replace: an operation that removes first cannot continue over a machine that is running, and a machine that is running is replaced in the other order, by a fresh command that does not carry --confirm-isolated.
+
+Nothing was deleted from the cluster.`, r.node.Name, r.old.HostID, r.old.SSHAddress)
+	}
+
+	pods, err := podsBoundToDeadNode(ctx, r.ServerConn, r.node.Name)
+	if err != nil {
+		return err
+	}
+	if len(pods) == 0 {
+		r.Logf("  drain:     no pod is bound to %s any more, so there is nothing to delete", r.node.Name)
+		return nil
+	}
+	r.Logf("  drain:     %d pod(s) are bound to %s, whose kubelet is gone: deleting them instead of evicting, because --confirm-isolated recorded that this machine is powered off or isolated, so no kubelet will ever run them again, and an eviction on a node with no kubelet would only wait out the drain timeout", len(pods), r.node.Name)
+	guarded := r.guard(r.ServerConn, StageRemoveDrain, nodeSpecs)
+	for _, p := range pods {
+		if _, err := k3s.Kubectl(ctx, guarded, "delete pod -n "+p.Namespace+" "+p.Name+" --force --grace-period=0"); err != nil {
+			return fmt.Errorf("force-deleting %s/%s from %s, whose kubelet is gone: %w", p.Namespace, p.Name, r.node.Name, err)
+		}
+		r.Logf("  drain:     deleted %s/%s --force --grace-period=0", p.Namespace, p.Name)
+	}
+	return nil
+}
+
 // stageRestoreCommands prints ONE restore command per workload whose claims were
 // stranded on the machine that is gone.
 //
@@ -693,6 +809,17 @@ func removeHalf(r *Replace) []stages.Stage {
 			s.Name = StageReplaceRemoveCordon
 		case StageRemoveDrain:
 			s.Name = StageReplaceRemoveDrain
+			// WHICH DRAIN THIS ORDER GETS IS WHAT THE ORDER MEANS. The machine
+			// that leaves first did not answer, so its kubelet is gone and an
+			// eviction there has nobody to complete it: the removal's own drain
+			// would mark every pod terminating and fail after its full timeout
+			// (lab w3, 2026-09-28). This branch therefore binds the force-delete
+			// that fits a node nobody will run pods on again; the add-first
+			// branch keeps the removal's evicting drain, because there the
+			// machine answers and its pods must be evicted properly.
+			if r.branch == BranchRemoveFirst {
+				s.Run = r.stageDeletePodsOfDeadNode
+			}
 		case StageRemoveUninstall:
 			s.Name = StageReplaceRemoveUninstall
 		case StageRemoveDelete:

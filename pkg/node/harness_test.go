@@ -301,6 +301,11 @@ func (h *fakeHost) scripted(command string) (sshx.Result, error) {
 		return sshx.Result{Stdout: `{"spec":{"unschedulable":false}}`}, nil
 	case strings.Contains(command, "get pv -o json"):
 		return sshx.Result{Stdout: `{"items":[]}`}, nil
+	case strings.Contains(command, "get pods --all-namespaces --field-selector spec.nodeName=") && strings.Contains(command, " -o json"):
+		// A node with no pods bound to it: the replace that takes a machine out
+		// first reads the pods of the dead node, and a cluster that was drained
+		// by the node's own death may report none at all.
+		return sshx.Result{Stdout: `{"items":[]}`}, nil
 	case strings.Contains(command, "get pods --all-namespaces -o json"):
 		return sshx.Result{Stdout: `{"items":[]}`}, nil
 	case strings.Contains(command, "get poddisruptionbudgets -A -o json"):
