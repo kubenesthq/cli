@@ -937,3 +937,53 @@ func mustRecipient(t *testing.T) string {
 	}
 	return key.Recipient()
 }
+
+// TestACheckpointIsFoundAtTheBucketRootWhateverTheTargetPrefix is the hardware
+// defect of 2026-09-28: the WRITER puts every checkpoint at the bucket root
+// under `control-plane/` (`controlplane.NewCheckpointTarget` forces that prefix,
+// and the checkpoint principal's policy covers only `<bucket>/control-plane/*`),
+// while the READER composed the target's prefix in front of it. Every recovery
+// from a --backup-target that carries a prefix — which is every real one — found
+// no checkpoint at all.
+func TestACheckpointIsFoundAtTheBucketRootWhateverTheTargetPrefix(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c31", "org-1", "inst-1", nil)
+	// The bucket holds the checkpoint where the writer puts it: the ROOT.
+	sealed, err := recoverykit.SealTo(f.fleet.Recipient(), []byte("the dump"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := "control-plane/2026-09-28T003149Z-nightly"
+	manifest, err := json.Marshal(map[string]any{
+		"key":                   dir,
+		"at":                    "2026-09-28T00:31:49Z",
+		"control_plane_version": "1.1",
+		"management_cluster_id": f.bind.ClusterID,
+		"envelope":              map[string]any{"sha256": recoverykit.Digest(sealed), "size_bytes": len(sealed)},
+		"dump":                  map[string]any{"postgres_major": 17, "postgres_image": "bitnami/postgresql@sha256:cccc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.bucket.objects[dir+"/manifest.json"] = manifest
+	f.bucket.objects[dir+"/control-plane.dump.age"] = sealed
+
+	// The target carries a prefix, which is what made the old reader look in
+	// the wrong place. testTarget points at .../ + recoveryTestScope.
+	s, _ := recoverySession(t, Options{Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server"})
+	s.recoveryStore = f.bucket
+	s.recoveryTargetValue = testTarget(t)
+	if s.recoveryTargetValue.Prefix == "" {
+		t.Fatal("this fixture's --backup-target has no prefix, so the test cannot tell the two compositions apart")
+	}
+	cp, dump, err := s.selectCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("the checkpoint the writer wrote was not found: %v", err)
+	}
+	if cp.ControlPlaneVersion != "1.1" || len(dump) == 0 {
+		t.Fatalf("the checkpoint was read as %+v (dump %d bytes)", cp, len(dump))
+	}
+	// The path it looked at is the writer's, not the target's prefix plus it.
+	if key := s.checkpointPrefix(); key != strings.Trim(backup.ControlPlanePrefix, "/") {
+		t.Fatalf("the reader looks under %q, and the writer writes under %q", key, backup.ControlPlanePrefix)
+	}
+}

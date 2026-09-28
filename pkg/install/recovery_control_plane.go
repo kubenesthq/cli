@@ -248,14 +248,23 @@ func (s *Session) selectCheckpoint(ctx context.Context) (*controlplane.BucketChe
 	return controlplane.SelectControlPlaneCheckpoint(ctx, s.recoveryStore.List, s.recoveryStore.Get, prefix)
 }
 
-// checkpointPrefix is the control-plane scope inside the bucket this recovery
-// reads.
+// checkpointPrefix is where the control plane's checkpoints live, and the
+// answer is the WRITER's: `backup.ControlPlanePrefix` at the BUCKET ROOT.
+//
+// `--backup-target`'s prefix scopes a cluster's own artifacts (its kits, sets,
+// backups and datastore snapshots), and `controlplane.NewCheckpointTarget`
+// deliberately does NOT put it in front of a checkpoint: the control plane's
+// checkpoints are the instance's, they go under `<bucket>/control-plane/*`, and
+// that is the only path the checkpoint principal's policy covers. A reader that
+// composed `<target prefix>/control-plane` looked somewhere nothing is ever
+// written, so every recovery from a target WITH a prefix — which is every real
+// one — found no checkpoint at all (found on hardware 2026-09-28: "there is no
+// checkpoint object under demo-a/control-plane/manifest.json").
+//
+// THERE IS ONE DEFINITION OF THE LOCATION AND THIS FUNCTION CALLS IT. The
+// constant is the writer's; nobody here spells the directory out again.
 func (s *Session) checkpointPrefix() string {
-	prefix := strings.Trim(s.recoveryTargetValue.Prefix, "/")
-	if prefix == "" {
-		return strings.Trim(backup.ControlPlanePrefix, "/")
-	}
-	return prefix + "/" + strings.Trim(backup.ControlPlanePrefix, "/")
+	return strings.Trim(backup.ControlPlanePrefix, "/")
 }
 
 // stageRecoveryControlPlane installs the control-plane chart with the kit's

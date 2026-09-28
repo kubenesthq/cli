@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/s3"
 )
@@ -617,7 +618,11 @@ type SetQuestion struct {
 // A CONTROL-PLANE SET IS NOT ASKED FOR A WORKLOAD BACKUP, and that is the whole
 // of this type. The control plane's artifacts are its kit (the keys and the
 // authority every CLI pins) and its versions; what a control-plane recovery
-// restores is the newest eligible CHECKPOINT under `control-plane/` — the
+// restores is the newest eligible CHECKPOINT at the BUCKET ROOT under
+// `control-plane/` (backup.ControlPlanePrefix, the one definition of where a
+// checkpoint lives: the writer puts it there whatever prefix the target
+// carries, and the checkpoint principal's policy covers `<bucket>/control-plane/*`
+// and nothing else) — the
 // database, which carries every organisation, member, role, window, alert route,
 // inventory and token floor — and then the MANAGEMENT CLUSTER'S own workload
 // namespaces from that cluster's OWN recovery set, which is written beside this
@@ -640,7 +645,7 @@ func (q SetQuestion) Answer() Answer {
 		return Answer{Detail: fmt.Sprintf("%s is about kit artifact %s, and this check is about %s", q.SetKey, q.Set.ArtifactID, q.ArtifactID)}
 	}
 	if q.Kind == recoverykit.KindControlPlane {
-		return Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; the control plane is restored from its newest eligible CHECKPOINT under %s, and the management cluster's own workloads from the recovery set of the cluster it runs in", q.SetKey, q.Expected, ControlPlaneCheckpointDir)}
+		return Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; the control plane is restored from its newest eligible CHECKPOINT under %s, and the management cluster's own workloads from the recovery set of the cluster it runs in", q.SetKey, q.Expected, backup.ControlPlanePrefix)}
 	}
 	if q.BackupName != "" {
 		found, ok := completedBackup(q.Set, q.BackupName)
@@ -654,10 +659,6 @@ func (q SetQuestion) Answer() Answer {
 	}
 	return Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; it names backup %q, completed at %s, covering %s", q.SetKey, q.Expected, q.Backup.Name, q.Backup.CompletedAt.UTC().Format(time.RFC3339), coverage(q.Backup))}
 }
-
-// ControlPlaneCheckpointDir is the directory inside a cluster's prefix that the
-// control plane's checkpoints are written under (PLAN 7.8's `control-plane/`).
-const ControlPlaneCheckpointDir = "control-plane/"
 
 func backupNames(set *recoverykit.Set) string {
 	if len(set.Backups) == 0 {
