@@ -47,6 +47,8 @@
 //	KUBENEST_DOMAIN                   the control plane's domain (S11)
 //	KUBENEST_ADMIN_PASSWORD           an administrator's own password (S11)
 //	KUBENEST_HUB_URL                  wss://hub.<domain>/ws/operator (S6's refusal check)
+//	KUBENEST_INSTANCE_ID              the instance id every kit is bound to; a fresh
+//	                                  laptop has no other source for it
 //
 // RUN
 //
@@ -453,6 +455,7 @@ func TestLostSingleServerRecovery(t *testing.T) {
 		"--recovery-kit", "s3",
 		"--backup-target", env.backupTarget,
 		"--fleet-key-file", env.fleetKeyFile,
+		"--instance-id", os.Getenv("KUBENEST_INSTANCE_ID"),
 		"--old-host-fenced",
 		"--server", env.freshHost,
 		"--ha", "single-server",
@@ -560,6 +563,7 @@ func TestAllInOneHostRecovery(t *testing.T) {
 		"--recovery-kit", "s3",
 		"--backup-target", env.backupTarget,
 		"--fleet-key-file", env.fleetKeyFile,
+		"--instance-id", os.Getenv("KUBENEST_INSTANCE_ID"),
 		"--old-host-fenced",
 		"--admin-password", env.adminPassword,
 		"--server", env.freshHost,
