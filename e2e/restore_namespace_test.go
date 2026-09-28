@@ -542,6 +542,31 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 		t.Errorf("activation left the CronJob suspended (%q)", suspend)
 	}
 
+	// kn-x0wv.8: THE RESTORED POD IS THE WORKLOAD'S OWN POD, AND ACTIVATION
+	// LEAVES IT. The ReplicaSet the restore brought back has replicas, so it
+	// adopted the pod the restore filled as one of its own replicas; deleting it
+	// at activation would restart the workload, and on a claim one node can mount
+	// once (OpenEBS LVM) the replacement cannot mount it while the deleted pod's
+	// mount is still going away. Velero's restore-wait init container in the
+	// pod's spec is what says this pod is the RESTORED one — a pod the ReplicaSet
+	// created has none — so its presence is the fix, and its absence is the
+	// second pod kn-x0wv.8 is about.
+	var ownPod string
+	c.waitFor(5*time.Minute, "the workload's own pod to be Running after activation", func() (bool, string) {
+		pod, err := c.runningWorkloadPodOf(namespace)
+		if err != nil {
+			return false, firstLineOfE2E(err.Error())
+		}
+		ownPod = pod
+		return true, pod
+	})
+	if init := strings.TrimSpace(c.kubectl("get pod " + ownPod + " -n " + namespace + ` -o go-template='{{range .spec.initContainers}}{{.name}} {{end}}'`)); !strings.Contains(init, "restore-wait") {
+		t.Errorf("the workload's pod %s carries no Velero restore-wait init container (init containers %q): the restored pod is the ReplicaSet's own replica and activation must leave it, so a pod the ReplicaSet created instead means the restored pod was lost and the workload restarted, which is kn-x0wv.8", ownPod, init)
+	}
+	if got := c.waitForDigestIn(namespace, ownPod, proofPath); got != written {
+		t.Errorf("the workload's own pod %s reads %s = %s, want the %s written before the backup: the restored data did not survive activation", ownPod, proofPath, got, written)
+	}
+
 	t.Run("an interrupted restore resumes without activating", func(t *testing.T) {
 		s4InterruptedResume(t, c, namespace, proof, proofPath)
 	})
@@ -648,6 +673,24 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 // the Restore stayed InProgress until Velero's itemOperationTimeout (4h) while
 // the CLI waited its own restore timeout (2h).
 //
+// kn-x0wv.8: WHAT THE FIRST FIX GOT WRONG. cf35f8f renamed every restored pod
+// the backup had copied a volume for, and that renamed too much. A ReplicaSet
+// WITH replicas adopts its restored pod and counts it as one of its replicas;
+// with the pod renamed it counted nothing, so it created a SECOND pod in the
+// same second — a pod with no Velero restore-wait init container, which mounted
+// the claim first, so the restored pod could never mount it (lab w1, 2026-09-28:
+// "MountVolume.SetUp failed ... verifyMount: device already mounted", OpenEBS LVM
+// refusing a second mount of one volume). An ORDINARY one-replica Deployment
+// hung that way. The danger is only ever the ReplicaSet the backup holds at ZERO
+// replicas, so the restore now renames THAT ReplicaSet's selector and template
+// (backup.HeldReplicaSetHash) and leaves every pod's labels alone.
+//
+// WHAT THIS ARM THEREFORE EXPECTS AFTER THE RESTORE: the restored hold pod keeps
+// its ORIGINAL pod-template-hash and has NO controller owner (the renamed
+// ReplicaSet does not select it), and the restored ReplicaSet s4-hold-rs is at 0
+// replicas with backup.HeldReplicaSetHash in its selector AND in its template.
+// Activation then deletes that orphan — and leaves the workload's own pod alone.
+//
 // WHY THE FIXTURE CANNOT SIMPLY RACE A ROLLOUT FOR THAT STATE. Three rules of
 // Velero and Kubernetes leave the live cluster almost no window in which to
 // catch it:
@@ -696,9 +739,11 @@ const (
 	// PodVolumeRestore name it.
 	s4HoldClaim  = "s4-hold-data"
 	s4HoldVolume = "data"
-	// s4HoldHash is the pod-template-hash the ReplicaSet selects: the label the
-	// restore's rename rule overwrites (backup.RestoredPodHash), and the reason
-	// the restored pod would be adopted and deleted without it.
+	// s4HoldHash is the pod-template-hash the fixture's ReplicaSet selects AND
+	// the fixture's pod carries. The restore never touches the pod's labels: it
+	// renames the SELECTOR AND TEMPLATE of the ReplicaSet, whose count is 0,
+	// to backup.HeldReplicaSetHash, so that ReplicaSet selects none of the
+	// restored pods — while the restored pod keeps this value.
 	s4HoldHash = "kubenest-hold"
 	// s4HoldMarker is written into the fixture's claim BY THE TEST, through the
 	// pod, before the backup: the fixture's container never writes that name, so
@@ -716,9 +761,9 @@ const (
 // kn-x0wv.2 describes rather than the work.
 const s4MidRolloutBound = 20 * time.Minute
 
-// s4MidRollout is kn-x0wv.2's hardware arm: the namespace is restored from a
-// backup taken in the state a rollout leaves between "the old ReplicaSet is at 0"
-// and "the old pod is gone".
+// s4MidRollout is kn-x0wv.2's hardware arm as kn-x0wv.8 reshaped the fix: the
+// namespace is restored from a backup taken in the state a rollout leaves between
+// "the old ReplicaSet is at 0" and "the old pod is gone".
 //
 // It runs after the arms above — it needs a live namespace and a workload — and
 // it leaves the namespace as it found it: it clears what the interrupt arm left
@@ -731,33 +776,28 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	// THE STATE THE ARMS ABOVE LEFT. The interrupt arm finishes with a pending
 	// operation: its record makes the restore verb refuse to start, and its
 	// pause keeps the reconcilers from recreating the namespace this arm deletes
-	// (which is the scenario's premise). A pod carrying the rename hash is a
-	// restored pod that arm owed activation; leaving it would put a second
-	// restored pod into this arm's backup and blur the assertion that activation
-	// leaves none. The gate's own body clears the record the same way.
+	// (which is the scenario's premise). There is nothing else to clear: a pod
+	// Velero restored for the workload's own claim carries the workload's OWN
+	// pod-template-hash and is adopted by the ReplicaSet that came back with it,
+	// so it IS the workload's own pod — it no longer marks itself as the
+	// restore's, and nothing about it needs emptying before this arm runs. (The
+	// gate's own body clears the record the same way.)
 	c.kubectl("delete configmap kubenest-operation -n kube-system --ignore-not-found")
 	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != "" {
 		c.kubectl("annotate project " + namespace + " -n kubenest-system " + backup.PauseAnnotationKey + "-")
 		t.Logf("cleared the pause %q the arm above left on project %s", pause, namespace)
 	}
-	c.kubectl("delete pods -n " + namespace + " -l pod-template-hash=" + backup.RestoredPodHash + " --ignore-not-found")
 
-	// readRunningWorkloadPod finds the S4 workload's OWN Running pod: not a
-	// restored one, whose pod-template-hash is the rename value and whose
-	// container is on its way out. What is read through it is what the claim
-	// holds.
+	// readRunningWorkloadPod finds the S4 workload's Running pod. There is one
+	// kind of it: the restore no longer renames a pod, so a pod the restore
+	// filled a volume through is the workload's own pod once its ReplicaSet
+	// adopts it. What is read through it is what the claim holds.
 	readRunningWorkloadPod := func() (string, string) {
-		out, err := c.kubectlStatus("get pods -n " + namespace + " -l app=s4-web -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.pod-template-hash} {.status.phase}{\"\\n\"}{end}'")
+		pod, err := c.runningWorkloadPodOf(namespace)
 		if err != nil {
 			return "", firstLineOfE2E(err.Error())
 		}
-		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) == 3 && fields[1] != backup.RestoredPodHash && fields[2] == "Running" {
-				return fields[0], ""
-			}
-		}
-		return "", "no Running pod of the S4 workload: " + strings.TrimSpace(out)
+		return pod, ""
 	}
 	waitForWorkloadPod := func(what string) string {
 		var pod string
@@ -893,8 +933,11 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 
 	// THE BACKUP HAS TO HOLD THE DANGER. The backup's PodVolumeBackups are the
 	// only place outside the object store that says which pods' volumes it
-	// copied — they are what the restore derives its rename rule from
-	// (pkg/backup, restoredPodsWithVolumeCopies) — so a backup that does not
+	// copied, and this arm's state exists only if one of them belongs to the
+	// fixture's pod — the pod whose ReplicaSet the backup holds at zero replicas.
+	// (The restore's own rule no longer reads this list: pkg/backup's
+	// heldReplicaSetRule matches a ReplicaSet by its count, so a resumed run
+	// builds one document whatever the backup holds.) A backup that does not
 	// name this pod and this claim is not a run of kn-x0wv.2's case, and the arm
 	// fails here rather than going green on a state it never produced.
 	pvbs := c.kubectl(fmt.Sprintf(
@@ -942,7 +985,7 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	restoreErr := c.runCLIWithContext(ctx, &plan, append([]string{"backup", "restore", "--namespace", namespace, "--from", midBackup, "--replace", "--confirm"}, c.verbArgs()...)...)
 	took := time.Since(began)
 	if restoreErr != nil || !strings.Contains(plan.String(), "restored — awaiting activation") {
-		t.Fatalf("the mid-rollout backup %s did not restore within %s: %v\n%s\n\nA PodVolumeRestore whose pod a zero-replica ReplicaSet adopted and deleted makes Velero wait its itemOperationTimeout (4h) and the CLI wait its own restore timeout, which is kn-x0wv.2; the rename rule (backup.RestoredPodHash) is what stops it, and the state the backup must hold is checked above.",
+		t.Fatalf("the mid-rollout backup %s did not restore within %s: %v\n%s\n\nA PodVolumeRestore whose pod a zero-replica ReplicaSet adopted and deleted makes Velero wait its itemOperationTimeout (4h) and the CLI wait its own restore timeout, which is kn-x0wv.2; the ReplicaSet hold rule (backup.HeldReplicaSetHash, pkg/backup's heldReplicaSetRule) is what stops it, and the state the backup must hold is checked above.",
 			midBackup, s4MidRolloutBound, restoreErr, plan.String())
 	}
 	t.Logf("the mid-rollout backup restored in %s, inside the %s bound", took.Round(time.Second), s4MidRolloutBound)
@@ -954,14 +997,19 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	// THE RESTORED STATE, BEFORE ACTIVATION. THIS IS THE FIX.
 	//
 	// The ReplicaSet is read from the RESTORED namespace, which is the backup:
-	// its being at zero is the proof that the backup held the danger.
+	// its being at zero is the proof that the backup held the danger, and the
+	// held hash in its selector AND its template is the fix itself.
 	if replicas := strings.TrimSpace(c.kubectl("get rs " + s4HoldRS + " -n " + namespace + " -o jsonpath={.spec.replicas}")); replicas != "0" {
 		t.Errorf("the restored ReplicaSet %s is at %q replica(s), want 0: the backup did not hold it at zero, so this restore did not run kn-x0wv.2's case", s4HoldRS, replicas)
 	}
-	// The pod Velero restored for that volume copy is ALIVE and carries the
-	// rename hash. Without the rename its pod-template-hash would still be
-	// kubenest-hold, the ReplicaSet at 0 would adopt it by its selector and
-	// delete it, and its PodVolumeRestore would never run.
+	held := strings.TrimSpace(c.kubectl("get rs " + s4HoldRS + " -n " + namespace + " -o jsonpath='{.spec.selector.matchLabels.pod-template-hash}|{.spec.template.metadata.labels.pod-template-hash}'"))
+	if held != backup.HeldReplicaSetHash+"|"+backup.HeldReplicaSetHash {
+		t.Errorf("the restored ReplicaSet %s carries selector|template pod-template-hash %q, want %q in both: the restore renames the SELECTOR of a ReplicaSet at 0 replicas so it cannot adopt and delete the restored pod, and renames the TEMPLATE with it because the API refuses a ReplicaSet whose selector does not match its own template", s4HoldRS, held, backup.HeldReplicaSetHash)
+	}
+	// The pod Velero restored for that volume copy is ALIVE and carries the hash
+	// the BACKUP held: the restore does not touch a pod's labels. Without the
+	// rule, the ReplicaSet at 0 would adopt it by its selector and delete it, and
+	// its PodVolumeRestore would never run.
 	c.waitFor(5*time.Minute, "the restored pod to be alive with its volume filled", func() (bool, string) {
 		out, err := c.kubectlStatus("get pod " + s4HoldPod + " -n " + namespace + " -o jsonpath='{.metadata.labels.pod-template-hash}|{.status.phase}|{.metadata.deletionTimestamp}'")
 		if err != nil {
@@ -971,14 +1019,25 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 		if len(fields) < 3 {
 			return false, strings.TrimSpace(out)
 		}
-		if fields[0] != backup.RestoredPodHash {
-			return false, "the restored pod carries pod-template-hash " + fields[0] + ", not " + backup.RestoredPodHash
+		if fields[0] != s4HoldHash {
+			return false, "the restored pod carries pod-template-hash " + fields[0] + ", want the backup's own " + s4HoldHash
 		}
 		if fields[2] != "" {
 			return false, "the restored pod is being deleted"
 		}
 		return fields[1] == "Running", "pod-template-hash " + fields[0] + ", phase " + fields[1]
 	})
+	// AND NO CONTROLLER OWNS IT, which is why activation deletes it: the renamed
+	// ReplicaSet selects nothing, so the pod is the RESTORE's own and not the
+	// workload's. A pod a controller had adopted would be the workload's own pod
+	// and would stay at activation.
+	ownerKinds, err := c.kubectlStatus("get pod " + s4HoldPod + " -n " + namespace + ` -o go-template='{{range .metadata.ownerReferences}}{{.kind}} {{end}}'`)
+	if err != nil {
+		t.Fatalf("reading the restored pod's owner references: %v", err)
+	}
+	if got := strings.TrimSpace(ownerKinds); got != "" {
+		t.Errorf("the restored pod %s is owned by %s: the renamed ReplicaSet %s selects nothing, so nothing may adopt it — and a pod a controller owns is the workload's own, which activation keeps instead of cleaning up", s4HoldPod, got, s4HoldRS)
+	}
 	// Its PodVolumeRestore COMPLETED: the volume the danger threatened was
 	// filled. (The marker's digest below is the stronger form of the same fact,
 	// because no container writes that file.)
@@ -990,8 +1049,15 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 		t.Errorf("the restored claim's %s is %s, want the %s written before the backup: the volume the danger threatened does not hold the bytes the backup copied", s4HoldMarker, got, holdMarkerDigest)
 	}
 	// The workload's own pod and its claim: the ordinary half of the restore,
-	// which the danger must not have disturbed.
+	// which the danger must not have disturbed. It is the pod the RESTORE filled
+	// — Velero's restore-wait init container is still in its spec — because the
+	// ReplicaSet that came back with it has replicas and adopted it as one of
+	// them. A pod the ReplicaSet had created instead is exactly kn-x0wv.8's
+	// second pod, and the claim it mounts is the one the restore needed.
 	proofPod = waitForWorkloadPod("the workload's own pod on the restored claim")
+	if init := strings.TrimSpace(c.kubectl("get pod " + proofPod + " -n " + namespace + ` -o go-template='{{range .spec.initContainers}}{{.name}} {{end}}'`)); !strings.Contains(init, "restore-wait") {
+		t.Errorf("the workload's pod %s carries no Velero restore-wait init container (init containers %q): the pod the restore filled must be the workload's own, adopted by the ReplicaSet that came back with it, and a pod the ReplicaSet created is the second pod kn-x0wv.8 is about", proofPod, init)
+	}
 	if got := c.waitForDigestIn(namespace, proofPod, s4ProofMarker); got != proofMarkerDigest {
 		t.Errorf("the restored claim's %s is %s, want the %s written before the backup", s4ProofMarker, got, proofMarkerDigest)
 	}
@@ -999,9 +1065,9 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 		t.Errorf("the restored %s is %s, want the %s written before the backup", proofPath, got, written)
 	}
 
-	// ACTIVATION: the pause is lifted, the restored pod — which existed only to
-	// fill the volumes — is deleted, and the workload's own controller's pods
-	// take the claims over.
+	// ACTIVATION: the pause is lifted, the restored ORPHAN — the pod that
+	// existed only to fill the volumes and that no controller owns — is deleted,
+	// and the workload's own controller's pods take the claims over.
 	var activation strings.Builder
 	if err := c.runCLI(&activation, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, c.verbArgs()...)...); err != nil {
 		t.Fatalf("activation failed: %v\n%s", err, activation.String())
@@ -1009,9 +1075,11 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	if pause := strings.TrimSpace(c.kubectl("get project " + namespace + " -n kubenest-system -o jsonpath='{.metadata.annotations.kubenest\\.io/reconcile-paused}'")); pause != "" {
 		t.Errorf("activation left the pause in place (%q)", pause)
 	}
-	// No pod carrying the rename hash is left.
-	if left := strings.TrimSpace(c.kubectl("get pods -n " + namespace + " -l pod-template-hash=" + backup.RestoredPodHash + " -o name")); left != "" {
-		t.Errorf("activation left %s: a restored pod carried the restored data and mounted the claim, and the workload's own controller creates the pod that takes it over", left)
+	// No restored ORPHAN is left: the fixture's pod was the restore's own, so
+	// activation deleted it. (The workload's own pod is NOT one of these — a
+	// controller owns it, so activation keeps it.)
+	if left := strings.TrimSpace(c.kubectl("get pod " + s4HoldPod + " -n " + namespace + " -o name --ignore-not-found")); left != "" {
+		t.Errorf("activation left the restored pod %s (%s): no controller owned it, so it existed only to fill the volumes and activation must delete it", s4HoldPod, left)
 	}
 	// The Deployment's OWN pod — a pod whose pod-template-hash matches a
 	// ReplicaSet with replicas > 0 — is Running on the restored claim.
@@ -1023,8 +1091,8 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	ownSet := ownPod[:at]
 	ownHash := strings.TrimSpace(c.kubectl("get pod " + ownPod + " -n " + namespace + " -o jsonpath={.metadata.labels.pod-template-hash}"))
 	ownReplicas := strings.TrimSpace(c.kubectl("get rs " + ownSet + " -n " + namespace + " -o jsonpath={.spec.replicas}"))
-	if ownHash == backup.RestoredPodHash || ownHash == "" || ownReplicas == "" || ownReplicas == "0" {
-		t.Errorf("the workload's pod %s carries pod-template-hash %q and ReplicaSet %s is at %q replica(s): want the workload's own pod, whose ReplicaSet has replicas", ownPod, ownHash, ownSet, ownReplicas)
+	if ownHash == "" || ownHash == backup.HeldReplicaSetHash || ownReplicas == "" || ownReplicas == "0" {
+		t.Errorf("the workload's pod %s carries pod-template-hash %q and ReplicaSet %s is at %q replica(s): want the workload's own pod, whose ReplicaSet has replicas and whose hash no held ReplicaSet carries", ownPod, ownHash, ownSet, ownReplicas)
 	}
 	if got := c.waitForDigestIn(namespace, ownPod, proofPath); got != written {
 		t.Errorf("the workload's own pod %s reads %s = %s, want the %s written before the backup: the restored data did not survive activation", ownPod, proofPath, got, written)
@@ -1053,6 +1121,11 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 // (<replicaset>-<suffix>), which is what lets a pod's name be walked back to its
 // ReplicaSet (the CLI's replicaSetOfPodName), and its labels are the
 // ReplicaSet's selector, which is what the restore's danger is made of.
+//
+// THE RESTORE LEAVES THE POD ALONE (kn-x0wv.8): what it renames is the
+// ReplicaSet's selector and template, to backup.HeldReplicaSetHash, so the
+// restored pod keeps s4HoldHash and nothing adopts it. The fixture is exactly
+// the state the BACKUP holds; the restore is what moves the selector out of it.
 //
 // The verbs are: %[1]s namespace, %[2]s pod, %[3]s ReplicaSet, %[4]s claim,
 // %[5]s pod-template-hash, %[6]s the value the fixture's container writes,
@@ -1285,6 +1358,24 @@ spec:
           image: busybox:1.36
           command: [wget, -q, -O, /dev/null, "%[2]s"]
 `, namespace, url)
+}
+
+// runningWorkloadPodOf names the S4 workload's Running pod in namespace, or says
+// why there is none. There is one kind of it: the restore no longer renames a
+// pod, so a pod it filled a volume through is the workload's own pod as soon as
+// its ReplicaSet adopts it, and the workload's own label is the whole filter.
+func (c *s4Cluster) runningWorkloadPodOf(namespace string) (string, error) {
+	out, err := c.kubectlStatus("get pods -n " + namespace + " -l app=s4-web -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.pod-template-hash} {.status.phase}{\"\\n\"}{end}'")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[2] == "Running" {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("no Running pod of the S4 workload: %s", strings.TrimSpace(out))
 }
 
 // waitForProof reads the known file's digest through the pod that mounts it,

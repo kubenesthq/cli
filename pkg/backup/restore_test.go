@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -1200,10 +1199,13 @@ func TestNamespaceRestoreSuspendsCronJobsThroughTheRestoreModifier(t *testing.T)
 	}
 
 	rules := modifierRules(t, f)
-	if len(rules) != 2 {
-		t.Fatalf("the modifier holds %d rule(s), want the unconditional rule that suspends and records, and then the rule that corrects a CronJob the backup had suspended: %v", len(rules), rules)
+	if len(rules) != 3 {
+		t.Fatalf("the modifier holds %d rule(s), want the unconditional rule that suspends and records, the rule that corrects a CronJob the backup had suspended, and the ReplicaSet hold: %v", len(rules), rules)
 	}
-	for i, rule := range rules {
+	// THE TWO CRONJOB RULES, in order. The third is the ReplicaSet hold, whose
+	// own behaviour and conditions are asserted in
+	// TestNamespaceRestoreHoldsZeroReplicaSetsOutOfTheRestoredPodsSelector.
+	for i, rule := range rules[:2] {
 		conditions, _ := rule["conditions"].(map[string]any)
 		if conditions["groupResource"] != "cronjobs.batch" {
 			t.Errorf("rule %d targets groupResource %v, want cronjobs.batch: a CronJob is in the batch group, and the resource part alone matches nothing", i, conditions["groupResource"])
@@ -2135,113 +2137,144 @@ func TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled(t *tes
 	}
 }
 
-// TestNamespaceRestoreRenamesTheRestoredPodOutOfItsReplicaSetsSelector is
-// kn-x0wv.2's second half: the decision for a backup taken mid-rollout.
+// TestNamespaceRestoreHoldsZeroReplicaSetsOutOfTheRestoredPodsSelector is
+// kn-x0wv.8: the decision for a backup taken mid-rollout, moved from the pods to
+// the ReplicaSet the backup holds at ZERO replicas.
 //
-// MODE 1 RENAMES, IT DOES NOT REFUSE. The backup holds the old pod and the old
-// ReplicaSet at zero; a restored pod is adopted by its ReplicaSet's SELECTOR, so
-// the rename is what stops the adoption, and it is the same answer mode 2
-// already carries (probe P5). Refusing instead was rejected: the CLI cannot see
-// what a backup holds — Velero keeps the items in the bucket, not in the CR — so
-// a plan-time refusal could only guess from the LIVE namespace, and a rollout
-// that finished after the backup would be refused for a state its restore would
-// have handled.
+// WHY THE REPLICASET AND NOT THE POD. Renaming every restored pod the backup
+// copied a volume for is what kn-x0wv.2 shipped, and it renamed too much. A
+// ReplicaSet WITH replicas adopts its restored pod and counts it as one of its
+// replicas; the rename stopped it doing so, so it created a second pod in the
+// same second, that pod mounted the claim first, and the restored pod's
+// PodVolumeRestore could never fill it — an ORDINARY one-replica Deployment,
+// hung on lab w1 on 2026-09-28 (OpenEBS LVM refuses a second mount of one
+// volume). The danger only ever exists for the ReplicaSet the backup holds at
+// zero replicas: that one adopts the restored pod by its selector and deletes it
+// at once, because its desired count is zero.
 //
-// THE PLANTED NEGATIVE IS TODAY'S REQUEST, which carries the CronJob rules and
-// no pod rule.
-func TestNamespaceRestoreRenamesTheRestoredPodOutOfItsReplicaSetsSelector(t *testing.T) {
+// THE PLANTED NEGATIVE IS A RULE THAT CHANGES A POD'S OWN LABELS — the pods rule
+// kn-x0wv.2 shipped. It is exactly what makes a ReplicaSet with replicas start a
+// second pod on the claim, so mode 1's modifier must not carry one.
+func TestNamespaceRestoreHoldsZeroReplicaSetsOutOfTheRestoredPodsSelector(t *testing.T) {
 	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
 	f := newRestoreFixture(t, facts)
-	f.cluster.podVolumeBackups = map[string][]BackupVolumeState{
-		"daily-good": {{Pod: "s4-web-5df4c559-qcqqp", Namespace: "payments", Volume: "data-0", ClaimUID: "uid-data-0"}},
-	}
-	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-1", Pod: "s4-web-5df4c559-qcqqp", Volume: "data-0", ClaimName: "data-0", Phase: "Completed"}}
 
 	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
 	if err != nil {
 		t.Fatalf("the restore failed: %v\n%s", err, out)
 	}
 	rules := modifierRules(t, f)
-	var rename map[string]any
-	for _, rule := range rules {
-		conditions, _ := rule["conditions"].(map[string]any)
-		if conditions["groupResource"] == "pods" {
-			rename = rule
-		}
-	}
-	if rename == nil {
-		t.Fatalf("the modifier carries no pod rule (%v): the restored pod is adopted by its zero-replica ReplicaSet and deleted, and its PodVolumeRestore never runs", rules)
-	}
-	conditions, _ := rename["conditions"].(map[string]any)
-	pattern, _ := conditions["resourceNameRegex"].(string)
-	matched, err := regexp.MatchString(pattern, "s4-web-5df4c559-qcqqp")
-	if err != nil || !matched {
-		t.Errorf("the pod rule matches %q for the backup's own pod (%v): %v", pattern, err, rename)
-	}
-	// ONLY THE BACKUP'S PODS: a rule that matched every pod would rename pods
-	// the restore did not need to protect, including the workload's own.
-	if matched, _ := regexp.MatchString(pattern, "s4-web-6b4c7c8567-zzzzz"); matched {
-		t.Errorf("the pod rule matches a pod the backup holds no volume copy for: %v", rename)
-	}
-	// A MERGE PATCH, because the pods a namespace restore names are not all
-	// ReplicaSet pods: a StatefulSet's pod carries no pod-template-hash for a
-	// JSON `replace` to overwrite.
-	patches, _ := rename["mergePatches"].([]any)
-	if len(patches) != 1 {
-		t.Fatalf("the pod rule carries %d merge patch(es), want the one that renames the hash: %v", len(patches), rename)
-	}
-	entry, _ := patches[0].(map[string]any)
-	raw, _ := entry["patchData"].(string)
-	var patch struct {
-		Metadata struct {
-			Labels map[string]string `json:"labels"`
-		} `json:"metadata"`
-	}
-	if err := json.Unmarshal([]byte(raw), &patch); err != nil {
-		t.Fatalf("the pod rule's patch is not JSON (%v): %s", err, raw)
-	}
-	if patch.Metadata.Labels["pod-template-hash"] != RestoredPodHash {
-		t.Errorf("the pod rule sets pod-template-hash=%q, want %q: a ReplicaSet selects on the hash, so anything else is adopted and deleted", patch.Metadata.Labels["pod-template-hash"], RestoredPodHash)
-	}
-	// AND THE CRONJOB RULES ARE STILL THERE: mode 1's modifier carries both.
 	if len(rules) != 3 {
-		t.Errorf("the modifier holds %d rule(s), want the two CronJob rules and the pod rename: %v", len(rules), rules)
+		t.Fatalf("the modifier holds %d rule(s), want the two CronJob rules and the ReplicaSet hold: %v", len(rules), rules)
+	}
+	hold := modifierRuleOn(t, rules, "replicasets.apps")
+	if hold == nil {
+		t.Fatalf("the modifier carries no replicasets.apps rule (%v): a zero-replica ReplicaSet adopts a restored pod by its selector and deletes it at once, and the PodVolumeRestore created for that pod then never fills its volume", rules)
+	}
+	conditions, _ := hold["conditions"].(map[string]any)
+	matches, _ := conditions["matches"].([]any)
+	if len(matches) != 1 {
+		t.Fatalf("the ReplicaSet rule's conditions are %v, want the one that matches a ReplicaSet whose spec.replicas is 0: a rule without it holds EVERY ReplicaSet, including one with replicas, which then starts a second pod on the claim the restore is filling", conditions)
+	}
+	entry, _ := matches[0].(map[string]any)
+	if entry["path"] != "/spec/replicas" || fmt.Sprint(entry["value"]) != "0" {
+		t.Errorf("the ReplicaSet rule matches %v, want spec.replicas 0: the danger is only ever the zero-replica ReplicaSet of a backup taken mid-rollout", entry)
+	}
+	patches := mergePatchesOfRule(t, hold)
+	if len(patches) != 1 {
+		t.Fatalf("the ReplicaSet rule carries %d merge patch(es), want the one that moves the hash: %v", len(patches), hold)
+	}
+	selector := stringMapAt(patches[0], "spec", "selector", "matchLabels")
+	template := stringMapAt(patches[0], "spec", "template", "metadata", "labels")
+	if selector["pod-template-hash"] != HeldReplicaSetHash || template["pod-template-hash"] != HeldReplicaSetHash {
+		t.Errorf("the ReplicaSet rule sets selector pod-template-hash=%q and template pod-template-hash=%q, want %q in BOTH: the API server refuses a ReplicaSet whose selector does not match its own pod template, so one half alone fails the restore",
+			selector["pod-template-hash"], template["pod-template-hash"], HeldReplicaSetHash)
 	}
 
-	// THE RESTORED POD IS OWED WORK. It carries the restored data and mounts the
-	// claim, and the workload's own controller creates the pod that takes over,
-	// so activation deletes it — mode 2's answer, mirrored.
-	record := f.kube.recordFor(operation.Name)
-	if got := pendingDetailOf(t, record, "pod/s4-web-5df4c559-qcqqp"); got == "" {
-		t.Errorf("the operation recorded no restored pod to clean up (%+v): it would stay mounted on the claim beside the workload's own pod", record.Pending)
-	}
-	var activated strings.Builder
-	if err := RunRestore(context.Background(), &activated, strings.NewReader(""), f.options(t, RestoreOptions{
-		Namespace: "payments",
-		Activate:  record.OperationID,
-	}), f.deps()); err != nil {
-		t.Fatalf("activation failed: %v\n%s", err, activated.String())
-	}
-	if !f.kube.sawCommand("delete pod s4-web-5df4c559-qcqqp -n payments") {
-		t.Errorf("activation did not delete the restored pod, so the claim is left mounted twice and a pod the workload never asked for keeps running:\n%s", activated.String())
+	// THE PLANTED NEGATIVE: no rule renames a POD's own labels.
+	for i, rule := range rules {
+		if ruleConditions, _ := rule["conditions"].(map[string]any); ruleConditions["groupResource"] == "pods" {
+			t.Errorf("rule %d targets pods: renaming a restored pod's own pod-template-hash is what makes a ReplicaSet WITH replicas create a second pod on the claim it is filling, which hangs an ordinary one-replica Deployment (kn-x0wv.8, lab w1)", i)
+		}
+		for _, patch := range mergePatchesOfRule(t, rule) {
+			if hash := stringMapAt(patch, "metadata", "labels")["pod-template-hash"]; hash != "" {
+				t.Errorf("rule %d writes pod-template-hash=%q into an object's own metadata.labels: only a ReplicaSet's selector and template labels may be moved, never a pod's own labels", i, hash)
+			}
+		}
 	}
 }
 
-// TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed: the modifier's pod list
-// is derived from the BACKUP, which outlives the namespace a restore deletes, so
-// a resumed run builds the same modifier and does not re-apply a weaker one over
-// the ConfigMap the running Restore reads its rules from.
-func TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed(t *testing.T) {
+// TestNamespaceRestoreHoldRuleLeavesAReplicaSetWithReplicasSelectingItsRestoredPod
+// applies the hold rule's own semantics to the two ReplicaSets a backup can
+// hold, because the rule's job is a selector's job: after it, a zero-replica
+// ReplicaSet must no longer select the restored pod, and a ReplicaSet with
+// replicas must still select it.
+//
+// VELERO'S `matches` STEP IS MODELLED HERE, not run: Velero evaluates each entry
+// as a JSON Patch `test` against the object the backup holds and skips the rule
+// when one fails (matchConditions, resource_modifiers.go), and holdRuleMatches
+// below does that much and no more. A green unit run therefore says the rule is
+// shaped the way those two steps need; only S4 on hardware says the real Velero
+// agrees.
+func TestNamespaceRestoreHoldRuleLeavesAReplicaSetWithReplicasSelectingItsRestoredPod(t *testing.T) {
 	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
 	f := newRestoreFixture(t, facts)
-	f.cluster.podVolumeBackups = map[string][]BackupVolumeState{
-		"daily-good": {{Pod: "s4-web-5df4c559-qcqqp", Namespace: "payments", Volume: "data-0", ClaimUID: "uid-data-0"}},
+	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err != nil {
+		t.Fatalf("the restore failed: %v", err)
 	}
+	rule := modifierRuleOn(t, modifierRules(t, f), "replicasets.apps")
+	if rule == nil {
+		t.Fatal("the modifier carries no replicasets.apps rule to apply")
+	}
+	// The pod Velero restored carries the labels the BACKUP held, hash included.
+	restoredPod := map[string]string{"app": "s4-web", "pod-template-hash": "s4-hold"}
+
+	// THE ZERO-REPLICA REPLICASET is the shape a backup taken mid-rollout holds.
+	zero := applyHoldRule(t, replicaSetObject(t, 0, "s4-hold"), rule)
+	if selectorMatches(selectorLabels(t, zero), restoredPod) {
+		t.Errorf("after the rule the zero-replica ReplicaSet still selects the restored pod %v with selector %v: it adopts what it selects and deletes it, because its desired count is 0, and the PodVolumeRestore created for that pod never fills its volume",
+			restoredPod, selectorLabels(t, zero))
+	}
+	if !selectorMatches(selectorLabels(t, zero), templateLabels(t, zero)) {
+		t.Errorf("the held ReplicaSet's selector %v does not match its own template %v: the API server refuses a ReplicaSet whose selector does not match its pod template, so the restore would fail instead of work", selectorLabels(t, zero), templateLabels(t, zero))
+	}
+	if got := selectorLabels(t, zero)["pod-template-hash"]; got != HeldReplicaSetHash {
+		t.Errorf("the held ReplicaSet's selector carries pod-template-hash %q, want %q", got, HeldReplicaSetHash)
+	}
+
+	// THE PLANTED NEGATIVE: the ReplicaSet the backup holds WITH replicas. The
+	// backup holds it at 1, not 0, so the rule does not match it and it is left
+	// exactly as it was — adopting the restored pod, which is the ordinary
+	// restore. A rule that held this one too would make it create a second pod.
+	one := applyHoldRule(t, replicaSetObject(t, 1, "s4-hold"), rule)
+	if got := selectorLabels(t, one)["pod-template-hash"]; got != "s4-hold" {
+		t.Errorf("the ReplicaSet at 1 replica was renamed (selector pod-template-hash %q): its restored pod no longer matches it, so it creates a second pod, that pod mounts the claim first, and the restored pod's PodVolumeRestore can never fill it (kn-x0wv.8, lab w1)", got)
+	}
+	if !selectorMatches(selectorLabels(t, one), restoredPod) {
+		t.Error("the ReplicaSet at 1 replica no longer selects the restored pod: it would create a second pod on the claim instead of adopting the one the restore filled")
+	}
+}
+
+// TestNamespaceRestoreResumeKeepsTheHeldReplicaSetsRule: the modifier is STATIC
+// — its rules read neither the backup nor the namespace — so a resumed run
+// derives the same document the interrupted run applied and points the Restore
+// at that same one rather than re-applying a different one over it. The
+// ConfigMap is the only copy of the rules, and the running Restore reads them
+// from it, so re-applying a weaker document would change what it does. (The old
+// rule depended on the backup's PodVolumeBackups for exactly this reason, and
+// re-deriving that list was the only thing a resume had to get right.)
+func TestNamespaceRestoreResumeKeepsTheHeldReplicaSetsRule(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
 	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
 	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err == nil {
 		t.Fatal("the interrupted run must fail")
 	}
 	opID := f.kube.recordFor(operation.Name).OperationID
+	// The document the interrupted run put on the cluster.
+	if modifierRuleOn(t, modifierRules(t, f), "replicasets.apps") == nil {
+		t.Fatal("the interrupted run applied a modifier with no ReplicaSet hold rule")
+	}
 
 	// The same cluster, the same backup, and a Restore that now completes.
 	resumed := newRestoreFixture(t, facts)
@@ -2250,7 +2283,6 @@ func TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed(t *testing.T) {
 	resumed.cluster.namespace = f.cluster.namespace
 	resumed.cluster.annotations = f.cluster.annotations
 	resumed.cluster.volumes = f.cluster.volumes
-	resumed.cluster.podVolumeBackups = f.cluster.podVolumeBackups
 	beforeApplies := resumed.kube.commandCount("apply -f -")
 
 	var out strings.Builder
@@ -2258,8 +2290,231 @@ func TestNamespaceRestoreResumeKeepsTheRestoredPodsRenamed(t *testing.T) {
 		t.Fatalf("--resume failed: %v\n%s", err, out.String())
 	}
 	if after := resumed.kube.commandCount("apply -f -"); after != beforeApplies {
-		t.Errorf("--resume applied %d document(s): the modifier it already applied holds the rename, and re-applying a different one would change the rules the running Restore reads", after-beforeApplies)
+		t.Errorf("--resume applied %d document(s): the modifier it already applied holds the rules, and re-applying a different one would change what the running Restore reads", after-beforeApplies)
 	}
+	if !strings.Contains(out.String(), RestoredStage) {
+		t.Errorf("--resume did not finish the data restore:\n%s", out.String())
+	}
+}
+
+// TestNamespaceRestoreActivationDeletesOnlyTheRestoredPodsNoControllerOwns is
+// kn-x0wv.8's activation half. A restored pod a controller has adopted IS the
+// workload's own pod — the ReplicaSet counted it as one of the replicas it
+// wants — so deleting it only restarts the workload, and on a claim one node can
+// mount once (OpenEBS LVM) the pod that restart creates cannot mount it. A
+// restored pod no controller owns is the restore's own, which existed to fill
+// the volumes, and activation deletes it. The two are told apart at the moment
+// activation runs, by the pod's controller owner.
+//
+// THE PLANTED NEGATIVE IS DELETING THE OWNED POD, which restarts a workload
+// whose claim the deleted pod was still holding.
+func TestNamespaceRestoreActivationDeletesOnlyTheRestoredPodsNoControllerOwns(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// Two pods the restore filled a volume for, both on the same claim.
+	f.cluster.volumes = []VolumeRestoreState{
+		{Name: "pvr-orphan", Pod: "s4-web-7f668764ff-orphan", Volume: "data-0", ClaimName: "data-0", Phase: "Completed"},
+		{Name: "pvr-owned", Pod: "s4-web-7f668764ff-owned", Volume: "data-0", ClaimName: "data-0", Phase: "Completed"},
+	}
+	if _, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, ""); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+	record := f.kube.recordFor(operation.Name)
+	for _, pod := range []string{"s4-web-7f668764ff-orphan", "s4-web-7f668764ff-owned"} {
+		if pendingDetailOf(t, record, "pod/"+pod) == "" {
+			t.Fatalf("the restore recorded no owed write for %s: %+v", pod, record.Pending)
+		}
+	}
+	// THE NAMESPACE IS BACK, as it is when activation runs on a real cluster:
+	// the restore recreated it, so the pods the restore left are visible. (The
+	// fake's `deleted` flag is set by the delete step and the restore does not
+	// clear it, so the test clears it here.)
+	f.cluster.deleted = false
+	f.cluster.pods = []PodState{
+		// No controller owner: the restore's own pod, which nothing wants.
+		{Name: "s4-web-7f668764ff-orphan", Namespace: "payments", Phase: "Running"},
+		// The workload's own pod: the ReplicaSet adopted it, and counts it as
+		// one of the replicas it wants.
+		{Name: "s4-web-7f668764ff-owned", Namespace: "payments", Phase: "Running",
+			Owners: []OwnerRef{{Kind: "ReplicaSet", Name: "s4-web-7f668764ff", Controller: true}}},
+	}
+
+	var activated strings.Builder
+	if err := RunRestore(context.Background(), &activated, strings.NewReader(""), f.options(t, RestoreOptions{
+		Namespace: "payments",
+		Activate:  record.OperationID,
+	}), f.deps()); err != nil {
+		t.Fatalf("activation failed: %v\n%s", err, activated.String())
+	}
+	if !f.kube.sawCommand("delete pod s4-web-7f668764ff-orphan -n payments") {
+		t.Errorf("activation did not delete the restored pod no controller owns, so a pod the workload never asked for keeps running on the claim:\n%s", activated.String())
+	}
+	if f.kube.sawCommand("delete pod s4-web-7f668764ff-owned") {
+		t.Errorf("activation deleted the pod its ReplicaSet had adopted: that pod IS the workload's own, so deleting it restarts the workload — and on a claim one node can mount once (OpenEBS LVM) its replacement cannot mount it:\n%s", activated.String())
+	}
+	if !strings.Contains(activated.String(), "s4-web-7f668764ff-owned is the workload's own pod now") {
+		t.Errorf("activation does not say the adopted pod stays, so an operator cannot see why it was left:\n%s", activated.String())
+	}
+	// AND THE OWED WORK IS DISCHARGED EITHER WAY, or the record reports work that
+	// has been done.
+	for _, pending := range f.kube.recordFor(operation.Name).Pending {
+		if pending.Status != operation.WriteDone {
+			t.Errorf("the owed write %s is still %s after activation", pending.Target, pending.Status)
+		}
+	}
+}
+
+// modifierRuleOn finds one rule by the groupResource its conditions name, or nil.
+func modifierRuleOn(t *testing.T, rules []map[string]any, groupResource string) map[string]any {
+	t.Helper()
+	for _, rule := range rules {
+		conditions, _ := rule["conditions"].(map[string]any)
+		if conditions["groupResource"] == groupResource {
+			return rule
+		}
+	}
+	return nil
+}
+
+// mergePatchesOfRule decodes every merge patch a rule carries, as JSON.
+func mergePatchesOfRule(t *testing.T, rule map[string]any) []map[string]any {
+	t.Helper()
+	entries, _ := rule["mergePatches"].([]any)
+	out := make([]map[string]any, 0, len(entries))
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		data, _ := entry["patchData"].(string)
+		var patch map[string]any
+		if err := json.Unmarshal([]byte(data), &patch); err != nil {
+			t.Fatalf("a rule's patchData is not JSON (%v): %s", err, data)
+		}
+		out = append(out, patch)
+	}
+	return out
+}
+
+// applyHoldRule is Velero's two steps for one object: evaluate the rule's
+// `matches` entries as JSON Patch `test` operations against it, and apply the
+// rule's merge patch only when every one of them holds.
+func applyHoldRule(t *testing.T, object, rule map[string]any) map[string]any {
+	t.Helper()
+	if !holdRuleMatches(object, rule) {
+		return object
+	}
+	patches := mergePatchesOfRule(t, rule)
+	if len(patches) != 1 {
+		t.Fatalf("the hold rule carries %d merge patch(es), want one: %v", len(patches), rule)
+	}
+	return mergeJSONObject(object, patches[0])
+}
+
+// holdRuleMatches models matchConditions for the paths the hold rule uses: each
+// `matches` entry is a JSON Patch `test`, and a failed or missing path means the
+// rule does not match. The values are compared as they print, because Velero
+// sends a `matches` value as the type it looks like — "0" goes as the number 0 —
+// while the rule document holds the string.
+func holdRuleMatches(object, rule map[string]any) bool {
+	conditions, _ := rule["conditions"].(map[string]any)
+	entries, _ := conditions["matches"].([]any)
+	for _, raw := range entries {
+		entry, _ := raw.(map[string]any)
+		path, _ := entry["path"].(string)
+		if fmt.Sprint(valueAtJSONPath(object, path)) != fmt.Sprint(entry["value"]) {
+			return false
+		}
+	}
+	return true
+}
+
+// valueAtJSONPath reads one pointer-style path out of a decoded object.
+func valueAtJSONPath(object map[string]any, path string) any {
+	var current any = object
+	for _, key := range strings.Split(strings.Trim(path, "/"), "/") {
+		asObject, ok := current.(map[string]any)
+		if !ok {
+			return nil
+		}
+		current = asObject[key]
+	}
+	return current
+}
+
+// mergeJSONObject applies a JSON merge patch to a decoded object: objects merge
+// key by key, anything else replaces.
+func mergeJSONObject(object, patch map[string]any) map[string]any {
+	out := make(map[string]any, len(object))
+	for key, value := range object {
+		out[key] = value
+	}
+	for key, value := range patch {
+		sub, isObject := value.(map[string]any)
+		existing, existingIsObject := out[key].(map[string]any)
+		if isObject && existingIsObject {
+			out[key] = mergeJSONObject(existing, sub)
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+// replicaSetObject is one ReplicaSet as the backup holds it, built through JSON
+// so that spec.replicas is the number JSON gives it.
+func replicaSetObject(t *testing.T, replicas int, hash string) map[string]any {
+	t.Helper()
+	body := fmt.Sprintf(`{"apiVersion":"apps/v1","kind":"ReplicaSet","spec":{"replicas":%d,"selector":{"matchLabels":{"app":"s4-web","pod-template-hash":%q}},"template":{"metadata":{"labels":{"app":"s4-web","pod-template-hash":%q}}}}}`,
+		replicas, hash, hash)
+	var object map[string]any
+	if err := json.Unmarshal([]byte(body), &object); err != nil {
+		t.Fatalf("the sample ReplicaSet is not JSON: %v", err)
+	}
+	return object
+}
+
+// selectorLabels reads a ReplicaSet's spec.selector.matchLabels.
+func selectorLabels(t *testing.T, object map[string]any) map[string]string {
+	t.Helper()
+	return stringMapAt(object, "spec", "selector", "matchLabels")
+}
+
+// templateLabels reads a ReplicaSet's spec.template.metadata.labels.
+func templateLabels(t *testing.T, object map[string]any) map[string]string {
+	t.Helper()
+	return stringMapAt(object, "spec", "template", "metadata", "labels")
+}
+
+// stringMapAt walks a decoded JSON object to one nested map of strings, and
+// returns an empty map when the path is not there.
+func stringMapAt(object map[string]any, path ...string) map[string]string {
+	current := object
+	for i, key := range path {
+		nested, _ := current[key].(map[string]any)
+		if nested == nil {
+			return map[string]string{}
+		}
+		if i == len(path)-1 {
+			out := map[string]string{}
+			for k, v := range nested {
+				out[k], _ = v.(string)
+			}
+			return out
+		}
+		current = nested
+	}
+	return map[string]string{}
+}
+
+// selectorMatches is a matchLabels subset check: a selector matches an object
+// when every key it names holds the same value there. It is written out because
+// the module does not depend on k8s.io/apimachinery, so there is no
+// LabelSelector to build one from.
+func selectorMatches(selector, labels map[string]string) bool {
+	for key, value := range selector {
+		if labels[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 // TestNamespaceRestoreActivation: --activate finds the held project, puts the

@@ -962,7 +962,7 @@ func (r *restoreRun) renderPlan() {
 	} else {
 		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs and any Job still running are suspended as soon as the pause is written, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
 		fmt.Fprintf(r.out, "  job pods:      excluded (pods carrying %s), so the pod of a Job that was running when the backup was taken is not restored and its work does not run again before activation\n", JobPodLabelKey)
-		fmt.Fprintf(r.out, "  restored pods: the pods the backup copied a volume for come back renamed out of their ReplicaSet's selector, so a ReplicaSet at 0 replicas cannot adopt one and delete it before its PodVolumeRestore fills the volume (a backup taken mid-rollout); activation deletes them, and the workload's own controller creates the pods that take the claims over\n")
+		fmt.Fprintf(r.out, "  restored pods: every ReplicaSet the backup holds at 0 replicas comes back with its pod-template-hash renamed, in the selector and the template both, so it cannot adopt and delete the pod the backup copied a volume for before that pod's PodVolumeRestore fills the volume (a backup taken mid-rollout). A ReplicaSet the backup holds with replicas keeps its selector and adopts its restored pod, so that pod is the workload's own; activation deletes only the restored pods no controller owns, and the workload's own controller creates the pods that take the claims over\n")
 	}
 }
 
@@ -2150,6 +2150,14 @@ func (r *restoreRun) waitRestore(ctx context.Context, name string) (*RestoreOutc
 // its next reconcile. In both, the volume cannot be filled and the restore
 // cannot finish, so the wait ends with a refusal instead of after hours.
 //
+// THE MEASURED CAUSE IS NOW REMOVED BEFORE IT CAN ARISE: the restore's own
+// resource modifier renames a zero-replica ReplicaSet's selector out of the way
+// as Velero creates it (heldReplicaSetRule, namespaceModifierDocument), so that
+// ReplicaSet no longer selects the restored pod it would have deleted. This
+// guard is kept as the last line of defence, because a pod can go another way —
+// deleted by hand, rescheduled elsewhere — and a wait that can never end must
+// still end with a refusal and a name rather than after hours.
+//
 // ONLY OUTSTANDING RESTORES COUNT: a Completed PodVolumeRestore has its data,
 // and a Failed one is Velero's own verdict, which checkVolumeRestores reports
 // with far more detail than this guard could.
@@ -2532,85 +2540,83 @@ func cronJobModifierRules() []any {
 	}
 }
 
-// RestoredPodHash is the pod-template-hash a restored pod carrying a volume copy
-// is given, so that no ReplicaSet of the backup can adopt it.
+// HeldReplicaSetHash is the pod-template-hash a ReplicaSet the backup holds at
+// zero replicas is renamed to, so that it selects none of the restored pods.
 //
 // IT IS NOT A HASH AND DOES NOT PRETEND TO BE: nothing selects on the value, and
-// the point is only that it is not the hash the ReplicaSet that created the pod
-// selects on. Mode 2 uses the same value for the same reason (probe P5).
-const RestoredPodHash = "kubenest-restored"
+// the point is only that it is not the hash that ReplicaSet's own pods carry.
+// The value is reserved for this one job, so no ReplicaSet's live selector can
+// ever hold it.
+const HeldReplicaSetHash = "kubenest-held"
 
-// podRenameRule is the rule that takes the restored pods carrying a volume copy
-// out of their ReplicaSet's selector.
+// heldReplicaSetRule is the rule that keeps a zero-replica ReplicaSet out of the
+// selector of the pods a namespace restore brings back.
 //
-// WHY IT IS NEEDED. In a backup taken while a Deployment was rolling out, the
-// only PodVolumeBackup can belong to the OLD pod, whose ReplicaSet the backup
-// holds at zero replicas. Velero restores that pod, strips its owner
-// references — and the ReplicaSet adopts it by its SELECTOR (the workload's
-// labels plus pod-template-hash) and deletes it at once, because its desired
-// count is zero. The pod the PodVolumeRestore was created for is then gone, the
-// restore never fills the volume, and it sits InProgress until Velero's own
-// itemOperationTimeout (four hours) with the CLI waiting its own (measured on
-// lab w3, 2026-09-27, kn-x0wv.2). Renaming the hash before the object exists is
-// what mode 2 does for the same reason.
+// WHY THE REPLICASET AND NOT THE POD. kn-x0wv.2 renamed every restored pod the
+// backup had copied a volume for, and that renamed too much. A ReplicaSet WITH
+// replicas adopts the restored pod as one of its own replicas — which is the
+// ordinary case and creates no second pod — but the rename stopped it doing so,
+// so the ReplicaSet found itself one replica short and created a NEW pod in the
+// same second. That new pod carries no Velero restore-wait init container, it
+// mounts the claim first, and the restored pod can then never mount it (on lab
+// w1, 2026-09-28: "MountVolume.SetUp failed ... verifyMount: device already
+// mounted", OpenEBS LVM refusing a second mount of one volume). The restored
+// pod's init container never ran, its PodVolumeRestore stayed in phase "", and
+// the restore sat InProgress for an ORDINARY one-replica Deployment.
 //
-// A MERGE PATCH, NOT A JSON PATCH `replace`. Mode 2's rule replaces the label
-// because every pod it names is a ReplicaSet pod and therefore carries it. Mode
-// 1 names every pod the backup copied a volume for, which can be a StatefulSet
-// pod, a Job's pod or one created by hand — none of which carries
-// pod-template-hash at all — and a JSON `replace` on a path that does not exist
-// is an error Velero would report against the restore.
-func podRenameRule(pods []string) map[string]any {
-	quoted := make([]string, 0, len(pods))
-	for _, pod := range pods {
-		quoted = append(quoted, regexpQuote(pod))
-	}
+// THE DANGER IS ONLY EVER THE ZERO-REPLICA REPLICASET. In a backup taken while
+// a Deployment was rolling out, the PodVolumeBackup belongs to the OLD pod,
+// whose ReplicaSet the backup holds at zero replicas; Velero restores that pod
+// and strips its owner references, and the ReplicaSet adopts it BY ITS SELECTOR
+// and deletes it at once, because its desired count is zero. So the rule moves
+// the hash on the ReplicaSet whose count is zero and leaves every pod's labels
+// alone.
+//
+// `matches` IS HOW "THE COUNT IS ZERO" IS READ. Velero evaluates a rule's
+// `matches` entries as JSON Patch `test` operations against the object as the
+// BACKUP holds it, and reads a failed or missing test as "this rule does not
+// match" (internal/resourcemodifiers/resource_modifiers.go, matchConditions,
+// v1.18.1 — the version chart 12.1.0 in pkg/bundles/manifests/platform-1.1.yaml
+// ships). The CronJob rules above use the same shape for /spec/suspend. The
+// value is written as the string "0" because Velero sends it as the number 0,
+// which is what spec.replicas is.
+//
+// BOTH HALVES OF THE HASH, OR THE API REFUSES THE OBJECT: a ReplicaSet's
+// spec.selector must match its pod template, so the merge patch writes the held
+// hash into spec.selector.matchLabels AND spec.template.metadata.labels. A
+// merge patch — not a JSON patch `replace` — for the same reason mode 2 uses
+// one: it creates the missing intermediate objects and carries JSON types.
+//
+// WHAT IT BUYS. A zero-replica ReplicaSet restored this way selects none of the
+// restored pods, so it cannot adopt and delete the pod its PodVolumeRestore
+// fills; a ReplicaSet with replicas is never matched, keeps its selector, and
+// adopts its restored pod as the replica it is.
+func heldReplicaSetRule() map[string]any {
+	held := `"pod-template-hash":"` + HeldReplicaSetHash + `"`
 	return map[string]any{
 		"conditions": map[string]any{
-			"groupResource":     "pods",
-			"resourceNameRegex": "^(" + strings.Join(quoted, "|") + ")$",
+			"groupResource": "replicasets.apps",
+			"matches":       []any{map[string]any{"path": "/spec/replicas", "value": "0"}},
 		},
 		"mergePatches": []any{
-			map[string]any{"patchData": `{"metadata":{"labels":{"pod-template-hash":"` + RestoredPodHash + `"}}}`},
+			map[string]any{"patchData": `{"spec":{"selector":{"matchLabels":{` + held + `}},"template":{"metadata":{"labels":{` + held + `}}}}}`},
 		},
 	}
 }
 
 // namespaceModifierDocument is mode 1's resource modifier: the CronJob rules,
-// and — when the backup holds a volume copy for any pod of the namespace — the
-// rule that keeps those pods from being adopted back by a ReplicaSet.
-func namespaceModifierDocument(operationID string, restoredPods []string) (*modifierConfigMap, error) {
-	rules := cronJobModifierRules()
-	if len(restoredPods) > 0 {
-		rules = append(rules, podRenameRule(restoredPods))
-	}
-	return modifierDocument(operationID, rules)
-}
-
-// restoredPodsWithVolumeCopies names the pods the CHOSEN BACKUP holds a volume
-// copy for, in the namespace this restore is about: the pods Velero will create
-// a PodVolumeRestore for, and the only ones whose survival the restore depends
-// on. A pod with no copied volume has no PodVolumeRestore to wait for.
+// and the rule that holds a zero-replica ReplicaSet out of the restored pods'
+// selector.
 //
-// The list comes from the backup's own PodVolumeBackup objects, which the
-// velero namespace keeps for the backup's lifetime, so a resumed run derives
-// the same list from the same backup and builds the same modifier document.
-func (r *restoreRun) restoredPodsWithVolumeCopies(ctx context.Context) ([]string, error) {
-	volumes, err := r.deps.Cluster.PodVolumeBackups(ctx, r.plan.Backup.Name)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	pods := []string{}
-	for _, volume := range volumes {
-		if volume.Namespace != r.opts.Namespace || volume.Pod == "" || seen[volume.Pod] {
-			continue
-		}
-		seen[volume.Pod] = true
-		pods = append(pods, volume.Pod)
-	}
-	sort.Strings(pods)
-	return pods, nil
+// THE REPLICASET RULE IS ALWAYS IN THE DOCUMENT. It reads nothing — not the
+// backup, not the namespace — and Velero simply finds no match when the backup
+// holds no zero-replica ReplicaSet, so carrying it is harmless. Being static is
+// also what lets a resumed run build exactly the document the interrupted run
+// already applied, without re-reading the backup: the old rule named the pods
+// the backup had copied a volume for, and re-deriving that list was the only
+// reason the document depended on the backup at all.
+func namespaceModifierDocument(operationID string) (*modifierConfigMap, error) {
+	return modifierDocument(operationID, append(cronJobModifierRules(), heldReplicaSetRule()))
 }
 
 // recordSuspendedCronJobs reads the CronJobs the restore brought back, records
@@ -2857,11 +2863,37 @@ func (r *restoreRun) activate(ctx context.Context) error {
 			return err
 		}
 	}
+	// THE RESTORED PODS THE RESTORE OWES WORK FOR, WITH ONE DECISION EACH. A pod
+	// a controller owns now is the workload's own pod — a ReplicaSet adopted it
+	// as one of its replicas — so deleting it would only restart the workload,
+	// and it stays. A pod no controller owns is the restore's own, which existed
+	// to fill the volumes, so activation deletes it, in the same step that puts
+	// the workloads back. A pod that is already gone is done: there is nothing
+	// to delete, and the owed write is discharged below either way.
+	var live map[string]PodState
 	for _, pending := range record.Pending {
 		if pending.Kind != "restore-pod" {
 			continue
 		}
 		pod := strings.TrimPrefix(pending.Target, "pod/")
+		if live == nil {
+			pods, err := r.deps.Cluster.Pods(ctx, r.opts.Namespace)
+			if err != nil {
+				return err
+			}
+			live = make(map[string]PodState, len(pods))
+			for _, restoredPod := range pods {
+				live[restoredPod.Name] = restoredPod
+			}
+		}
+		restoredPod, present := live[pod]
+		if !present {
+			continue
+		}
+		if owner := controllerOwnerOf(restoredPod); owner != nil {
+			fmt.Fprintf(r.out, "  pod:           %s is the workload's own pod now (owned by %s %s), so it stays\n", pod, owner.Kind, owner.Name)
+			continue
+		}
 		fmt.Fprintf(r.out, "  pod:           deleting restored pod %s — it existed only to fill the volumes\n", pod)
 		if err := r.stage("activate-pod-"+pod).Delete(ctx, "pod "+pod+" -n "+r.opts.Namespace+" --wait=false"); err != nil {
 			return err
@@ -3163,16 +3195,10 @@ func (r *restoreRun) execute(ctx context.Context) error {
 	if err := r.verifyIdentities(ctx); err != nil {
 		return err
 	}
-	// THE PODS THE BACKUP COPIED A VOLUME FOR ARE READ WHILE THE NAMESPACE IS
-	// STILL WHOLE, and before anything is captured or destroyed: the modifier
-	// that keeps them out of their ReplicaSet's selector is built from this
-	// list, and a read that fails must fail before the safety backup rather
-	// than after the namespace is gone.
-	restoredPods, err := r.restoredPodsWithVolumeCopies(ctx)
-	if err != nil {
-		return err
-	}
-	modifier, err := namespaceModifierDocument(r.handle.OperationID(), restoredPods)
+	// THE MODIFIER IS BUILT BEFORE ANYTHING CHANGES and reads nothing: its
+	// rules are static, so what it writes is the same before the safety backup,
+	// after the namespace is gone, and on a resumed run.
+	modifier, err := namespaceModifierDocument(r.handle.OperationID())
 	if err != nil {
 		return err
 	}
@@ -3200,18 +3226,20 @@ func (r *restoreRun) execute(ctx context.Context) error {
 		// fill, and every one of them must have a Completed PodVolumeRestore.
 		NamedVolumes: r.plan.Claims,
 		// THE MODIFIER CARRIES BOTH: the CronJob suspension, so no restored
-		// CronJob can fire between the restore and activation, and the pod
-		// rename, so a backup taken mid-rollout cannot have its restored pod
-		// adopted and deleted by a zero-replica ReplicaSet before its volume is
-		// filled (namespaceModifierDocument, podRenameRule).
+		// CronJob can fire between the restore and activation, and the
+		// ReplicaSet hold, so a backup taken mid-rollout cannot have its
+		// restored pod adopted and deleted by a zero-replica ReplicaSet before
+		// its volume is filled (namespaceModifierDocument, heldReplicaSetRule).
+		// A ReplicaSet with replicas is left alone: it adopts its restored pod
+		// rather than starting a second one.
 		ResourceModifier: modifier,
 	})
 	if err != nil {
 		return err
 	}
-	// THE PODS THE RESTORE FILLED VOLUMES THROUGH ARE NOW OWED WORK: activation
-	// deletes them, exactly as mode 2's do, because the workload's own
-	// controller creates the pods that take the claims over.
+	// THE PODS THE RESTORE FILLED VOLUMES THROUGH ARE NOW OWED WORK, exactly as
+	// mode 2's are: activation deletes the ones no controller owns, and the
+	// workload's own controller creates the pods that take the claims over.
 	if err := r.recordRestoredPods(ctx, restores); err != nil {
 		return err
 	}
@@ -3224,12 +3252,14 @@ func (r *restoreRun) execute(ctx context.Context) error {
 // recordRestoredPods records, as owed work, the pods the restore filled volumes
 // through — the pods the PodVolumeRestores name.
 //
-// MIRRORS MODE 2 (verifyRefilledClaims) and for the same reason: a restored pod
-// is not the workload's pod when the restore is done with it. It carries the
-// restored data and mounts the claim, and the pod the workload's controller
-// creates next does too; leaving the restore's own pod running leaves two pods
-// on one claim and a pod the operator never asked for. So activation deletes
-// it, in the same step that puts the workloads back.
+// NOT EVERY ONE OF THEM IS THE RESTORE'S TO DELETE, and activation decides that
+// when it runs (activate) by reading the pod's controller owner. A ReplicaSet
+// the backup held with replicas keeps its selector, so it adopts the restored
+// pod as one of its own replicas; that pod IS the workload's own pod, and
+// deleting it only restarts the workload — on a claim a single node can mount
+// once (OpenEBS LVM) the pod that restart creates cannot mount the claim while
+// the deleted pod's mount is still going away. So the record is not a list of
+// deletions: it is the list of what may still be owed.
 func (r *restoreRun) recordRestoredPods(ctx context.Context, restores []VolumeRestoreState) error {
 	seen := map[string]bool{}
 	for _, restore := range restores {
