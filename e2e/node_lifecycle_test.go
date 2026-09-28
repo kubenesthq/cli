@@ -485,7 +485,17 @@ func TestNodeLifecycleGate(t *testing.T) {
 
 		// The isolation confirmation is the operator's step: without it the
 		// command refuses and names the machine, and nothing is removed.
-		out, err := nodeVerb(t, withSSH(env, "node", "replace", "--cluster", env.cluster, "--node", dead, "--with", spare, "--now")...)
+		//
+		// THE REFUSED RUN CARRIES EVERY ARGUMENT THE CONFIRMED ONE DOES, the
+		// storage device included: the verb journals its arguments on the first
+		// run and resumes only the identical command, so on lab w3 (2026-09-28)
+		// a refused run without --storage-device made the confirmed run with it
+		// a "different node-replace". --confirm-isolated is the one difference.
+		replace := []string{"node", "replace", "--cluster", env.cluster, "--node", dead, "--with", spare, "--now"}
+		if spareDevice != "" {
+			replace = append(replace, "--storage-device", spareDevice)
+		}
+		out, err := nodeVerb(t, withSSH(env, replace...)...)
 		if err == nil {
 			t.Fatalf("a replace of a machine that does not answer was accepted without --confirm-isolated:\n%s", out)
 		}
@@ -499,11 +509,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 			t.Fatal("the refusal removed the Node object it refused to remove")
 		}
 
-		args := []string{"node", "replace", "--cluster", env.cluster, "--node", dead, "--with", spare, "--confirm-isolated", "--now"}
-		if spareDevice != "" {
-			args = append(args, "--storage-device", spareDevice)
-		}
-		out, err = nodeVerb(t, withSSH(env, args...)...)
+		out, err = nodeVerb(t, withSSH(env, append(replace, "--confirm-isolated")...)...)
 		if err != nil {
 			t.Fatalf("node replace failed:\n%s\n%v", out, err)
 		}
