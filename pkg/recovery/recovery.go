@@ -59,6 +59,67 @@ type Request struct {
 	Backup string
 }
 
+// ChooseBackup picks the backup a recovery starts from, and says plainly when the
+// one it must start from cannot be shown to cover anything.
+//
+// TWO RULES MEET HERE, AND NEITHER MAY BE DROPPED (PLAN 7.5's eligibility rule
+// and PLAN 7.9's step 5):
+//
+//   - never restore data whose coverage cannot be shown. A backup that records
+//     no coverage is a backup nobody can say the contents of, and restoring it
+//     would put arbitrary objects over a namespace;
+//   - never dead-end a recovery whose control plane is already back. On a
+//     bundle 1.1 fleet the operator records no expected coverage at all
+//     (that arrived with kn-t210 in 2.7.0-rc.1), so demanding coverage there
+//     would end every all-in-one recovery after the database was already
+//     restored, with a resume unable to change it.
+//
+// So the recovery SELECTS the newest completed backup that records coverage, or,
+// when none does, the newest completed one and the REASON it will not be
+// restored from — which the caller records and reports rather than failing on.
+func ChooseBackup(set *recoverykit.Set, named string) (recoverykit.Backup, string, error) {
+	if set == nil {
+		return recoverykit.Backup{}, "", errors.New("no recovery set: the backup comes from the set that binds the kit")
+	}
+	var completed []recoverykit.Backup
+	for _, b := range set.Backups {
+		if !b.Completed() {
+			continue
+		}
+		if named != "" && b.Name != named {
+			continue
+		}
+		completed = append(completed, b)
+	}
+	if len(completed) == 0 {
+		if named != "" {
+			return recoverykit.Backup{}, "", fmt.Errorf("the recovery set at %s does not record backup %q as completed; it names %s", SetKeyOf(set), named, backupNames(set))
+		}
+		return recoverykit.Backup{}, "", fmt.Errorf("the recovery set names no completed backup: it was written with the install baseline and no backup has been recorded in it yet")
+	}
+	// Newest first, and prefer one that can be shown to cover something.
+	sort.SliceStable(completed, func(i, j int) bool { return completed[i].CompletedAt.After(completed[j].CompletedAt) })
+	for _, b := range completed {
+		if len(b.Coverage) > 0 {
+			return b, "", nil
+		}
+	}
+	b := completed[0]
+	return b, fmt.Sprintf("the backup %q records no namespace coverage, so nothing can say which workloads it holds or whether it holds them: the operator that places a backup's expected coverage records it from bundle 1.2's agent (kn-t210), and this cluster's operator is older. The control plane has been recovered; its own workloads have NOT, and they stay held until an operator restores them deliberately", b.Name), nil
+}
+
+// SetKeyOf is the object key a set was read from, when it is known, so a refusal
+// can name the object rather than describe it.
+func SetKeyOf(set *recoverykit.Set) string {
+	if set == nil {
+		return "the recovery set"
+	}
+	if v := set.Checksums["set_key"]; v != "" {
+		return v
+	}
+	return "the recovery set for cluster " + set.Binding.ClusterID
+}
+
 // Selection is what the bucket says a recovery of one cluster starts from: the
 // recovery set, the kit it binds, and the backup to restore.
 type Selection struct {
@@ -74,6 +135,11 @@ type Selection struct {
 	// message can name the object rather than describe it.
 	SetKey string
 	KitKey string
+	// RestoreSkipReason, when set, is why this recovery will NOT restore the
+	// backup's namespaces. It is recorded and reported, never a failure: a
+	// control plane that is already back must not be dead-ended by a backup
+	// nobody can show the coverage of.
+	RestoreSkipReason string
 }
 
 // Validate refuses a request that cannot identify what to recover. It runs
@@ -341,6 +407,11 @@ func SelectManagementCluster(ctx context.Context, store Store, scope, instanceID
 		if !set.Eligible() {
 			continue
 		}
+		// A set with NO completed backup is not a candidate at all. One whose
+		// only completed backup records no coverage IS: the recovery carries on
+		// with the reason it will not restore from it, because refusing here
+		// would dead-end an all-in-one recovery whose control plane is already
+		// back (PLAN 7.9 step 5; kn-t210 added coverage records in 1.2).
 		if _, ok := completedBackup(set, backup); !ok {
 			continue
 		}
@@ -378,13 +449,16 @@ func materialise(ctx context.Context, store Store, scope string, req Request, se
 	if kit.ArtifactID != set.ArtifactID {
 		return nil, fmt.Errorf("the recovery set at %s binds kit artifact %s and the kit at %s is artifact %s: the two do not describe the same artifact", setKey, set.ArtifactID, kitKey, kit.ArtifactID)
 	}
-	backup, ok := completedBackup(set, req.Backup)
-	if !ok {
-		// A control-plane recovery starts from its CHECKPOINT, not from the
-		// management cluster's workload backup, and the set is written before
-		// either exists. An empty selection is reported as such rather than
-		// invented.
-		backup = recoverykit.Backup{}
+	backup, skipReason, err := ChooseBackup(set, req.Backup)
+	if err != nil {
+		if set.Binding.Kind == recoverykit.KindControlPlane {
+			// A CONTROL-PLANE SET CARRIES NO WORKLOAD BACKUP and is not asked
+			// for one: its data point is the checkpoint, and the management
+			// cluster's own workloads come from that cluster's set.
+			backup, skipReason = recoverykit.Backup{}, ""
+		} else {
+			return nil, err
+		}
 	}
 	local, err := localCopy(req, set.ArtifactID)
 	if err != nil {
@@ -395,9 +469,10 @@ func materialise(ctx context.Context, store Store, scope string, req Request, se
 		Kit:    kit,
 		KitDoc: kitDoc,
 		Local:  local,
-		Backup: backup,
-		SetKey: setKey,
-		KitKey: kitKey,
+		Backup:            backup,
+		SetKey:            setKey,
+		KitKey:            kitKey,
+		RestoreSkipReason: skipReason,
 	}, nil
 }
 

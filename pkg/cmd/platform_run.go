@@ -296,6 +296,23 @@ func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
 	}
 	fmt.Fprintf(out, "Journal: %s\n", journal.Path())
 
+	// COMPLETED WITH AN EXCEPTION THE OPERATOR MUST ACT ON, stated where they
+	// will read it: not restoring a backup nobody can show the coverage of is
+	// the right call, and leaving it to a line in the stage log is how an
+	// operator discovers later that a workload never came back.
+	if reason := session.Record.RecoveryRestoreSkipReason; reason != "" {
+		fmt.Fprintf(out, "\nNOT RESTORED: this recovery did NOT restore any workload namespace.\n")
+		fmt.Fprintf(out, "  Why: %s\n", reason)
+		if len(session.Record.RecoveryNamespacesNotRestored) > 0 {
+			fmt.Fprintf(out, "  Namespaces left held: %s\n", strings.Join(session.Record.RecoveryNamespacesNotRestored, ", "))
+		} else {
+			fmt.Fprintf(out, "  The backup names no namespaces, so none can be listed here.\n")
+		}
+		fmt.Fprintf(out, "  Restore them deliberately, once you have accepted the data's age:\n")
+		fmt.Fprintf(out, "    kubenest backup restore --namespace <ns> --from %s --replace --accept-data-age --confirm\n", session.Record.RecoveryBackupName)
+		fmt.Fprintf(out, "  The control plane itself is recovered and serving; only these workloads are still held.\n")
+	}
+
 	if f.ControlPlane {
 		fmt.Fprintf(out, "\nConsole:      https://app.%s\n", domain)
 		fmt.Fprintf(out, "Logged in to https://api.%s\n", domain)

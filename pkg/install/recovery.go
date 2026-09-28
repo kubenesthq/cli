@@ -234,6 +234,7 @@ func stageRecoverySelect(ctx context.Context, s *Session) error {
 	}
 	s.Record.RecoverySetKey = sel.SetKey
 	s.Record.RecoveryBackupName = sel.Backup.Name
+	s.Record.RecoveryRestoreSkipReason = sel.RestoreSkipReason
 	if err := s.saveRecord(); err != nil {
 		return err
 	}
@@ -599,8 +600,21 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		return err
 	}
 	namespaces := sel.Backup.Coverage
+	if reason := s.Record.RecoveryRestoreSkipReason; reason != "" {
+		// NEVER RESTORE WHAT CANNOT BE SHOWN TO BE COVERED, AND NEVER DEAD-END A
+		// RECOVERY: the reason was decided at selection time and is reported by
+		// the command; this stage finishes rather than failing.
+		s.Logf("  NOT restoring the workloads of namespace(s) %s: %s", coverageOrUnknown(namespaces), reason)
+		for _, ns := range coverageOrNames(namespaces) {
+			markNotRestored(s, ns, reason)
+		}
+		if len(namespaces) == 0 && (s.recoveryWorkloadSel != nil || sel.Set.Binding.Kind == recoverykit.KindControlPlane) {
+			s.Logf("  the backup names no namespaces, so the report cannot list them; `kubenest backup restore --latest` after choosing a namespace by hand")
+		}
+		return nil
+	}
 	if len(namespaces) == 0 {
-		return fmt.Errorf("the recovery set's backup %q records no namespace coverage, so there is nothing this stage could restore. A backup whose expected set was never recorded cannot be shown to cover anything — restore the workload by hand with `kubenest backup restore --namespace <ns> --from %s`, or select a backup that records what it covers", sel.Backup.Name, sel.Backup.Name)
+		return fmt.Errorf("the recovery set's backup %q records no namespace coverage, so there is nothing this stage could restore. A backup whose expected set was never recorded cannot be shown to cover anything — restore the workload by hand with `kubenest backup restore --namespace <ns> --from %s --replace --accept-data-age --confirm`", sel.Backup.Name, sel.Backup.Name)
 	}
 	deps := backup.RestoreDeps{
 		Cluster: backup.NewK3sCluster(server),
@@ -612,6 +626,22 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		if containsString(s.Record.RecoveryNamespacesRestored, namespace) {
 			s.Logf("  namespace %s was already restored by this recovery: not restoring it again over its own data", namespace)
 			continue
+		}
+		// THE FULL ELIGIBILITY RULE, PER NAMESPACE, NOW THAT THERE IS A CLUSTER
+		// TO ASK: completed, coverage known, no missing or failed volume, and
+		// the storage location Available. Selection could only judge coverage
+		// (the cluster does not exist yet); this is where the rest is knowable.
+		// An INELIGIBLE backup is skipped with its reason, never failed: the
+		// namespaces stay held and the report says why.
+		if facts, err := backup.NewVeleroBackups(server).NamedBackup(ctx, namespace, sel.Backup.Name); err == nil {
+			if reason := facts.IneligibleReason(); reason != "" {
+				s.Logf("  NOT restoring namespace %s: %s", namespace, reason)
+				markNotRestored(s, namespace, reason)
+				if err := s.saveRecord(); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
 		opts := backup.RestoreOptions{
@@ -731,6 +761,10 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 			s.Logf("  %s was already activated by this recovery", namespace)
 			continue
 		}
+		if containsString(s.Record.RecoveryNamespacesNotRestored, namespace) {
+			s.Logf("  %s stays HELD: its data was not restored (%s), and activating it would start its workloads against whatever is in the namespace rather than against the data they expect", namespace, s.Record.RecoveryRestoreSkipReason)
+			continue
+		}
 		ns := namespace
 		probe := func(ctx context.Context) (bool, converge.State, error) {
 			hold, err := cluster.ProjectHold(ctx, ns)
@@ -768,3 +802,26 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 	}
 	return nil
 }
+
+// markNotRestored records a namespace whose data was not restored, so the
+// report names it and activation leaves it held.
+func markNotRestored(s *Session, namespace, reason string) {
+	if !containsString(s.Record.RecoveryNamespacesNotRestored, namespace) {
+		s.Record.RecoveryNamespacesNotRestored = append(s.Record.RecoveryNamespacesNotRestored, namespace)
+	}
+	if s.Record.RecoveryRestoreSkipReason == "" {
+		s.Record.RecoveryRestoreSkipReason = reason
+	}
+}
+
+// coverageOrUnknown names the namespaces a backup is known to cover, or says
+// that nothing knows.
+func coverageOrUnknown(namespaces []string) string {
+	if len(namespaces) == 0 {
+		return "(the backup records no coverage, so no namespace can be named)"
+	}
+	return strings.Join(namespaces, ", ")
+}
+
+// coverageOrNames is the list to record, which is empty when nothing is known.
+func coverageOrNames(namespaces []string) []string { return namespaces }

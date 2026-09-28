@@ -200,12 +200,21 @@ type Record struct {
 	// recovery already chose and reported, and re-deriving them is how a resume
 	// silently switches to a newer backup, or to a different set, half way
 	// through a recovery.
-	RecoveryOperationID         string   `json:"recovery_operation_id,omitempty"`
-	RecoverySetKey              string   `json:"recovery_set_key,omitempty"`
-	RecoveryBackupName          string   `json:"recovery_backup_name,omitempty"`
-	RecoveryCheckpointKey       string   `json:"recovery_checkpoint_key,omitempty"`
-	RecoveryNamespacesRestored  []string `json:"recovery_namespaces_restored,omitempty"`
-	RecoveryNamespacesActivated []string `json:"recovery_namespaces_activated,omitempty"`
+	RecoveryOperationID   string `json:"recovery_operation_id,omitempty"`
+	RecoverySetKey        string `json:"recovery_set_key,omitempty"`
+	RecoveryBackupName    string `json:"recovery_backup_name,omitempty"`
+	RecoveryCheckpointKey string `json:"recovery_checkpoint_key,omitempty"`
+	// RecoveryRestoreSkipReason is why this recovery is NOT restoring the
+	// management cluster's (or the cluster's) workload namespaces. It is
+	// recorded rather than raised: the control plane may already be back, and a
+	// recovery that ends there in a dead end is worse than one that reports the
+	// exception and finishes.
+	RecoveryRestoreSkipReason string `json:"recovery_restore_skip_reason,omitempty"`
+	// RecoveryNamespacesNotRestored are the namespaces whose data was NOT
+	// restored, so the report can name them and activation can leave them held.
+	RecoveryNamespacesNotRestored []string `json:"recovery_namespaces_not_restored,omitempty"`
+	RecoveryNamespacesRestored    []string `json:"recovery_namespaces_restored,omitempty"`
+	RecoveryNamespacesActivated   []string `json:"recovery_namespaces_activated,omitempty"`
 }
 
 // Session is one install run's state.

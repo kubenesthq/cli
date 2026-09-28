@@ -222,6 +222,16 @@ func (f *recoveryFixture) request() recovery.Request {
 // recoverySession builds a session in the recovery shape with a server node the
 // test controls and no control-plane client: the stages under test decide
 // before a client matters, and the ones that need one are refused by name.
+
+// onlyThe11Backup leaves only the coverage-less backup in the bucket, which is
+// what a bundle 1.1 fleet has: the fixture's own set (whose backup records its
+// coverage, as a 1.2 operator does) is removed so the test is about the shape
+// the hardware produced.
+func onlyThe11Backup(f *recoveryFixture) {
+	delete(f.bucket.objects, recoverykit.SetKey(recoveryTestScope, f.bind.ClusterID, recoverykit.KindCluster, f.art))
+	delete(f.bucket.objects, recoverykit.KitKey(recoveryTestScope, f.bind.ClusterID, recoverykit.KindCluster, f.art))
+}
+
 func recoverySession(t *testing.T, opts Options) (*Session, *recordingRunner) {
 	t.Helper()
 	m, err := manifest.Parse([]byte("bundle: \"1.1\"\nlimits:\n  timeouts:\n    install-total: 30m\n    component-ready: 5m\n"))
@@ -1295,5 +1305,127 @@ func TestAResumeKeepsTheArtifactTheOperationChose(t *testing.T) {
 	fresh, _ := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
 	if err := fresh.refuseASwitchedSet(sel); err != nil {
 		t.Fatalf("a first attempt was refused: %v", err)
+	}
+}
+
+// TestA11FleetRecoversItsControlPlaneAndSkipsTheRestore is the hardware dead
+// end of 2026-09-28: prod-1 ran bundle 1.1, whose operator (2.6.17) records no
+// expected coverage — that arrived with kn-t210 in 2.7.0-rc.1 — so on a 1.1
+// fleet no backup can ever carry coverage, and stage 20 refused after the
+// control plane was already back, with a resume unable to change it.
+//
+// The decision (PLAN 7.5's rule, and PLAN 7.9's step 5): never restore data
+// whose coverage cannot be shown, and never dead-end a recovery whose control
+// plane is already back. The backup is chosen with its reason, the stages SKIP,
+// the reason is journalled and reported, and the command finishes.
+func TestA11FleetRecoversItsControlPlaneAndSkipsTheRestore(t *testing.T) {
+	const clusterA = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c36"
+	// A 1.1-shaped bucket: completed, and with no coverage recorded.
+	f := newRecoveryFixture(t, clusterA, "org-1", "inst-1", nil)
+	onlyThe11Backup(f)
+	f.publish(t, f.bind, "20260928T000000Z-11111111", f.secrets, nil, true, recoverykit.Backup{
+		Name:        "manual-20260927-235954",
+		CompletedAt: time.Date(2026, 9, 27, 23, 59, 54, 0, time.UTC),
+		Status:      "Completed",
+	})
+	sel, err := recovery.SelectManagementCluster(context.Background(), f.bucket, recoveryTestScope, "inst-1", clusterA, "")
+	if err != nil {
+		t.Fatalf("a 1.1-shaped workload backup was refused at selection: %v", err)
+	}
+	if sel.Backup.Name != "manual-20260927-235954" {
+		t.Fatalf("the backup chosen is %q", sel.Backup.Name)
+	}
+	if sel.RestoreSkipReason == "" {
+		t.Fatal("a backup that records no coverage was chosen with no reason to skip it, so the restore stage would try it")
+	}
+	for _, want := range []string{"coverage", "kn-t210"} {
+		if !strings.Contains(sel.RestoreSkipReason, want) {
+			t.Fatalf("the reason does not name %q, so the operator cannot tell why their workloads did not come back: %s", want, sel.RestoreSkipReason)
+		}
+	}
+
+	// The restore stage SKIPS rather than failing, and records it.
+	s, runner := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
+	s.recoverySel = sel
+	s.Record.RecoveryRestoreSkipReason = sel.RestoreSkipReason
+	s.Record.RecoveryBackupName = sel.Backup.Name
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the stage failed on a backup it had already decided not to restore from, which is the dead end this fix removes: %v", err)
+	}
+	if len(s.Record.RecoveryNamespacesNotRestored) != 0 {
+		t.Fatalf("a backup that names no namespaces produced a namespace list: %v", s.Record.RecoveryNamespacesNotRestored)
+	}
+	if len(runner.ran) != 0 {
+		t.Fatalf("the skip issued %d command(s) on the cluster: %v", len(runner.ran), runner.ran)
+	}
+
+	// Activation leaves the workloads held rather than starting them against
+	// whatever is in the namespace.
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("activation failed: %v", err)
+	}
+	if runner.ranAny("annotate") {
+		t.Fatalf("a namespace whose data was not restored was activated: %s", runner.ranAll())
+	}
+}
+
+// TestAnEligibleBackupStillRestores: the skip is for a backup nobody can show
+// the coverage of, not for the recovery path in general. A backup that records
+// its namespaces is chosen with no reason to skip.
+func TestAnEligibleBackupStillRestores(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c37", "org-1", "inst-1", nil)
+	sel, err := recovery.SelectManagementCluster(context.Background(), f.bucket, recoveryTestScope, "inst-1", f.bind.ClusterID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel.RestoreSkipReason != "" {
+		t.Fatalf("a backup that records its coverage was skipped: %s", sel.RestoreSkipReason)
+	}
+	if len(sel.Backup.Coverage) == 0 {
+		t.Fatal("the fixture's backup records no coverage, so this test cannot tell the two cases apart")
+	}
+}
+
+// TestTheResumeFromAFailedStage20Completes: stage 20 failed on the hardware, so
+// the journal has it failed and everything before it completed or re-run. With
+// the reason recorded, the re-entered restore stage finishes instead of failing
+// again, and the stages after it run.
+func TestTheResumeFromAFailedStage20Completes(t *testing.T) {
+	const clusterA = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c38"
+	f := newRecoveryFixture(t, clusterA, "org-1", "inst-1", nil)
+	onlyThe11Backup(f)
+	f.publish(t, f.bind, "20260928T010000Z-22222222", f.secrets, nil, true, recoverykit.Backup{
+		Name: "manual-20260927-235954", CompletedAt: time.Date(2026, 9, 27, 23, 59, 54, 0, time.UTC), Status: "Completed",
+	})
+	sel, err := recovery.SelectManagementCluster(context.Background(), f.bucket, recoveryTestScope, "inst-1", clusterA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, _ := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
+	s.recoverySel = sel
+	now := time.Now().UTC()
+	for _, stage := range []string{StageRecoveryOwnership, StageK3sServer, StageRecoveryRepository, StageRegister, StageAgent, StageRecoveryProvisional} {
+		if err := s.Jnl.Append(Entry{Stage: stage, Status: StatusCompleted, At: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Jnl.Append(Entry{Stage: StageRecoveryRestore, Status: StatusFailed, At: now, Detail: "records no namespace coverage"}); err != nil {
+		t.Fatal(err)
+	}
+	// The selection the resume re-derives carries the reason, the stage records
+	// it and returns, and the activation and report stages have what they need.
+	s.Record.RecoveryRestoreSkipReason = sel.RestoreSkipReason
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the resumed stage failed again: %v", err)
+	}
+	if err := s.saveRecord(); err != nil {
+		t.Fatal(err)
+	}
+	record, err := Recorded(s.Jnl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.RecoveryRestoreSkipReason == "" {
+		t.Fatal("the reason was not journalled, so the report cannot state it after a resume")
 	}
 }
