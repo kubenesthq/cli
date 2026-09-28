@@ -513,6 +513,7 @@ func TestLostSingleServerRecovery(t *testing.T) {
 	if err := recoveryWaitsForNamespace(runner, env.namespace, 20*time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	recoveryRequiresProof(t, runner, env.namespace)
 	// THE CALL CANNOT ARRIVE UNTIL ACTIVATION, so it is waited for rather than
 	// demanded: the fixture's CronJob runs every minute, the restore leaves it
 	// suspended, and activation is what puts it back — on 2026-09-28 an
@@ -620,6 +621,7 @@ func TestAllInOneHostRecovery(t *testing.T) {
 	if err := recoveryWaitsForNamespace(runner, env.namespace, 30*time.Minute); err != nil {
 		t.Fatal(err)
 	}
+	recoveryRequiresProof(t, runner, env.namespace)
 	// Bounded, for the same reason as S6: the call only comes once the
 	// restored CronJob has been activated and its next minute has passed.
 	waitForSentinelCall(t, sentinel, 3*time.Minute,
@@ -660,6 +662,43 @@ func dialHost(t *testing.T, env recoveryEnv, address string) *sshx.Client {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
+}
+
+// recoveryRequiresProof checks that the restored workload reads the bytes the
+// backup copied: the SHA-256 of /data/proof.txt, read through a Running pod of
+// the namespace, against KUBENEST_RECOVERY_PROOF_SHA256, the digest the fixture
+// read back through the pod before the backup.
+//
+// A RUNNING POD IS NOT RESTORED DATA. The namespace can come back with a fresh,
+// empty claim and a workload that starts on it; until 2026-09-28 this gate took
+// the pod and the sentinel as the whole proof, and the digest was compared by
+// hand on lab s6. The comparison is the scenario's own claim, so it is the gate's.
+func recoveryRequiresProof(t *testing.T, runner *sshx.Client, namespace string) {
+	t.Helper()
+	want := strings.TrimSpace(os.Getenv("KUBENEST_RECOVERY_PROOF_SHA256"))
+	if want == "" {
+		t.Fatal("KUBENEST_RECOVERY_PROOF_SHA256 is not set: the fixture records the proof file's digest before the backup, and without it this gate cannot show the data came back")
+	}
+	ctx := context.Background()
+	out, err := k3s.Kubectl(ctx, runner, "get pods -n "+namespace+` -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}'`)
+	if err != nil {
+		t.Fatalf("listing the Running pods of %s: %v", namespace, err)
+	}
+	var last string
+	for _, pod := range strings.Fields(strings.Trim(out, "'")) {
+		sum, err := k3s.Kubectl(ctx, runner, "exec -n "+namespace+" "+pod+" -- sha256sum /data/proof.txt")
+		if err != nil {
+			last = pod + ": " + err.Error()
+			continue
+		}
+		got := strings.Fields(sum)
+		if len(got) > 0 && got[0] == want {
+			t.Logf("the restored /data/proof.txt in %s/%s has the digest the fixture recorded before the backup (%s)", namespace, pod, want)
+			return
+		}
+		last = fmt.Sprintf("%s: %s", pod, strings.TrimSpace(sum))
+	}
+	t.Fatalf("no Running pod of %s reads /data/proof.txt with the digest %s the fixture recorded before the backup (last: %s)", namespace, want, last)
 }
 
 // recoveryWaitsForNamespace waits until a namespace is back and its pods are
