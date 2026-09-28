@@ -308,6 +308,16 @@ const (
 	// annotation.
 	StoppedCronJobTarget = "cronjob-stop/"
 	StoppedJobTarget     = "job-stop/"
+	// SafetyBackupSkipWrite is the record kind naming the safety backup a run
+	// did not take because the namespace was not there to copy. Like the stop
+	// step's entries it is written ALREADY DISCHARGED (operation.WriteDone): it
+	// answers "what did the safety step do", and it is not work activation owes.
+	SafetyBackupSkipWrite = "safety-backup-skipped"
+	// SkippedSafetyBackupTarget is where that entry points. It is its own
+	// target — never "backup/<name>" — so a skipped backup can never be read
+	// back as the backup a run took, or as a postcondition a resume proves by
+	// observing Velero for an object that was never created.
+	SkippedSafetyBackupTarget = "safety-backup/"
 )
 
 // The marker the operator's restore drill puts on ITS Velero Restore. Both
@@ -1211,6 +1221,14 @@ func (r *restoreRun) request() operation.Request {
 	versions := map[string]string{
 		"backup": r.chosenBackup(),
 		"mode":   r.opts.Mode(),
+		// THE NAMESPACE IS ALSO A VERSION OF THE REQUEST, not only an identity:
+		// a namespace the plan found ABSENT has no UID to pin (identityOf
+		// records none), and a mode-1 plan with nothing in that namespace
+		// records no claim identity either, so the record would name the
+		// namespace nowhere and the `--resume` this run tells the operator to
+		// use would be refused with "records no namespace" (kn-x0wv.9, lab s6,
+		// 2026-09-28). restoreNamespaceOf reads it back from here.
+		"namespace": r.opts.Namespace,
 	}
 	if r.opts.Bundle != nil {
 		versions["bundle"] = r.opts.Bundle.Bundle
@@ -1746,12 +1764,39 @@ func (r *restoreRun) verifyIdentities(ctx context.Context) error {
 // safetyBackup takes the pre-restore backup of the namespace as it stands, and
 // waits for it within limits.timeouts.backup.
 //
+// A NAMESPACE THE PLAN FOUND ABSENT HAS NOTHING TO PRESERVE, so no backup is
+// taken. The safety copy exists so the namespace as it stands can be brought
+// back if the restore goes wrong, and a namespace that is not there holds
+// nothing to bring back; asking Velero for it anyway is not a no-op. Velero
+// settles a backup whose included namespace is not on the cluster as
+// PartiallyFailed — "Velero: resource: /namespaces message: /fail to get the
+// namespace <ns> specified in backup.Spec.IncludedNamespaces" — and the
+// refusal below then stops a restore that had nothing to lose. Measured on
+// hardware in a lost-server recovery (lab s6, 2026-09-28), where the rebuilt
+// cluster held the re-delivered Project and not its namespace.
+//
+// THE ABSENCE IS THE PLAN'S OWN FACT, printed as "does not exist; the restore
+// recreates it" (restorePlan.Exists, set by buildPlan and rebuilt on a resume
+// from the record's own identities), and the read that established it has just
+// been re-established by verifyIdentities. The step is RECORDED as a write the
+// operation discharged, so the record says what the safety step did and a
+// `--resume` makes the same decision from the immutable request rather than
+// from a fresh look at a cluster whose namespace its own Restore has since put
+// back.
+//
 // IT IS NOT TakeBackup. That one excludes the platform's own namespaces and
 // derives its TTL from the schedule; this one must cover THIS namespace
 // whatever its name, and keeps seven days. The wait is the same converge probe,
 // so the two cannot drift apart.
 func (r *restoreRun) safetyBackup(ctx context.Context) error {
 	name := "kubenest-safety-" + r.handle.OperationID()
+	if !r.plan.Exists {
+		if err := r.recordDischarged(ctx, SkippedSafetyBackupTarget+name, SafetyBackupSkipWrite, "the namespace does not exist"); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "  safety:        skipped: namespace %s does not exist, so there is nothing a safety copy could bring back\n", r.opts.Namespace)
+		return nil
+	}
 	doc, err := safetyBackupDocument(name, r.opts.Namespace, r.handle.OperationID(), SafetyBackupTTL)
 	if err != nil {
 		return err
@@ -1936,13 +1981,28 @@ func (r *restoreRun) stopWork(ctx context.Context, when string) error {
 // "job/<name>", "deployment/<name>" and "statefulset/<name>", so a record entry
 // here can never be mistaken for one of those.
 func (r *restoreRun) recordStoppedWork(ctx context.Context, target, kind, was string) error {
+	return r.recordDischarged(ctx, target, kind, was)
+}
+
+// recordDischarged writes one "what this step did" entry into the operation, as
+// a PendingWrite the operation does NOT owe: it carries operation.WriteDone and
+// a DoneAt for the moment it is written.
+//
+// IT IS NOT recordPending. That one records work activation still has to
+// perform, and activation reads its kinds — "restore-replicas",
+// "restore-cronjob", "restore-job", "restore-pod" — to put the namespace back.
+// A call here answers a question a reader asks OF a finished run ("did the stop
+// step suspend this Job, and what does it go back to?", "did the safety step
+// take a backup?"), which is why each caller gives its entry a target of its
+// own.
+func (r *restoreRun) recordDischarged(ctx context.Context, target, kind, detail string) error {
 	now := r.deps.Now()
 	return r.deps.Store.Update(ctx, r.handle, func(rec *operation.Record) error {
 		for i := range rec.Pending {
 			if rec.Pending[i].Target != target || rec.Pending[i].Kind != kind {
 				continue
 			}
-			rec.Pending[i].Detail = was
+			rec.Pending[i].Detail = detail
 			rec.Pending[i].Status = operation.WriteDone
 			rec.Pending[i].DoneAt = &now
 			return nil
@@ -1950,7 +2010,7 @@ func (r *restoreRun) recordStoppedWork(ctx context.Context, target, kind, was st
 		rec.Pending = append(rec.Pending, operation.PendingWrite{
 			Kind:   kind,
 			Target: target,
-			Detail: was,
+			Detail: detail,
 			Status: operation.WriteDone,
 			At:     now,
 			DoneAt: &now,
@@ -1983,6 +2043,14 @@ func (r *restoreRun) namespaceDeletionDone() bool {
 // gone: restoring into a terminating namespace is how a restore comes back
 // half-applied.
 //
+// A NAMESPACE THE PLAN FOUND ABSENT IS NOT THIS OPERATION'S TO DELETE. There
+// was nothing to destroy when the operation was planned and confirmed, and the
+// only thing that has created a namespace with that name since is this
+// operation's own Velero Restore — so on a resume a live read finds this
+// restore's own output, and deleting it destroys the data the operator has just
+// recovered, with no second Restore to put it back (kn-x0wv.9; the plan's
+// absence is the same recorded fact the safety step is skipped on).
+//
 // A DELETION THIS OPERATION ALREADY DID IS NOT WAITED FOR AGAIN. The
 // reconcilers recreate the namespace as soon as it is gone — that is the
 // ordinary state the pause exists to stop mid-flight — so on a resume the
@@ -1992,6 +2060,10 @@ func (r *restoreRun) namespaceDeletionDone() bool {
 func (r *restoreRun) deleteNamespace(ctx context.Context) error {
 	if r.namespaceDeletionDone() {
 		fmt.Fprintf(r.out, "  namespace:     %s was deleted by this operation (the step is recorded as done): not deleting it again, and not waiting for the name to stay empty — the reconcilers may have recreated it\n", r.opts.Namespace)
+		return nil
+	}
+	if !r.plan.Exists {
+		fmt.Fprintf(r.out, "  namespace:     %s did not exist when this restore was planned, so this operation has nothing to delete (the restore recreates it)\n", r.opts.Namespace)
 		return nil
 	}
 	if state, err := r.deps.Cluster.Namespace(ctx, r.opts.Namespace); err != nil {
@@ -3033,8 +3105,15 @@ func (r *restoreRun) restoreRecord(ctx context.Context, operationID string) (*op
 }
 
 // restoreNamespaceOf reads the namespace a record is about. Mode 1 records it
-// as an identity of its own; mode 2 records only the claims it refills, and
-// both shapes name the namespace.
+// as an identity of its own whenever the namespace exists; mode 2 records only
+// the claims it refills, and both shapes name the namespace.
+//
+// A NAMESPACE THAT DID NOT EXIST IS NAMED BY THE REQUEST'S OWN VALUE. An absent
+// namespace has no UID, so mode 1 records no identity for it, and a namespace
+// that held nothing records no claim identity to read the name out of — the
+// case a lost-server recovery builds (lab s6, 2026-09-28). The request carries
+// the name as a version for exactly that, because a record that cannot name its
+// namespace cannot be resumed.
 func restoreNamespaceOf(record *operation.Record) string {
 	for _, artifact := range record.Request.Artifacts {
 		if rest, ok := strings.CutPrefix(artifact.Name, "namespace/"); ok {
@@ -3046,7 +3125,7 @@ func restoreNamespaceOf(record *operation.Record) string {
 			return namespace
 		}
 	}
-	return ""
+	return record.Request.Versions["namespace"]
 }
 
 // restoreSpecs decides which of the commands this verb submits are ACTIONS —

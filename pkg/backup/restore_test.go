@@ -553,6 +553,19 @@ type fakeOpKube struct {
 	objects  map[string]map[string]any
 	rev      int
 	commands []string
+	// safetyPhase is the phase this fake answers for a safety backup
+	// (kubenest-safety-*), and safetyFailure is the reason it gives with it.
+	// Empty means Completed, which is what it answers for every other backup.
+	//
+	// A REAL VELERO IS NOT ALWAYS COMPLETED, and for a backup whose included
+	// namespace is not on the cluster it never is: it settles PartiallyFailed
+	// with "Velero: resource: /namespaces message: /fail to get the namespace
+	// <ns> specified in backup.Spec.IncludedNamespaces" (measured on hardware
+	// in a lost-server recovery, lab s6, 2026-09-28). A test that means to
+	// model that answer sets it, so the run is provable against what Velero
+	// really reports rather than against a fake that always says Completed.
+	safetyPhase   string
+	safetyFailure string
 }
 
 func newFakeOpKube() *fakeOpKube {
@@ -568,10 +581,17 @@ func (k *fakeOpKube) Run(ctx context.Context, command string) (sshx.Result, erro
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.commands = append(k.commands, command)
-	if strings.Contains(command, "get backup ") && strings.Contains(command, "-n velero") {
-		// The safety backup's settle probe reads Velero's own object; the fake
-		// cluster's backup is Completed as soon as it exists.
-		return sshx.Result{Stdout: `{"status":{"phase":"Completed"}}`}, nil
+	if name, ok := backupNameIn(command); ok {
+		// The safety backup's settle probe reads Velero's own object; every
+		// other backup this fake is asked about is Completed as soon as it
+		// exists, which is what the tests that are not about Velero's own
+		// answer rely on.
+		phase, failure := "Completed", ""
+		if strings.HasPrefix(name, "kubenest-safety-") && k.safetyPhase != "" {
+			phase, failure = k.safetyPhase, k.safetyFailure
+		}
+		body, _ := json.Marshal(map[string]any{"status": map[string]any{"phase": phase, "failureReason": failure}})
+		return sshx.Result{Stdout: string(body)}, nil
 	}
 	if name, ok := configMapNameIn(command); ok {
 		obj, found := k.objects[name]
@@ -694,6 +714,21 @@ func (k *fakeOpKube) commandIndex(needle string) int {
 		}
 	}
 	return -1
+}
+
+// backupNameIn is the backup name in a `kubectl get backup <name> ...`
+// command, whichever output form it asks for (-o json for a wait's probe, -o
+// name for an action's postcondition).
+func backupNameIn(command string) (string, bool) {
+	i := strings.Index(command, "get backup ")
+	if i < 0 {
+		return "", false
+	}
+	fields := strings.Fields(command[i+len("get backup "):])
+	if len(fields) == 0 {
+		return "", false
+	}
+	return fields[0], true
 }
 
 func configMapNameIn(command string) (string, bool) {
@@ -975,6 +1010,113 @@ func TestNamespaceRestoreReplace(t *testing.T) {
 	}
 	if !strings.Contains(out, "does not exist") {
 		t.Errorf("the run did not say the namespace was absent:\n%s", out)
+	}
+}
+
+// TestNamespaceRestoreTakesNoSafetyBackupOfAnAbsentNamespace is kn-x0wv.9: a
+// restore whose namespace does not exist has nothing to preserve, so it takes
+// no safety backup at all and goes on to request the Velero Restore.
+//
+// THE HARDWARE RUN IS THE PLANTED NEGATIVE (lab s6, 2026-09-28). A lost-server
+// recovery had rebuilt the cluster with the Project re-delivered and its
+// namespace gone; the plan printed "namespace: does not exist; the restore
+// recreates it", and the run then asked Velero for a safety backup of that
+// namespace. Velero answered what it answers to any backup of a namespace that
+// is not on the cluster — PartiallyFailed, "fail to get the namespace s6-data
+// specified in backup.Spec.IncludedNamespaces" — and the run refused a restore
+// that had nothing to lose. The fake Velero below answers exactly that, so on
+// the unfixed code this test stops at that refusal.
+func TestNamespaceRestoreTakesNoSafetyBackupOfAnAbsentNamespace(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	// THE CLUSTER THE OPERATOR FINDS: the Project is there — this run pauses it
+	// — and the namespace is not, with nothing in it to read.
+	f.cluster.namespace = nil
+	f.cluster.claims = nil
+	f.cluster.workloads = nil
+	f.cluster.cronjobs = nil
+	f.cluster.jobs = nil
+	f.kube.safetyPhase = "PartiallyFailed"
+	f.kube.safetyFailure = "Velero: resource: /namespaces message: /fail to get the namespace payments specified in backup.Spec.IncludedNamespaces"
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true}, "")
+	if err != nil {
+		t.Fatalf("a namespace that does not exist must restore without a safety backup: %v\n%s", err, out)
+	}
+	if len(f.cluster.backupsMade) != 0 {
+		t.Errorf("the run asked Velero for a safety backup of a namespace that does not exist: %v", f.cluster.backupsMade)
+	}
+	if f.kube.sawCommand("kubenest-safety-") {
+		t.Error("a safety backup document reached the cluster for a namespace that does not exist")
+	}
+	// The skip is SAID, in the safety step's own line: a silence here reads as
+	// a backup that was taken.
+	line := ""
+	for _, candidate := range strings.Split(out, "\n") {
+		if strings.Contains(candidate, "safety:") {
+			line = candidate
+		}
+	}
+	if line == "" {
+		t.Errorf("the run printed no safety line at all, so the operator cannot tell that no copy was taken:\n%s", out)
+	} else if !strings.Contains(line, "does not exist") {
+		t.Errorf("the safety line does not say the namespace does not exist: %q", line)
+	}
+	// AND IT IS RECORDED, as a step that reports what it did rather than work
+	// the operation owes: a recorded skip leaves nothing outstanding for
+	// activation to discharge.
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("the run left no record")
+	}
+	skipped := false
+	for _, pending := range record.Pending {
+		if pending.Kind == SafetyBackupSkipWrite {
+			skipped = true
+			if pending.Status != operation.WriteDone {
+				t.Errorf("the recorded safety-backup skip is %q, want it discharged: %+v", pending.Status, pending)
+			}
+		}
+	}
+	if !skipped {
+		t.Errorf("the record does not say the safety backup was skipped: %+v", record.Pending)
+	}
+	if len(f.cluster.restoresMade) != 1 {
+		t.Fatalf("the run did not go on to request the Velero Restore: %v", f.cluster.restoresMade)
+	}
+	if !strings.Contains(out, RestoredStage) {
+		t.Errorf("the run did not finish at %q:\n%s", RestoredStage, out)
+	}
+}
+
+// TestNamespaceRestoreStillTakesTheSafetyBackupOfALiveNamespace is the planted
+// negative of the skip above: an over-broad "take no safety backup" would leave
+// the ordinary restore — the one that HAS something to bring back — with no way
+// back, so a namespace that exists must still take one, and a safety backup
+// that did not complete must still stop the run before anything is destroyed.
+func TestNamespaceRestoreStillTakesTheSafetyBackupOfALiveNamespace(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.kube.safetyPhase = "PartiallyFailed"
+	f.kube.safetyFailure = "the volume could not be written"
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatalf("a safety backup that settled PartiallyFailed must stop the run:\n%s", out)
+	}
+	if len(f.cluster.backupsMade) != 1 {
+		t.Fatalf("the run took %d safety backup(s) of a namespace that exists, want exactly one: %v", len(f.cluster.backupsMade), f.cluster.backupsMade)
+	}
+	for _, want := range []string{"PartiallyFailed", f.cluster.backupsMade[0]} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %q: %v", want, err)
+		}
+	}
+	if f.cluster.deleted {
+		t.Error("the namespace was deleted after a safety backup that did not complete")
+	}
+	if len(f.cluster.restoresMade) != 0 {
+		t.Errorf("a Velero Restore was requested after a safety backup that did not complete: %v", f.cluster.restoresMade)
 	}
 }
 
@@ -1669,6 +1811,69 @@ func TestNamespaceRestoreResume(t *testing.T) {
 	}
 	if suspended, ok := resumed.cluster.suspended["nightly"]; ok && !suspended {
 		t.Error("--resume un-suspended a CronJob: activating is not resuming")
+	}
+}
+
+// TestNamespaceRestoreResumeTakesNoSafetyBackupEither is the resume half of
+// kn-x0wv.9: the decision to skip the safety backup is the one the run
+// RECORDED — the plan's absent namespace — and not a fresh read of the cluster,
+// so a resume makes the same decision and does not take one either.
+//
+// THE CLUSTER THE RESUME FINDS IS WHAT MAKES THAT THE POINT: the first run's
+// own Velero Restore has since put the namespace back, so a resume that asked
+// the cluster instead of the record would find a namespace, take a safety
+// backup of it, and stop on the answer the hardware gave (lab s6, 2026-09-28).
+func TestNamespaceRestoreResumeTakesNoSafetyBackupEither(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.namespace = nil
+	f.cluster.claims = nil
+	f.cluster.workloads = nil
+	f.cluster.cronjobs = nil
+	f.cluster.jobs = nil
+	// Velero's own answer for a backup of a namespace that is not on the
+	// cluster, so a run or a resume that takes one is REFUSED rather than
+	// quietly tolerated — the skip is what this test is about.
+	f.kube.safetyPhase = "PartiallyFailed"
+	f.kube.safetyFailure = "Velero: resource: /namespaces message: /fail to get the namespace payments specified in backup.Spec.IncludedNamespaces"
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true}, "")
+	if err != nil {
+		t.Fatalf("the run must restore an absent namespace without a safety backup: %v\n%s", err, out)
+	}
+	record := f.kube.recordFor(operation.Name)
+	if record == nil {
+		t.Fatal("the run left no record to resume")
+	}
+	if record.Stage != RestoredStage {
+		t.Fatalf("the run is at %q, want %q: this test resumes a run that got past its safety step", record.Stage, RestoredStage)
+	}
+	opID := record.OperationID
+
+	// THE CLUSTER THE RESUME FINDS: the namespace is back, because this
+	// operation's own Velero Restore put it back.
+	resumed := newRestoreFixture(t, facts)
+	resumed.kube = f.kube
+	resumed.cluster.namespace = f.cluster.namespace
+	resumed.cluster.annotations = f.cluster.annotations
+	resumed.cluster.workloads = nil
+	resumed.cluster.cronjobs = nil
+	resumed.cluster.jobs = nil
+
+	before := resumed.kube.commandCount("kubenest-safety-")
+	var resumedOut strings.Builder
+	err = RunRestore(context.Background(), &resumedOut, strings.NewReader(""), resumed.options(t, RestoreOptions{Resume: opID}), resumed.deps())
+	if err != nil {
+		t.Fatalf("--resume failed: %v\n%s", err, resumedOut.String())
+	}
+	if after := resumed.kube.commandCount("kubenest-safety-"); after != before {
+		t.Errorf("--resume asked Velero for a safety backup of the namespace this operation's plan recorded as absent (%d command(s))", after-before)
+	}
+	if len(resumed.cluster.backupsMade) != 0 {
+		t.Errorf("--resume took a safety backup: %v", resumed.cluster.backupsMade)
+	}
+	if resumed.cluster.deleted {
+		t.Error("--resume deleted the namespace its own restore had just put back")
 	}
 }
 
