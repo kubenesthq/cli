@@ -523,12 +523,19 @@ func TestLostSingleServerRecovery(t *testing.T) {
 
 	// ── `node replace` on a single-server cluster's only server names THIS
 	// procedure rather than replacing it.
+	//
+	// THE ONLY SERVER IS NOW THE FRESH HOST, and the cluster is named the way
+	// every --cluster flag names it. On lab s6 (2026-09-28) this arm passed the
+	// cluster's id and the dead host's address: the command answered "no
+	// cluster named <id>", and after the recovery the inventory no longer
+	// holds the dead host at all, so neither form could reach the refusal
+	// this arm is about.
 	var replaceOut bytes.Buffer
 	err = runCLI(&replaceOut,
 		"node", "replace",
-		"--cluster", record.ID,
-		"--node", env.server,
-		"--with", env.freshHost,
+		"--cluster", env.cluster,
+		"--node", env.freshHost,
+		"--with", env.server,
 		"--ssh-user", env.sshUser, "--ssh-key", env.sshKey,
 	)
 	if err == nil {
