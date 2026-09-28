@@ -436,11 +436,19 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		if env.skipInstall {
 			t.Fatalf("KUBENEST_UPGRADE_SKIP_INSTALL is set but no cluster named %s is registered: install the fixture with the released %s CLI and register it, or unset the variable", env.cluster, env.from)
 		}
+		// Each host's by-id path carries its own volume's serial, so on real
+		// hosts the two nodes name two different devices (kn-hku7). Without
+		// the agent's, the one device is every node's, which suits a volume
+		// group created by hand (no device at all) or identical kernel names.
+		devices := storage.Devices{All: env.storageDevice}
+		if agentDevice := os.Getenv("KUBENEST_LAB_NODE2_STORAGE_DEVICE"); env.storageDevice != "" && agentDevice != "" {
+			devices = storage.Devices{PerHost: map[string]string{env.server: env.storageDevice, env.agent: agentDevice}}
+		}
 		opts := install.Options{
 			Bundle: env.from, Name: env.cluster, HATier: "single-server",
 			Servers: []string{env.server}, Agents: []string{env.agent},
 			SSHUser: env.sshUser, SSHKey: env.sshKey,
-			StorageDevices: storage.Devices{All: env.storageDevice},
+			StorageDevices: devices,
 		}
 		s, _ := session(t, env.gateEnv, t.TempDir()+"/install.json", fetchBundle(t, client, env.from), opts)
 		defer s.Close()
