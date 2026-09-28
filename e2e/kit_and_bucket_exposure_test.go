@@ -71,6 +71,7 @@ import (
 	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/s3"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // kitEnv is the fixture this gate needs beyond gateEnvironment's.
@@ -164,7 +165,7 @@ func TestKitAndBucketExposure(t *testing.T) {
 	started := time.Now()
 	sessionOne := kitSession(t, controlPlane, bundle, journalOne, install.Options{
 		Bundle: env.bundle, Name: clusterOne, Servers: []string{env.server}, HATier: "single-server",
-		SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevice: env.storageDevice,
+		SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevices: storage.Devices{All: env.storageDevice},
 		ControlPlaneInstall: true, Domain: env.server + ".sslip.io", AdminEmail: "admin@" + env.server + ".sslip.io",
 		BackupTarget: kitTargetFlag(kit.targetFlag, kit.prefixA),
 	}, &firstOut)
@@ -239,7 +240,7 @@ func TestKitAndBucketExposure(t *testing.T) {
 	var secondOut bytes.Buffer
 	sessionTwo := kitSession(t, fleet, bundle, journalTwo, install.Options{
 		Bundle: env.bundle, Name: clusterTwo, Servers: []string{kit.secondServer}, HATier: "single-server",
-		SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevice: kit.secondStorage,
+		SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevices: storage.Devices{All: kit.secondStorage},
 		ControlPlaneCA: []byte(cfgTwo.ControlPlaneCA),
 		BackupTarget:   kitTargetFlag(kit.targetFlag, kit.prefixB),
 	}, &secondOut)

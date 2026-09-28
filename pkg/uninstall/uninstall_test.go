@@ -65,7 +65,7 @@ func TestDestroyDataRemovesVolumesAndAnInstallerCreatedGroup(t *testing.T) {
 		Nodes:       []uninstall.Node{n},
 		DestroyData: true,
 		Ownership:   storage.InstallerCreated,
-		Device:      "/dev/disk/by-id/scsi-0HC_Volume_123",
+		Devices:     storage.Devices{All: "/dev/disk/by-id/scsi-0HC_Volume_123"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -174,5 +174,42 @@ func TestOneBadNodeDoesNotStopTheOthers(t *testing.T) {
 	}
 	if !ranAny(goodFake.Commands(), "k3s-agent-uninstall.sh") {
 		t.Error("the healthy node must still have been cleaned")
+	}
+}
+
+// A real multi-node install names one device per node, because the stable
+// by-id path contains the volume's serial. Releasing the volume group's device
+// then means each node's OWN device: pvremove of another host's path is an
+// error at best, and on a host that has no such volume it releases nothing.
+func TestDestroyDataReleasesEachNodesOwnDevice(t *testing.T) {
+	serverFake := &componenttest.FakeRunner{Respond: withVolumes("pvc-abc")}
+	agentFake := &componenttest.FakeRunner{Respond: withVolumes("pvc-def")}
+
+	if err := uninstall.Run(context.Background(), uninstall.Options{
+		Nodes: []uninstall.Node{
+			{Address: "10.0.1.10", Role: uninstall.RoleServer, Runner: serverFake},
+			{Address: "10.0.1.11", Role: uninstall.RoleAgent, Runner: agentFake},
+		},
+		DestroyData: true,
+		Ownership:   storage.InstallerCreated,
+		Devices: storage.Devices{PerHost: map[string]string{
+			"10.0.1.10": "/dev/disk/by-id/scsi-0HC_Volume_101",
+			"10.0.1.11": "/dev/disk/by-id/scsi-0HC_Volume_102",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ranAny(serverFake.Commands(), "pvremove -y /dev/disk/by-id/scsi-0HC_Volume_101") {
+		t.Errorf("the server's own device was not released:\n%s", strings.Join(serverFake.Commands(), "\n"))
+	}
+	if !ranAny(agentFake.Commands(), "pvremove -y /dev/disk/by-id/scsi-0HC_Volume_102") {
+		t.Errorf("the agent's own device was not released:\n%s", strings.Join(agentFake.Commands(), "\n"))
+	}
+	if ranAny(serverFake.Commands(), "Volume_102") {
+		t.Errorf("the server was told to release the agent's device:\n%s", strings.Join(serverFake.Commands(), "\n"))
+	}
+	if ranAny(agentFake.Commands(), "Volume_101") {
+		t.Errorf("the agent was told to release the server's device:\n%s", strings.Join(agentFake.Commands(), "\n"))
 	}
 }

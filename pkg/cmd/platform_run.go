@@ -146,23 +146,31 @@ func readFleetKeyFile(path string) (string, error) {
 
 // runInstall is `kubenest platform install`.
 func runInstall(ctx context.Context, out io.Writer, f InstallFlags) error {
+	// The device mapping is resolved FIRST, before the manifest is fetched and
+	// before this machine's config is read: a --storage-device shape that
+	// cannot describe one install is a request that is refused without
+	// touching anything.
+	devices, err := f.storageDevices()
+	if err != nil {
+		return err
+	}
 	client, bundle, err := installSources(ctx, f)
 	if err != nil {
 		return err
 	}
 
 	opts := install.Options{
-		Bundle:        f.Bundle,
-		Name:          f.Name,
-		Org:           f.Org,
-		Servers:       f.Servers,
-		Agents:        f.Agents,
-		HATier:        f.HATier,
-		Profiles:      f.Profiles,
-		SSHUser:       f.SSHUser,
-		SSHKey:        f.SSHKey,
-		StorageDevice: f.StorageDevice,
-		BackupTarget:  f.BackupTarget,
+		Bundle:         f.Bundle,
+		Name:           f.Name,
+		Org:            f.Org,
+		Servers:        f.Servers,
+		Agents:         f.Agents,
+		HATier:         f.HATier,
+		Profiles:       f.Profiles,
+		SSHUser:        f.SSHUser,
+		SSHKey:         f.SSHKey,
+		StorageDevices: devices,
+		BackupTarget:   f.BackupTarget,
 		// The fleet's identity: normally from this machine's config (written
 		// by the install that created the control plane), overridable by flag
 		// for a machine that never ran one.
@@ -398,7 +406,7 @@ func runUninstall(ctx context.Context, out io.Writer, name string, destroyData b
 
 	servers, agents := f.Servers, f.Agents
 	var ownership storage.Ownership
-	device := ""
+	var devices storage.Devices
 	if journal != nil {
 		recorded, err := install.Recorded(journal)
 		if err != nil {
@@ -408,7 +416,7 @@ func runUninstall(ctx context.Context, out io.Writer, name string, destroyData b
 			servers, agents = install.NodesFromJournal(journal)
 		}
 		ownership = recorded.Ownership
-		device = recorded.Device
+		devices = recorded.Devices
 		if f.SSHUser == "" {
 			fmt.Fprintf(out, "Using the journal at %s.\n", journalPath)
 		}
@@ -457,7 +465,7 @@ func runUninstall(ctx context.Context, out io.Writer, name string, destroyData b
 		Nodes:       nodes,
 		DestroyData: destroyData,
 		Ownership:   ownership,
-		Device:      device,
+		Devices:     devices,
 		Out:         out,
 	}); err != nil {
 		return err

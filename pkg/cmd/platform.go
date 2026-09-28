@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+
+	"kubenest.io/cli/pkg/storage"
 )
 
 // The platform command surface follows docs.kubenest.io/platform/install. The
@@ -34,15 +36,19 @@ type InstallFlags struct {
 	// Org is only needed when the credential can see more than one
 	// organization; registering a customer's cluster under the wrong one is
 	// a support call, not a typo.
-	Org           string
-	Servers       []string
-	Agents        []string
-	HATier        string
-	Profiles      []string
-	SSHUser       string
-	SSHKey        string
-	StorageDevice string
-	BackupTarget  string
+	Org      string
+	Servers  []string
+	Agents   []string
+	HATier   string
+	Profiles []string
+	SSHUser  string
+	SSHKey   string
+	// StorageDevices is --storage-device as it was given: one value for every
+	// node, or one HOST=DEV value per node. It is held as the raw flag values
+	// and resolved by storageDevices(), so a caller that skips Validate()
+	// cannot silently drop the flag the operator passed.
+	StorageDevices []string
+	BackupTarget   string
 	// ControlPlane installs the KubeNest control plane INTO this cluster and
 	// registers the cluster to it: this is how the FIRST cluster of a fleet
 	// is built, and it leaves the CLI logged in to https://api.<domain>.
@@ -172,6 +178,25 @@ func (f InstallFlags) controlPlaneAdminEmail(domain string) string {
 	return "admin@" + domain
 }
 
+// nodes is the install's node list in the order the operator wrote it: the
+// --server values, then the --agent values. It is the list a per-host
+// --storage-device value has to name.
+func (f InstallFlags) nodes() []string {
+	hosts := make([]string, 0, len(f.Servers)+len(f.Agents))
+	hosts = append(hosts, f.Servers...)
+	hosts = append(hosts, f.Agents...)
+	return hosts
+}
+
+// storageDevices resolves --storage-device against the node list, refusing
+// every shape that cannot describe one install. It runs before anything is
+// dialled: the mix of a single value with per-host values, a host that is not
+// a node of this install, a host named twice, and a per-host set that leaves a
+// node unnamed are all refused here, naming the node and the fix.
+func (f InstallFlags) storageDevices() (storage.Devices, error) {
+	return storage.ParseDevices(f.StorageDevices, f.nodes())
+}
+
 // Validate applies the checks that need no manifest and no network: flag
 // shape only. Everything deeper (profile names against the bundle, node
 // counts against limits) is preflight's job and needs the manifest.
@@ -211,6 +236,12 @@ func (f *InstallFlags) Validate() error {
 	}
 	if f.HATier == "single-server" && len(f.Servers) > 1 {
 		return fmt.Errorf("--ha single-server takes exactly one --server, got %d", len(f.Servers))
+	}
+	// Last, because it reads the node list: which device each node gets is a
+	// question about the nodes, and every refusal it makes names the node it
+	// is about.
+	if _, err := f.storageDevices(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -256,7 +287,14 @@ address, so nothing has to be set up in advance, and --admin-email defaults to
 admin@<domain>.
 
 Every later cluster is added with a plain install against the control plane
-this machine is logged in to; it needs no control plane of its own.`,
+this machine is logged in to; it needs no control plane of its own.
+
+--storage-device names the blank device the installer creates kubenest-vg on.
+On a multi-node install name it once per node as HOST=DEVICE, with HOST a
+--server or --agent value exactly as given: the stable /dev/disk/by-id/...
+path contains the volume's serial, so it is different on every host. One
+value with no HOST= is used on every node, which fits a cluster whose nodes
+share one device path.`,
 		Example: `  # The first cluster: the platform, and the KubeNest control plane.
   kubenest platform install \
     --control-plane \
@@ -276,7 +314,22 @@ this machine is logged in to; it needs no control plane of its own.`,
     --ha single-server \
     --ssh-user ubuntu \
     --ssh-key ~/.ssh/id_ed25519 \
-    --storage-device /dev/nvme1n1`,
+    --storage-device /dev/nvme1n1
+
+  # Three hosts with their own data volumes: the by-id path contains the
+  # volume's serial, so each node is named with its own device.
+  kubenest platform install \
+    --bundle 1.1 \
+    --name prod-ha \
+    --server 10.0.3.10 \
+    --server 10.0.3.11 \
+    --server 10.0.3.12 \
+    --ha ha \
+    --ssh-user ubuntu \
+    --ssh-key ~/.ssh/id_ed25519 \
+    --storage-device 10.0.3.10=/dev/disk/by-id/scsi-0HC_Volume_101 \
+    --storage-device 10.0.3.11=/dev/disk/by-id/scsi-0HC_Volume_102 \
+    --storage-device 10.0.3.12=/dev/disk/by-id/scsi-0HC_Volume_103`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := f.Validate(); err != nil {
 				return err
@@ -298,7 +351,7 @@ this machine is logged in to; it needs no control plane of its own.`,
 	fs.StringArrayVar(&f.Profiles, "profile", nil, "profile to install on top of core (repeatable)")
 	fs.StringVar(&f.SSHUser, "ssh-user", "", "SSH user on the target nodes")
 	fs.StringVar(&f.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
-	fs.StringVar(&f.StorageDevice, "storage-device", "", "blank device for the installer to create kubenest-vg on (omit if you created the volume group yourself)")
+	fs.StringArrayVar(&f.StorageDevices, "storage-device", nil, "blank device for the installer to create kubenest-vg on: DEVICE for every node, or HOST=DEVICE per node (repeatable; HOST is one of the --server/--agent values exactly as given); omit if you created the volume group yourself")
 	fs.StringVar(&f.BackupTarget, "backup-target", "", "S3-compatible backup target for Velero (optional; unset reports backup: unconfigured)")
 	fs.StringVar(&f.FleetRecipient, "fleet-recipient", "", "the fleet recovery key's PUBLIC recipient (age1...); normally read from this machine's config after a --control-plane install")
 	fs.StringVar(&f.InstanceID, "instance-id", "", "the instance id every recovery kit is bound to; normally read from this machine's config after a --control-plane install")

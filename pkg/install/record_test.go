@@ -13,6 +13,7 @@ import (
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // recordAPI is a fake control plane that keeps what the record stage wrote.
@@ -124,14 +125,19 @@ func runRecordStage(t *testing.T, s *install.Session) error {
 
 func recordOptions() install.Options {
 	return install.Options{
-		Bundle:        "1.0",
-		Name:          "prod-1",
-		Servers:       []string{"10.0.1.10"},
-		Agents:        []string{"10.0.1.20"},
-		HATier:        "single-server",
-		Profiles:      []string{"observability"},
-		SSHUser:       "kubenest",
-		StorageDevice: "/dev/disk/by-id/nvme-eui.0000000000000001",
+		Bundle:   "1.0",
+		Name:     "prod-1",
+		Servers:  []string{"10.0.1.10"},
+		Agents:   []string{"10.0.1.20"},
+		HATier:   "single-server",
+		Profiles: []string{"observability"},
+		SSHUser:  "kubenest",
+		// One device per node: the stable by-id path contains the volume's
+		// serial, so no two hosts share it.
+		StorageDevices: storage.Devices{PerHost: map[string]string{
+			"10.0.1.10": "/dev/disk/by-id/nvme-eui.0000000000000001",
+			"10.0.1.20": "/dev/disk/by-id/nvme-eui.0000000000000002",
+		}},
 	}
 }
 
@@ -175,10 +181,17 @@ func TestStageRecordWritesEveryHostWithItsRoleAndStoragePath(t *testing.T) {
 	if server.Role != "server" || agent.Role != "agent" {
 		t.Errorf("roles = %q/%q, want server/agent", server.Role, agent.Role)
 	}
-	for _, host := range []api.HostRecord{server, agent} {
-		if host.StorageDevice != "/dev/disk/by-id/nvme-eui.0000000000000001" {
-			t.Errorf("host %s records storage device %q, want the --storage-device by-id path",
-				host.SSHAddress, host.StorageDevice)
+	for _, want := range []struct {
+		host   api.HostRecord
+		device string
+	}{
+		{server, "/dev/disk/by-id/nvme-eui.0000000000000001"},
+		{agent, "/dev/disk/by-id/nvme-eui.0000000000000002"},
+	} {
+		host := want.host
+		if host.StorageDevice != want.device {
+			t.Errorf("host %s records storage device %q, want %q — the device --storage-device named for THAT node, because the by-id path is different on every host",
+				host.SSHAddress, host.StorageDevice, want.device)
 		}
 		if host.LifecycleState != "active" {
 			t.Errorf("host %s records lifecycle %q, want active: the install has finished with it",

@@ -30,6 +30,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/uninstall"
 )
 
@@ -144,7 +145,7 @@ func TestInstallLifecycleOverSSE(t *testing.T) {
 	}
 
 	opts := gateOptions(env)
-	opts.StorageDevice = env.storageDevice
+	opts.StorageDevices = storage.Devices{All: env.storageDevice}
 	var clusterID string
 
 	// Each injection asserts the SERVER's record, not the CLI's error: what

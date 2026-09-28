@@ -47,6 +47,7 @@ import (
 	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/sshx"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/uninstall"
 )
 
@@ -110,7 +111,7 @@ func TestHostPolicyGate(t *testing.T) {
 			Bundle: env.bundle, Name: env.cluster, HATier: "single-server",
 			Servers: []string{env.server}, Agents: []string{agent},
 			SSHUser: env.sshUser, SSHKey: env.sshKey,
-			StorageDevice: env.storageDevice,
+			StorageDevices: storage.Devices{All: env.storageDevice},
 		})
 		defer s.Close()
 		if _, err := install.Execute(ctx, s, install.Plan(s)); err != nil {

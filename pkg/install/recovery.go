@@ -323,7 +323,7 @@ func stageRecoveryPreflight(ctx context.Context, s *Session) error {
 	// The replacement host's capacity, against what the recovery set says the
 	// restored volumes need. Refused here, where it is a two-minute fix.
 	for _, node := range s.NodesWithRole(RoleServer) {
-		capacity, err := recovery.CheckCapacity(ctx, node.Runner, s.recoverySel.Set, s.Opts.StorageDevice)
+		capacity, err := recovery.CheckCapacity(ctx, node.Runner, s.recoverySel.Set, s.deviceFor(node.Address))
 		s.Logf("  recovery check [%s] capacity on %s: %s", yesNo(err == nil || capacity.Known), node.Address, capacity.Report())
 		if err != nil {
 			return err

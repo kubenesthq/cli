@@ -351,11 +351,11 @@ func (a *Add) stageWindow(ctx context.Context) error {
 // (storageIsOurs). Anything else is refused exactly as before.
 func (a *Add) stagePreflight(ctx context.Context) error {
 	report, err := preflight.Run(ctx, preflight.Options{
-		Bundle:        a.Bundle,
-		BundleVersion: a.Record.BundleVersion,
-		HATier:        a.Record.HATier,
-		Profiles:      a.Record.Profiles,
-		StorageDevice: a.Opts.StorageDevice,
+		Bundle:         a.Bundle,
+		BundleVersion:  a.Record.BundleVersion,
+		HATier:         a.Record.HATier,
+		Profiles:       a.Record.Profiles,
+		StorageDevices: storage.Devices{All: a.Opts.StorageDevice},
 		Nodes: []preflight.Node{
 			{Address: a.Server.SSHAddress, Role: a.Server.Role, Runner: a.ServerConn, PortPeer: true},
 			{

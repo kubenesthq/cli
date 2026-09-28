@@ -53,9 +53,11 @@ type Options struct {
 	// Ownership is the journal's record of who created kubenest-vg. Empty
 	// means unknown, which is treated as the customer's.
 	Ownership storage.Ownership
-	// Device is the block device the installer used, if it created the
-	// volume group.
-	Device string
+	// Devices is the storage device the installer used on each node, if it
+	// created the volume group. It is a mapping because a real multi-node
+	// install names one device per node: the stable /dev/disk/by-id/... path
+	// contains the volume's serial, so it differs per host.
+	Devices storage.Devices
 	// Out receives a line per action, so an operator can see exactly what
 	// was removed and what was deliberately left.
 	Out io.Writer
@@ -177,16 +179,17 @@ func removeData(ctx context.Context, opts Options, node Node) error {
 	if res.ExitCode != 0 && !strings.Contains(res.Stderr, "not found") {
 		return fmt.Errorf("removing volume group: exit %d: %s", res.ExitCode, firstLine(res.Stderr))
 	}
-	if opts.Device == "" {
+	device := opts.Devices.For(node.Address)
+	if device == "" {
 		return nil
 	}
-	logf(opts.Out, "%s: releasing %s", node.Address, opts.Device)
-	res, err = node.Runner.Run(ctx, "sudo -n pvremove -y "+shellArg(opts.Device))
+	logf(opts.Out, "%s: releasing %s", node.Address, device)
+	res, err = node.Runner.Run(ctx, "sudo -n pvremove -y "+shellArg(device))
 	if err != nil {
-		return fmt.Errorf("releasing %s: %w", opts.Device, err)
+		return fmt.Errorf("releasing %s: %w", device, err)
 	}
 	if res.ExitCode != 0 && !strings.Contains(res.Stderr, "not found") {
-		return fmt.Errorf("releasing %s: exit %d: %s", opts.Device, res.ExitCode, firstLine(res.Stderr))
+		return fmt.Errorf("releasing %s: exit %d: %s", device, res.ExitCode, firstLine(res.Stderr))
 	}
 	return nil
 }

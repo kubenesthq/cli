@@ -141,7 +141,7 @@ func gateOptions(env gateEnv) install.Options {
 		HATier:  "single-server",
 		SSHUser: env.sshUser,
 		SSHKey:  env.sshKey,
-		// StorageDevice is deliberately NOT set here. The gate's timed
+		// StorageDevices is deliberately NOT set here. The gate's timed
 		// install uses install.mdx Option 1 — the volume group already
 		// exists and the installer never touches the customer's block
 		// devices. Only the failure-injection run, which starts from a blank
@@ -208,7 +208,7 @@ func TestPlatformInstallGate(t *testing.T) {
 		poisoned.Limits.Timeouts["component-ready"] = 2 * time.Minute
 
 		opts := gateOptions(env)
-		opts.StorageDevice = env.storageDevice
+		opts.StorageDevices = storage.Devices{All: env.storageDevice}
 		s, _ := session(t, env, t.TempDir()+"/poisoned.json", poisoned, opts)
 		defer s.Close()
 

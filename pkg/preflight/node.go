@@ -271,6 +271,11 @@ func checkResources(ctx context.Context, opts Options, node Node, rep *Report) {
 // device. There is no auto-detection, because guessing which disk is
 // disposable on someone else's infrastructure is not a risk worth taking.
 func checkVolumeGroup(ctx context.Context, opts Options, node Node, rep *Report) {
+	// WHICH DEVICE IS THIS NODE'S. A --storage-device mapping names one device
+	// for every node or one per node, and on real hosts it has to be the
+	// second: the stable /dev/disk/by-id/... path embeds the volume's serial,
+	// so it is different on every host.
+	device := opts.StorageDevices.For(node.Address)
 	// A resumed install re-runs preflight after stage 7 already created the
 	// volume group; without this the "device must be blank" rule would
 	// refuse the install's own work.
@@ -281,10 +286,10 @@ func checkVolumeGroup(ctx context.Context, opts Options, node Node, rep *Report)
 		})
 		return
 	}
-	ownership, err := storage.PreflightVolumeGroup(ctx, node.Runner, opts.StorageDevice)
+	ownership, err := storage.PreflightVolumeGroup(ctx, node.Runner, device)
 	if err != nil {
 		fix := "create it before installing: `sudo vgcreate " + storage.VolumeGroup + " <device>` (lvm2 ships on the stock Ubuntu 24.04 cloud image), or pass --storage-device with a blank device for the installer to create it"
-		if opts.StorageDevice != "" {
+		if device != "" {
 			fix = "--storage-device must name a device with no partition table, filesystem or existing volume group; use the stable /dev/disk/by-id/... path"
 		}
 		rep.add(Result{Check: CheckVolumeGroup, Node: node.Address, Outcome: Fail, Detail: err.Error(), Fix: fix})
@@ -292,7 +297,7 @@ func checkVolumeGroup(ctx context.Context, opts Options, node Node, rep *Report)
 	}
 	detail := storage.VolumeGroup + " exists with free extents (you created it; the installer will not touch your block devices)"
 	if ownership == storage.InstallerCreated {
-		detail = opts.StorageDevice + " is blank; the installer will create " + storage.VolumeGroup + " on it"
+		detail = device + " is blank; the installer will create " + storage.VolumeGroup + " on it"
 	}
 	rep.add(Result{Check: CheckVolumeGroup, Node: node.Address, Outcome: Pass, Detail: detail})
 }

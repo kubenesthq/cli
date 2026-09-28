@@ -41,6 +41,7 @@ import (
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/uninstall"
 	"kubenest.io/cli/pkg/upgrade"
 )
@@ -204,7 +205,7 @@ func TestUpgradeGate(t *testing.T) {
 		Bundle: from, Name: env.cluster, HATier: "single-server",
 		Servers: []string{env.server}, Agents: []string{env.agent},
 		SSHUser: env.sshUser, SSHKey: env.sshKey,
-		StorageDevice: env.storageDevice,
+		StorageDevices: storage.Devices{All: env.storageDevice},
 	}
 	journalPath := t.TempDir() + "/install.json"
 

@@ -226,7 +226,7 @@ func stageRecoveryPreflightControlPlane(ctx context.Context, s *Session) error {
 		return errors.New("recovery replaces a machine, so it needs the operator to confirm the old one is FENCED first: power it off at the provider, or make it unreachable, then pass --old-host-fenced. Nothing has been changed")
 	}
 	for _, node := range s.NodesWithRole(RoleServer) {
-		capacity, err := recovery.CheckCapacity(ctx, node.Runner, s.recoverySel.Set, s.Opts.StorageDevice)
+		capacity, err := recovery.CheckCapacity(ctx, node.Runner, s.recoverySel.Set, s.deviceFor(node.Address))
 		s.Logf("  recovery check [%s] capacity on %s: %s", yesNo(err == nil || capacity.Known), node.Address, capacity.Report())
 		if err != nil {
 			return err

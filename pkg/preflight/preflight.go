@@ -23,6 +23,7 @@ import (
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/storage"
 )
 
 // Check names, exactly as install.mdx's table names them. A check that fails
@@ -180,11 +181,12 @@ type Options struct {
 	BundleVersion string
 	HATier        string
 	Profiles      []string
-	// StorageDevice is --storage-device: empty means the customer created
-	// kubenest-vg themselves, which is the default path.
-	StorageDevice string
-	Nodes         []Node
-	Egress        []EgressTarget
+	// StorageDevices is --storage-device: the device kubenest-vg is created on
+	// for each node of this install, or empty on every node when the customer
+	// created the volume group themselves, which is the default path.
+	StorageDevices storage.Devices
+	Nodes          []Node
+	Egress         []EgressTarget
 	// Catalog is where the offered bundles are read from: the control plane
 	// in an ordinary install, the versions built into this binary in a
 	// control-plane install. Preflight does not care which — the request is

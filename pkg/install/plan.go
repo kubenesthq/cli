@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,17 +39,26 @@ import (
 // Options is the install request — `kubenest platform install`'s flag surface
 // resolved into the engine's terms.
 type Options struct {
-	Bundle        string
-	Name          string
-	Org           string
-	Servers       []string
-	Agents        []string
-	HATier        string
-	Profiles      []string
-	SSHUser       string
-	SSHKey        string
-	StorageDevice string
-	BackupTarget  string
+	Bundle   string
+	Name     string
+	Org      string
+	Servers  []string
+	Agents   []string
+	HATier   string
+	Profiles []string
+	SSHUser  string
+	SSHKey   string
+	// StorageDevices is --storage-device: the block device kubenest-vg is
+	// created on for each node — one device for every node, or one per node.
+	// Empty on every node means the operator created the volume group
+	// themselves and the installer touches no block device.
+	//
+	// A PER-HOST MAPPING IS THE ONLY FORM THAT WORKS ON REAL MULTI-NODE
+	// INSTALLS: the device an operator must name is the stable
+	// /dev/disk/by-id/... path, whose tail is the volume's serial, and every
+	// host has its own volume. See storage.Devices.
+	StorageDevices storage.Devices
+	BackupTarget   string
 	// ControlPlaneInstall is --control-plane: install the KubeNest control
 	// plane into the first cluster and register that cluster through it,
 	// instead of registering with a control plane that already exists.
@@ -92,6 +102,16 @@ type Options struct {
 	Recovery *RecoveryOptions
 }
 
+// nodeAddresses is every node this install touches, in the order the operator
+// gave them: the --server values, then the --agent values. It is the list a
+// per-host --storage-device mapping has to name.
+func (o Options) nodeAddresses() []string {
+	hosts := make([]string, 0, len(o.Servers)+len(o.Agents))
+	hosts = append(hosts, o.Servers...)
+	hosts = append(hosts, o.Agents...)
+	return hosts
+}
+
 // Identity is the part of the request a resume must match exactly. The install
 // MODE is part of it: a journal started as a registered install must not be
 // resumed as a control-plane one, because the stages that already ran would
@@ -128,7 +148,7 @@ func (o Options) Identity() Identity {
 			"mode":             mode,
 			"bundle":           o.Bundle,
 			"HA tier":          o.HATier,
-			"--storage-device": o.StorageDevice,
+			"--storage-device": o.StorageDevices.Identity(),
 			"domain":           o.Domain,
 			"servers":          stages.List(o.Servers),
 			"agents":           stages.List(o.Agents),
@@ -167,11 +187,15 @@ type Credentials any
 // entries themselves. It is journalled; nothing in it is a secret, and there
 // is deliberately no field a credential would fit into.
 type Record struct {
-	TokenVersion int               `json:"token_version,omitempty"`
-	RepoURL      string            `json:"repo_url,omitempty"`
-	Adopted      bool              `json:"adopted,omitempty"`
-	Device       string            `json:"storage_device,omitempty"`
-	Ownership    storage.Ownership `json:"volume_group_ownership,omitempty"`
+	TokenVersion int    `json:"token_version,omitempty"`
+	RepoURL      string `json:"repo_url,omitempty"`
+	Adopted      bool   `json:"adopted,omitempty"`
+	// Devices is --storage-device as this install resolved it: the one device
+	// every node got, or one device per node. It is journalled because
+	// UNINSTALL reads it back: releasing the device behind kubenest-vg needs
+	// each node's own path, and uninstall has no flags to be told it again.
+	Devices   storage.Devices   `json:"storage_devices,omitzero"`
+	Ownership storage.Ownership `json:"volume_group_ownership,omitempty"`
 	// AdminPasswordShown records that a --control-plane install has printed
 	// its administrator password, so it is printed exactly once per install
 	// however many runs that install takes.
@@ -215,6 +239,44 @@ type Record struct {
 	RecoveryNamespacesNotRestored []string `json:"recovery_namespaces_not_restored,omitempty"`
 	RecoveryNamespacesRestored    []string `json:"recovery_namespaces_restored,omitempty"`
 	RecoveryNamespacesActivated   []string `json:"recovery_namespaces_activated,omitempty"`
+}
+
+// UnmarshalJSON reads a record written by ANY version of this CLI, including
+// one that predates a per-node --storage-device.
+//
+// BEFORE kn-hku7 AN INSTALL RECORDED ITS DEVICE AS ONE STRING under
+// "storage_device". That journal lives on the operator's laptop and outlives
+// the release that wrote it, and `platform uninstall --destroy-data` reads it
+// to release the device behind kubenest-vg: a record the reader cannot
+// understand is a device left behind, silently. The old key only ever meant
+// "this one device on every node", which is exactly
+// storage.Devices{All: device}.
+//
+// READING PERSISTED DATA IN ITS OLD SHAPE IS A MIGRATION, NOT A SECOND WAY OF
+// DOING THINGS: nothing writes the old key, and "storage_devices" wins
+// whenever a record carries both.
+func (r *Record) UnmarshalJSON(data []byte) error {
+	// A local alias, or this method would call itself.
+	type record Record
+	decoded := record(*r)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	// The two device keys, kept raw: the migration decides on which key is
+	// PRESENT, so a record that carries the new key with nothing in it keeps
+	// meaning "no device", not "the old device".
+	var keys struct {
+		Devices *json.RawMessage `json:"storage_devices"`
+		Device  *string          `json:"storage_device"`
+	}
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	*r = Record(decoded)
+	if keys.Devices == nil && keys.Device != nil {
+		r.Devices = storage.Devices{All: *keys.Device}
+	}
+	return nil
 }
 
 // Session is one install run's state.
@@ -550,10 +612,33 @@ func Plan(s *Session) []Stage {
 	}
 }
 
+// deviceFor is the block device kubenest-vg is created on for one node: that
+// node's own entry in a per-host --storage-device mapping, or the one device
+// named for every node. Empty means the volume group already exists there and
+// the installer must not touch a block device.
+func (s *Session) deviceFor(address string) string {
+	return s.Opts.StorageDevices.For(address)
+}
+
+// storageDevicesCoverEveryNode refuses a per-host --storage-device mapping
+// that leaves one of this install's nodes without a device.
+//
+// PREFLIGHT CALLS IT BEFORE IT DIALS, so the refusal costs nothing, and the
+// storage stage calls it immediately before it would touch a device, because
+// that is the stage that writes. A node the mapping does not name would
+// otherwise get Option 1's treatment — "the volume group is the operator's" —
+// for a request that never said that.
+func (s *Session) storageDevicesCoverEveryNode() error {
+	return s.Opts.StorageDevices.RefuseUnnamed(s.Opts.nodeAddresses())
+}
+
 // stagePreflight opens a connection to every node and runs all eleven checks.
 // It writes nothing anywhere, which is what makes abandoning an install here
 // free, and it is also where the connections every later stage uses come from.
 func stagePreflight(ctx context.Context, s *Session) error {
+	if err := s.storageDevicesCoverEveryNode(); err != nil {
+		return err
+	}
 	nodes := s.dialAll(ctx)
 
 	// A resumed install re-runs preflight after earlier stages already
@@ -572,14 +657,14 @@ func stagePreflight(ctx context.Context, s *Session) error {
 	}
 
 	report, err := preflight.Run(ctx, preflight.Options{
-		Bundle:        s.Bundle,
-		BundleVersion: s.Opts.Bundle,
-		HATier:        s.Opts.HATier,
-		Profiles:      s.Opts.Profiles,
-		StorageDevice: s.Opts.StorageDevice,
-		Nodes:         nodes,
-		Egress:        EgressTargets(s),
-		Catalog:       s.catalog(),
+		Bundle:         s.Bundle,
+		BundleVersion:  s.Opts.Bundle,
+		HATier:         s.Opts.HATier,
+		Profiles:       s.Opts.Profiles,
+		StorageDevices: s.Opts.StorageDevices,
+		Nodes:          nodes,
+		Egress:         EgressTargets(s),
+		Catalog:        s.catalog(),
 		// The control plane is what this run is installing, so there is no
 		// control-plane connectivity to check yet — the bundle request is
 		// still checked, against the catalog built into this binary.
@@ -893,23 +978,34 @@ func stageCerts(ctx context.Context, s *Session) error {
 
 // stageStorage verifies or creates the volume group on every node that can
 // hold data, then installs OpenEBS Local PV LVM and the default StorageClass.
+//
+// EACH NODE GETS ITS OWN DEVICE. --storage-device may name one device for
+// every node or one per node, and on real hosts it has to be the second: the
+// documented stable path embeds the volume's serial, so it differs per host.
 func stageStorage(ctx context.Context, s *Session) error {
+	// Before anything is written to a device: a per-host mapping that left a
+	// node out is refused here as well as in preflight, because this is the
+	// stage that touches block devices.
+	if err := s.storageDevicesCoverEveryNode(); err != nil {
+		return err
+	}
 	server, err := s.Server()
 	if err != nil {
 		return err
 	}
 	ownership := storage.CustomerCreated
+	if !s.Opts.StorageDevices.Empty() {
+		ownership = storage.InstallerCreated
+	}
 	for _, node := range s.Nodes {
-		if s.Opts.StorageDevice != "" {
-			ownership = storage.InstallerCreated
-		}
-		if err := storage.EnsureVolumeGroup(ctx, node.Runner, s.Opts.StorageDevice); err != nil {
+		if err := storage.EnsureVolumeGroup(ctx, node.Runner, s.deviceFor(node.Address)); err != nil {
 			return fmt.Errorf("volume group on %s: %w", node.Address, err)
 		}
 	}
 	// Recorded before the install proceeds, because it is what uninstall
-	// reads to decide whether it may ever remove a volume group.
-	s.Record.Device = s.Opts.StorageDevice
+	// reads to decide whether it may ever remove a volume group — and, with a
+	// per-host mapping, which device to release on which node.
+	s.Record.Devices = s.Opts.StorageDevices
 	s.Record.Ownership = ownership
 	if err := s.saveRecord(); err != nil {
 		return err
@@ -1738,12 +1834,13 @@ func (s *Session) hostInventory(ctx context.Context, ownership storage.Ownership
 		uids = byAddress
 	}
 
-	// The storage stage records the device in the journal and this stage runs
-	// after it; the flag is the same value for a run that has not reached that
-	// stage yet.
-	device := s.Record.Device
-	if device == "" {
-		device = s.Opts.StorageDevice
+	// The storage stage records the mapping in the journal and this stage runs
+	// after it; the flag is the same mapping for a run that has not reached
+	// that stage yet, and a resume with a different mapping is refused at the
+	// journal, so the two can only agree.
+	devices := s.Opts.StorageDevices
+	if devices.Empty() {
+		devices = s.Record.Devices
 	}
 
 	hosts := make([]api.HostRecord, 0, len(s.Nodes))
@@ -1768,7 +1865,7 @@ func (s *Session) hostInventory(ctx context.Context, ownership storage.Ownership
 			HostKeyFingerprint:   fingerprint,
 			JoinAddress:          joinAddress,
 			NodeUID:              uids[n.Address],
-			StorageDevice:        device,
+			StorageDevice:        devices.For(n.Address),
 			VolumeGroupOwnership: string(ownership),
 			LifecycleState:       node.StateActive,
 		}.Record()

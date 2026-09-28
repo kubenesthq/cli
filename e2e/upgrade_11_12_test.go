@@ -69,6 +69,7 @@ import (
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/stages"
+	"kubenest.io/cli/pkg/storage"
 	"kubenest.io/cli/pkg/upgrade"
 	"kubenest.io/cli/pkg/window"
 )
@@ -439,7 +440,7 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 			Bundle: env.from, Name: env.cluster, HATier: "single-server",
 			Servers: []string{env.server}, Agents: []string{env.agent},
 			SSHUser: env.sshUser, SSHKey: env.sshKey,
-			StorageDevice: env.storageDevice,
+			StorageDevices: storage.Devices{All: env.storageDevice},
 		}
 		s, _ := session(t, env.gateEnv, t.TempDir()+"/install.json", fetchBundle(t, client, env.from), opts)
 		defer s.Close()
