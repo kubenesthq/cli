@@ -295,7 +295,8 @@ func TestPlatformInstallGate(t *testing.T) {
 		defer s.Close()
 
 		start := time.Now()
-		result, err := install.Execute(ctx, s, install.Plan(s))
+		plan := install.Plan(s)
+		result, err := install.Execute(ctx, s, plan)
 		elapsed := time.Since(start)
 		if err != nil {
 			t.Fatalf("install failed after %s:\n%v", elapsed.Round(time.Second), err)
@@ -303,8 +304,10 @@ func TestPlatformInstallGate(t *testing.T) {
 		clusterID = s.Jnl.ClusterID
 
 		t.Logf("install completed in %s (budget %s)", elapsed.Round(time.Second), Budget)
-		if len(result.Ran) != 13 {
-			t.Errorf("ran %d stages, want all thirteen: %v", len(result.Ran), result.Ran)
+		// A fresh install runs every stage of its plan and skips none.
+		if len(result.Ran) != len(plan) || len(result.Skipped) != 0 {
+			t.Errorf("ran %d of the plan's %d stages and skipped %v: a fresh install runs them all: %v",
+				len(result.Ran), len(plan), result.Skipped, result.Ran)
 		}
 		if elapsed > Budget {
 			t.Errorf("install took %s, over the %s budget — that is a defect in the installer, not a number to revise upward",
@@ -337,7 +340,8 @@ func TestPlatformInstallGate(t *testing.T) {
 		defer s.Close()
 
 		start := time.Now()
-		result, err := install.Execute(ctx, s, install.Plan(s))
+		plan := install.Plan(s)
+		result, err := install.Execute(ctx, s, plan)
 		if err != nil {
 			t.Fatalf("a second identical run must converge, not fail:\n%v", err)
 		}
@@ -351,8 +355,9 @@ func TestPlatformInstallGate(t *testing.T) {
 		if strings.Join(result.Ran, ",") != strings.Join(want, ",") {
 			t.Errorf("re-run executed %v, want only %v", result.Ran, want)
 		}
-		if len(result.Skipped) != 10 {
-			t.Errorf("re-run skipped %d stages, want 10: %v", len(result.Skipped), result.Skipped)
+		if len(result.Skipped) != len(plan)-len(want) {
+			t.Errorf("re-run skipped %d of the plan's %d stages, want every stage but %v: %v",
+				len(result.Skipped), len(plan), want, result.Skipped)
 		}
 	})
 
