@@ -244,6 +244,12 @@ type Session struct {
 	// bucket. It is held rather than re-read so every later stage restores the
 	// artifact the operator was shown, not whatever the bucket holds by then.
 	recoverySel *recovery.Selection
+	// recoveryWorkloadSel is the recovery set of the cluster a CONTROL-PLANE
+	// recovery is restoring: the management cluster's own Velero repository and
+	// its workload backups, which live in that cluster's set rather than in the
+	// instance's control-plane set. Nil for a workload recovery, where
+	// recoverySel is itself that cluster's set.
+	recoveryWorkloadSel *recovery.Selection
 	// recoveryStore is the bucket those reads came from.
 	recoveryStore recovery.Store
 	// recoveryTargetValue is the parsed --backup-target.

@@ -13,6 +13,7 @@ import (
 
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/config"
+	"kubenest.io/cli/pkg/recovery"
 	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/s3"
 )
@@ -239,33 +240,41 @@ func runKitCheck(ctx context.Context, in kitCheck) (kitAnswers, error) {
 
 	// 4. Is the set complete, is it about this cluster, and does it name the
 	// backup the operator asked about?
+	//
+	// THE QUESTION IS THE RECOVERY'S OWN (pkg/recovery.SetQuestion), so the
+	// answer an operator reads here is the answer the recovery acts on. A
+	// separate copy of the rule is how the check came to refuse every
+	// control-plane kit: the control plane's set binds its kit and its versions,
+	// and what a control-plane recovery starts from is its newest eligible
+	// CHECKPOINT, not a Velero backup recorded inside the set.
 	if set != nil {
-		if !set.Complete {
-			out.Set = kitAnswer{Detail: fmt.Sprintf("%s records an upload that never completed: a partial upload is never something to recover from", setKey)}
-		} else if set.ArtifactID != in.ArtifactID {
-			out.Set = kitAnswer{Detail: fmt.Sprintf("%s is about kit artifact %s, and this check is about %s", setKey, set.ArtifactID, in.ArtifactID)}
-		} else if in.Backup != "" {
-			var found *recoverykit.Backup
-			for i := range set.Backups {
-				if set.Backups[i].Name == in.Backup {
-					found = &set.Backups[i]
-				}
-			}
-			switch {
-			case found == nil:
-				out.Set = kitAnswer{Detail: fmt.Sprintf("the set does not name backup %q; it names %s", in.Backup, backupNames(set))}
-			case !found.Completed():
-				out.Set = kitAnswer{Detail: fmt.Sprintf("backup %q is recorded as %s, which is not something to recover from", in.Backup, found.Status)}
-			default:
-				out.Set = kitAnswer{OK: true, Detail: fmt.Sprintf("backup %q completed at %s and is recorded in the set, which belongs to %s", in.Backup, found.CompletedAt.UTC().Format("2006-01-02T15:04:05Z"), in.Expected)}
-			}
-		} else if latest, ok := set.Latest(); ok {
-			out.Set = kitAnswer{OK: true, Detail: fmt.Sprintf("the set belongs to %s and names %d completed backup(s), the newest %q at %s; pass --backup to check a specific one", in.Expected, len(set.Backups), latest.Name, latest.CompletedAt.UTC().Format("2006-01-02T15:04:05Z"))}
-		} else {
-			out.Set = kitAnswer{Detail: "the set names no completed backup: it was written with the install baseline and no backup has been recorded in it yet"}
+		q := recovery.SetQuestion{
+			Kind:       in.Kind,
+			Set:        set,
+			SetKey:     setKey,
+			ArtifactID: in.ArtifactID,
+			Expected:   in.Expected,
+			BackupName: in.Backup,
 		}
+		if in.Backup != "" {
+			q.Backup, _ = completedBackupOf(set, in.Backup)
+		}
+		answer := q.Answer()
+		out.Set = kitAnswer{OK: answer.OK, Detail: answer.Detail}
 	}
 	return out, nil
+}
+
+// completedBackupOf names the completed backup the set records under one name,
+// so the check's answer is about the backup the operator asked for rather than
+// about the set's newest.
+func completedBackupOf(set *recoverykit.Set, name string) (recoverykit.Backup, bool) {
+	for _, b := range set.Backups {
+		if b.Name == name && b.Completed() {
+			return b, true
+		}
+	}
+	return recoverykit.Backup{}, false
 }
 
 func backupNames(set *recoverykit.Set) string {
@@ -342,6 +351,14 @@ cluster it does belong to.`,
     --backup daily-20260925020000`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
+
+			// A control-plane kit is an INSTANCE resource and its binding
+			// carries no organisation, so asking for one would produce a
+			// refusal about an empty organisation rather than an answer about
+			// the kit. Refused here, with the reason.
+			if kind == string(recoverykit.KindControlPlane) && org != "" {
+				return fmt.Errorf("--organisation does not apply to --kind %s: a control-plane kit belongs to an INSTANCE and carries no organisation — it is instance-level, not a cluster resource. Drop --organisation, or check a cluster's kit with --kind %s (whose binding does carry the organisation that owns the cluster)", recoverykit.KindControlPlane, recoverykit.KindCluster)
+			}
 
 			// The key first, from the file or the prompt. Never from a flag:
 			// a secret on a command line lands in shell history and in ps.

@@ -217,10 +217,10 @@ func stageRecoverySelect(ctx context.Context, s *Session) error {
 		ClusterID:      cluster.ID,
 	}
 	sel, err := recovery.Select(ctx, store, recovery.Scope(recoverykit.Location{Prefix: target.Prefix}), recovery.Request{
-		Kind:     rec.Kind,
+		Kind:      rec.Kind,
 		ClusterID: cluster.ID,
-		Backup:   rec.Backup,
-		Expected: expected,
+		Backup:    rec.Backup,
+		Expected:  expected,
 	})
 	if err != nil {
 		return err
@@ -435,14 +435,15 @@ func recoveryOperator() string {
 // whole life. So the kit's password must be on the cluster before the Velero
 // server is: this stage runs before the stage that installs Velero.
 func stageRecoveryRepository(ctx context.Context, s *Session) error {
-	if s.recoverySel == nil {
+	sel := s.workloadSelection()
+	if sel == nil {
 		return errors.New("the repository stage has no recovery set: it runs after the select stage")
 	}
 	server, err := s.Server()
 	if err != nil {
 		return err
 	}
-	secrets, err := s.recoverySel.Kit.Secrets(s.Opts.Recovery.FleetKey)
+	secrets, err := sel.Kit.Secrets(s.Opts.Recovery.FleetKey)
 	if err != nil {
 		return fmt.Errorf("opening the recovery kit for the repository password: %w", err)
 	}
@@ -450,9 +451,9 @@ func stageRecoveryRepository(ctx context.Context, s *Session) error {
 	if !ok || password == "" {
 		return fmt.Errorf("the recovery kit carries no %s, so there is no password that opens the repository the recovery set names. A kit without it cannot open an existing repository, and generating one would create a second repository beside the data", recoverykit.KeyVeleroRepoPassword)
 	}
-	repoID := s.recoverySel.Set.VeleroRepositoryID
+	repoID := sel.Set.VeleroRepositoryID
 	if repoID == "" {
-		repoID = s.recoverySel.Kit.VeleroRepositoryID
+		repoID = sel.Kit.VeleroRepositoryID
 	}
 	state, err := recovery.OpenRepository(ctx, server, recovery.Repository{ID: repoID, Password: password})
 	if err != nil {
@@ -534,6 +535,17 @@ func stageRecoveryRegister(ctx context.Context, s *Session) error {
 	return s.saveRecord()
 }
 
+// workloadSelection is the set whose backups this recovery restores: for a
+// workload cluster its own, and for a control-plane recovery the management
+// cluster's, which is written beside the instance's control-plane set because
+// the control plane runs in a cluster.
+func (s *Session) workloadSelection() *recovery.Selection {
+	if s.recoveryWorkloadSel != nil {
+		return s.recoveryWorkloadSel
+	}
+	return s.recoverySel
+}
+
 // recoveryBundleVersion is the bundle this rebuild installs: the one the
 // recovery set names, when it names one, and the one the command was given
 // otherwise. The set is the authority when it disagrees: it is the manifest
@@ -557,16 +569,17 @@ func (s *Session) recoveryBundleVersion() string {
 // application containers from running before their data is back: the restore
 // leaves every project paused, and the activate stage releases them after.
 func stageRecoveryRestore(ctx context.Context, s *Session) error {
-	if s.recoverySel == nil {
+	sel := s.workloadSelection()
+	if sel == nil {
 		return errors.New("the restore stage has no recovery set: it runs after the select stage")
 	}
 	server, err := s.Server()
 	if err != nil {
 		return err
 	}
-	namespaces := s.recoverySel.Backup.Coverage
+	namespaces := sel.Backup.Coverage
 	if len(namespaces) == 0 {
-		return fmt.Errorf("the recovery set's backup %q records no namespace coverage, so there is nothing this stage could restore. A backup whose expected set was never recorded cannot be shown to cover anything — restore the workload by hand with `kubenest backup restore --namespace <ns> --from %s`, or select a backup that records what it covers", s.recoverySel.Backup.Name, s.recoverySel.Backup.Name)
+		return fmt.Errorf("the recovery set's backup %q records no namespace coverage, so there is nothing this stage could restore. A backup whose expected set was never recorded cannot be shown to cover anything — restore the workload by hand with `kubenest backup restore --namespace <ns> --from %s`, or select a backup that records what it covers", sel.Backup.Name, sel.Backup.Name)
 	}
 	deps := backup.RestoreDeps{
 		Cluster: backup.NewK3sCluster(server),
@@ -575,11 +588,11 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		Runner:  server,
 	}
 	for _, namespace := range namespaces {
-		s.Logf("  restoring namespace %s from %s", namespace, s.recoverySel.Backup.Name)
+		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
 		opts := backup.RestoreOptions{
 			Cluster:   s.recoveryName(),
 			Namespace: namespace,
-			From:      s.recoverySel.Backup.Name,
+			From:      sel.Backup.Name,
 			// The rebuild has no namespace yet, but --replace is the honest
 			// statement: the restore must not refuse because a namespace the
 			// desired state already created is in the way.
@@ -589,7 +602,7 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 			Bundle:        s.Bundle,
 		}
 		if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
-			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, s.recoverySel.Backup.Name, err))
+			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
 		}
 	}
 	return nil
@@ -609,7 +622,7 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 // desired state, so this waits for it, bounded, rather than failing on the
 // first look.
 func stageRecoveryActivate(ctx context.Context, s *Session) error {
-	if s.recoverySel == nil {
+	if s.workloadSelection() == nil {
 		return errors.New("the activate stage has no recovery set: it runs after the select stage")
 	}
 	server, err := s.Server()
@@ -621,7 +634,7 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 	if err != nil {
 		return fmt.Errorf("the bundle declares no component-ready timeout, so waiting for a project to appear has no deadline and this stage will not guess one: %w", err)
 	}
-	for _, namespace := range s.recoverySel.Backup.Coverage {
+	for _, namespace := range s.workloadSelection().Backup.Coverage {
 		ns := namespace
 		probe := func(ctx context.Context) (bool, converge.State, error) {
 			hold, err := cluster.ProjectHold(ctx, ns)

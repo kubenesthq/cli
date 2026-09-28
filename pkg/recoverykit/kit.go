@@ -122,6 +122,14 @@ func (b Binding) validate() error {
 		if b.InstanceID == "" {
 			return fmt.Errorf("a control-plane kit is an instance resource and needs the instance id (got %s)", b)
 		}
+		// A CONTROL-PLANE KIT CARRIES NO ORGANISATION, and saying so here is
+		// what stops a caller expecting one: a binding with an organisation is
+		// a cluster's, so comparing it against a control-plane kit reported a
+		// mismatch about an empty organisation rather than about the kind
+		// (kn-t48-all-host-recovery-s11-prao.2).
+		if b.OrganisationID != "" {
+			return fmt.Errorf("a control-plane kit belongs to an INSTANCE and carries no organisation, and this binding names %q: an organisation belongs to a cluster's kit, so this is either a cluster binding with the control-plane kind or a stray --organisation", b.OrganisationID)
+		}
 		// ClusterID is OPTIONAL and means something different here: it names
 		// the MANAGEMENT cluster, the one the control plane runs in. It is
 		// recorded because the instance's control plane is not an abstraction

@@ -237,7 +237,13 @@ func SelectControlPlane(ctx context.Context, store Store, scope, instanceID, art
 			return nil, fmt.Errorf("%s is not a readable recovery set: %w", key, err)
 		}
 		if instanceID != "" {
-			if err := set.Verify(recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: instanceID}); err != nil {
+			// The MANAGEMENT cluster's id is part of this binding and the
+			// operator does not know it — it is inside the artifact they cannot
+			// read yet — so the comparison takes it from the set and checks the
+			// fact that is the point: the set belongs to this INSTANCE. A set
+			// from another instance is refused with what it belongs to.
+			expected := recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: instanceID, ClusterID: set.Binding.ClusterID}
+			if err := set.Verify(expected); err != nil {
 				return nil, fmt.Errorf("%s: %w", key, err)
 			}
 		} else if set.Binding.InstanceID != "" {
@@ -285,6 +291,66 @@ func SelectControlPlane(ctx context.Context, store Store, scope, instanceID, art
 	// read from it rather than passed in.
 	expected := recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: instanceID, ClusterID: set.Binding.ClusterID}
 	return materialise(ctx, store, scope, Request{Kind: recoverykit.KindControlPlane, ClusterID: set.Binding.ClusterID, Expected: expected}, set, byKey[set])
+}
+
+// SelectManagementCluster finds the recovery set of the cluster the control
+// plane runs in: its Velero repository password, and the workload backups a
+// control-plane recovery restores after the database is back (PLAN 7.8 step 5).
+//
+// THE ORGANISATION IS LEARNED HERE, NOT CHECKED, and that is deliberate. On the
+// laptop recovering an all-in-one host nothing knows the management cluster's
+// organisation — the control plane that would say is the thing that is gone —
+// so the check this can make is the one that matters: the set is bound to this
+// INSTANCE and to this cluster, both read from the control-plane set beside it
+// under the same prefix. A set from another instance is refused by name; the
+// organisation is then read back from the set, and the kit is verified against
+// the set that names it.
+func SelectManagementCluster(ctx context.Context, store Store, scope, instanceID, clusterID, backup string) (*Selection, error) {
+	if store == nil {
+		return nil, errors.New("a recovery needs the bucket: no S3 client was built")
+	}
+	if instanceID == "" || clusterID == "" {
+		return nil, errors.New("the management cluster's recovery set is selected by its instance id and its cluster id, and one of them is empty")
+	}
+	prefix := strings.Trim(scope, "/") + "/" + recoverykit.SetsDir + "/" + clusterID + "/"
+	keys, truncated, err := store.List(ctx, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing the management cluster's recovery sets under %s: %w", prefix, err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("the management cluster's recovery sets under %s are truncated: the newest could be in the part that was not returned", prefix)
+	}
+	var chosen *recoverykit.Set
+	var chosenKey string
+	for _, key := range keys {
+		if !strings.HasSuffix(key, ".json") || !strings.Contains(key, "/"+setSuffix(recoverykit.KindCluster)) {
+			continue
+		}
+		raw, err := store.Get(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("reading the recovery set at %s: %w", key, err)
+		}
+		set, err := recoverykit.LoadSet(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s is not a readable recovery set: %w", key, err)
+		}
+		if set.Binding.Kind != recoverykit.KindCluster || set.Binding.InstanceID != instanceID || set.Binding.ClusterID != clusterID {
+			return nil, fmt.Errorf("%s: %w: this cluster set belongs to %s, and this recovery is for instance %q cluster %q", key, recoverykit.ErrForeign, set.Binding, instanceID, clusterID)
+		}
+		if !set.Eligible() {
+			continue
+		}
+		if _, ok := completedBackup(set, backup); !ok {
+			continue
+		}
+		if chosen == nil || set.WrittenAt.After(chosen.WrittenAt) {
+			chosen, chosenKey = set, key
+		}
+	}
+	if chosen == nil {
+		return nil, fmt.Errorf("the management cluster %s has no usable workload backup: the sets under %s are incomplete uploads or name no completed backup, so there is nothing to restore its own namespaces from. Take one (`kubenest backup now --cluster <the management cluster>`) and run the recovery again — the control plane's DATABASE comes from its checkpoint, but its workloads come from here", clusterID, prefix)
+	}
+	return materialise(ctx, store, scope, Request{Kind: recoverykit.KindCluster, ClusterID: clusterID, Expected: chosen.Binding, Backup: backup}, chosen, chosenKey)
 }
 
 // materialise reads the kit a selected set binds, proves the object is the one
@@ -506,15 +572,102 @@ func Verify(ctx context.Context, store Store, sel *Selection, fleetKey string) (
 
 	// 4. Is the set complete, and does it belong here? Select has already
 	// verified the binding; this states it for the record.
-	switch {
-	case !sel.Set.Complete:
-		out.Set = Answer{Detail: fmt.Sprintf("%s records an upload that never completed, and a partial upload is never something to recover from", sel.SetKey)}
-	case sel.Backup.Name == "":
-		out.Set = Answer{Detail: fmt.Sprintf("%s names no completed backup", sel.SetKey)}
-	default:
-		out.Set = Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; it names backup %q, completed at %s, covering %s", sel.SetKey, sel.Set.Binding, sel.Backup.Name, sel.Backup.CompletedAt.UTC().Format(time.RFC3339), coverage(sel.Backup))}
-	}
+	out.Set = AskSet(SetQuestion{
+		Kind:       sel.Set.Binding.Kind,
+		Set:        sel.Set,
+		SetKey:     sel.SetKey,
+		ArtifactID: sel.Set.ArtifactID,
+		Expected:   sel.Set.Binding,
+		Backup:     sel.Backup,
+	}).Answer()
 	return out, nil
+}
+
+// SetQuestion is the fourth question — is the set complete, is it about this
+// cluster, and is there something to recover from in it — and everything the
+// answer needs.
+//
+// IT IS ONE FUNCTION BECAUSE IT IS ONE QUESTION, ASKED IN TWO PLACES. The
+// recovery asks it before its first change (PLAN 7.9 step 2) and
+// `kubenest recovery-kit check` asks it on a laptop, and a check that answered
+// differently from the recovery would be worse than no check at all: it is the
+// document an operator reads to decide whether to run the recovery.
+type SetQuestion struct {
+	// Kind is which authority the set belongs to, because the two kinds are
+	// asked different things.
+	Kind recoverykit.Kind
+	// Set is the recovery set, or nil when none was found.
+	Set *recoverykit.Set
+	// SetKey is where it was read from, so every answer names the object.
+	SetKey string
+	// ArtifactID is the kit artifact the caller is checking.
+	ArtifactID string
+	// Expected is what this instance, organisation and cluster are.
+	Expected recoverykit.Binding
+	// BackupName, when set, is a backup the caller named and the set must
+	// record as completed.
+	BackupName string
+	// Backup is the completed backup the recovery will restore: filled when a
+	// selection has already resolved one.
+	Backup recoverykit.Backup
+}
+
+// Answer is the answer to the fourth question.
+//
+// A CONTROL-PLANE SET IS NOT ASKED FOR A WORKLOAD BACKUP, and that is the whole
+// of this type. The control plane's artifacts are its kit (the keys and the
+// authority every CLI pins) and its versions; what a control-plane recovery
+// restores is the newest eligible CHECKPOINT under `control-plane/` — the
+// database, which carries every organisation, member, role, window, alert route,
+// inventory and token floor — and then the MANAGEMENT CLUSTER'S own workload
+// namespaces from that cluster's OWN recovery set, which is written beside this
+// one because the control plane runs in a cluster (PLAN 7.8 "It is stored under
+// the MANAGEMENT cluster's id"; 7.8's step 5). Demanding a Velero backup inside
+// the control-plane set was a rule that could never be satisfied: no command
+// records one there, and the backups a control-plane recovery restores are
+// recorded where they belong — in the management cluster's set.
+func AskSet(q SetQuestion) SetQuestion { return q }
+
+// Answer resolves the fourth question.
+func (q SetQuestion) Answer() Answer {
+	if q.Set == nil {
+		return Answer{Detail: "there is no recovery set to check"}
+	}
+	if !q.Set.Complete {
+		return Answer{Detail: fmt.Sprintf("%s records an upload that never completed, and a partial upload is never something to recover from", q.SetKey)}
+	}
+	if q.ArtifactID != "" && q.Set.ArtifactID != q.ArtifactID {
+		return Answer{Detail: fmt.Sprintf("%s is about kit artifact %s, and this check is about %s", q.SetKey, q.Set.ArtifactID, q.ArtifactID)}
+	}
+	if q.Kind == recoverykit.KindControlPlane {
+		return Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; the control plane is restored from its newest eligible CHECKPOINT under %s, and the management cluster's own workloads from the recovery set of the cluster it runs in", q.SetKey, q.Expected, ControlPlaneCheckpointDir)}
+	}
+	if q.BackupName != "" {
+		found, ok := completedBackup(q.Set, q.BackupName)
+		if !ok {
+			return Answer{Detail: fmt.Sprintf("the set does not name backup %q as completed; it names %s", q.BackupName, backupNames(q.Set))}
+		}
+		return Answer{OK: true, Detail: fmt.Sprintf("backup %q completed at %s and is recorded in %s, which belongs to %s", found.Name, found.CompletedAt.UTC().Format(time.RFC3339), q.SetKey, q.Expected)}
+	}
+	if q.Backup.Name == "" {
+		return Answer{Detail: fmt.Sprintf("%s names no completed backup: it was written with the install baseline and no backup has been recorded in it yet", q.SetKey)}
+	}
+	return Answer{OK: true, Detail: fmt.Sprintf("%s is complete and belongs to %s; it names backup %q, completed at %s, covering %s", q.SetKey, q.Expected, q.Backup.Name, q.Backup.CompletedAt.UTC().Format(time.RFC3339), coverage(q.Backup))}
+}
+
+// ControlPlaneCheckpointDir is the directory inside a cluster's prefix that the
+// control plane's checkpoints are written under (PLAN 7.8's `control-plane/`).
+const ControlPlaneCheckpointDir = "control-plane/"
+
+func backupNames(set *recoverykit.Set) string {
+	if len(set.Backups) == 0 {
+		return "no backups"
+	}
+	names := make([]string, 0, len(set.Backups))
+	for _, b := range set.Backups {
+		names = append(names, b.Name+" ("+b.Status+")")
+	}
+	return strings.Join(names, ", ")
 }
 
 func coverage(b recoverykit.Backup) string {

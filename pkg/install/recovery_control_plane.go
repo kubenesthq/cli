@@ -61,6 +61,10 @@ func controlPlaneRecoveryPlan(s *Session, bind stageBinder) []Stage {
 		// first table (probe P3 question 3, arm B).
 		{Name: StageRecoveryControlPlane, AlwaysRun: true, Run: bind(stageRecoveryControlPlane)},
 		{Name: StageRecoveryCheckpoint, Run: bind(stageRecoveryCheckpoint)},
+		// The management cluster's repository password, before Velero starts:
+		// its own workloads come back from that repository, and Velero writes
+		// its vendored default into an absent Secret (probe P3 question 2).
+		{Name: StageRecoveryRepository, Run: bind(stageRecoveryRepository)},
 		// The management cluster registers through the control plane it now
 		// hosts, by the normal path.
 		{Name: StageRegister, AlwaysRun: true, Run: bind(stageRegister)},
@@ -114,12 +118,25 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	if sel.Set.Binding.ClusterID == "" {
 		return fmt.Errorf("the control-plane recovery set at %s is bound to no management cluster, so a restored control plane would have no cluster of its own to report into", sel.SetKey)
 	}
+	// AND THE MANAGEMENT CLUSTER'S OWN SET, which is where its workload backups
+	// live: the control-plane set binds the instance's artifacts, and the
+	// cluster the control plane runs in has its own set beside it (PLAN 7.8).
+	// Without this the database would come back and the management workload
+	// would not, which is the half of an all-in-one host that holds data.
+	workload, err := recovery.SelectManagementCluster(ctx, client,
+		recovery.Scope(recoverykit.Location{Prefix: target.Prefix}),
+		sel.Set.Binding.InstanceID, sel.Set.Binding.ClusterID, "")
+	if err != nil {
+		return err
+	}
 	s.recoveryStore = client
 	s.recoveryTargetValue = target
 	s.recoverySel = sel
+	s.recoveryWorkloadSel = workload
 	s.kit = sel.Kit
 	s.Jnl.ClusterID = sel.Set.Binding.ClusterID
 	s.Logf("  recovery: instance kit artifact %s from %s, for the management cluster %s", sel.Set.ArtifactID, sel.SetKey, sel.Set.Binding.ClusterID)
+	s.Logf("  recovery: the management cluster's own workloads come from %s, backup %q", workload.SetKey, workload.Backup.Name)
 	return s.saveRecord()
 }
 
@@ -206,7 +223,9 @@ func stageRecoveryPreflightControlPlane(ctx context.Context, s *Session) error {
 
 // checkpointView adapts the bucket's checkpoint manifest to the eligibility
 // rules pkg/recovery applies.
-type checkpointView struct{ cp *controlplane.BucketCheckpoint }
+type checkpointView struct {
+	cp *controlplane.BucketCheckpoint
+}
 
 func (v checkpointView) CheckpointVersion() string       { return v.cp.ControlPlaneVersion }
 func (v checkpointView) CheckpointPostgresMajor() int    { return v.cp.Dump.PostgresMajor }

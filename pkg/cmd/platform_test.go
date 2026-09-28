@@ -646,3 +646,34 @@ func TestRestoreFromWithoutARecoveryKitIsRefused(t *testing.T) {
 		t.Fatalf("the refusal does not name --name: %v", err)
 	}
 }
+
+// `recovery-kit check --kind control-plane --organisation O` was refused with
+// "the artifact belongs to another instance, organisation or cluster", which
+// names an empty organisation and says nothing about the kind. The flag does
+// not apply: a control-plane kit is an INSTANCE resource (kn-t48-...-prao.2).
+//
+// Asserted at the command, rather than only in the kit's own validation,
+// because the refusal has to happen before anything is read: the operator gets
+// the sentence, not a 404 against a bucket they were told to look in.
+func TestRecoveryKitCheckRefusesAnOrganisationForAControlPlaneKit(t *testing.T) {
+	root := NewRootCommand()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{
+		"recovery-kit", "check",
+		"--kind", "control-plane",
+		"--organisation", "0f3d0000-0000-7000-8000-000000000002",
+		"--cluster", "01a02362-f8a3-7dd6-aa07-2f10ed7a5c30",
+	})
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("an organisation was accepted for a control-plane kit:\n%s", out.String())
+	}
+	message := out.String() + err.Error()
+	for _, want := range []string{"INSTANCE", "organisation"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("the refusal does not say %q, so the operator cannot tell why the flag does not apply:\n%s", want, message)
+		}
+	}
+}
