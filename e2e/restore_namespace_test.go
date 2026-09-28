@@ -1087,8 +1087,10 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 		if err != nil {
 			return false, firstLineOfE2E(err.Error())
 		}
-		left := strings.Trim(strings.TrimSpace(out), "'")
-		return left == "", "still there: phase|deletionTimestamp " + left
+		if left := strings.Trim(strings.TrimSpace(out), "'"); left != "" {
+			return false, "still there: phase|deletionTimestamp " + left
+		}
+		return true, "gone"
 	})
 	// The Deployment's OWN pod — a pod whose pod-template-hash matches a
 	// ReplicaSet with replicas > 0 — is Running on the restored claim.
