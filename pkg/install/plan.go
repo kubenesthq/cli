@@ -250,8 +250,16 @@ type Session struct {
 	// instance's control-plane set. Nil for a workload recovery, where
 	// recoverySel is itself that cluster's set.
 	recoveryWorkloadSel *recovery.Selection
-	// recoveryStore is the bucket those reads came from.
+	// recoveryStore is the bucket those reads came from, with the CLUSTER
+	// principal: recovery sets and kits live under the cluster's own prefix.
 	recoveryStore recovery.Store
+	// recoveryCheckpointStore is the bucket again, with the CONTROL PLANE's own
+	// principal: the checkpoints live at the bucket root under control-plane/,
+	// and PLAN 7.8 keeps that credential separate from every cluster's — it
+	// reaches the control-plane prefix and nothing else, so a recovery that
+	// read checkpoints with the cluster's key is refused by the store rather
+	// than quietly sharing one credential (found on hardware 2026-09-28).
+	recoveryCheckpointStore recovery.Store
 	// recoveryTargetValue is the parsed --backup-target.
 	recoveryTargetValue backup.Target
 	// recoveryCopy is the off-cluster copy the ownership stage writes and

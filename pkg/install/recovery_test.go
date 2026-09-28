@@ -971,6 +971,9 @@ func TestACheckpointIsFoundAtTheBucketRootWhateverTheTargetPrefix(t *testing.T) 
 	// the wrong place. testTarget points at .../ + recoveryTestScope.
 	s, _ := recoverySession(t, Options{Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server"})
 	s.recoveryStore = f.bucket
+	// The checkpoint lives at the bucket root and is read with the control
+	// plane's own principal; this fixture has one store, so it is both.
+	s.recoveryCheckpointStore = f.bucket
 	s.recoveryTargetValue = testTarget(t)
 	if s.recoveryTargetValue.Prefix == "" {
 		t.Fatal("this fixture's --backup-target has no prefix, so the test cannot tell the two compositions apart")
@@ -986,4 +989,113 @@ func TestACheckpointIsFoundAtTheBucketRootWhateverTheTargetPrefix(t *testing.T) 
 	if key := s.checkpointPrefix(); key != strings.Trim(backup.ControlPlanePrefix, "/") {
 		t.Fatalf("the reader looks under %q, and the writer writes under %q", key, backup.ControlPlanePrefix)
 	}
+}
+
+// TestTheCheckpointIsReadWithTheControlPlanesOwnPrincipal is the hardware
+// defect of 2026-09-28: the recovery listed the checkpoints with the CLUSTER
+// principal, so a store that follows PLAN 7.8's separate-principal rule — the
+// cluster's credential scoped to its own prefix, the control plane's to
+// `control-plane/` — answered AccessDenied, and no recovery from such a store
+// could start.
+func TestTheCheckpointIsReadWithTheControlPlanesOwnPrincipal(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c32", "org-1", "inst-1", nil)
+	sealed, err := recoverykit.SealTo(f.fleet.Recipient(), []byte("the dump"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := "control-plane/2026-09-28T010000Z-nightly"
+	manifest, err := json.Marshal(map[string]any{
+		"key":                   dir,
+		"at":                    "2026-09-28T01:00:00Z",
+		"control_plane_version": "1.1",
+		"management_cluster_id": f.bind.ClusterID,
+		"envelope":              map[string]any{"sha256": recoverykit.Digest(sealed), "size_bytes": len(sealed)},
+		"dump":                  map[string]any{"postgres_major": 17, "postgres_image": "bitnami/postgresql@sha256:cccc"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two stores with two policies, which is what a customer following PLAN 7.8
+	// has: the cluster's refuses anything under control-plane/, the control
+	// plane's refuses anything outside it.
+	clusterStore := &scopedBucket{
+		objects: f.bucket.objects,
+		allow:   func(key string) bool { return !strings.HasPrefix(key, backup.ControlPlanePrefix) },
+	}
+	checkpointStore := &scopedBucket{
+		objects: map[string][]byte{dir + "/manifest.json": manifest, dir + "/control-plane.dump.age": sealed},
+		allow:   func(key string) bool { return strings.HasPrefix(key, backup.ControlPlanePrefix) },
+	}
+
+	s, _ := recoverySession(t, Options{Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server"})
+	s.recoveryStore = clusterStore
+	s.recoveryCheckpointStore = checkpointStore
+	s.recoveryTargetValue = testTarget(t)
+
+	cp, dump, err := s.selectCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("the checkpoint was not read with the control plane's own principal: %v", err)
+	}
+	if cp.ControlPlaneVersion != "1.1" || len(dump) != len(sealed) {
+		t.Fatalf("the checkpoint was read as %+v (dump %d bytes)", cp, len(dump))
+	}
+
+	// And the other half: with no checkpoint principal the recovery refuses
+	// BEFORE reading, naming the variables, rather than surfacing a store's
+	// AccessDenied.
+	t.Setenv("KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID", "")
+	t.Setenv("KUBENEST_CONTROL_PLANE_CHECKPOINT_SECRET_ACCESS_KEY", "")
+	t.Setenv("KUBENEST_CHECKPOINT_ACCESS_KEY_ID", "")
+	t.Setenv("KUBENEST_CHECKPOINT_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	s.recoveryCheckpointStore = nil
+	_, _, err = s.selectCheckpoint(context.Background())
+	if err == nil {
+		t.Fatal("a recovery with no checkpoint principal tried to read the checkpoints anyway")
+	}
+	for _, want := range []string{"KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID", "separate"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the refusal does not name %q, so the operator cannot tell which credential is missing: %v", want, err)
+		}
+	}
+}
+
+// scopedBucket is a store with a policy: it answers AccessDenied to everything
+// outside its scope, exactly as the S3-compatible store does.
+type scopedBucket struct {
+	objects map[string][]byte
+	allow   func(key string) bool
+}
+
+func (b *scopedBucket) permitted(key string) error {
+	if b.allow != nil && !b.allow(key) {
+		return fmt.Errorf("s3 ListObjectsV2: AccessDenied (403): Access Denied")
+	}
+	return nil
+}
+
+func (b *scopedBucket) Get(_ context.Context, key string) ([]byte, error) {
+	if err := b.permitted(key); err != nil {
+		return nil, err
+	}
+	if body, ok := b.objects[key]; ok {
+		return body, nil
+	}
+	return nil, s3.ErrNotFound
+}
+
+func (b *scopedBucket) List(_ context.Context, prefix string) ([]string, bool, error) {
+	if err := b.permitted(prefix); err != nil {
+		return nil, false, err
+	}
+	var keys []string
+	for key := range b.objects {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, false, nil
 }

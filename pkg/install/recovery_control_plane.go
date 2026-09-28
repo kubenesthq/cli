@@ -123,6 +123,14 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	// cluster the control plane runs in has its own set beside it (PLAN 7.8).
 	// Without this the database would come back and the management workload
 	// would not, which is the half of an all-in-one host that holds data.
+	// The CONTROL PLANE's own principal, for every read under control-plane/.
+	// Its absence is refused here, before anything is read, because the
+	// alternative is an AccessDenied from the store that says nothing about
+	// which of the two credentials is missing.
+	checkpointStore, err := s.checkpointStore()
+	if err != nil {
+		return err
+	}
 	workload, err := recovery.SelectManagementCluster(ctx, client,
 		recovery.Scope(recoverykit.Location{Prefix: target.Prefix}),
 		sel.Set.Binding.InstanceID, sel.Set.Binding.ClusterID, "")
@@ -130,6 +138,7 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 		return err
 	}
 	s.recoveryStore = client
+	s.recoveryCheckpointStore = checkpointStore
 	s.recoveryTargetValue = target
 	s.recoverySel = sel
 	s.recoveryWorkloadSel = workload
@@ -244,8 +253,50 @@ func orNone(s string) string {
 // selectCheckpoint lists the instance's checkpoints in the bucket and picks the
 // newest eligible one, with its sealed dump.
 func (s *Session) selectCheckpoint(ctx context.Context) (*controlplane.BucketCheckpoint, []byte, error) {
-	prefix := s.checkpointPrefix()
-	return controlplane.SelectControlPlaneCheckpoint(ctx, s.recoveryStore.List, s.recoveryStore.Get, prefix)
+	if s.recoveryCheckpointStore == nil {
+		return nil, nil, errors.New("this recovery has no checkpoint principal, so it cannot read the control plane's checkpoints: set KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID and KUBENEST_CONTROL_PLANE_CHECKPOINT_SECRET_ACCESS_KEY (KUBENEST_CHECKPOINT_* is accepted too). The checkpoints live under the bucket's control-plane/ prefix, which PLAN 7.8 gives its own credential, separate from every cluster's")
+	}
+	return controlplane.SelectControlPlaneCheckpoint(ctx, s.recoveryCheckpointStore.List, s.recoveryCheckpointStore.Get, s.checkpointPrefix())
+}
+
+// checkpointCredentials are the control plane's own object-store principal.
+// They are read from the control plane's variables first and never from the
+// cluster's pair: a recovery that used the cluster's credential here would be
+// sharing one principal between a cluster's backups and the control plane's
+// database, which is the boundary `backup set-target` exists to prove.
+func checkpointCredentials() (keyID, secret string) {
+	keyID = envFirst("KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID", "KUBENEST_CHECKPOINT_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+	secret = envFirst("KUBENEST_CONTROL_PLANE_CHECKPOINT_SECRET_ACCESS_KEY", "KUBENEST_CHECKPOINT_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
+	return keyID, secret
+}
+
+// checkpointStore is the bucket reached with that principal. It is the store
+// every read under control-plane/ goes through: the checkpoint listing, each
+// manifest, and the sealed dump.
+func (s *Session) checkpointStore() (recovery.Store, error) {
+	keyID, secret := checkpointCredentials()
+	if keyID == "" || secret == "" {
+		return nil, errors.New("a control-plane recovery needs the CONTROL PLANE's object-store credentials to read its checkpoints: set KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID and KUBENEST_CONTROL_PLANE_CHECKPOINT_SECRET_ACCESS_KEY (KUBENEST_CHECKPOINT_* is accepted too). They are not the cluster's KUBENEST_BACKUP_* pair: PLAN 7.8 gives the checkpoints their own principal, which reaches the bucket's control-plane/ prefix and nothing else, and the cluster's principal reaches only that cluster's prefix — so neither can do the other's reading")
+	}
+	target, err := s.recoveryTarget()
+	if err != nil {
+		return nil, err
+	}
+	// The same store, the other principal: endpoint, bucket and region come
+	// from --backup-target, and the prefix is the control plane's own.
+	checkpointTarget := backup.Target{
+		Endpoint:        target.Endpoint,
+		Bucket:          target.Bucket,
+		Region:          target.Region,
+		Prefix:          backup.ControlPlanePrefix,
+		AccessKeyID:     keyID,
+		SecretAccessKey: secret,
+	}
+	client, err := checkpointTarget.S3Client()
+	if err != nil {
+		return nil, fmt.Errorf("building the control plane's own object-store client: %w", err)
+	}
+	return client, nil
 }
 
 // checkpointPrefix is where the control plane's checkpoints live, and the
@@ -514,12 +565,8 @@ func (s *Session) checkpointTargetForRecovery(ctx context.Context, server k3s.Ru
 	if err != nil {
 		return nil, err
 	}
-	cp := controlplane.NewCheckpointTarget(
-		target,
-		s.recoveryRecipient,
-		envFirst("KUBENEST_CONTROL_PLANE_CHECKPOINT_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
-		envFirst("KUBENEST_CONTROL_PLANE_CHECKPOINT_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
-	)
+	keyID, secret := checkpointCredentials()
+	cp := controlplane.NewCheckpointTarget(target, s.recoveryRecipient, keyID, secret)
 	if err := controlplane.EnsureCredentials(ctx, server, cp); err != nil {
 		return nil, err
 	}
