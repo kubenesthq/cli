@@ -902,3 +902,154 @@ func TestAddTakeOverContinuesAnAddThatDiedAfterTheJoin(t *testing.T) {
 		t.Errorf("the taken-over operation did not finish the record (terminal=%v, result=%q)", after.Terminal, after.Result)
 	}
 }
+
+// A resume that finds the k3s THIS operation installed must accept it.
+//
+// Preflight always re-runs — it must see the host as it is now — and on hardware
+// the machine that has just joined answers `command -v k3s` like any other node,
+// so an add interrupted after its join was refused by the check that exists to
+// stop the CLI adopting somebody else's cluster (kn-t52-…-kd2q.2, lab demo
+// 2026-09-28: "Existing Kubernetes on 5.75.252.113: already present: k3s").
+//
+// The exception is the operation's OWN work and nothing else: the journal names
+// the node this operation joined, and the cluster still reports that node with
+// the UID the journal recorded for it.
+func TestAddResumeAcceptsTheK3sItsOwnJoinInstalled(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	const newNode = "prod-1-agt-2"
+	// The machine is fresh until the join installs the agent on it; after that it
+	// answers like the node it became.
+	installed := false
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		installed = true
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+	f.agent.on("command -v", func(_ *fakeHost, _ string) (sshx.Result, error) {
+		if installed {
+			return ok("k3s\ncontainerd\n")(nil, "")
+		}
+		return ok("\n")(nil, "")
+	})
+
+	dead := stopAfterTheJoin(t, f)
+	// The advice the stopped run left NAMES THE COMMAND that continues it, flags
+	// and all: `--resume` alone is refused with "--agent is required", so a
+	// message that named only the id would send the operator into a refusal.
+	advice := f.out.String()
+	for _, want := range []string{"kubenest node add", "--agent " + testAgentAddr, dead.OperationID} {
+		if !strings.Contains(advice, want) {
+			t.Errorf("the stopped run's advice does not name %q:\n%s", want, advice)
+		}
+	}
+
+	resuming := secondProcess(t, f, "run-2")
+	if err := drive(resuming, AddOptions{Agent: testAgentAddr, Resume: dead.OperationID}); err != nil {
+		t.Fatalf("the resume was refused by the k3s its own join installed: %v\n%s", err, f.out.String())
+	}
+	joiner := hostWithAddress(f.records.inventory(), testAgentAddr)
+	if joiner.LifecycleState != string(StateActive) || joiner.NodeUID == "" {
+		t.Errorf("the resumed add did not record the machine active with its node uid: %+v", joiner)
+	}
+	if got := f.log.count("get.k3s.io"); got != 1 {
+		t.Errorf("%d install attempts, want the interrupted run's one: the resume must not join the machine again", got)
+	}
+	after := readRecord(t, f.server)
+	if !after.Terminal || after.Result != string(operation.ResultSucceeded) {
+		t.Errorf("the resumed operation did not finish the record (terminal=%v, result=%q)", after.Terminal, after.Result)
+	}
+}
+
+// The same for the device this operation filled: an add that stopped after its
+// own storage stage would otherwise be refused by the blank-device rule, which
+// exists for a device the operator points at by mistake — "kubenest-vg already
+// exists on this node: omit --storage-device".
+func TestAddResumeAcceptsTheVolumeGroupItsOwnStorageStageCreated(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	const (
+		newNode = "prod-1-agt-2"
+		device  = "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive2"
+	)
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+	// The device is blank when the operation starts, and carries the volume group
+	// this operation creates on it afterwards.
+	created := false
+	f.agent.on("vgcreate", func(_ *fakeHost, _ string) (sshx.Result, error) {
+		created = true
+		return sshx.Result{}, nil
+	})
+	f.agent.on("vgs", func(_ *fakeHost, _ string) (sshx.Result, error) {
+		if created {
+			return ok("  53687091200\n")(nil, "")
+		}
+		return fail(1, "Volume group \"kubenest-vg\" not found")(nil, "")
+	})
+
+	// The same interruption as above, one stage later: the storage stage has run
+	// and the ACTIVE inventory write is the one that fails.
+	first := &Add{Session: f.session, Opts: AddOptions{Agent: testAgentAddr, StorageDevice: device}}
+	f.records.failOn = 2
+	_, runErr := stages.Execute(context.Background(), first, PlanAdd(first))
+	if runErr == nil {
+		t.Fatal("the planted inventory-write failure did not fail the run")
+	}
+	first.Finish(context.Background(), runErr, true)
+	if joiner := hostWithAddress(f.records.inventory(), testAgentAddr); joiner.LifecycleState != string(StateJoining) {
+		t.Fatalf("the interrupted run left the host as %q, want %q", joiner.LifecycleState, StateJoining)
+	}
+	if !created {
+		t.Fatal("the interrupted run never created the volume group, so this test proves nothing")
+	}
+
+	resuming := secondProcess(t, f, "run-2")
+	if err := drive(resuming, AddOptions{Agent: testAgentAddr, StorageDevice: device, Resume: readRecord(t, f.server).OperationID}); err != nil {
+		t.Fatalf("the resume was refused by the volume group its own storage stage created: %v\n%s", err, f.out.String())
+	}
+	joiner := hostWithAddress(f.records.inventory(), testAgentAddr)
+	if joiner.LifecycleState != string(StateActive) {
+		t.Errorf("the resumed add did not record the machine active: %+v", joiner)
+	}
+	if joiner.VolumeGroupOwnership != string(storage.InstallerCreated) {
+		t.Errorf("the resumed add recorded the volume group as %q, want %q", joiner.VolumeGroupOwnership, storage.InstallerCreated)
+	}
+}
+
+// The exception is not an amnesty: a resume that finds SOMEBODY ELSE'S k3s on
+// the machine is still refused, and the refusal names the check that exists for
+// it. The cluster reports a node with the name the journal knows and another
+// UID — a rebuilt machine, or another cluster's k3s running on it — so the k3s
+// there is not the node this operation joined.
+func TestAddResumeStillRefusesAnotherClustersK3sOnTheMachine(t *testing.T) {
+	f := newFixture(t, serverHost(), agentHost())
+	const newNode = "prod-1-agt-2"
+	f.agent.on("get.k3s.io", func(h *fakeHost, _ string) (sshx.Result, error) {
+		f.server.setNodes(joinedNodes(t, newNode, true))
+		return sshx.Result{}, nil
+	})
+	dead := stopAfterTheJoin(t, f)
+
+	f.agent.on("command -v", ok("k3s\ncontainerd\n"))
+	f.server.setNodes(nodesJSON(t,
+		testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+		testNode{Name: testAgentNode, UID: "uid-agt", Addresses: []string{agentHost().SSHAddress}, Ready: true},
+		testNode{Name: newNode, UID: "uid-somebody-else", Addresses: []string{testAgentAddr}, Ready: true},
+	))
+
+	resuming := secondProcess(t, f, "run-2")
+	err := drive(resuming, AddOptions{Agent: testAgentAddr, Resume: dead.OperationID})
+	if err == nil {
+		t.Fatal("a machine running another cluster's k3s was accepted by the resume")
+	}
+	if !strings.Contains(err.Error(), "Existing Kubernetes") {
+		t.Errorf("the refusal is not the existing-Kubernetes check: %v", err)
+	}
+	if got := f.log.count("get.k3s.io"); got != 1 {
+		t.Errorf("%d install attempts, want the interrupted run's one: the resume must not join a machine it refused", got)
+	}
+	if joiner := hostWithAddress(f.records.inventory(), testAgentAddr); joiner.LifecycleState == string(StateActive) {
+		t.Error("the refused resume recorded the machine active")
+	}
+}

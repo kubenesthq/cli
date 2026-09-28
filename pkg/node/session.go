@@ -72,6 +72,15 @@ type Session struct {
 	Window    *window.Window
 	WindowErr error
 
+	// ResumeCommand is this operation's own command line WITHOUT the operation
+	// id: the flags that make a resume the SAME operation. A resume repeats the
+	// command, not just the id — the request and the journal identity are
+	// compared and a changed argument is refused by name — so a stop message
+	// that named only an id would name a command an operator cannot use. The
+	// verb sets this where it takes the record; a verb that does not gets the
+	// generic advice instead.
+	ResumeCommand string
+
 	// Now, Sleep and Poll are the run's clock, so a test measures a timeout
 	// instead of enduring it.
 	Now   func() time.Time
@@ -154,7 +163,19 @@ var nodeExits = []string{
 	"continue a live operation record with --resume <operation-id>, as the record names it",
 }
 
-func (s *Session) Exits() []string { return nodeExits }
+// Exits names the command a failed operation is continued by. When the verb
+// knows its own flags the second line names them, because a resume repeats the
+// SAME command: `--resume` on its own is not enough, and advice that named only
+// an id would send an operator to a refusal.
+func (s *Session) Exits() []string {
+	if s.ResumeCommand == "" {
+		return nodeExits
+	}
+	return []string{
+		nodeExits[0],
+		"continue the stopped operation with the same flags: " + s.ResumeCommand + " --resume <operation-id>",
+	}
+}
 
 // Logf writes narrative that is not a stage transition.
 func (s *Session) Logf(format string, args ...any) {
@@ -512,7 +533,7 @@ func (s *Session) openRecord(ctx context.Context, kind operation.Kind, request o
 			return err
 		}
 		s.handle = handle
-		s.Logf("  record:    %s (resume with --resume %s if this is interrupted)", handle.OperationID(), handle.OperationID())
+		s.Logf("  record:    %s (%s)", handle.OperationID(), s.resumeAdvice(handle.OperationID()))
 		return nil
 	}
 	// A resume — and a take-over — reconciles BEFORE anything is repeated: the
@@ -552,6 +573,48 @@ func (s *Session) removeJournal() {
 	}
 }
 
+// resumeAdvice is what to do about a record this run left behind: the command
+// that continues it, with the operation id on the end.
+//
+// A resume REPEATS THE COMMAND — the record compares the immutable request and
+// the journal compares its identity, so a changed flag is refused by name — and
+// advice that named only an id would send an operator into exactly that refusal.
+// A verb that knows its own flags names them (ResumeCommand, set where it takes
+// the record); one that does not is told to re-run the same command.
+func (s *Session) resumeAdvice(id string) string {
+	if s.ResumeCommand == "" {
+		return "continue it with --resume " + id + ", repeating the flags this operation was started with"
+	}
+	return "continue it with: " + s.ResumeCommand + " --resume " + id
+}
+
+// resumeFlag renders one --name value pair for a resume command, or nothing at
+// all when the operator did not pass it: the command the advice names must be
+// one the operator could have typed, so an unset flag is left out rather than
+// printed with an empty value.
+//
+// It is never given a credential: a resume runs on the laptop that has the SSH
+// key, where the operator's own ssh-agent and ~/.ssh/config already answer.
+func resumeFlag(name, value string) string {
+	if value == "" {
+		return ""
+	}
+	return " " + name + " " + value
+}
+
+// windowFlagFor is the window flag a run was started with, for the same reason:
+// a resume IS the same command, and --wait must still wait for the window rather
+// than becoming an immediate action.
+func windowFlagFor(now, wait bool) string {
+	switch {
+	case now:
+		return " --now"
+	case wait:
+		return " --wait"
+	}
+	return ""
+}
+
 // finishRecord closes the operation record the way the run ended. An
 // interrupted run is marked stopped rather than finished, so a successor may
 // take it over (a terminal record cannot be resumed by anyone).
@@ -563,7 +626,7 @@ func (s *Session) finishRecord(ctx context.Context, runErr error, interrupted bo
 		if err := s.store.Stop(ctx, s.handle); err != nil {
 			s.Logf("warning: the operation record %s could not be marked stopped: %v", s.handle.OperationID(), err)
 		}
-		s.Logf("  record:    %s marked stopped; continue it with --resume %s", s.handle.OperationID(), s.handle.OperationID())
+		s.Logf("  record:    %s marked stopped; %s", s.handle.OperationID(), s.resumeAdvice(s.handle.OperationID()))
 		return
 	}
 	result := operation.ResultSucceeded

@@ -466,8 +466,13 @@ func TestReplaceResumeContinuesAfterTheReplacementWasRecorded(t *testing.T) {
 	}
 
 	// The resume continues the removal, with the machine that replaces already
-	// an active host of this cluster.
+	// an active host of this cluster — and, on hardware, already RUNNING the k3s
+	// this operation's own join installed on it, which is what the resumed
+	// preflight sees and must accept (kn-t52-…-kd2q.2: add's stagePreflight is
+	// this verb's preflight, and the machine it excuses is the one its own
+	// journal joined, matched by node UID).
 	f.server.rules = nil
+	f.agent.on("command -v", ok("k3s\ncontainerd\n"))
 	resume := NewReplace(f.sessionFor(t, "run-2"), ReplaceOptions{Node: "h-agt", With: testAgentAddr, Resume: operationID})
 	result, err := RunReplace(context.Background(), resume)
 	resume.Finish(context.Background(), err, false)

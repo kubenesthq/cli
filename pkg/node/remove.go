@@ -297,6 +297,17 @@ func (r *Remove) stageWindow(ctx context.Context) error {
 
 // stageLock creates the operation record: the CLI-vs-CLI lock.
 func (r *Remove) stageLock(ctx context.Context) error {
+	// The advice an interrupted run leaves behind names this command, so the stop
+	// message and what --resume accepts cannot disagree: a resume repeats the
+	// flags (session.resumeAdvice).
+	line := "kubenest node remove" +
+		resumeFlag("--cluster", r.Cluster) +
+		resumeFlag("--node", r.Opts.Node) +
+		windowFlagFor(r.Opts.Now, r.Opts.Wait)
+	if r.Opts.AbandonVolumes {
+		line += " --abandon-volumes"
+	}
+	r.Session.ResumeCommand = line
 	request := operation.Request{
 		Kind:    operation.KindNodeRemove,
 		Cluster: r.Cluster,

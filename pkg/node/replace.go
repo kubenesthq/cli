@@ -528,6 +528,20 @@ func (r *Replace) stageWindow(ctx context.Context) error {
 // is in the request on purpose (PLAN 7.3): a resume continues the order it
 // started in.
 func (r *Replace) stageLock(ctx context.Context) error {
+	// The advice an interrupted run leaves behind names this command, so the stop
+	// message and what --resume accepts cannot disagree: a resume repeats the
+	// flags (session.resumeAdvice). Both machines are named, because a resume
+	// that changed either is a different request and is refused by name.
+	line := "kubenest node replace" +
+		resumeFlag("--cluster", r.Cluster) +
+		resumeFlag("--node", r.Opts.Node) +
+		resumeFlag("--with", r.Opts.With) +
+		resumeFlag("--storage-device", r.Opts.StorageDevice) +
+		windowFlagFor(r.Opts.Now, r.Opts.Wait)
+	if r.Opts.ConfirmIsolated {
+		line += " --confirm-isolated"
+	}
+	r.Session.ResumeCommand = line
 	request := operation.Request{
 		Kind:    operation.KindNodeReplace,
 		Cluster: r.Cluster,

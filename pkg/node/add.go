@@ -335,6 +335,20 @@ func (a *Add) stageWindow(ctx context.Context) error {
 // port checks, but the per-host checks are for the machine being ADDED. The
 // server already runs k3s and already has kubenest-vg, so running the install's
 // host checks against it refuses every add by construction.
+//
+// WHAT THIS OPERATION ITSELF DID IS NOT A REFUSAL (kn-t52-…-kd2q.2, lab demo
+// 2026-09-28). Preflight always re-runs, because it must see the host as it is
+// now, so on a resume it sees the k3s this operation's join installed and the
+// volume group its own storage stage created. Two of the eleven checks exist to
+// stop the CLI adopting somebody else's cluster (and somebody else's device), and
+// without these flags they refuse this operation's own work — which is the case
+// an interrupted add always ends in.
+//
+// The exception is NARROW on purpose: the k3s on the machine is called ours only
+// when the journal names the node THIS operation joined AND the cluster still
+// reports that node with the UID the journal recorded (joinedThisOperation), and
+// the volume group only when this operation recorded creating it
+// (storageIsOurs). Anything else is refused exactly as before.
 func (a *Add) stagePreflight(ctx context.Context) error {
 	report, err := preflight.Run(ctx, preflight.Options{
 		Bundle:        a.Bundle,
@@ -344,7 +358,11 @@ func (a *Add) stagePreflight(ctx context.Context) error {
 		StorageDevice: a.Opts.StorageDevice,
 		Nodes: []preflight.Node{
 			{Address: a.Server.SSHAddress, Role: a.Server.Role, Runner: a.ServerConn, PortPeer: true},
-			{Address: a.Opts.Agent, Role: string(RoleAgent), Runner: a.Conn},
+			{
+				Address: a.Opts.Agent, Role: string(RoleAgent), Runner: a.Conn,
+				ExistingK3sIsOurs: a.joinedThisOperation(),
+				StorageIsOurs:     a.storageIsOurs(),
+			},
 		},
 		Egress:  a.Egress,
 		Catalog: a.Catalog,
@@ -358,6 +376,43 @@ func (a *Add) stagePreflight(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+// joinedThisOperation reports whether the k3s on the machine being added is THIS
+// operation's own work.
+//
+// Two things must hold, and the second is the one that matters on a machine that
+// could have been reinstalled with somebody else's cluster: the journal names
+// the node this operation joined, and the cluster still reports that node with
+// the UID the journal recorded for it. A node object with the same name and
+// another UID is not the node this operation joined — a rebuilt machine, or
+// another cluster's k3s running on it — and preflight must refuse it exactly as
+// it refuses a machine that was never ours.
+func (a *Add) joinedThisOperation() bool {
+	st := a.stageState()
+	if st.NodeName == "" || st.NodeUID == "" {
+		return false
+	}
+	if a.Node.Name != st.NodeName || a.Node.UID != st.NodeUID {
+		return false
+	}
+	// The inventory entry, when it has learned the UID, must agree with the
+	// journal: two records of one machine that disagree are not a machine to
+	// excuse checks on.
+	return a.Host.NodeUID == "" || a.Host.NodeUID == st.NodeUID
+}
+
+// storageIsOurs reports whether kubenest-vg on this machine is THIS operation's
+// own work: its storage stage recorded the ownership of a volume group it
+// created on the device the operator named.
+//
+// The JOURNAL STATE is what is read, not the storage stage's completion: the
+// state is written by the stage that did the work, so it survives a kill between
+// the work and the engine's completion append — and a group this operation made
+// is still its own however the process ended. A group the customer created is
+// never ours to excuse, and a first run has recorded nothing.
+func (a *Add) storageIsOurs() bool {
+	return a.ownership == storage.InstallerCreated
 }
 
 // stageLock creates the operation record, which is the CLI-vs-CLI lock
@@ -376,6 +431,15 @@ func (a *Add) stagePreflight(ctx context.Context) error {
 // w3). The node the host became is recorded where it belongs — the host's
 // inventory entry, and the journal's node name and UID.
 func (a *Add) stageLock(ctx context.Context) error {
+	// The advice an interrupted run leaves behind names this command (it is
+	// printed with the operation id by session.resumeAdvice), so a stop message
+	// and what --resume accepts cannot disagree: a resume repeats the flags,
+	// because the record compares the request and the journal its identity.
+	a.Session.ResumeCommand = "kubenest node add" +
+		resumeFlag("--cluster", a.Cluster) +
+		resumeFlag("--agent", a.Opts.Agent) +
+		resumeFlag("--storage-device", a.Opts.StorageDevice) +
+		windowFlagFor(a.Opts.Now, a.Opts.Wait)
 	request := operation.Request{
 		Kind:    operation.KindNodeAdd,
 		Cluster: a.Cluster,
