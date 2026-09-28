@@ -436,6 +436,7 @@ func stageRecoveryControlPlane(ctx context.Context, s *Session) error {
 	// database state renders the same replicas, so a resume does not roll the
 	// chart back and forth between held and running.
 	applied := values
+	startedBackend := false
 	loaded, detail, probeErr := controlplane.DatabaseHasControlPlaneData(ctx, server)
 	switch {
 	case probeErr == nil && loaded:
@@ -443,6 +444,7 @@ func stageRecoveryControlPlane(ctx context.Context, s *Session) error {
 		if err != nil {
 			return err
 		}
+		startedBackend = true
 		s.Logf("  the checkpoint is already loaded (%s): applying the chart with the backend RUNNING, because the stage that starts it has already run on an earlier attempt", detail)
 	default:
 		applied, err = controlplane.HoldBackend(values)
@@ -455,13 +457,35 @@ func stageRecoveryControlPlane(ctx context.Context, s *Session) error {
 			s.Logf("  the database is empty (%s): holding the backend until the checkpoint is loaded", detail)
 		}
 	}
-	if _, err := controlplane.Apply(ctx, server, applied); err != nil {
+	revision, err := controlplane.Apply(ctx, server, applied)
+	if err != nil {
 		return err
 	}
 	// The management cluster's own operator trusts the authority in the kit,
 	// which is the authority every CLI and agent in the fleet already pinned.
 	s.Opts.ControlPlaneCA = []byte(sec.CABundle())
 	s.recoveryValues = values
+
+	// WHOEVER STARTS THE BACKEND WAITS FOR IT. The chart goes on
+	// asynchronously — k3s's Helm controller installs it after this call
+	// returns — so a stage that applied the chart with the backend RUNNING and
+	// returned at once left the next stage logging in to a pod that was still
+	// starting (found on hardware 2026-09-28: `recovery-api` got
+	// "connection refused"). Stage 11, the other stage that starts the backend,
+	// has always waited; this is the same wait, on the same function. The log
+	// line names the state this stage actually left the cluster in: the old one
+	// said "held" on a path that had just started it.
+	if startedBackend {
+		if err := controlplane.WaitReady(ctx, server, revision, s.Bundle, s.Reporter); err != nil {
+			return err
+		}
+		addr, err := controlplane.BackendAddr(ctx, server)
+		if err != nil {
+			return err
+		}
+		s.Logf("  the restored control plane is serving through %s (revision %s); the backend was already running, so this attempt started it back up rather than holding it", addr, revision)
+		return nil
+	}
 	s.Logf("  the control plane chart was applied with the kit's CA and key material; the backend is held at zero replicas until the checkpoint is loaded")
 	return nil
 }
@@ -554,6 +578,12 @@ func stageRecoveryCheckpoint(ctx context.Context, s *Session) error {
 	s.Logf("  the restored control plane is serving through %s (revision %s)", addr, revision)
 	return nil
 }
+
+// NOTE ON STAGE 12 (recovery-api): it does NOT tolerate a backend that is still
+// starting, deliberately. The stage that starts the backend waits for it, so a
+// backend that is not serving at stage 12 means that wait failed or was skipped
+// — and retrying the login would turn a control plane that never comes up into
+// a command that hangs instead of a sentence naming what is not ready.
 
 // openControlPlaneTunnel returns a control-plane client that reaches the
 // backend through the SSH connection this install already holds, signed in with

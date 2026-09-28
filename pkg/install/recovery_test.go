@@ -1,12 +1,14 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -1518,14 +1520,34 @@ func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
 		t.Setenv("KUBENEST_CHECKPOINT_ACCESS_KEY_ID", "checkpoint-key")
 		t.Setenv("KUBENEST_CHECKPOINT_SECRET_ACCESS_KEY", "checkpoint-secret")
 		s, runner := recoverySession(t, opts)
+		s.Out = &bytes.Buffer{}
 		s.recoveryStore = f.bucket
 		s.recoveryCheckpointStore = f.bucket
 		s.recoveryTargetValue = testTarget(t)
 		// The select stage runs on every attempt (it is AlwaysRun), so the
 		// session state the chart stage needs is built exactly as a resume
 		// builds it.
+		backendLooks := 0
 		runner.respond = func(command string) (sshx.Result, error) {
 			switch {
+			// The readiness probe: three Deployments, the Postgres
+			// StatefulSet, the certificate's condition and the Gateway's. The
+			// backend reports not-ready for its first two observations, which
+			// is what a pod that is still starting looks like.
+			case strings.Contains(command, "get deployment/"):
+				if strings.Contains(command, "kubenest-cp-backend") {
+					backendLooks++
+					if backendLooks <= 2 {
+						return sshx.Result{Stdout: `{"metadata":{"generation":1},"spec":{"replicas":1,"template":{"metadata":{"annotations":{"kubenest.io/install-revision":"` + revisionOf(runner) + `"}}}},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"availableReplicas":0}}`}, nil
+					}
+				}
+				return sshx.Result{Stdout: `{"metadata":{"generation":1},"spec":{"replicas":1,"template":{"metadata":{"annotations":{"kubenest.io/install-revision":"` + revisionOf(runner) + `"}}}},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"availableReplicas":1}}`}, nil
+			case strings.Contains(command, "get statefulset"):
+				return sshx.Result{Stdout: `{"spec":{"replicas":1},"status":{"readyReplicas":1}}`}, nil
+			case strings.Contains(command, "get certificate/"), strings.Contains(command, "get gateway/"):
+				return sshx.Result{Stdout: `{"status":{"conditions":[{"type":"Ready","status":"True"},{"type":"Programmed","status":"True"}]}}`}, nil
+			case strings.Contains(command, "get service kubenest-cp-backend"):
+				return sshx.Result{Stdout: "10.43.105.14"}, nil
 			case strings.Contains(command, "get secret kubenest-cp-install"):
 				// A fresh host: this recovery writes that Secret itself.
 				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): secrets "kubenest-cp-install" not found`}, nil
@@ -1544,6 +1566,15 @@ func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
 		}
 		return s, runner
 	}
+	backendProbes := func(runner *recordingRunner) int {
+		n := 0
+		for _, command := range runner.ran {
+			if strings.Contains(command, "get deployment/kubenest-cp-backend") {
+				n++
+			}
+		}
+		return n
+	}
 	appliedValues := func(runner *recordingRunner) string {
 		var sb strings.Builder
 		for _, in := range runner.inputs {
@@ -1553,10 +1584,14 @@ func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
 	}
 
 	// A resume whose database already holds the checkpoint: the chart goes back
-	// on with the backend RUNNING.
+	// on with the backend RUNNING, and the stage WAITS for it to serve — the
+	// Helm controller installs asynchronously, and the next stage logs in.
 	s, runner := build(t, "3\n", "")
 	if err := stageRecoveryControlPlane(context.Background(), s); err != nil {
 		t.Fatalf("the chart stage failed on a resume: %v", err)
+	}
+	if probes := backendProbes(runner); probes < 3 {
+		t.Fatalf("the backend was probed %d time(s): the stage applied the chart with the backend running and returned without waiting for it, so the next stage logs in to a pod that is still starting", probes)
 	}
 	resumed := appliedValues(runner)
 	if !strings.Contains(resumed, "replicas: 1") {
@@ -1564,6 +1599,14 @@ func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
 	}
 	if strings.Contains(resumed, "replicas: 0") {
 		t.Fatal("the applied chart holds the backend at zero replicas on a resume whose database is loaded")
+	}
+	// And the log line says what this stage actually did.
+	transcript := logOf(t, s)
+	if !strings.Contains(transcript, "RUNNING") || !strings.Contains(transcript, "is serving through") {
+		t.Fatalf("the stage does not report that it started and waited for the backend:\n%s", transcript)
+	}
+	if strings.Contains(transcript, "held at zero replicas") {
+		t.Fatalf("the stage reports holding the backend on a path that started it:\n%s", transcript)
 	}
 
 	// A first attempt (no pod yet, nothing loaded): the chart goes on HELD,
@@ -1575,9 +1618,44 @@ func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
 	if held := appliedValues(firstRunner); !strings.Contains(held, "replicas: 0") {
 		t.Fatalf("a first attempt applied the chart with the backend running, so it would build the schema before the checkpoint is loaded:\n%s", tailOf(held, 400))
 	}
+	if probes := backendProbes(firstRunner); probes != 0 {
+		t.Fatalf("a first attempt probed the backend for readiness %d time(s): a held backend is not waited for", probes)
+	}
+	if transcript := logOf(t, first); !strings.Contains(transcript, "held at zero replicas") {
+		t.Fatalf("a first attempt does not report holding the backend:\n%s", transcript)
+	}
 }
 
-// tailOf is the last n characters, so a failure shows the end of the applied
+// logOf returns what the stage printed, so a claim about which path ran is
+// read from the operator's own transcript rather than from a field.
+func logOf(t *testing.T, s *Session) string {
+	t.Helper()
+	if buf, ok := s.Out.(*bytes.Buffer); ok {
+		return buf.String()
+	}
+	t.Fatal("this session does not capture its output")
+	return ""
+}
+
+// revisionPattern finds the install revision the stage rendered, in the
+// document it applies.
+var revisionPattern = regexp.MustCompile(`installRevision["\x27]?\s*:\s*["\x27]?([0-9a-f]{8,})`)
+
+// revisionOf is the install revision the stage has applied so far, read from
+// the document it sent: the readiness probe compares the Deployment's
+// annotation with exactly this value, and the annotation is only in the
+// document once the chart stage has applied it.
+func revisionOf(runner *recordingRunner) string {
+	out := ""
+	for _, in := range runner.inputs {
+		if match := revisionPattern.FindSubmatch(in); match != nil {
+			out = string(match[1])
+		}
+	}
+	return out
+}
+
+// tailOf is the last n characters, so a failure shows the end of an applied
 // document rather than 200 KB of values.
 func tailOf(s string, n int) string {
 	if len(s) <= n {
