@@ -662,6 +662,9 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		// Kubernetes state written SINCE the snapshot: a ConfigMap created now.
 		// The restore must lose it, which is the observable form of "what was
 		// written since the snapshot".
+		// The failure left k3s restarting on the server; the marker is written
+		// once the API answers again, or its absence proves nothing.
+		w12WaitForKubectl(t, ctx, server)
 		marker := fmt.Sprintf("gate-after-snapshot-%d", time.Now().Unix())
 		if err := kubectlApplyDoc(ctx, server, fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap

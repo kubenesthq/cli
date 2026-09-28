@@ -54,6 +54,13 @@ import (
 // ScheduleAnyway rather than DoNotSchedule so a drained replica can land
 // anywhere during the upgrade rather than staying Pending, which would be an
 // outage caused by the test's own scheduling rules.
+//
+// The PodDisruptionBudget is what makes a drain wait for the replacement.
+// ScheduleAnyway lets both replicas end up on one node after an earlier drain
+// (lab up, 2026-09-28: an earlier arm drained the agent, both replicas moved to
+// the server and stayed there), and without a budget the server's own drain
+// then evicts both at once. With minAvailable 1 the drain evicts one, waits
+// until its replacement is Ready elsewhere, and only then takes the other.
 const availabilityWorkload = `apiVersion: v1
 kind: Namespace
 metadata:
@@ -86,6 +93,16 @@ spec:
           readinessProbe:
             httpGet: {path: /, port: 80}
             periodSeconds: 2
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: always-up
+  namespace: gate-availability
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: always-up}
 ---
 apiVersion: v1
 kind: Service
