@@ -474,3 +474,52 @@ func mutateSealed(t *testing.T, doc []byte) []byte {
 	out[i] ^= 0x01
 	return out
 }
+
+// With no --backup, the check asks the recovery's own question: does the set
+// name a completed backup a recovery would restore? Lab s6, 2026-09-28: the
+// set named a completed backup, and the check answered NO, "names no completed
+// backup", because it only looked for one when a name was given.
+func TestRecoveryKitCheckWithoutABackupNameAsksForTheNewestCompletedOne(t *testing.T) {
+	ctx := context.Background()
+	fleet, err := recoverykit.GenerateFleetKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	localKit, localDoc := sealedKit(t, fleet, kitCluster)
+	baseline, err := recoverykit.NewSet(localKit, map[string]string{"bundle": "1.2"}, recoverykit.Digest(localDoc), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline.Complete = true
+	withBackup, err := baseline.WithBackup(recoverykit.Backup{Name: "manual-1", Status: "Completed", CompletedAt: time.Now().UTC(), Coverage: []string{"app"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(set *recoverykit.Set) kitAnswers {
+		t.Helper()
+		doc, err := set.Document()
+		if err != nil {
+			t.Fatal(err)
+		}
+		answers, err := runKitCheck(ctx, kitCheck{
+			Local: localDoc, ArtifactID: kitArtifactID, Scope: kitScope, ClusterID: kitCluster,
+			Kind: recoverykit.KindCluster, Expected: kitBindingFor(kitCluster),
+			FleetKey: fleet.SecretKeyString(), Store: mustBucket(t, map[string][]byte{
+				recoverykit.KitKey(kitScope, kitCluster, recoverykit.KindCluster, kitArtifactID): localDoc,
+				recoverykit.SetKey(kitScope, kitCluster, recoverykit.KindCluster, kitArtifactID): doc,
+			}),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return answers
+	}
+
+	if answers := check(withBackup); !answers.Set.OK {
+		t.Errorf("the set records completed backup manual-1, yet the check without --backup answered no: %+v", answers.Set)
+	}
+	// The baseline alone still names nothing a recovery could restore.
+	if answers := check(baseline); answers.Set.OK {
+		t.Errorf("a set holding only the install baseline answered yes: %+v", answers.Set)
+	}
+}

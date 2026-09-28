@@ -258,6 +258,10 @@ func runKitCheck(ctx context.Context, in kitCheck) (kitAnswers, error) {
 		}
 		if in.Backup != "" {
 			q.Backup, _ = completedBackupOf(set, in.Backup)
+		} else if chosen, _, err := recovery.ChooseBackup(set, ""); err == nil {
+			// No name asked about: the backup a recovery from this set would
+			// restore, chosen by the recovery's own rule.
+			q.Backup = chosen
 		}
 		answer := q.Answer()
 		out.Set = kitAnswer{OK: answer.OK, Detail: answer.Detail}
