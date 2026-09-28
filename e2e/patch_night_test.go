@@ -54,6 +54,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -238,15 +239,66 @@ func pnBootID(t *testing.T, ctx context.Context, r k3s.Runner) string {
 }
 
 // pnBootIDOrEmpty is pnBootID for a host that may be DOWN, which a reboot
-// makes it: the SSH read fails then, and an expected absence is not a failure.
-// An empty answer means "not observed", and a caller comparing boot ids must
-// treat it as "keep waiting" rather than as a value.
-func pnBootIDOrEmpty(ctx context.Context, r k3s.Runner) string {
-	res, err := r.Run(ctx, "cat /proc/sys/kernel/random/boot_id")
+// makes it: an expected absence is not a failure. An empty answer means "not
+// observed", and a caller comparing boot ids must treat it as "keep waiting"
+// rather than as a value.
+//
+// IT DIALS A NEW CONNECTION FOR EVERY READ. A reboot kills the connection the
+// test opened before it, and sshx.Client does not reconnect: on lab w3
+// (2026-09-28) both agents rebooted inside the window, one at a time, yet a
+// read over the old connections failed for the rest of the wait, so the arm
+// could only ever time out. A host that is down fails the dial, which is the
+// "not observed" answer.
+func pnBootIDOrEmpty(ctx context.Context, env pnEnv, address string) string {
+	dir, err := os.MkdirTemp("", "kn-s3-hosts-")
+	if err != nil {
+		return ""
+	}
+	defer os.RemoveAll(dir)
+	opts := pnSSHOptions(env, filepath.Join(dir, "known_hosts"))
+	endpoint, err := sshx.Resolve(address, opts)
+	if err != nil {
+		return ""
+	}
+	client, err := sshx.Dial(ctx, endpoint, opts)
+	if err != nil {
+		return ""
+	}
+	defer client.Close()
+	res, err := client.Run(ctx, "cat /proc/sys/kernel/random/boot_id")
 	if err != nil || res.ExitCode != 0 {
 		return ""
 	}
 	return strings.TrimSpace(res.Stdout)
+}
+
+// pnRedial opens a new connection to a host that has rebooted, kept open for
+// owner's lifetime, so the arms after a reboot read the host through a live
+// connection rather than the one the reboot killed (the pattern
+// e2e/node_reboot_test.go uses after its own reboot).
+func pnRedial(t, owner *testing.T, env pnEnv, address, user string) k3s.Runner {
+	t.Helper()
+	opts := pnSSHOptions(env, filepath.Join(t.TempDir(), "known_hosts"))
+	opts.User = user
+	endpoint, err := sshx.Resolve(address, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := sshx.Dial(context.Background(), endpoint, opts)
+	if err != nil {
+		t.Fatalf("redialling %s after its reboot: %v", address, err)
+	}
+	owner.Cleanup(func() { client.Close() })
+	return client
+}
+
+func pnSSHOptions(env pnEnv, knownHosts string) sshx.Options {
+	return sshx.Options{
+		User:           env.sshUser,
+		KeyPath:        env.sshKey,
+		KnownHostsPath: knownHosts,
+		DialTimeout:    15 * time.Second,
+	}
 }
 
 // pnRebootPending is Ubuntu's own marker. The operator's whole os_patching
@@ -897,6 +949,9 @@ func TestS3PatchNightGate(t *testing.T) {
 
 	nodes := pnConnect(t, env)
 	server := nodes[0].runner
+	// gate owns the connections the arms open after a reboot, so they outlive
+	// the arm that opened them.
+	gate := t
 	t.Cleanup(func() {
 		if os.Getenv("KUBENEST_GATE_KEEP") != "" {
 			t.Logf("[%s] KUBENEST_GATE_KEEP is set: leaving the patch-night cluster installed", pnNow())
@@ -1287,7 +1342,7 @@ func TestS3PatchNightGate(t *testing.T) {
 		for time.Now().Before(deadline) {
 			done := true
 			for _, node := range nodes[1:] {
-				got := pnBootIDOrEmpty(ctx, node.runner)
+				got := pnBootIDOrEmpty(ctx, env, node.address)
 				if got != "" && got != agentBootBefore[node.address] {
 					seen[node.address] = got
 					continue
@@ -1302,7 +1357,8 @@ func TestS3PatchNightGate(t *testing.T) {
 			}
 			time.Sleep(15 * time.Second)
 		}
-		for _, node := range nodes[1:] {
+		for i := 1; i < len(nodes); i++ {
+			node := nodes[i]
 			after := seen[node.address]
 			if after == "" {
 				t.Errorf("agent %s's boot id has not changed %s after the window opened: kured either never got the window or never saw the marker",
@@ -1310,7 +1366,10 @@ func TestS3PatchNightGate(t *testing.T) {
 				continue
 			}
 			t.Logf("[%s] agent %s rebooted (boot id %s → %s)", pnNow(), node.address, agentBootBefore[node.address], after)
-			if pnRebootPending(t, ctx, node.runner) {
+			// The reboot killed the connection opened at the start; every
+			// later read of this agent goes through a new one.
+			nodes[i].runner = pnRedial(t, gate, env, node.address, env.sshUser)
+			if pnRebootPending(t, ctx, nodes[i].runner) {
 				t.Errorf("agent %s still carries the reboot marker after rebooting: its pending state did not clear", node.address)
 			}
 		}
@@ -1469,6 +1528,10 @@ func TestS3PatchNightGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("the manual server reboot failed after %s: %v\n%s", elapsed.Round(time.Second), err, output)
 		}
+		// The reboot killed the connection this test opened to the server;
+		// every read from here on goes through a new one.
+		server = pnRedial(t, gate, env, env.server, env.sshUser)
+		nodes[0].runner = server
 		if after := pnBootID(t, ctx, server); after == before {
 			t.Errorf("the boot id did not change (%s): the server was not rebooted", after)
 		}
@@ -1611,6 +1674,8 @@ func TestS3PatchNightGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("lane A's manual server reboot failed after %s: %v\n%s", time.Since(started).Round(time.Second), err, out.String())
 		}
+		// The reboot killed this arm's connection to lane A's server.
+		lane = pnRedial(t, t, env, laneHost.SSHAddress, envOr("KUBENEST_LAB_SSH_USER", laneHost.SSHUser))
 		if after := pnBootID(t, ctx, lane); after == before {
 			t.Errorf("lane A's boot id did not change (%s): the host was not rebooted", after)
 		}
