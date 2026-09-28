@@ -1429,3 +1429,59 @@ func TestTheResumeFromAFailedStage20Completes(t *testing.T) {
 		t.Fatal("the reason was not journalled, so the report cannot state it after a resume")
 	}
 }
+
+// TestTheControlPlaneSelectCarriesTheSkipReasonToo: the S6 path carried the
+// reason and the control-plane path did not, so an all-in-one recovery reached
+// stage 20 with an empty reason and refused exactly as the S6 path had before
+// the fix. Both select paths must set every field the other does.
+//
+// The parity is asserted field by field rather than by reading the code: a
+// selection that decides something the later stages act on has to survive being
+// made by either path.
+func TestTheControlPlaneSelectCarriesTheSkipReasonToo(t *testing.T) {
+	const mgmt = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c39"
+	f := newRecoveryFixture(t, mgmt, "org-1", "inst-1", nil)
+	onlyThe11Backup(f)
+	f.publish(t, f.bind, "20260928T020000Z-33333333", f.secrets, nil, true, recoverykit.Backup{
+		Name: "manual-20260927-235954", CompletedAt: time.Date(2026, 9, 27, 23, 59, 54, 0, time.UTC), Status: "Completed",
+	})
+	// The instance's own set, beside it, as a --control-plane install writes it.
+	cpBinding := recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: "inst-1", ClusterID: mgmt}
+	f.publish(t, cpBinding, "20260928T020000Z-44444444", map[string]string{
+		recoverykit.KeyEncryptionKey:  "VALUE-enc",
+		recoverykit.KeyAgentJWTSecret: "VALUE-jwt",
+		recoverykit.KeyControlPlaneCA: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\ny\n-----END EC PRIVATE KEY-----\n",
+	}, nil, true, recoverykit.Backup{
+		Name: "cp-baseline", CompletedAt: time.Date(2026, 9, 28, 2, 0, 0, 0, time.UTC), Status: "Completed",
+	})
+
+	opts := Options{
+		Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+		ControlPlaneInstall: true, Name: "prod-1", Domain: "example.test",
+		BackupTarget: "s3://kubenest-kit/" + recoveryTestScope + "?endpoint=minio.example.test&region=main",
+		Recovery: &RecoveryOptions{
+			RestoreFrom: "latest", Kit: "s3", FleetKey: f.fleet.SecretKeyString(),
+			OldHostFenced: true, Kind: recoverykit.KindControlPlane,
+		},
+	}
+	s, _ := recoverySession(t, opts)
+	s.recoveryStore = f.bucket
+	s.recoveryCheckpointStore = f.bucket
+	s.recoveryTargetValue = testTarget(t)
+	if err := stageRecoverySelectControlPlane(context.Background(), s); err != nil {
+		t.Fatalf("the control-plane select stage failed: %v", err)
+	}
+	if s.recoveryWorkloadSel == nil {
+		t.Fatal("the control-plane select did not select the management cluster's own set")
+	}
+	if s.Record.RecoveryRestoreSkipReason == "" {
+		t.Fatal("the control-plane select did not record why the workloads cannot be restored, so stage 20 refuses with the old dead end")
+	}
+	if s.Record.RecoverySetKey == "" || s.Record.RecoveryBackupName == "" {
+		t.Fatalf("the control-plane select did not record the artifacts it chose: set %q, backup %q", s.Record.RecoverySetKey, s.Record.RecoveryBackupName)
+	}
+	// And stage 20 acts on it: it finishes rather than refusing.
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("stage 20 refused on a recovery whose select stage had already decided to skip: %v", err)
+	}
+}

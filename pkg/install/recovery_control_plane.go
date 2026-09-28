@@ -111,9 +111,15 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	client, err := target.S3Client()
-	if err != nil {
-		return err
+	// The same seam the workload select has: a resumed run keeps the store it
+	// already read the sets from, and a test drives this stage without a bucket.
+	client := s.recoveryStore
+	if client == nil {
+		built, err := target.S3Client()
+		if err != nil {
+			return err
+		}
+		client = built
 	}
 	key, err := recoverykit.ParseFleetKey(rec.FleetKey)
 	if err != nil {
@@ -137,9 +143,13 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	// Its absence is refused here, before anything is read, because the
 	// alternative is an AccessDenied from the store that says nothing about
 	// which of the two credentials is missing.
-	checkpointStore, err := s.checkpointStore()
-	if err != nil {
-		return err
+	checkpointStore := s.recoveryCheckpointStore
+	if checkpointStore == nil {
+		built, err := s.checkpointStore()
+		if err != nil {
+			return err
+		}
+		checkpointStore = built
 	}
 	if err := s.refuseASwitchedSet(sel); err != nil {
 		return err
@@ -159,8 +169,17 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	s.recoverySel = sel
 	s.Record.RecoverySetKey = sel.SetKey
 	s.Record.RecoveryBackupName = workload.Backup.Name
+	// THE SKIP REASON IS PART OF THE SELECTION, and both select paths must carry
+	// it: without this line an all-in-one recovery reached stage 20 with an
+	// empty reason and an empty coverage list and refused — the dead end the
+	// reason exists to remove, one path at a time (found on hardware
+	// 2026-09-28, after the S6 path had been fixed).
+	s.Record.RecoveryRestoreSkipReason = workload.RestoreSkipReason
 	if err := s.saveRecord(); err != nil {
 		return err
+	}
+	if reason := workload.RestoreSkipReason; reason != "" {
+		s.Logf("  warning: the management cluster's own workloads will NOT be restored by this recovery: %s", reason)
 	}
 	s.recoveryWorkloadSel = workload
 	s.kit = sel.Kit
