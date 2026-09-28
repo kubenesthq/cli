@@ -431,7 +431,14 @@ func TestNodeLifecycleGate(t *testing.T) {
 				t.Skipf("the machine that replaces is already a host of this cluster (recorded %s), so S5's spare is spent: run this subtest alone on a fresh four-node fixture with -run 'TestNodeLifecycleGate/replace-dead-node'", h.LifecycleState)
 			}
 		}
-		addresses := lab.nodeNames()
+		// nodeNames maps ADDRESS to node name (the direction `node replace`
+		// needs for the spare below); this arm starts from a node name, so it
+		// reads the map the other way round. Indexing it by name found nothing on
+		// lab w3 (2026-09-28) and failed before the node loss.
+		addresses := map[string]string{}
+		for address, name := range lab.nodeNames() {
+			addresses[name] = address
+		}
 		agents := lab.agents(t)
 		if len(agents) < 2 {
 			t.Skipf("S5 needs two agents — the one that dies and the one that must keep serving — and this cluster reports %d", len(agents))
