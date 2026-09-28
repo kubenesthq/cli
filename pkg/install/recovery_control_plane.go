@@ -423,11 +423,39 @@ func stageRecoveryControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
-	held, err := controlplane.HoldBackend(values)
-	if err != nil {
-		return err
+	// THE BACKEND IS HELD ONLY WHILE THE CHECKPOINT IS NOT LOADED, and the
+	// question is asked of the DATABASE rather than of this stage's memory. A
+	// held backend is what the load needs (a backend started on an empty
+	// database builds the schema itself and the restore then fails at its first
+	// table); but stage 11 is SKIPPABLE once it has run, so a resume after it
+	// would otherwise re-hold a backend that is already serving — leaving every
+	// later stage with nothing to talk to (found on hardware 2026-09-28:
+	// `recovery-api` could not log in because `kubenest-cp-backend` had no pod).
+	//
+	// It also keeps the chart's content-addressed revision STABLE: the same
+	// database state renders the same replicas, so a resume does not roll the
+	// chart back and forth between held and running.
+	applied := values
+	loaded, detail, probeErr := controlplane.DatabaseHasControlPlaneData(ctx, server)
+	switch {
+	case probeErr == nil && loaded:
+		applied, err = controlplane.StartBackend(values, 1)
+		if err != nil {
+			return err
+		}
+		s.Logf("  the checkpoint is already loaded (%s): applying the chart with the backend RUNNING, because the stage that starts it has already run on an earlier attempt", detail)
+	default:
+		applied, err = controlplane.HoldBackend(values)
+		if err != nil {
+			return err
+		}
+		if probeErr != nil {
+			s.Logf("  the database cannot be asked yet (%v): holding the backend, which is what the load needs", probeErr)
+		} else {
+			s.Logf("  the database is empty (%s): holding the backend until the checkpoint is loaded", detail)
+		}
 	}
-	if _, err := controlplane.Apply(ctx, server, held); err != nil {
+	if _, err := controlplane.Apply(ctx, server, applied); err != nil {
 		return err
 	}
 	// The management cluster's own operator trusts the authority in the kit,

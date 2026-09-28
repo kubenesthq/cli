@@ -1450,7 +1450,7 @@ func TestTheControlPlaneSelectCarriesTheSkipReasonToo(t *testing.T) {
 	f.publish(t, cpBinding, "20260928T020000Z-44444444", map[string]string{
 		recoverykit.KeyEncryptionKey:  "VALUE-enc",
 		recoverykit.KeyAgentJWTSecret: "VALUE-jwt",
-		recoverykit.KeyControlPlaneCA: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\ny\n-----END EC PRIVATE KEY-----\n",
+		recoverykit.KeyControlPlaneCA: "-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\nYTJiM2M0\n-----END EC PRIVATE KEY-----\n",
 	}, nil, true, recoverykit.Backup{
 		Name: "cp-baseline", CompletedAt: time.Date(2026, 9, 28, 2, 0, 0, 0, time.UTC), Status: "Completed",
 	})
@@ -1484,4 +1484,104 @@ func TestTheControlPlaneSelectCarriesTheSkipReasonToo(t *testing.T) {
 	if err := stageRecoveryRestore(context.Background(), s); err != nil {
 		t.Fatalf("stage 20 refused on a recovery whose select stage had already decided to skip: %v", err)
 	}
+}
+
+// TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished is the class the
+// hardware found on 2026-09-28: stage 10 (AlwaysRun) re-applied the chart with
+// the backend HELD, stage 11 (skippable, and already completed) is what starts
+// it, and every resume after that left the backend stopped — so recovery-api
+// could not log in and no later stage had anything to talk to.
+//
+// The fix renders the replica count from the DATABASE rather than from this
+// stage's memory, which also keeps the content-addressed revision stable across
+// resumes: the same database state renders the same values.
+func TestAnAlwaysRunStageDoesNotUndoWhatALaterStageEstablished(t *testing.T) {
+	const mgmt = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c40"
+	build := func(t *testing.T, dbRows string, psqlErr string) (*Session, *recordingRunner) {
+		t.Helper()
+		f := newRecoveryFixture(t, mgmt, "org-1", "inst-1", nil)
+		cpBinding := recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: "inst-1", ClusterID: mgmt}
+		f.publish(t, cpBinding, "20260928T030000Z-55555555", map[string]string{
+			recoverykit.KeyEncryptionKey:  "VALUE-enc",
+			recoverykit.KeyAgentJWTSecret: "VALUE-jwt",
+			recoverykit.KeyControlPlaneCA: "-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\nYTJiM2M0\n-----END EC PRIVATE KEY-----\n",
+		}, nil, true, recoverykit.Backup{Name: "cp-baseline", CompletedAt: time.Now().UTC(), Status: "Completed"})
+		opts := Options{
+			Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+			ControlPlaneInstall: true, Name: "prod-1", Domain: "example.test", AdminEmail: "admin@example.test",
+			BackupTarget: "s3://kubenest-kit/" + recoveryTestScope + "?endpoint=minio.example.test&region=main",
+			Recovery: &RecoveryOptions{
+				RestoreFrom: "latest", Kit: "s3", FleetKey: f.fleet.SecretKeyString(),
+				OldHostFenced: true, Kind: recoverykit.KindControlPlane,
+			},
+		}
+		t.Setenv("KUBENEST_CHECKPOINT_ACCESS_KEY_ID", "checkpoint-key")
+		t.Setenv("KUBENEST_CHECKPOINT_SECRET_ACCESS_KEY", "checkpoint-secret")
+		s, runner := recoverySession(t, opts)
+		s.recoveryStore = f.bucket
+		s.recoveryCheckpointStore = f.bucket
+		s.recoveryTargetValue = testTarget(t)
+		// The select stage runs on every attempt (it is AlwaysRun), so the
+		// session state the chart stage needs is built exactly as a resume
+		// builds it.
+		runner.respond = func(command string) (sshx.Result, error) {
+			switch {
+			case strings.Contains(command, "get secret kubenest-cp-install"):
+				// A fresh host: this recovery writes that Secret itself.
+				return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): secrets "kubenest-cp-install" not found`}, nil
+			case strings.Contains(command, "get pods") && strings.Contains(command, "postgresql"):
+				return sshx.Result{Stdout: "kubenest-cp-postgresql-0"}, nil
+			case strings.Contains(command, "psql"):
+				if psqlErr != "" {
+					return sshx.Result{ExitCode: 1, Stderr: psqlErr}, nil
+				}
+				return sshx.Result{Stdout: dbRows}, nil
+			}
+			return sshx.Result{}, nil
+		}
+		if err := stageRecoverySelectControlPlane(context.Background(), s); err != nil {
+			t.Fatalf("the select stage failed: %v", err)
+		}
+		return s, runner
+	}
+	appliedValues := func(runner *recordingRunner) string {
+		var sb strings.Builder
+		for _, in := range runner.inputs {
+			sb.Write(in)
+		}
+		return sb.String()
+	}
+
+	// A resume whose database already holds the checkpoint: the chart goes back
+	// on with the backend RUNNING.
+	s, runner := build(t, "3\n", "")
+	if err := stageRecoveryControlPlane(context.Background(), s); err != nil {
+		t.Fatalf("the chart stage failed on a resume: %v", err)
+	}
+	resumed := appliedValues(runner)
+	if !strings.Contains(resumed, "replicas: 1") {
+		t.Fatalf("the chart was applied with the backend still held after the checkpoint was loaded, so every later stage has nothing to talk to:\n%s", tailOf(resumed, 400))
+	}
+	if strings.Contains(resumed, "replicas: 0") {
+		t.Fatal("the applied chart holds the backend at zero replicas on a resume whose database is loaded")
+	}
+
+	// A first attempt (no pod yet, nothing loaded): the chart goes on HELD,
+	// which is what the load needs.
+	first, firstRunner := build(t, "", `ERROR: relation "organization" does not exist`)
+	if err := stageRecoveryControlPlane(context.Background(), first); err != nil {
+		t.Fatalf("the chart stage failed on a first attempt: %v", err)
+	}
+	if held := appliedValues(firstRunner); !strings.Contains(held, "replicas: 0") {
+		t.Fatalf("a first attempt applied the chart with the backend running, so it would build the schema before the checkpoint is loaded:\n%s", tailOf(held, 400))
+	}
+}
+
+// tailOf is the last n characters, so a failure shows the end of the applied
+// document rather than 200 KB of values.
+func tailOf(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
