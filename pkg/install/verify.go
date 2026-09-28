@@ -130,7 +130,7 @@ func verifyComponentsRunning(ctx context.Context, s *Session) error {
 		// kured is a DaemonSet in kube-system, which also holds coredns and
 		// the helm-install jobs; checking the whole namespace would wait on
 		// things that are not ours.
-		return day2KuredReady(ctx, server)
+		return day2.KuredReadyProbe(server)(ctx)
 	}
 	res, err := converge.Wait(ctx, probe, converge.Options{
 		Name: "core-components-running", Deadline: deadline, Reporter: s.Reporter,
@@ -139,21 +139,6 @@ func verifyComponentsRunning(ctx context.Context, s *Session) error {
 		return err
 	}
 	return res.Err()
-}
-
-func day2KuredReady(ctx context.Context, r k3s.Runner) (bool, converge.State, error) {
-	out, err := k3s.Kubectl(ctx, r,
-		"get daemonset -n "+day2.KuredNamespace+" kured -o jsonpath='{.status.desiredNumberScheduled} {.status.numberReady}'")
-	object := "daemonset kured in " + day2.KuredNamespace
-	if err != nil {
-		return false, converge.State{Object: object, Status: "not created yet"}, err
-	}
-	fields := strings.Fields(strings.Trim(out, "'"))
-	if len(fields) != 2 {
-		return false, converge.State{Object: object, Status: "no status yet"}, nil
-	}
-	state := converge.State{Object: object, Status: fields[1] + "/" + fields[0] + " Ready"}
-	return fields[0] != "0" && fields[0] == fields[1], state, nil
 }
 
 // verifyStorageProvisions binds a real PersistentVolumeClaim with a real

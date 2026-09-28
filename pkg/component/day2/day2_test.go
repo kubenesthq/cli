@@ -360,3 +360,62 @@ func TestHoldingANodeLeavesAnotherNodesLockAlone(t *testing.T) {
 		t.Errorf("%d writes to kured's DaemonSet while it held another node's lock", len(r.Inputs()))
 	}
 }
+
+// kuredCluster answers the kubectl reads kured's readiness probe makes: the
+// DaemonSet's generation, observed generation, desired and ready counts, and
+// the nodes that do NOT carry the reboot hold.
+func kuredCluster(generation, observed, desired, ready string, unheld ...string) *componenttest.FakeRunner {
+	return &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.Contains(command, "get daemonset") && strings.Contains(command, "kured"):
+			return sshx.Result{Stdout: strings.Join([]string{generation, observed, desired, ready}, " ")}, nil
+		case strings.Contains(command, "get nodes") && strings.Contains(command, NoAutoRebootLabel+"!="+NoAutoRebootValue):
+			var names []string
+			for _, n := range unheld {
+				names = append(names, "node/"+n)
+			}
+			return sshx.Result{Stdout: strings.Join(names, "\n")}, nil
+		}
+		return sshx.Result{ExitCode: 1, Stderr: "unexpected command: " + command}, nil
+	}}
+}
+
+// On a 1.2 single-server cluster the server carries the hold, so kured's
+// DaemonSet schedules no pod anywhere. That is the correct end state, and an
+// install must not fail its acceptance check on it (lab cp, 2026-09-28: the
+// control-plane install failed verify on "kured is 0/0 Ready").
+func TestKuredIsReadyWhenEveryNodeIsHeld(t *testing.T) {
+	ready, state, err := KuredReadyProbe(kuredCluster("3", "3", "0", "0"))(context.Background())
+	if err != nil || !ready {
+		t.Fatalf("every node is held and kured has nowhere to run, but the probe says not ready (%v): %+v", err, state)
+	}
+}
+
+// Zero desired pods while a node is NOT held means the DaemonSet has not
+// placed kured yet, and waiting is right.
+func TestKuredIsNotReadyWithZeroPodsWhileANodeIsUnheld(t *testing.T) {
+	ready, state, _ := KuredReadyProbe(kuredCluster("3", "3", "0", "0", "agent-1"))(context.Background())
+	if ready {
+		t.Fatalf("agent-1 is not held, so kured should run there, but zero pods was accepted: %+v", state)
+	}
+	if !strings.Contains(state.Detail, "agent-1") {
+		t.Errorf("the wait does not name the node kured has not reached: %+v", state)
+	}
+}
+
+// A status the controller has not recomputed since the last change says
+// nothing, whatever its counts.
+func TestKuredIsNotReadyOnAStaleStatus(t *testing.T) {
+	if ready, state, _ := KuredReadyProbe(kuredCluster("4", "3", "0", "0"))(context.Background()); ready {
+		t.Fatalf("the DaemonSet's status predates its spec, yet the probe accepted it: %+v", state)
+	}
+}
+
+func TestKuredReadinessCountsPods(t *testing.T) {
+	if ready, state, _ := KuredReadyProbe(kuredCluster("2", "2", "2", "2"))(context.Background()); !ready {
+		t.Errorf("2 of 2 kured pods are ready, but the probe says not ready: %+v", state)
+	}
+	if ready, state, _ := KuredReadyProbe(kuredCluster("2", "2", "2", "1"))(context.Background()); ready {
+		t.Errorf("1 of 2 kured pods is ready, but the probe accepted it: %+v", state)
+	}
+}

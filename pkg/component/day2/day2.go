@@ -310,7 +310,7 @@ func InstallKured(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, 
 		return err
 	}
 
-	res, err := converge.Wait(ctx, kuredReadyProbe(r), converge.Options{
+	res, err := converge.Wait(ctx, KuredReadyProbe(r), converge.Options{
 		Name: "kured", Deadline: deadline, Reporter: rep,
 	})
 	if err != nil {
@@ -319,33 +319,51 @@ func InstallKured(ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, 
 	return res.Err()
 }
 
-// kuredReadyProbe watches kured's DaemonSet rather than every pod in
+// KuredReadyProbe watches kured's DaemonSet rather than every pod in
 // kube-system, which holds coredns, metrics-server and the helm-install jobs
 // as well.
-func kuredReadyProbe(r k3s.Runner) converge.Probe {
+//
+// ZERO PODS CAN BE THE RIGHT ANSWER. kured's node affinity excludes every node
+// carrying NoAutoRebootLabel=NoAutoRebootValue, and a server carries it
+// permanently from bundle 1.2, so on a single-server cluster kured schedules
+// nowhere. The probe accepts zero only when the DaemonSet's status is current
+// and no node lacks the hold; zero while some node is unheld means kured has
+// not been placed yet, and the wait names that node.
+func KuredReadyProbe(r k3s.Runner) converge.Probe {
 	return func(ctx context.Context) (bool, converge.State, error) {
+		object := "daemonset kured in " + KuredNamespace
 		out, err := k3s.Kubectl(ctx, r,
-			"get daemonset -n "+KuredNamespace+" kured -o jsonpath='{.status.desiredNumberScheduled} {.status.numberReady}'")
+			"get daemonset -n "+KuredNamespace+" kured -o jsonpath='{.metadata.generation} {.status.observedGeneration} {.status.desiredNumberScheduled} {.status.numberReady}'")
 		if err != nil {
 			return false, converge.State{
-				Object: "daemonset kured in " + KuredNamespace,
+				Object: object,
 				Status: "not created yet",
 				Detail: "the helm-install job has not applied the chart yet",
 			}, err
 		}
 		fields := strings.Fields(strings.Trim(out, "'"))
-		if len(fields) != 2 {
-			return false, converge.State{Object: "daemonset kured in " + KuredNamespace, Status: "no status yet"}, nil
+		if len(fields) != 4 || fields[0] != fields[1] {
+			return false, converge.State{Object: object, Status: "no status yet"}, nil
 		}
-		desired, ready := fields[0], fields[1]
-		state := converge.State{
-			Object: "daemonset kured in " + KuredNamespace,
-			Status: ready + "/" + desired + " Ready",
+		desired, ready := fields[2], fields[3]
+		state := converge.State{Object: object, Status: ready + "/" + desired + " Ready"}
+		if desired != ready {
+			return false, state, nil
 		}
-		if desired != "0" && desired == ready {
+		if desired != "0" {
 			return true, state, nil
 		}
-		return false, state, nil
+		unheld, err := k3s.Kubectl(ctx, r,
+			"get nodes -l '"+NoAutoRebootLabel+"!="+NoAutoRebootValue+"' -o name")
+		if err != nil {
+			return false, state, err
+		}
+		if names := strings.Fields(unheld); len(names) > 0 {
+			state.Detail = "no kured pod yet on " + strings.Join(names, ", ")
+			return false, state, nil
+		}
+		state.Detail = "every node carries " + NoAutoRebootLabel + "=" + NoAutoRebootValue + ", so kured has no node to run on"
+		return true, state, nil
 	}
 }
 
