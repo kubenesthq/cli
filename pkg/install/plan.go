@@ -194,6 +194,16 @@ type Record struct {
 	// overwrite the data it just recovered, and a second activation is at best
 	// a no-op and at worst a second wave of Jobs. A resume reads this list and
 	// does not repeat work it has already done.
+	// RecoveryOperationID, RecoverySetKey, RecoveryBackupName and
+	// RecoveryCheckpointKey are what a LATER ATTEMPT would otherwise have to
+	// re-derive. Every one of them is a non-secret name of an artifact this
+	// recovery already chose and reported, and re-deriving them is how a resume
+	// silently switches to a newer backup, or to a different set, half way
+	// through a recovery.
+	RecoveryOperationID         string   `json:"recovery_operation_id,omitempty"`
+	RecoverySetKey              string   `json:"recovery_set_key,omitempty"`
+	RecoveryBackupName          string   `json:"recovery_backup_name,omitempty"`
+	RecoveryCheckpointKey       string   `json:"recovery_checkpoint_key,omitempty"`
 	RecoveryNamespacesRestored  []string `json:"recovery_namespaces_restored,omitempty"`
 	RecoveryNamespacesActivated []string `json:"recovery_namespaces_activated,omitempty"`
 }
@@ -447,7 +457,10 @@ func Plan(s *Session) []Stage {
 			// refusal here has cost the operator nothing.
 			{Name: StageRecoverySelect, AlwaysRun: true, Run: bind(stageRecoverySelect)},
 			{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
-			{Name: StageRecoveryPreflight, Run: bind(stageRecoveryPreflight)},
+			// AlwaysRun because it is the ONLY thing that selects the
+			// checkpoint, and it reads only: on a resume the journal skips it
+			// and the stage that loads the database finds no selection.
+			{Name: StageRecoveryPreflight, AlwaysRun: true, Run: bind(stageRecoveryPreflight)},
 			// Step 1: ownership outside the cluster, recorded in the operation
 			// before the first change.
 			{Name: StageRecoveryOwnership, Run: bind(stageRecoveryOwnership)},

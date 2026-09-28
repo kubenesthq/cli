@@ -49,7 +49,11 @@ func controlPlaneRecoveryPlan(s *Session, bind stageBinder) []Stage {
 	return []Stage{
 		{Name: StageRecoverySelect, AlwaysRun: true, Run: bind(stageRecoverySelectControlPlane)},
 		{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
-		{Name: StageRecoveryPreflight, Run: bind(stageRecoveryPreflightControlPlane)},
+		// AlwaysRun because it is the ONLY thing that selects the checkpoint,
+		// and it reads only: on a resume the journal skips it and the stage
+		// that loads the database finds no selection (found on hardware
+		// 2026-09-28).
+		{Name: StageRecoveryPreflight, AlwaysRun: true, Run: bind(stageRecoveryPreflightControlPlane)},
 		{Name: StageRecoveryOwnership, Run: bind(stageRecoveryOwnership)},
 		{Name: StageK3sServer, Component: "k3s", Run: bind(stageK3sServer)},
 		{Name: StageK3sAgents, Component: "k3s", Run: bind(stageK3sAgents)},
@@ -62,6 +66,11 @@ func controlPlaneRecoveryPlan(s *Session, bind stageBinder) []Stage {
 		// first table (probe P3 question 3, arm B).
 		{Name: StageRecoveryControlPlane, AlwaysRun: true, Run: bind(stageRecoveryControlPlane)},
 		{Name: StageRecoveryCheckpoint, Run: bind(stageRecoveryCheckpoint)},
+		// The control-plane client is in-memory state that stage builds and
+		// the stages after it need: on a resume the checkpoint stage is
+		// skipped, and the register stage would have no client to register
+		// through.
+		{Name: StageRecoveryAPI, AlwaysRun: true, Run: bind(stageRecoveryAPI)},
 		// The management cluster's repository password, before Velero starts:
 		// its own workloads come back from that repository, and Velero writes
 		// its vendored default into an absent Secret (probe P3 question 2).
@@ -132,9 +141,15 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
+	if err := s.refuseASwitchedSet(sel); err != nil {
+		return err
+	}
+	// The BACKUP is pinned to the one this operation first chose: a newer backup
+	// appearing between attempts must not change what the management cluster's
+	// own namespaces are restored from.
 	workload, err := recovery.SelectManagementCluster(ctx, client,
 		recovery.Scope(recoverykit.Location{Prefix: target.Prefix}),
-		sel.Set.Binding.InstanceID, sel.Set.Binding.ClusterID, "")
+		sel.Set.Binding.InstanceID, sel.Set.Binding.ClusterID, s.Record.RecoveryBackupName)
 	if err != nil {
 		return err
 	}
@@ -142,6 +157,11 @@ func stageRecoverySelectControlPlane(ctx context.Context, s *Session) error {
 	s.recoveryCheckpointStore = checkpointStore
 	s.recoveryTargetValue = target
 	s.recoverySel = sel
+	s.Record.RecoverySetKey = sel.SetKey
+	s.Record.RecoveryBackupName = workload.Backup.Name
+	if err := s.saveRecord(); err != nil {
+		return err
+	}
 	s.recoveryWorkloadSel = workload
 	s.kit = sel.Kit
 	s.Jnl.ClusterID = sel.Set.Binding.ClusterID
@@ -200,6 +220,22 @@ func stageRecoveryPreflightControlPlane(ctx context.Context, s *Session) error {
 	// different Postgres major is a migration rather than a recovery.
 	cp, sealed, err := s.selectCheckpoint(ctx)
 	if err != nil {
+		return err
+	}
+	// A RESUME PREFERS THE CHECKPOINT IT ALREADY CHOSE. A newer eligible
+	// checkpoint appearing between attempts would otherwise silently change what
+	// the database is loaded with — and if the recorded one has been pruned by
+	// its retention, the newest eligible one is used and SAID so, rather than
+	// blocking a recovery whose database may already hold the earlier load.
+	if recorded := s.Record.RecoveryCheckpointKey; recorded != "" && recorded != cp.Key {
+		if earlier, err := s.checkpointByKey(ctx, recorded); err == nil {
+			cp, sealed = earlier.cp, earlier.dump
+		} else {
+			s.Logf("  warning: the checkpoint this operation chose earlier (%s) is no longer in the bucket; using %s instead. If the database was already loaded from the earlier one, that load is what it holds", recorded, cp.Key)
+		}
+	}
+	s.Record.RecoveryCheckpointKey = cp.Key
+	if err := s.saveRecord(); err != nil {
 		return err
 	}
 	chart, err := controlplane.ChartVersionOf()
@@ -549,6 +585,39 @@ func (s *Session) waitForDatabasePod(ctx context.Context, r k3s.Runner, deadline
 		return fmt.Errorf("the control plane's database is not serving, so the checkpoint is not loaded into it: %w. The chart is applied and its Postgres is not Ready; a resume re-runs this stage and waits again", err)
 	}
 	return nil
+}
+
+// checkpointWithDump is one checkpoint and the sealed dump it names.
+type checkpointWithDump struct {
+	cp   *controlplane.BucketCheckpoint
+	dump []byte
+}
+
+// checkpointByKey finds the checkpoint this operation chose on an earlier
+// attempt, by the key it recorded. It is what keeps a resume on the artifact
+// the operator was shown instead of whatever is newest by the time they retry.
+func (s *Session) checkpointByKey(ctx context.Context, key string) (checkpointWithDump, error) {
+	if s.recoveryCheckpointStore == nil {
+		return checkpointWithDump{}, errors.New("this recovery has no checkpoint principal")
+	}
+	points, err := controlplane.FindCheckpoints(ctx, s.recoveryCheckpointStore.List, s.recoveryCheckpointStore.Get, s.checkpointPrefix())
+	if err != nil {
+		return checkpointWithDump{}, err
+	}
+	for _, cp := range points {
+		if cp.Key != key {
+			continue
+		}
+		if !cp.Eligible() {
+			return checkpointWithDump{}, fmt.Errorf("the checkpoint this operation chose (%s) is in the bucket but is no longer eligible to restore from", key)
+		}
+		dump, err := s.recoveryCheckpointStore.Get(ctx, cp.DumpKey)
+		if err != nil {
+			return checkpointWithDump{}, fmt.Errorf("reading the dump of the checkpoint this operation chose (%s): %w", key, err)
+		}
+		return checkpointWithDump{cp: cp, dump: dump}, nil
+	}
+	return checkpointWithDump{}, fmt.Errorf("the checkpoint this operation chose (%s) is no longer in the bucket", key)
 }
 
 // stageRecoveryProvisional compares the desired state the restored database

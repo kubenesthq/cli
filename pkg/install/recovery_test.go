@@ -1213,3 +1213,87 @@ func TestTheOwnershipTestSurvivesAFailedLaterAttempt(t *testing.T) {
 		t.Fatal("an operation that never installed this host's k3s claimed to own the objects in its cluster")
 	}
 }
+
+// TestAResumedRecoveryRebuildsEveryPieceOfInMemoryState is the hardware defect
+// of 2026-09-28 (the second one of that shape): `recovery-preflight` selects the
+// checkpoint IN MEMORY, the journal skips the stage on a resume, and the stage
+// that loads the database then found no selection. Every piece of state a later
+// stage reads from `s.` must therefore be filled by a stage that ALWAYS runs.
+func TestAResumedRecoveryRebuildsEveryPieceOfInMemoryState(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c34", "org-1", "inst-1", nil)
+	cpOpts := Options{
+		Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+		ControlPlaneInstall: true, Name: "prod-1", Domain: "example.test",
+		Recovery: &RecoveryOptions{
+			RestoreFrom: "latest", Kit: "s3", FleetKey: f.fleet.SecretKeyString(),
+			OldHostFenced: true, Kind: recoverykit.KindControlPlane,
+		},
+	}
+	s, _ := recoverySession(t, cpOpts)
+	// The journal shape of a resume that failed at the checkpoint stage: the
+	// host was built, the chart applied, and the loading stage is re-entered.
+	now := time.Now().UTC()
+	for _, stage := range []string{StageK3sServer, StageRecoveryControlPlane, StageRecoveryRepository} {
+		if err := s.Jnl.Append(Entry{Stage: stage, Status: StatusCompleted, At: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan := Plan(s)
+	if len(plan) == 0 {
+		t.Fatal("the control-plane recovery has no plan")
+	}
+
+	// EVERY stage that fills state a later stage reads must be AlwaysRun. The
+	// list is the audit: select (the sets, the stores, the kit), the pre-flight
+	// (the checkpoint and its dump, and the capacity verdict), the chart stage
+	// (the chart values), and the API stage (the client the register stage
+	// registers through).
+	for _, name := range []string{StageRecoverySelect, StageRecoveryPreflight, StageRecoveryControlPlane, StageRecoveryAPI, StageRegister, StageVerify} {
+		idx := stageIndex(t, plan, name)
+		if !plan[idx].AlwaysRun {
+			t.Fatalf("stage %q fills in-memory state a later stage reads, and the journal would skip it on a resume", name)
+		}
+	}
+	// And the skippable stages must not be the only writer of anything: the
+	// ownership stage's operation id and the selection are journalled instead,
+	// because those stages may legitimately be skipped.
+	if s.recoveryActivationValue() != "" {
+		t.Fatal("a session with no journal state claims an activation value")
+	}
+	s.Record.RecoveryOperationID = "0123456789abcdef0123456789abcdef"
+	if got := s.recoveryActivationValue(); got != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("the activation value is not the operation the journal recorded (%q): a resumed activation would write an annotation with an empty value", got)
+	}
+}
+
+// TestAResumeKeepsTheArtifactTheOperationChose: the bucket may have changed
+// between attempts, and a recovery that silently switched to a newer set or
+// backup half way through would leave the data it had already restored coming
+// from one artifact and the rest from another.
+func TestAResumeKeepsTheArtifactTheOperationChose(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c35", "org-1", "inst-1", nil)
+	s, _ := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
+	s.Record.RecoverySetKey = "clusters/s6/recovery-sets/other/cluster-someone-elses.json"
+	// The set this attempt would otherwise pick, from the bucket it reads.
+	sel, err := recovery.Select(context.Background(), f.bucket, recoveryTestScope, f.request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.recoverySel = sel
+	if err := s.refuseASwitchedSet(sel); err == nil {
+		t.Fatal("a resume switched to a different recovery set than the one its earlier attempt used")
+	} else if !strings.Contains(err.Error(), "earlier attempt") {
+		t.Fatalf("the refusal does not say why it will not switch: %v", err)
+	}
+	// The same operation resuming its own selection passes, so the check is
+	// about a CHANGE and not about resuming at all.
+	s.Record.RecoverySetKey = sel.SetKey
+	if err := s.refuseASwitchedSet(sel); err != nil {
+		t.Fatalf("a resume of the same selection was refused: %v", err)
+	}
+	// And a first attempt has nothing recorded to disagree with.
+	fresh, _ := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
+	if err := fresh.refuseASwitchedSet(sel); err != nil {
+		t.Fatalf("a first attempt was refused: %v", err)
+	}
+}

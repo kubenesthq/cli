@@ -229,6 +229,14 @@ func stageRecoverySelect(ctx context.Context, s *Session) error {
 		return err
 	}
 
+	if err := s.refuseASwitchedSet(sel); err != nil {
+		return err
+	}
+	s.Record.RecoverySetKey = sel.SetKey
+	s.Record.RecoveryBackupName = sel.Backup.Name
+	if err := s.saveRecord(); err != nil {
+		return err
+	}
 	s.recoveryStore = store
 	s.recoveryTargetValue = target
 	s.recoverySel = sel
@@ -391,6 +399,9 @@ func stageRecoveryOwnership(ctx context.Context, s *Session) error {
 		return err
 	}
 	s.recoveryOpID = opID
+	// Journalled, because the ownership stage is skippable on a resume and the
+	// activate stage needs the operation id as the annotation's value.
+	s.Record.RecoveryOperationID = opID
 	ownerKey, mode, err := recovery.Claim(ctx, *claim, opID, recoveryOperator(), now, rec.AcknowledgeSingleOperator)
 	if err != nil {
 		return err
@@ -626,6 +637,58 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 	return nil
 }
 
+// refuseASwitchedSet refuses a resume that would restore from a different
+// artifact than the attempts before it.
+//
+// THE BUCKET MAY HAVE CHANGED BETWEEN ATTEMPTS — a new backup, a new set, a new
+// checkpoint — and a recovery that silently followed the newest one would leave
+// the namespaces it already restored coming from one artifact and the rest from
+// another. The recorded key is the operation's own statement of what it is
+// recovering from; a different set is a DIFFERENT recovery, and the operator
+// starts one deliberately rather than discovering it half way through.
+func (s *Session) refuseASwitchedSet(sel *recovery.Selection) error {
+	recorded := s.Record.RecoverySetKey
+	if recorded == "" || sel == nil || recorded == sel.SetKey {
+		return nil
+	}
+	return fmt.Errorf("this operation selected %s on an earlier attempt and the bucket now offers %s as the newest eligible set: a resume must not switch artifacts half way through a recovery, because the data already restored came from the first one. Nothing was changed. If the newer set is the one you want, start a NEW recovery from it deliberately", recorded, sel.SetKey)
+}
+
+// recoveryActivationValue is the operation id the activation annotation
+// carries: the one this attempt took, or — on a resume, where the ownership
+// stage did not run and the in-memory id is empty — the one the operation
+// recorded when it did.
+func (s *Session) recoveryActivationValue() string {
+	if s.recoveryOpID != "" {
+		return s.recoveryOpID
+	}
+	return s.Record.RecoveryOperationID
+}
+
+// StageRecoveryAPI makes sure this recovery holds a client for the control
+// plane it rebuilt. It is AlwaysRun because the stage that builds it holds it
+// in memory only: a journal cannot carry a token, so a resume that skipped that
+// stage would reach the register stage with no client at all.
+const StageRecoveryAPI = "recovery-api"
+
+// stageRecoveryAPI re-establishes the control-plane client on a resume.
+func stageRecoveryAPI(ctx context.Context, s *Session) error {
+	if s.API != nil {
+		return nil
+	}
+	server, err := s.Server()
+	if err != nil {
+		return err
+	}
+	client, err := s.openControlPlaneTunnel(ctx, server)
+	if err != nil {
+		return err
+	}
+	s.API = client
+	s.Logf("  re-established the connection to the restored control plane this attempt is resuming into")
+	return nil
+}
+
 // containsString is the membership test the recovery's journalled "already
 // done" lists use.
 func containsString(list []string, want string) bool {
@@ -697,7 +760,7 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 		if err := cluster.AnnotateProject(ctx, ns, backup.ActivateAnnotationKey, s.recoveryOpID); err != nil {
 			return stages.NewComponentError("kubenest-agent", fmt.Errorf("activating project %s: %w", ns, err))
 		}
-		s.Logf("  activated %s: %s=%s on project %s/%s", ns, backup.ActivateAnnotationKey, s.recoveryOpID, backup.ProjectCRNamespace, ns)
+		s.Logf("  activated %s: %s=%s on project %s/%s", ns, backup.ActivateAnnotationKey, s.recoveryActivationValue(), backup.ProjectCRNamespace, ns)
 		s.Record.RecoveryNamespacesActivated = append(s.Record.RecoveryNamespacesActivated, ns)
 		if err := s.saveRecord(); err != nil {
 			return err
