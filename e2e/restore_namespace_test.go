@@ -1077,10 +1077,19 @@ func s4MidRollout(t *testing.T, c *s4Cluster, namespace, proof, proofPath string
 	}
 	// No restored ORPHAN is left: the fixture's pod was the restore's own, so
 	// activation deleted it. (The workload's own pod is NOT one of these — a
-	// controller owns it, so activation keeps it.)
-	if left := strings.TrimSpace(c.kubectl("get pod " + s4HoldPod + " -n " + namespace + " -o name --ignore-not-found")); left != "" {
-		t.Errorf("activation left the restored pod %s (%s): no controller owned it, so it existed only to fill the volumes and activation must delete it", s4HoldPod, left)
-	}
+	// controller owns it, so activation keeps it.) Activation deletes without
+	// waiting, and the pod then takes its grace period to stop: on lab w1
+	// (2026-09-28) a check made straight after activation still found it
+	// terminating, and it was gone moments later. So the claim is that it GOES,
+	// within a bound; a pod activation never deleted stays Running and fails it.
+	c.waitFor(2*time.Minute, "the restored orphan "+s4HoldPod+" to be gone after activation", func() (bool, string) {
+		out, err := c.kubectlStatus("get pod " + s4HoldPod + " -n " + namespace + " -o jsonpath='{.status.phase}|{.metadata.deletionTimestamp}' --ignore-not-found")
+		if err != nil {
+			return false, firstLineOfE2E(err.Error())
+		}
+		left := strings.Trim(strings.TrimSpace(out), "'")
+		return left == "", "still there: phase|deletionTimestamp " + left
+	})
 	// The Deployment's OWN pod — a pod whose pod-template-hash matches a
 	// ReplicaSet with replicas > 0 — is Running on the restored claim.
 	ownPod := waitForWorkloadPod("the workload's own pod after activation")
