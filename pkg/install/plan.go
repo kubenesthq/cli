@@ -239,6 +239,19 @@ type Record struct {
 	RecoveryNamespacesNotRestored []string `json:"recovery_namespaces_not_restored,omitempty"`
 	RecoveryNamespacesRestored    []string `json:"recovery_namespaces_restored,omitempty"`
 	RecoveryNamespacesActivated   []string `json:"recovery_namespaces_activated,omitempty"`
+	// RecoveryRestoreOperations names, per restored namespace, the pkg/backup
+	// operation whose restore put that namespace's data back.
+	//
+	// A NAMESPACE RESTORE IS NOT FINISHED WHEN ITS DATA IS BACK: it stops at
+	// `restored — awaiting activation` with the project paused and its
+	// CronJobs suspended, and ACTIVATING THAT SAME OPERATION is what lifts the
+	// pause and puts the scheduled work back. The recovery activates it after
+	// writing the operator's own release, so it has to know which operation
+	// each namespace's restore was — and a resume, which re-enters the activate
+	// stage without the restore that named it, has only the journal to read it
+	// from. Without this the recovery restored a namespace (lab s6, 2026-09-28)
+	// and left its CronJob suspended for ever.
+	RecoveryRestoreOperations map[string]string `json:"recovery_restore_operations,omitempty"`
 }
 
 // UnmarshalJSON reads a record written by ANY version of this CLI, including

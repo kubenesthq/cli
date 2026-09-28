@@ -821,6 +821,23 @@ func (w recoveryWait) run(ctx context.Context) error {
 	}
 }
 
+// recoveryRestoreDeps is the dependency set a pkg/backup restore run is driven
+// with.
+//
+// BOTH STAGES THAT DRIVE ONE BUILD IT THE SAME WAY, because they are two steps
+// of ONE operation: the restore stage starts it and leaves it awaiting
+// activation, and the activate stage finishes it. Same transport, same record,
+// same operator name in that record — a second construction that drifted would
+// be two executors of one operation.
+func recoveryRestoreDeps(server k3s.Runner) backup.RestoreDeps {
+	return backup.RestoreDeps{
+		Cluster: backup.NewK3sCluster(server),
+		Backups: backup.NewVeleroBackups(server),
+		Store:   &operation.Store{Runner: server, Operator: recoveryOperator()},
+		Runner:  server,
+	}
+}
+
 // stageRecoveryRestore restores every namespace the recovery set's backup
 // covers (PLAN 7.9 step 5).
 //
@@ -881,12 +898,7 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 	if err := s.waitForRecoveryBackup(ctx, server, sel.Backup.Name, namespaces[0], syncDeadline); err != nil {
 		return err
 	}
-	deps := backup.RestoreDeps{
-		Cluster: backup.NewK3sCluster(server),
-		Backups: backup.NewVeleroBackups(server),
-		Store:   &operation.Store{Runner: server, Operator: recoveryOperator()},
-		Runner:  server,
-	}
+	deps := recoveryRestoreDeps(server)
 	for _, namespace := range namespaces {
 		if containsString(s.Record.RecoveryNamespacesRestored, namespace) {
 			s.Logf("  namespace %s was already restored by this recovery: not restoring it again over its own data", namespace)
@@ -923,6 +935,12 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 			return err
 		}
 		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
+		// THE OPERATION ID IS HANDED BACK, NOT READ OUT OF THE OUTPUT. The
+		// restore prints `next: kubenest backup restore --activate <id>`, and
+		// that line is for the operator: this stage needs the id to run that
+		// activation itself once the operator's own release is written, and
+		// the record is what a resume reads it from.
+		restoredOp := ""
 		opts := backup.RestoreOptions{
 			Cluster:   s.recoveryName(),
 			Namespace: namespace,
@@ -934,9 +952,16 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 			Confirm:       true,
 			AcceptDataAge: true,
 			Bundle:        s.Bundle,
+			OnOperation:   func(id string) { restoredOp = id },
 		}
 		if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
 			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
+		}
+		if restoredOp != "" {
+			if s.Record.RecoveryRestoreOperations == nil {
+				s.Record.RecoveryRestoreOperations = map[string]string{}
+			}
+			s.Record.RecoveryRestoreOperations[namespace] = restoredOp
 		}
 		s.Record.RecoveryNamespacesRestored = append(s.Record.RecoveryNamespacesRestored, namespace)
 		if err := s.saveRecord(); err != nil {
@@ -1015,9 +1040,17 @@ func containsString(list []string, want string) bool {
 // ACTIVATION IS THE OPERATOR'S POSITIVE DECISION, and in recovery mode nothing
 // else releases a project: the operator holds every project until it carries
 // the activation annotation, so a pause that is removed is not a release. This
-// stage writes that annotation on each restored namespace's project — and only
-// after its restore completed, which is what keeps a restored Job, CronJob or
-// application container from running against data that is not back.
+// stage writes that annotation on each restored namespace's project — and
+// only after its restore completed, which is what keeps a restored Job, CronJob
+// or application container from running against data that is not back.
+//
+// IT ALSO FINISHES THE RESTORE ITSELF. The operator's annotation releases the
+// project from RECOVERY MODE's hold; the namespace restore's own pause is a
+// SECOND hold, and only `backup restore --activate <that operation>` lifts it,
+// puts the CronJobs back to the suspend value the backup held and scales the
+// workloads back up. Writing the recovery's annotation alone left a namespace
+// restored, paused and with its scheduled work off (lab s6, 2026-09-28), which
+// is the defect this stage now closes.
 //
 // The project itself is created by the operator from the control plane's
 // desired state, so this waits for it, bounded, rather than failing on the
@@ -1031,6 +1064,9 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 		return err
 	}
 	cluster := backup.NewK3sCluster(server)
+	// THE SAME DEPS THE RESTORE STAGE BUILT, because this stage finishes the
+	// operation that stage started.
+	deps := recoveryRestoreDeps(server)
 	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
 	if err != nil {
 		return fmt.Errorf("the bundle declares no component-ready timeout, so waiting for a project to appear has no deadline and this stage will not guess one: %w", err)
@@ -1074,12 +1110,122 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 			return stages.NewComponentError("kubenest-agent", fmt.Errorf("activating project %s: %w", ns, err))
 		}
 		s.Logf("  activated %s: %s=%s on project %s/%s", ns, backup.ActivateAnnotationKey, s.recoveryActivationValue(), backup.ProjectCRNamespace, ns)
+		// THE OPERATOR'S RELEASE IS ONLY HALF OF IT. The namespace's data was
+		// put back by ITS OWN restore operation, which stopped at `restored —
+		// awaiting activation` with the project paused and every CronJob
+		// suspended; that operation has to be activated too, or the project
+		// keeps the restore's pause and the scheduled work never runs. On lab
+		// s6 (2026-09-28) the project carried both the recovery's activation
+		// and the namespace restore's pause, and `kn-recovery-sentinel` stayed
+		// suspended for ever.
+		if err := s.activateNamespaceRestore(ctx, deps, ns); err != nil {
+			return err
+		}
 		s.Record.RecoveryNamespacesActivated = append(s.Record.RecoveryNamespacesActivated, ns)
 		if err := s.saveRecord(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// activateNamespaceRestore finishes the pkg/backup operation that restored one
+// namespace: it lifts that operation's pause and puts the workloads and the
+// CronJobs back to the state the BACKUP held.
+//
+// IT RUNS AFTER THE OPERATOR'S OWN RELEASE, because the two holds are
+// independent and the recovery's own annotation is what this stage exists to
+// write; a failure between them leaves the namespace held by the restore's
+// pause, which is the state the hardware was in and a state a resume repairs.
+//
+// WHICH OPERATION IT IS COMES FROM THE RECORD. The restore stage was handed the
+// id by pkg/backup and wrote it down per namespace, and a resume that re-enters
+// this stage without any restore in memory reads it back from there. A journal
+// written before this CLI recorded it names the restored namespaces but not
+// their operations, so the pause annotation the restore itself wrote on the
+// project is the fallback: it is the same fact, from the same actor, and it is
+// the only other place a recovery can read it.
+func (s *Session) activateNamespaceRestore(ctx context.Context, deps backup.RestoreDeps, ns string) error {
+	restoreOp := s.Record.RecoveryRestoreOperations[ns]
+	if restoreOp == "" {
+		hold, err := deps.Cluster.ProjectHold(ctx, ns)
+		if err != nil {
+			return err
+		}
+		if hold != nil {
+			restoreOp = hold.PausedBy
+		}
+	}
+	if restoreOp == "" {
+		// NO RESTORE'S PAUSE IS ON THIS PROJECT, so the thing activation would
+		// lift is already gone: the operation was activated by an earlier
+		// attempt (a crash between this stage's two steps is exactly that) and
+		// only the journal write was lost. There is nothing to activate and
+		// nothing to refuse.
+		s.Logf("  %s carries no pause from a namespace restore, so that restore was activated already", ns)
+		return nil
+	}
+	done, err := restoreActivationDone(ctx, deps.Store, restoreOp)
+	if err != nil {
+		return err
+	}
+	if done {
+		s.Logf("  the namespace restore of %s (operation %s) is complete: activation already ran, so it is not run again", ns, restoreOp)
+		return nil
+	}
+	opts := backup.RestoreOptions{
+		Cluster:   s.recoveryName(),
+		Namespace: ns,
+		Activate:  restoreOp,
+		Confirm:   true,
+		// THE CONTROL PLANE'S DESIRED STATE WINS where the restored
+		// configuration differs from it. The rebuilt cluster's desired state
+		// was re-delivered by the control plane onto a machine that had no
+		// configuration at all, so it is the newer statement of what the
+		// cluster should hold; the restored copy is what the dead host last
+		// saw. Activation's other answer, --keep-restored, would leave two
+		// statements of intent and let reconciliation decide (S4's own gate
+		// activates with --keep-desired for the same reason).
+		KeepDesired: true,
+		Bundle:      s.Bundle,
+	}
+	if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
+		return stages.NewComponentError("recovery-restore", fmt.Errorf("activating the namespace restore of %s (operation %s): %w. Its data is back and the project is released by this recovery; run the same install again to resume here", ns, restoreOp, err))
+	}
+	s.Logf("  activated the namespace restore of %s: operation %s is closed, its pause is lifted and its scheduled work is back to the state the backup held", ns, restoreOp)
+	return nil
+}
+
+// restoreActivationDone reports whether the restore operation this recovery is
+// about to activate has already been activated.
+//
+// THE ONE CASE A RESUME HAS TO RECOGNISE is an operation that is already
+// finished: activation closes its record, so a run that crashed after the
+// restore's activation and before the journal write that follows it finds a
+// TERMINAL record, and `--activate` refuses a terminal operation outright
+// ("there is nothing to do for it"). That refusal is right for an operator
+// asking again and wrong here, where the record is the proof the step is done.
+func restoreActivationDone(ctx context.Context, store *operation.Store, opID string) (bool, error) {
+	stored, err := store.Find(ctx, opID)
+	if err != nil {
+		return false, fmt.Errorf("reading the record of the namespace restore %s, which is what says whether it still needs activating: %w", opID, err)
+	}
+	if !stored.Record.Terminal {
+		return false, nil
+	}
+	// Complete appends the outstanding writes to the result ("succeeded;
+	// pending: …"), so a successful operation is recognised by its first word
+	// rather than by the whole string.
+	if strings.HasPrefix(stored.Record.Result, string(operation.ResultSucceeded)) {
+		return true, nil
+	}
+	return false, fmt.Errorf("the namespace restore %s is terminal (%s), so it never reached its activation and this recovery must not close it over: %s. Its data is back and the namespace stays held; inspect the operation before activating it by hand", opID, stored.Record.Result, backupActivationAdvice(opID))
+}
+
+// backupActivationAdvice names the command that finishes a namespace restore by
+// hand, which is the same step this stage just could not take.
+func backupActivationAdvice(opID string) string {
+	return fmt.Sprintf("`kubenest backup restore --activate %s`", opID)
 }
 
 // markNotRestored records a namespace whose data was not restored, so the

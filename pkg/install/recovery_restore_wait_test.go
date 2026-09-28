@@ -85,6 +85,23 @@ type syncingVelero struct {
 	// namespace's Project before the operator has created it. Zero models a
 	// cluster whose operator has already written the CR.
 	projectAbsentFor int
+	// cronJob is the CronJob the BACKUP holds in the covered namespace, and
+	// Velero therefore recreates when the Restore completes — suspended by the
+	// restore's resource modifier, carrying the suspend value the backup held
+	// in the annotation that same modifier writes. It is empty for a recovery
+	// whose namespace holds no scheduled work.
+	cronJob string
+	// restored is set the moment the Velero Restore reports Completed: the
+	// namespace and its CronJob exist on the cluster from then on, and every
+	// read before that finds a namespace that went with the dead host.
+	restored bool
+	// pauseLifted is set when the namespace restore's own activation removes
+	// the pause annotation from the Project, which is the change a lost-server
+	// recovery has to make and did not.
+	pauseLifted bool
+	// history is the finished record copies the CLI writes when an operation
+	// completes, by object name. The live record is `record`.
+	history map[string][]byte
 
 	listed int
 	// projectReads counts the looks at that Project: every read, and the read
@@ -110,15 +127,35 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 	// The operation record: the CLI writes it with a create or a replace and
 	// reads it back before every change, so the fake has to keep what it was
 	// given and answer with the resourceVersion each write returned.
+	//
+	// THE HISTORY COPY IS A SECOND OBJECT, not the live record: completing an
+	// operation writes a copy named after that operation, and a fake that kept
+	// the copy as the live record would answer every later read with a terminal
+	// one.
 	case isOperationRecordWrite(command):
-		c.record = lastInput(runner)
+		doc := lastInput(runner)
 		c.rv++
+		if name := objectName(doc); strings.HasPrefix(name, operation.Name+"-") {
+			if c.history == nil {
+				c.history = map[string][]byte{}
+			}
+			c.history[name] = doc
+		} else {
+			c.record = doc
+		}
 		return sshx.Result{Stdout: fmt.Sprintf(`{"metadata":{"resourceVersion":%q}}`, strconv.Itoa(c.rv))}, nil
 	case strings.Contains(command, "get configmap "+operation.Name+" -n "+operation.Namespace):
 		if c.record == nil {
 			return notFound("configmaps", operation.Name), nil
 		}
 		return sshx.Result{Stdout: c.recordDocument()}, nil
+	case strings.Contains(command, "get configmap "+operation.Name+"-"):
+		name := configMapObject(command)
+		doc, found := c.history[name]
+		if !found {
+			return notFound("configmaps", name), nil
+		}
+		return sshx.Result{Stdout: string(doc)}, nil
 
 	// The backup the recovery restores. The bucket holds it; whether Velero has
 	// listed it is exactly what the stage under test has to wait for.
@@ -161,15 +198,36 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 		if !c.projectPresent() {
 			return notFound("projects.kubenest.io", recoveryWaitNamespace), nil
 		}
-		c.opID = pauseOpID(command)
+		switch {
+		case strings.Contains(command, backup.PauseAnnotationKey+"-"):
+			// The namespace restore's own activation clears the pause it left,
+			// which is the change this fake exists to observe.
+			c.pauseLifted = true
+		case strings.Contains(command, backup.PauseAnnotationKey+"="):
+			c.opID = pauseOpID(command)
+		}
 		return sshx.Result{}, nil
 
 	// The namespace went with the host, so the restore recreates it, and the
-	// restore's own Velero Restore completes at once.
+	// restore's own Velero Restore completes at once. A namespace read from
+	// then on finds what that Restore created.
 	case strings.Contains(command, "get namespace "+recoveryWaitNamespace+" -o json"):
-		return notFound("namespaces", recoveryWaitNamespace), nil
+		if !c.restored {
+			return notFound("namespaces", recoveryWaitNamespace), nil
+		}
+		return sshx.Result{Stdout: `{"metadata":{"name":` + strconv.Quote(recoveryWaitNamespace) + `,"uid":"namespace-uid-after-restore"}}`}, nil
 	case strings.Contains(command, "get restore "):
+		c.restored = true
 		return sshx.Result{Stdout: `{"status":{"phase":"Completed","progress":{"itemsRestored":1}}}`}, nil
+
+	// The CronJobs of the namespace: none before the Restore completes, and
+	// the backup's own after it — suspended by the restore's modifier, carrying
+	// the suspend value the backup held.
+	case strings.Contains(command, "get cronjobs -n "+recoveryWaitNamespace):
+		if c.cronJob == "" || !c.restored {
+			return sshx.Result{Stdout: `{"items":[]}`}, nil
+		}
+		return sshx.Result{Stdout: c.cronJobDocument()}, nil
 
 	// Everything else the plan and the restore read back is an empty list: this
 	// cluster has a namespace with no workloads of its own.
@@ -259,15 +317,66 @@ func (c *syncingVelero) coverageDocument() string {
 }
 
 // holdDocument is the Project the restore pauses. Before the pause annotation
-// has been written the project holds nothing; afterwards the condition carries
-// the operation the restore asked it to pause for.
+// has been written the project holds nothing; afterwards the annotation names
+// the operation — which is how the restore's own activation is told which
+// operation it is finishing — and the condition carries the same operation. The
+// annotation goes when that activation lifts it.
 func (c *syncingVelero) holdDocument() string {
-	if c.opID == "" {
+	if c.opID == "" || c.pauseLifted {
 		return `{"status":{"conditions":[]}}`
 	}
-	return `{"status":{"conditions":[{"type":` + strconv.Quote(backup.ConditionReconcilePaused) +
+	return `{"metadata":{"annotations":{` + strconv.Quote(backup.PauseAnnotationKey) + `:` + strconv.Quote(c.opID) + `}},` +
+		`"status":{"conditions":[{"type":` + strconv.Quote(backup.ConditionReconcilePaused) +
 		`,"status":"True","reason":` + strconv.Quote(backup.ReasonPausedByOperation) +
 		`,"message":` + strconv.Quote("holding reconciliation for operation "+c.opID) + `}]}}`
+}
+
+// cronJobDocument is the CronJob Velero brings back with the namespace: the
+// restore's own resource modifier has suspended it and written the value the
+// BACKUP held into the annotation activation reads.
+func (c *syncingVelero) cronJobDocument() string {
+	doc := map[string]any{
+		"items": []any{map[string]any{
+			"metadata": map[string]any{
+				"name":        c.cronJob,
+				"annotations": map[string]string{backup.CronJobSuspendedAnnotationKey: "false"},
+			},
+			"spec": map[string]any{"schedule": "* * * * *", "suspend": true},
+		}},
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return "{}"
+	}
+	return string(out)
+}
+
+// objectName reads the metadata.name of one of the documents the CLI writes, so
+// the fake can tell a live operation record from its finished copy.
+func objectName(doc []byte) string {
+	var obj struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(doc, &obj); err != nil {
+		return ""
+	}
+	return obj.Metadata.Name
+}
+
+// configMapObject reads the object name out of a `kubectl get configmap` line.
+func configMapObject(command string) string {
+	const marker = "get configmap "
+	at := strings.Index(command, marker)
+	if at < 0 {
+		return ""
+	}
+	rest := command[at+len(marker):]
+	if end := strings.IndexByte(rest, ' '); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 func notFound(kind, name string) sshx.Result {
@@ -637,5 +746,218 @@ func TestAResumedRunDoesNotWaitForAProjectItAlreadyRestored(t *testing.T) {
 	}
 	if len(s.Record.RecoveryNamespacesRestored) != 1 {
 		t.Errorf("a resumed recovery recorded %v, and the namespace it had already restored is listed twice", s.Record.RecoveryNamespacesRestored)
+	}
+}
+
+// THE SECOND HARDWARE DEFECT OF LAB S6 (2026-09-28, kn-t49-…5). The recovery
+// restored s6-data's data — the proof digest matched — and then activated
+// nothing that ran: CronJob kn-recovery-sentinel stayed suspended, the Project
+// carried BOTH the recovery's own activation annotation and the namespace
+// restore's pause, and the sentinel receiver never saw a call.
+//
+// THE RESTORE IS TWO STEPS OF ONE OPERATION. `backup.RunRestore` in mode 1
+// stops at `restored — awaiting activation` with the project paused and every
+// restored CronJob suspended, and `backup.RunRestore --activate <id>` is what
+// lifts the pause, puts each CronJob back to the suspend value the BACKUP held
+// and scales the workloads back. The recovery wrote the operator's recovery-mode
+// release and stopped there, so half of the restore's own state was never
+// reached.
+const (
+	// recoveryActivateCronJob is the CronJob the fixture's backup holds, and
+	// therefore the one the gate's sentinel runs on.
+	recoveryActivateCronJob = "kn-recovery-sentinel"
+	// recoveryActivateOpID is the recovery's own operation, which the operator's
+	// recovery-mode annotation names.
+	recoveryActivateOpID = "9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+)
+
+// TestTheActivateStageActivatesTheRestoreItRan is the defect: the stage has to
+// write the operator's recovery-mode release AND perform the activation of the
+// namespace restore that put the data back.
+//
+// THE POSITIVE OBSERVABLE: the pause annotation the restore left on the Project
+// is removed, and the CronJob goes back to the suspend value the BACKUP held —
+// both of which only the restore's OWN activation does.
+//
+// THE PLANTED NEGATIVE IS THIS SAME FAKE ON THE OLD CODE: the recovery's
+// annotation is written, the restore's pause stays on the Project and the
+// CronJob is never patched, which is the state the hardware was left in.
+func TestTheActivateStageActivatesTheRestoreItRan(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", cronJob: recoveryActivateCronJob}
+	s, runner, _ := recoveryWaitSession(t, cluster)
+	s.Record.RecoveryOperationID = recoveryActivateOpID
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the restore stage failed, so there is nothing for activation to activate: %v", err)
+	}
+	// The restore of one namespace is an operation of its own, and the stage
+	// recorded which one so that a later stage can finish it. It is the
+	// operation whose pause is on the Project, which is the same fact read two
+	// ways.
+	restoreOp := s.Record.RecoveryRestoreOperations[recoveryWaitNamespace]
+	if restoreOp == "" {
+		t.Fatalf("the restore stage did not record the namespace restore's operation id, so nothing can activate it later: %v", s.Record.RecoveryRestoreOperations)
+	}
+	if restoreOp != cluster.opID {
+		t.Errorf("the recorded operation id %q is not the operation that paused the Project (%q)", restoreOp, cluster.opID)
+	}
+
+	before := len(runner.ran)
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("the activate stage failed on a namespace whose data is back: %v", err)
+	}
+	if !containsString(s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace) {
+		t.Errorf("activation recorded %v, and the namespace it activated (%s) is not among them", s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace)
+	}
+	activation := strings.Join(runner.ran[before:], "\n")
+
+	// The operator's recovery-mode release, which is what the stage did before.
+	if !strings.Contains(activation, "annotate project "+recoveryWaitNamespace+" -n "+backup.ProjectCRNamespace+" "+backup.ActivateAnnotationKey+"=") {
+		t.Errorf("activation did not write the operator's recovery-mode annotation on %s, so the operator keeps holding the project:\n%s", recoveryWaitNamespace, activation)
+	}
+	// AND the restore's own activation, which is the half that was missing: the
+	// pause it left is lifted...
+	if !strings.Contains(activation, backup.PauseAnnotationKey+"-") {
+		t.Errorf("activation did not lift the pause the namespace restore left on the Project, so the project stays held by an operation that is waiting for exactly this:\n%s", activation)
+	}
+	if !cluster.pauseLifted {
+		t.Errorf("the Project still carries %s after activation:\n%s", backup.PauseAnnotationKey, activation)
+	}
+	// ...and the CronJob goes back to the suspend value the BACKUP held
+	// (kn-x0wv.3): the restored one is suspended by the restore's modifier, and
+	// the backup had it running, so this is what starts the scheduled work.
+	wantPatch := "patch cronjob " + recoveryActivateCronJob + " -n " + recoveryWaitNamespace
+	if !strings.Contains(activation, wantPatch) || !strings.Contains(activation, `"suspend":false`) {
+		t.Errorf("activation did not put CronJob %s back to the suspend value the backup held, so the scheduled work stays off for ever:\n%s", recoveryActivateCronJob, activation)
+	}
+}
+
+// TestAResumedRecoveryKeepsTheRestoreOperationItRecorded: the operation id is
+// what a resume has instead of the restore in memory, so the journal has to
+// carry it. The stage that finds a namespace already restored must neither
+// restore it again nor forget which operation did — the activation that follows
+// reads that id out of the record.
+func TestAResumedRecoveryKeepsTheRestoreOperationItRecorded(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", cronJob: recoveryActivateCronJob}
+	s, runner, _ := recoveryWaitSession(t, cluster)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the restore stage failed: %v", err)
+	}
+	restoreOp := s.Record.RecoveryRestoreOperations[recoveryWaitNamespace]
+	if restoreOp == "" {
+		t.Fatalf("the restore stage did not record the namespace restore's operation id: %v", s.Record.RecoveryRestoreOperations)
+	}
+
+	// The resume: the next attempt reads the record back out of the journal
+	// rather than holding it in memory.
+	record, err := Recorded(s.Jnl)
+	if err != nil {
+		t.Fatalf("reading the record back out of the journal: %v", err)
+	}
+	if record.RecoveryRestoreOperations[recoveryWaitNamespace] != restoreOp {
+		t.Fatalf("the journal kept %v for the restored namespaces, so a resumed activation has no operation to activate", record.RecoveryRestoreOperations)
+	}
+	s.Record = record
+
+	before := len(runner.ran)
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the resumed restore stage failed: %v", err)
+	}
+	if again := strings.Join(runner.ran[before:], "\n"); strings.Contains(again, "annotate") {
+		t.Errorf("a resumed restore ran over a namespace it had already restored:\n%s", again)
+	}
+	if got := s.Record.RecoveryRestoreOperations[recoveryWaitNamespace]; got != restoreOp {
+		t.Fatalf("a resumed stage recorded %q for %s, and the operation that restored it is %q", got, recoveryWaitNamespace, restoreOp)
+	}
+
+	// And the activation the resume reaches is THAT operation's: the pause it
+	// left is lifted and the CronJob goes back.
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("the resumed activation failed: %v", err)
+	}
+	activated := strings.Join(runner.ran[before:], "\n")
+	requireContains(t, "the resumed activation", activated,
+		backup.PauseAnnotationKey+"-", "patch cronjob "+recoveryActivateCronJob)
+	if !containsString(s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace) {
+		t.Errorf("the resumed activation recorded %v, and the namespace it activated is not among them", s.Record.RecoveryNamespacesActivated)
+	}
+}
+
+// TestAResumedActivationDoesNotActivateTheRestoreTwice is the crash between the
+// two steps: the operator's annotation is written, the restore's own activation
+// runs and CLOSES its operation, and the write that records the namespace in
+// the journal is the one that never lands. The resumed stage finds the restore
+// already finished, and finishing it again is both refused by `activate`
+// ("there is nothing to do for it") and wrong — a second activation would run
+// the workloads and the CronJobs a second time.
+//
+// THE PLANTED NEGATIVE IS THE SAME FAKE WITHOUT THAT RECOGNITION: the resume
+// fails on the terminal operation, and the namespace is never recorded as
+// activated.
+func TestAResumedActivationDoesNotActivateTheRestoreTwice(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", cronJob: recoveryActivateCronJob}
+	s, runner, _ := recoveryWaitSession(t, cluster)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the restore stage failed: %v", err)
+	}
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("the activate stage failed: %v", err)
+	}
+	// The crash: the operation is closed and the journal write did not land.
+	s.Record.RecoveryNamespacesActivated = nil
+
+	before := len(runner.ran)
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("a resume after the namespace restore's own activation completed failed, which is the crash between the two steps the record cannot see: %v", err)
+	}
+	if !containsString(s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace) {
+		t.Fatalf("the resumed activation recorded %v, so the namespace it activated is still not marked as activated", s.Record.RecoveryNamespacesActivated)
+	}
+	again := strings.Join(runner.ran[before:], "\n")
+	if strings.Contains(again, "patch cronjob") || strings.Contains(again, backup.PauseAnnotationKey+"-") {
+		t.Errorf("a resumed activation activated the namespace restore a second time, which would run its workloads and its CronJobs again:\n%s", again)
+	}
+}
+
+// TestAnOlderRecoveryActivationReadsTheRestoreFromTheProject: a journal written
+// by a CLI that did not record the operation id per namespace — every recovery
+// started before this fix, including lab s6's — names the namespaces it
+// restored and nothing about the operations that restored them. The pause
+// annotation the restore wrote on the Project is the same fact from the same
+// actor, and reading it is what lets such a recovery finish instead of leaving
+// the namespace held.
+//
+// THE PLANTED NEGATIVE IS THE SAME FAKE WITHOUT THAT FALLBACK: the stage writes
+// the operator's release and the restore's pause stays, which is the state the
+// hardware is in.
+func TestAnOlderRecoveryActivationReadsTheRestoreFromTheProject(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", cronJob: recoveryActivateCronJob}
+	s, runner, _ := recoveryWaitSession(t, cluster)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the restore stage failed: %v", err)
+	}
+	if cluster.opID == "" {
+		t.Fatal("the fixture's restore paused no project, so this test cannot tell the two sources of the operation id apart")
+	}
+	// The journal of a recovery started by the CLI that did not record it.
+	s.Record.RecoveryRestoreOperations = nil
+	s.Record.RecoveryNamespacesRestored = []string{recoveryWaitNamespace}
+
+	before := len(runner.ran)
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("activating a namespace whose restore operation only the Project names failed: %v", err)
+	}
+	activated := strings.Join(runner.ran[before:], "\n")
+	if !strings.Contains(activated, backup.PauseAnnotationKey+"-") {
+		t.Errorf("activation did not lift the pause the namespace restore left on the Project, so the namespace stays held:\n%s", activated)
+	}
+	if !strings.Contains(activated, "patch cronjob "+recoveryActivateCronJob) {
+		t.Errorf("activation did not put the restored CronJob back, so the scheduled work stays off:\n%s", activated)
+	}
+	if !containsString(s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace) {
+		t.Errorf("the activation recorded %v, and the namespace it activated is not among them", s.Record.RecoveryNamespacesActivated)
 	}
 }

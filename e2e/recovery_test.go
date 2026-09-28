@@ -513,9 +513,13 @@ func TestLostSingleServerRecovery(t *testing.T) {
 	if err := recoveryWaitsForNamespace(runner, env.namespace, 20*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if hits := sentinel.count(); hits == 0 {
-		t.Fatalf("the sentinel receiver saw no call: nothing proved the workload is running again, and this file's claims about ordering rest on that receiver")
-	}
+	// THE CALL CANNOT ARRIVE UNTIL ACTIVATION, so it is waited for rather than
+	// demanded: the fixture's CronJob runs every minute, the restore leaves it
+	// suspended, and activation is what puts it back — on 2026-09-28 an
+	// immediate check here failed on a recovery whose activation had not run,
+	// which read as a missing sentinel rather than a workload left suspended.
+	waitForSentinelCall(t, sentinel, 3*time.Minute,
+		"the sentinel receiver saw no call: nothing proved the workload is running again, and this file's claims about ordering rest on that receiver")
 
 	// ── `node replace` on a single-server cluster's only server names THIS
 	// procedure rather than replacing it.
@@ -609,8 +613,33 @@ func TestAllInOneHostRecovery(t *testing.T) {
 	if err := recoveryWaitsForNamespace(runner, env.namespace, 30*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if sentinel.count() == 0 {
-		t.Fatal("the sentinel receiver saw no call: nothing proved the management workload runs again after activation")
+	// Bounded, for the same reason as S6: the call only comes once the
+	// restored CronJob has been activated and its next minute has passed.
+	waitForSentinelCall(t, sentinel, 3*time.Minute,
+		"the sentinel receiver saw no call: nothing proved the management workload runs again after activation")
+}
+
+// waitForSentinelCall waits, bounded, for the workload the recovery restored to
+// call the receiver.
+//
+// IT IS A WAIT AND NOT A LOOK because the call is the END of a chain the
+// recovery drives: the namespace's data comes back, the project is activated,
+// activation puts the CronJob back to the suspend value the backup held, and
+// the CronJob then fires on its own schedule — every minute, in the fixture.
+// The receiver's count is the whole observable, so the bound is the only thing
+// that separates "the workload is not running" from "the minute has not come
+// round yet".
+func waitForSentinelCall(t *testing.T, sentinel *s4Sentinel, within time.Duration, message string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if sentinel.count() > 0 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("%s (waited %s)", message, within)
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 

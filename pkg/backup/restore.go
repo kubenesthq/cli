@@ -512,6 +512,18 @@ type RestoreOptions struct {
 	KeepDesired  bool
 	// Bundle is the cluster's bundle manifest.
 	Bundle *manifest.Manifest
+	// OnOperation, when set, is handed the id of the operation this run drives,
+	// as soon as the run has taken its record.
+	//
+	// A NAMESPACE RESTORE IS TWO STEPS OF ONE OPERATION: the run that puts the
+	// data back stops at `restored — awaiting activation` with the project still
+	// paused, and a later `--activate <id>` finishes it. A caller that drives
+	// the first step and must drive the second one itself needs the id in
+	// between — the lost-server recovery does exactly that (PLAN 7.9 steps 5
+	// and 6) — and the id is not knowable from the flags it passed. It is a
+	// callback rather than a return value because the id exists only once the
+	// record has been claimed, and there are many paths back from there.
+	OnOperation func(id string)
 }
 
 // recovery is the two recovery flags as pkg/operation's Recovery, where their
@@ -622,6 +634,16 @@ type restoreRun struct {
 	// limits.timeouts.restore-drill (or a dedicated `restore` timeout when a
 	// later bundle declares one).
 	restoreTimeout time.Duration
+}
+
+// takeOperationID hands this run's operation id to the caller's OnOperation
+// hook, if one was given. It is called wherever this run learns which operation
+// it is driving: a new restore claims one, and a resume takes up the one its
+// earlier attempt claimed.
+func (r *restoreRun) takeOperationID(id string) {
+	if r.opts.OnOperation != nil && id != "" {
+		r.opts.OnOperation(id)
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -1293,6 +1315,7 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 			return err
 		}
 		r.handle = handle
+		r.takeOperationID(handle.OperationID())
 		fmt.Fprintf(r.out, "  record:        %s (resume with `kubenest backup restore --resume %s` if this is interrupted)\n", handle.OperationID(), handle.OperationID())
 		return nil
 	}
@@ -1406,6 +1429,7 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 		return err
 	}
 	r.handle = handle
+	r.takeOperationID(handle.OperationID())
 	r.renderPlan()
 	return nil
 }
