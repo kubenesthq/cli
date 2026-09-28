@@ -75,9 +75,16 @@ func controlPlaneRecoveryPlan(s *Session, bind stageBinder) []Stage {
 		// its own workloads come back from that repository, and Velero writes
 		// its vendored default into an absent Secret (probe P3 question 2).
 		{Name: StageRecoveryRepository, Run: bind(stageRecoveryRepository)},
-		// The management cluster registers through the control plane it now
-		// hosts, by the normal path.
-		{Name: StageRegister, AlwaysRun: true, Run: bind(stageRegister)},
+		// The management cluster adopts its own record as a NEW physical
+		// incarnation before its agent credentials are minted, exactly as a
+		// workload recovery does. It is NOT the ordinary register path: the
+		// backend re-delivers a cluster's confirmed projects only when a new
+		// incarnation of that cluster is recorded, so registering "by the
+		// normal path" left every project of the management cluster
+		// undelivered and stage 20 waiting for namespaces that never arrived
+		// (found on hardware 2026-09-28, lab s11: `recovery-restore` waited its
+		// full ten minutes for Project kubenest-system/s11-data).
+		{Name: StageRegister, AlwaysRun: true, Run: bind(stageRecoveryRegister)},
 		{Name: StageBackup, Component: "velero", Run: bind(stageBackup)},
 		{Name: StageDay2, Component: "system-upgrade-controller", Run: bind(stageDay2)},
 		{Name: StageBackupTarget, Component: "velero", Run: bind(stageBackupTarget)},

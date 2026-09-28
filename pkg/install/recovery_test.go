@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1485,6 +1488,349 @@ func TestTheControlPlaneSelectCarriesTheSkipReasonToo(t *testing.T) {
 	// And stage 20 acts on it: it finishes rather than refusing.
 	if err := stageRecoveryRestore(context.Background(), s); err != nil {
 		t.Fatalf("stage 20 refused on a recovery whose select stage had already decided to skip: %v", err)
+	}
+}
+
+// recoveryRegisterAPI answers the register stage for these tests — both the
+// ordinary path's calls and the recovery path's — and keeps the ORDER of the
+// calls it saw.
+//
+// THE TRANSCRIPT IS THE EVIDENCE. "A new incarnation is recorded" and "it is
+// recorded before the credentials are minted" are claims about what crossed the
+// wire and in which order, so both are read from the calls the client made
+// rather than from the stage's own log lines.
+type recoveryRegisterAPI struct {
+	// cluster is the record every path reads: by id for the recovery path, and
+	// out of the organisation's cluster list by name for the ordinary one.
+	cluster *api.Cluster
+
+	mu       sync.Mutex
+	calls    []string
+	recorded []recordedIncarnation
+	mints    int
+}
+
+// recordedIncarnation is one POST to the incarnations endpoint, with what it
+// carried.
+type recordedIncarnation struct {
+	clusterID string
+	reason    string
+	note      string
+}
+
+func (a *recoveryRegisterAPI) serve(t *testing.T) *api.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		a.mu.Lock()
+		a.calls = append(a.calls, req.Method+" "+req.URL.Path)
+		a.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+
+		incarnations := "/api/v1/clusters/" + a.cluster.ID + "/incarnations"
+		credentials := "/api/v1/clusters/" + a.cluster.ID + "/agent-credentials"
+
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/api/v1/orgs":
+			a.write(w, []api.Org{{ID: a.cluster.OrgID, Name: "Acme", Slug: "acme"}})
+		case req.Method == http.MethodGet && req.URL.Path == "/api/v1/orgs/"+a.cluster.OrgID+"/clusters":
+			// The listing is paginated: a bare array here is not what the
+			// client reads, and the envelope is what tells it there is no
+			// second page.
+			a.write(w, map[string]any{"data": []api.Cluster{*a.cluster}, "has_more": false, "total_count": 1, "page": 1})
+		case req.Method == http.MethodGet && req.URL.Path == "/api/v1/clusters/"+a.cluster.ID:
+			a.write(w, a.cluster)
+		case req.Method == http.MethodPost && req.URL.Path == incarnations:
+			var body struct {
+				Reason string `json:"reason"`
+				Note   string `json:"note"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Errorf("reading the incarnation request: %v", err)
+			}
+			a.mu.Lock()
+			a.recorded = append(a.recorded, recordedIncarnation{clusterID: a.cluster.ID, reason: body.Reason, note: body.Note})
+			ordinal := len(a.recorded)
+			a.mu.Unlock()
+			a.write(w, map[string]any{
+				"id": fmt.Sprintf("inc-%d", ordinal), "cluster_id": a.cluster.ID,
+				"ordinal": ordinal, "reason": body.Reason,
+				"recorded_at": time.Now().UTC().Format(time.RFC3339),
+			})
+		case req.Method == http.MethodPost && req.URL.Path == credentials:
+			a.mu.Lock()
+			a.mints++
+			version := a.mints + 1
+			a.mu.Unlock()
+			a.write(w, map[string]any{
+				"cluster_id": a.cluster.ID,
+				"agent_jwt": map[string]any{
+					"token": "agent-token", "hub_url": "wss://hub.example.test/ws/operator",
+					"expires_at":    time.Date(2027, 9, 26, 0, 0, 0, 0, time.UTC).Format(time.RFC3339),
+					"token_version": version,
+				},
+				"operator": map[string]any{"namespace": "kubenest-system", "chart_ref": "agent-1.1.0"},
+			})
+		default:
+			t.Errorf("the register stage called %s %s, which this fake does not answer: the test would otherwise pass on a path it never served", req.Method, req.URL.Path)
+			http.NotFound(w, req)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := api.New(srv.URL, api.WithToken("knp_test"))
+	if err != nil {
+		t.Fatalf("api.New: %v", err)
+	}
+	return client
+}
+
+func (a *recoveryRegisterAPI) write(w http.ResponseWriter, body any) {
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		// The handler runs on the server's goroutine, so there is no test to
+		// fail from here; the client sees a broken response instead.
+		return
+	}
+}
+
+// incarnations is every incarnation this fake was asked to record.
+func (a *recoveryRegisterAPI) incarnations() []recordedIncarnation {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]recordedIncarnation(nil), a.recorded...)
+}
+
+// minted is how many credential mints happened.
+func (a *recoveryRegisterAPI) minted() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.mints
+}
+
+// callIndex is where the first call carrying a fragment sits in the transcript,
+// or -1. It is what makes "the incarnation comes first" checkable.
+func (a *recoveryRegisterAPI) callIndex(fragment string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, call := range a.calls {
+		if strings.Contains(call, fragment) {
+			return i
+		}
+	}
+	return -1
+}
+
+// controlPlaneRegisterSession is an all-in-one recovery's session at the moment
+// its register stage runs: the select stage has run, so the sets, the management
+// cluster's id and the control-plane client are all in place, and the plan is
+// the one the command would run.
+func controlPlaneRegisterSession(t *testing.T, f *recoveryFixture, client *api.Client) *Session {
+	t.Helper()
+	opts := Options{
+		Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+		ControlPlaneInstall: true, Name: "prod-1", Domain: "example.test",
+		InstanceID:   "inst-1",
+		BackupTarget: "s3://kubenest-kit/" + recoveryTestScope + "?endpoint=minio.example.test&region=main",
+		Recovery: &RecoveryOptions{
+			RestoreFrom: "latest", Kit: "s3", FleetKey: f.fleet.SecretKeyString(),
+			OldHostFenced: true, Kind: recoverykit.KindControlPlane,
+		},
+	}
+	s, _ := recoverySession(t, opts)
+	s.API = client
+	s.recoveryStore = f.bucket
+	s.recoveryCheckpointStore = f.bucket
+	s.recoveryTargetValue = testTarget(t)
+	if err := stageRecoverySelectControlPlane(context.Background(), s); err != nil {
+		t.Fatalf("the control-plane select stage failed: %v", err)
+	}
+	if s.Jnl.ClusterID != f.bind.ClusterID {
+		t.Fatalf("the select stage bound the session to cluster %s and this fixture is about %s", s.Jnl.ClusterID, f.bind.ClusterID)
+	}
+	return s
+}
+
+// publishControlPlaneSet writes the instance's own recovery set beside the
+// management cluster's, as a --control-plane install does. Its binding carries
+// NO organisation on purpose: a control-plane kit belongs to an instance, and
+// that is why the set which can confirm a cluster record is the cluster's own.
+func publishControlPlaneSet(t *testing.T, f *recoveryFixture, artifact string) {
+	t.Helper()
+	f.publish(t, recoverykit.Binding{Kind: recoverykit.KindControlPlane, InstanceID: "inst-1", ClusterID: f.bind.ClusterID},
+		artifact, map[string]string{
+			recoverykit.KeyEncryptionKey:  "VALUE-enc",
+			recoverykit.KeyAgentJWTSecret: "VALUE-jwt",
+			recoverykit.KeyControlPlaneCA: "-----BEGIN CERTIFICATE-----\nY2VydA==\n-----END CERTIFICATE-----\n-----BEGIN EC PRIVATE KEY-----\nYTJiM2M0\n-----END EC PRIVATE KEY-----\n",
+		}, nil, true, recoverykit.Backup{
+			Name: "cp-baseline", CompletedAt: time.Date(2026, 9, 28, 2, 0, 0, 0, time.UTC), Status: "Completed",
+		})
+}
+
+// TestTheAllInOneRegisterRecordsANewIncarnationBeforeMinting is the hardware
+// defect of 2026-09-28 on lab s11: the all-in-one recovery registered the
+// management cluster "by the normal path", which records no incarnation — and
+// the backend re-delivers a cluster's confirmed projects only when a NEW
+// incarnation of that cluster is recorded, so stage 20 waited its full ten
+// minutes for Project kubenest-system/s11-data and failed with "never arrived
+// on the rebuilt cluster".
+//
+// THE ORDER IS AS LOAD-BEARING AS THE RECORD. Recording the incarnation raises
+// the cluster's revocation floor, so an incarnation recorded AFTER the mint
+// would refuse the token the mint had just issued.
+func TestTheAllInOneRegisterRecordsANewIncarnationBeforeMinting(t *testing.T) {
+	const mgmt = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c41"
+	f := newRecoveryFixture(t, mgmt, "org-1", "inst-1", nil)
+	publishControlPlaneSet(t, f, "20260928T040000Z-66666666")
+	fake := &recoveryRegisterAPI{cluster: &api.Cluster{ID: mgmt, Name: "prod-1", OrgID: "org-1", Status: "connected"}}
+	s := controlPlaneRegisterSession(t, f, fake.serve(t))
+
+	plan := Plan(s)
+	if err := plan[stageIndex(t, plan, StageRegister)].Run(context.Background()); err != nil {
+		t.Fatalf("the all-in-one recovery's register stage failed: %v", err)
+	}
+
+	incarnations := fake.incarnations()
+	if len(incarnations) != 1 {
+		t.Fatalf("the all-in-one register recorded %d incarnation(s) of the management cluster, want 1: without one the control plane has no boundary to re-arm against, and the projects the restored database holds are never re-delivered to the rebuilt cluster", len(incarnations))
+	}
+	got := incarnations[0]
+	if want := s.recoveryWorkloadSel.Set.Binding.ClusterID; got.clusterID != want {
+		t.Fatalf("the incarnation was recorded for cluster %s and the management cluster's own set is bound to %s: the identity is the CLUSTER's, and rebuilding a host must not register some other cluster", got.clusterID, want)
+	}
+	if got.reason != "recovery" {
+		t.Fatalf("the incarnation was recorded for reason %q: a rebuild is the one reason the control plane retires the superseded machine's credentials for", got.reason)
+	}
+	// The detail names the artifact and the host, like the workload path's.
+	if key := s.recoveryWorkloadSel.SetKey; !strings.Contains(got.note, key) {
+		t.Fatalf("the incarnation's detail (%q) does not name the recovery set this rebuild came from (%s), so the control plane's record does not say what the new machine was built from", got.note, key)
+	}
+	if !strings.Contains(got.note, "10.0.9.9") {
+		t.Fatalf("the incarnation's detail (%q) does not name the host the cluster was rebuilt on", got.note)
+	}
+
+	// THE INCARNATION COMES FIRST, and the credentials are minted once.
+	recorded, minted := fake.callIndex("/incarnations"), fake.callIndex("/agent-credentials")
+	if minted < 0 {
+		t.Fatal("the register stage minted no credentials, so the rebuilt agent has nothing to report with")
+	}
+	if recorded > minted {
+		t.Fatalf("the incarnation was recorded at call %d and the credentials minted at call %d: the mint sets the revocation floor, so recording the incarnation afterwards would refuse the token this very mint issued", recorded, minted)
+	}
+	if n := fake.minted(); n != 1 {
+		t.Fatalf("the register stage minted %d time(s), want exactly 1", n)
+	}
+	if s.Record.TokenVersion != 2 {
+		t.Fatalf("the minted credentials were not adopted by the session (token version %d, want the fake's 2), so the agent stage has nothing to install", s.Record.TokenVersion)
+	}
+}
+
+// TestTheAllInOneRegisterRefusesARecordFromAnotherOrganisation is the planted
+// negative the incarnation record needs: adopting a cluster record whose
+// organisation is not the one the recovery set is bound to would rebuild
+// ANOTHER cluster's host with this cluster's data.
+//
+// It also says which set does the confirming. The instance's own control-plane
+// set carries no organisation at all — a control-plane kit belongs to an
+// instance — so the authority here is the management cluster's own set, whose
+// binding does carry it.
+func TestTheAllInOneRegisterRefusesARecordFromAnotherOrganisation(t *testing.T) {
+	const mgmt = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c42"
+	f := newRecoveryFixture(t, mgmt, "org-1", "inst-1", nil)
+	publishControlPlaneSet(t, f, "20260928T050000Z-77777777")
+	foreign := &recoveryRegisterAPI{cluster: &api.Cluster{ID: mgmt, Name: "prod-1", OrgID: "org-2", Status: "connected"}}
+	s := controlPlaneRegisterSession(t, f, foreign.serve(t))
+
+	plan := Plan(s)
+	err := plan[stageIndex(t, plan, StageRegister)].Run(context.Background())
+	if err == nil {
+		t.Fatal("a management cluster record in another organisation was adopted: this recovery set belongs to org-1 and the record it registers is org-2's")
+	}
+	if !strings.Contains(err.Error(), "org-2") || !strings.Contains(err.Error(), "org-1") {
+		t.Fatalf("the refusal does not name both organisations, so the operator cannot tell which side is wrong: %v", err)
+	}
+	if n := len(foreign.incarnations()); n != 0 {
+		t.Fatalf("the refusal recorded %d incarnation(s) anyway: a refused adoption must not register a new machine for the cluster it refused", n)
+	}
+	if n := foreign.minted(); n != 0 {
+		t.Fatalf("the refusal minted %d credential set(s) anyway: credentials minted for a refused adoption would rotate the real cluster's identity", n)
+	}
+}
+
+// TestAResumedAllInOneRegisterRecordsNoSecondIncarnation: the resume after a
+// failed later stage must not record a second incarnation or re-mint. The
+// operator is already installed and holding the credentials the first attempt
+// minted, so a second mint would bump the token version again and raise the
+// cluster's revocation floor above the token that machine is using.
+func TestAResumedAllInOneRegisterRecordsNoSecondIncarnation(t *testing.T) {
+	const mgmt = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c43"
+	f := newRecoveryFixture(t, mgmt, "org-1", "inst-1", nil)
+	publishControlPlaneSet(t, f, "20260928T060000Z-88888888")
+	fake := &recoveryRegisterAPI{cluster: &api.Cluster{ID: mgmt, Name: "prod-1", OrgID: "org-1", Status: "connected"}}
+	s := controlPlaneRegisterSession(t, f, fake.serve(t))
+	plan := Plan(s)
+	register := plan[stageIndex(t, plan, StageRegister)]
+
+	// The first attempt: one incarnation, one mint.
+	if err := register.Run(context.Background()); err != nil {
+		t.Fatalf("the first attempt's register stage failed: %v", err)
+	}
+	if n := len(fake.incarnations()); n != 1 {
+		t.Fatalf("the first attempt recorded %d incarnation(s), want 1: this test cannot tell a resume from a first attempt unless the first attempt records one", n)
+	}
+	if n := fake.minted(); n != 1 {
+		t.Fatalf("the first attempt minted %d time(s), want 1", n)
+	}
+
+	// The resume: a later stage failed, and the agent stage had already
+	// completed, so the credentials the first attempt minted are in use.
+	if err := s.Jnl.Append(Entry{Stage: StageAgent, Status: StatusCompleted, At: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := register.Run(context.Background()); err != nil {
+		t.Fatalf("the resumed register stage failed: %v", err)
+	}
+	if n := len(fake.incarnations()); n != 1 {
+		t.Fatalf("the resume recorded a second incarnation (now %d): the floor would rise above the token the machine is already using", n)
+	}
+	if n := fake.minted(); n != 1 {
+		t.Fatalf("the resume re-minted (now %d): the operator installed by the first attempt holds the older token, and the mint would refuse it", n)
+	}
+}
+
+// TestAWorkloadRecoveryStillRecordsItsIncarnation is the control for the fix:
+// the workload path's register stage is the shared one, and what it does — one
+// incarnation for the cluster's own id, reason "recovery", before the mint —
+// must be what it did before the all-in-one path started using it.
+func TestAWorkloadRecoveryStillRecordsItsIncarnation(t *testing.T) {
+	const clusterA = "01a02362-f8a3-7dd6-aa07-2f10ed7a5c44"
+	f := newRecoveryFixture(t, clusterA, "org-1", "inst-1", nil)
+	fake := &recoveryRegisterAPI{cluster: &api.Cluster{ID: clusterA, Name: "prod-1", OrgID: "org-1", Status: "connected"}}
+	s, _ := recoverySession(t, recoveryOptions(f, f.fleet.SecretKeyString()))
+	s.API = fake.serve(t)
+	s.recoveryStore = f.bucket
+	sel, err := recovery.Select(context.Background(), f.bucket, recoveryTestScope, f.request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.recoverySel = sel
+	s.Jnl.ClusterID = clusterA
+
+	plan := Plan(s)
+	if err := plan[stageIndex(t, plan, StageRegister)].Run(context.Background()); err != nil {
+		t.Fatalf("the workload recovery's register stage failed: %v", err)
+	}
+
+	incarnations := fake.incarnations()
+	if len(incarnations) != 1 {
+		t.Fatalf("the workload recovery recorded %d incarnation(s), want 1: a rebuilt workload cluster is a new machine under the same immutable id, and its projects are re-delivered on that boundary", len(incarnations))
+	}
+	if incarnations[0].clusterID != clusterA || incarnations[0].reason != "recovery" {
+		t.Fatalf("the incarnation was recorded for cluster %s with reason %q, want %s and \"recovery\"", incarnations[0].clusterID, incarnations[0].reason, clusterA)
+	}
+	if !strings.Contains(incarnations[0].note, sel.SetKey) {
+		t.Fatalf("the incarnation's detail (%q) does not name the recovery set this rebuild came from (%s)", incarnations[0].note, sel.SetKey)
+	}
+	if recorded, minted := fake.callIndex("/incarnations"), fake.callIndex("/agent-credentials"); recorded > minted || minted < 0 {
+		t.Fatalf("the incarnation was recorded at call %d and the credentials minted at call %d: the incarnations must come first", recorded, minted)
 	}
 }
 

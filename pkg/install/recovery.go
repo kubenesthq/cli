@@ -504,8 +504,17 @@ func stageRecoveryRepository(ctx context.Context, s *Session) error {
 //
 // Nothing here is replayed from the old host: the cluster's projects, members
 // and windows are the control plane's, and they were never on the dead machine.
+//
+// THE SET THAT BINDS THE CLUSTER IS THE ONE THIS READS, and `workloadSelection`
+// is that set for both recovery shapes: a workload recovery's own set, and — in
+// an all-in-one recovery, where this stage registers the MANAGEMENT cluster —
+// that cluster's own set. It is the artifact this rebuild is described by, and
+// the only one of the two whose binding carries the organisation at all: a
+// control-plane kit belongs to an instance and names no organisation, so it
+// could not confirm a cluster record against anything.
 func stageRecoveryRegister(ctx context.Context, s *Session) error {
-	if s.recoverySel == nil {
+	sel := s.workloadSelection()
+	if sel == nil {
 		return errors.New("the register stage has no recovery set: it runs after the select stage")
 	}
 	client, err := s.recoveryAPI()
@@ -516,9 +525,9 @@ func stageRecoveryRegister(ctx context.Context, s *Session) error {
 	if err != nil {
 		return fmt.Errorf("reading cluster %s to adopt it: %w", s.Jnl.ClusterID, err)
 	}
-	if want := s.recoverySel.Set.Binding.OrganisationID; want != "" && cluster.OrgID != want {
+	if want := sel.Set.Binding.OrganisationID; want != "" && cluster.OrgID != want {
 		return fmt.Errorf("cluster %s is in organisation %s and the recovery set at %s is bound to organisation %s: this set belongs to another cluster, and adopting this one with it would restore another cluster's data here. Nothing has been registered",
-			cluster.ID, cluster.OrgID, s.recoverySel.SetKey, want)
+			cluster.ID, cluster.OrgID, sel.SetKey, want)
 	}
 	s.Opts.Name = cluster.Name
 	s.orgID = cluster.OrgID
@@ -535,7 +544,7 @@ func stageRecoveryRegister(ctx context.Context, s *Session) error {
 	}
 
 	incarnation, err := client.RecordIncarnation(ctx, cluster.ID, "recovery",
-		fmt.Sprintf("rebuilt from recovery set %s on host %s", s.recoverySel.SetKey, s.Opts.Servers[0]))
+		fmt.Sprintf("rebuilt from recovery set %s on host %s", sel.SetKey, s.Opts.Servers[0]))
 	if err != nil {
 		return fmt.Errorf("recording the new physical incarnation of cluster %s: %w", cluster.ID, err)
 	}
