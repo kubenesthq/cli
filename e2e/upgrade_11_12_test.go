@@ -738,6 +738,60 @@ data:
 		if got := strings.Trim(strings.TrimSpace(out2), "'"); got != "2" {
 			t.Errorf("after the recovery the workload has %q ready replicas, want 2", got)
 		}
+
+		// THE ROLLBACK HAS TO HOLD, not merely to have run.
+		//
+		// The restore removed the upgrade's two Plan manifest files from
+		// k3s's auto-deploy directory before it started the server again, and
+		// this dwell is what makes that observable: k3s applies every file in
+		// that directory when the server starts, so a manifest left behind is
+		// re-applied by its deploy controller within seconds and the
+		// system-upgrade controller then cordons and drains a node and
+		// finishes the upgrade again. Lab up, 2026-09-28: k3s came back on the
+		// starting bundle at 11:31:00, the server Plan was re-created at
+		// 11:31:15, the server was drained at 11:31:28 and it was on the
+		// target version at 11:31:48 — the rollback undone outside any
+		// maintenance window, with no operation record and no lock.
+		//
+		// The dwell is deliberately longer than that whole sequence: a check
+		// made immediately after the restore cannot tell a manifest that was
+		// removed from one the deploy controller has not read yet.
+		time.Sleep(postRollbackPlanDwell)
+
+		targetK3s, err := toBundle.Core.Version("k3s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		plans := w12PlanVersions(t, ctx, server)
+		t.Logf("[%s] %s after the rollback the %s namespace holds the Plans %v; the upgrade's target k3s is %s",
+			w12Now(), postRollbackPlanDwell, w12PlanNamespace, plans, targetK3s)
+		for name, version := range plans {
+			if version == targetK3s {
+				t.Errorf("[%s] Plan %s/%s is at %s after the rollback and a %s dwell: the upgrade's manifest file is still in k3s's auto-deploy directory and k3s re-applied it, so the rollback was undone",
+					w12Now(), w12PlanNamespace, name, targetK3s, postRollbackPlanDwell)
+			}
+		}
+
+		forBundleNow := fetchBundle(t, client, env.from)
+		fromK3s, err := forBundleNow.Core.Version("k3s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out3, err := k3s.Kubectl(ctx, server, `get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
+		if err != nil {
+			t.Fatalf("reading the nodes' kubelet versions after the dwell: %v", err)
+		}
+		kubelets := strings.Fields(strings.Trim(out3, "'"))
+		if len(kubelets) != 2 {
+			t.Fatalf("expected two nodes, got %v", kubelets)
+		}
+		for _, got := range kubelets {
+			if got != fromK3s {
+				t.Errorf("a node runs %s after the rollback and a %s dwell, want the starting bundle's %s: the upgrade's own Plan re-ran after the restore and the rollback did not hold",
+					got, postRollbackPlanDwell, fromK3s)
+			}
+		}
+		t.Logf("[%s] both nodes are still on the starting bundle's k3s %s after the dwell", w12Now(), fromK3s)
 	})
 
 	// The datastore restore above restarted k3s, and the readiness gate
@@ -866,4 +920,39 @@ func w12WaitForWorkload(t *testing.T, ctx context.Context, r k3s.Runner) {
 		time.Sleep(5 * time.Second)
 	}
 	t.Fatal("the workload never became ready, so there is nothing to measure")
+}
+
+// w12PlanNamespace is where the upgrade's Plans live: system-upgrade-controller
+// watches that namespace and nothing else.
+const w12PlanNamespace = "system-upgrade"
+
+// postRollbackPlanDwell is how long the post-point-of-no-return arm waits after
+// the datastore restore before it asserts that the rollback held.
+//
+// It has to be longer than the whole sequence it is looking for: k3s's deploy
+// controller reconciles the auto-deploy directory seconds after the server
+// starts, and the system-upgrade controller has re-created (11:31:15), drained
+// the server (11:31:28) and finished the upgrade (11:31:48) in under a minute
+// on lab up, 2026-09-28. Two minutes covers all three with room for a slower
+// host, so a manifest left on disk has had every chance to undo the rollback.
+const postRollbackPlanDwell = 2 * time.Minute
+
+// w12PlanVersions reads every Plan's name and spec.version in the
+// system-upgrade namespace. A Plan is what drives the Kubernetes stage, so a
+// Plan at the target k3s version after a rollback is the upgrade running again.
+func w12PlanVersions(t *testing.T, ctx context.Context, r k3s.Runner) map[string]string {
+	t.Helper()
+	out, err := k3s.Kubectl(ctx, r, fmt.Sprintf(
+		`get plans.upgrade.cattle.io -n %s -o jsonpath='{range .items[*]}{.metadata.name}={.spec.version}{"\n"}{end}'`,
+		w12PlanNamespace))
+	if err != nil {
+		t.Fatalf("reading the %s namespace's Plans: %v", w12PlanNamespace, err)
+	}
+	versions := map[string]string{}
+	for _, line := range strings.Split(strings.Trim(strings.TrimSpace(out), "'"), "\n") {
+		if name, version, ok := strings.Cut(strings.TrimSpace(line), "="); ok && name != "" {
+			versions[name] = version
+		}
+	}
+	return versions
 }

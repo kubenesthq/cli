@@ -129,6 +129,99 @@ func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
 	if !strings.Contains(err.Error(), "encrypted with different token") {
 		t.Errorf("the error does not carry k3s's reason, only: %v", err)
 	}
+	if ranCommand(runner, "rm -f") || ranCommand(runner, "systemctl start k3s") {
+		t.Errorf("a failed cluster-reset still went on to touch the manifest files or start k3s: %v", runner.Commands())
+	}
+}
+
+// k3s applies every file in its auto-deploy directory when the server starts,
+// and the upgrade leaves its two Plan manifests there. The datastore restore
+// does not remove them — the snapshot was taken before they existed — but the
+// files are still on disk, so the first server start after the restore hands
+// them back to k3s's deploy controller and the system-upgrade controller
+// finishes the upgrade the operator just rolled back. Lab up, 2026-09-28: the
+// server came back on bundle 1.1 at 11:31:00, the server Plan was re-created
+// at 11:31:15, the server was drained at 11:31:28 and k3s was back on bundle
+// 1.2 at 11:31:48 — outside any maintenance window, with no operation record
+// and no lock.
+//
+// So a restore removes both manifest files BETWEEN the reset and the start,
+// and this test asserts the order: stop, cluster-reset, remove, start.
+// Removing them after the start would already have replayed the upgrade.
+func TestARestoreRemovesTheUpgradePlanManifestsBeforeItStartsK3s(t *testing.T) {
+	wrote := "pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791"
+	runner := snapshotHost(wrote)
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311"); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+
+	commands := runner.Commands()
+	at := -1
+	for _, step := range []string{"systemctl stop k3s", "--cluster-reset", "rm -f", "systemctl start k3s"} {
+		next := -1
+		for i := at + 1; i < len(commands); i++ {
+			if strings.Contains(commands[i], step) {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			t.Fatalf("the restore never ran %q after its step at position %d; it ran:\n%s",
+				step, at, strings.Join(commands, "\n"))
+		}
+		at = next
+	}
+
+	// Both files, built from the names the upgrade writes them with, in the
+	// directory k3s auto-deploys from. One Plan left behind is enough to
+	// re-run the upgrade on the nodes it selects.
+	var removal string
+	for _, command := range commands {
+		if strings.Contains(command, "rm -f") {
+			removal = command
+			break
+		}
+	}
+	for _, want := range []string{
+		k3s.ManifestDir + "/" + serverPlan + ".yaml",
+		k3s.ManifestDir + "/" + agentPlan + ".yaml",
+	} {
+		if !strings.Contains(removal, want) {
+			t.Errorf("the removal does not name %s, so that Plan stays on disk to re-run the upgrade: %q", want, removal)
+		}
+	}
+}
+
+// A removal that fails stops the rollback BEFORE k3s is started.
+//
+// Nothing else can take those files off disk: the snapshot was taken before
+// they were written, and the datastore restore does not reach the filesystem.
+// Starting k3s with them in place replays the upgrade the operator just rolled
+// back, which is worse than a server left stopped — a stopped server is
+// recoverable by hand, a re-run upgrade is what the restore exists to undo.
+func TestARestoreThatCannotRemoveThePlanManifestsDoesNotStartK3s(t *testing.T) {
+	wrote := "pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791"
+	host := snapshotHost(wrote)
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "rm -f "+k3s.ManifestDir) {
+			return sshx.Result{ExitCode: 1, Stderr: "rm: cannot remove: Read-only file system"}, nil
+		}
+		return host.Respond(command)
+	}}
+
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311")
+	if err == nil {
+		t.Fatal("a restore whose Plan removal failed was reported as done")
+	}
+	if !ranCommand(runner, "rm -f "+k3s.ManifestDir) {
+		t.Fatalf("the restore never even tried to remove the Plan manifests: %v", runner.Commands())
+	}
+	if ranCommand(runner, "systemctl start k3s") {
+		t.Errorf("k3s was started with the Plan manifests still on disk, which re-runs the upgrade the restore just undid: %v", runner.Commands())
+	}
+	if !strings.Contains(err.Error(), "k3s is stopped on this server") {
+		t.Errorf("the failure does not tell the operator the server is stopped and how to bring it back: %v", err)
+	}
 }
 
 // A revert is done when the chart REPORTS the starting bundle's version and its

@@ -236,6 +236,9 @@ func snapshotFile(ctx context.Context, r k3s.Runner, name string) (string, error
 //
 // The snapshot is found on disk BEFORE anything stops, so a snapshot that is
 // missing or ambiguous is refused while the cluster still runs.
+//
+// It also removes the upgrade's Plan manifests from k3s's auto-deploy
+// directory before it starts the server again; the step below says why.
 func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
 	if snapshot == "" {
 		return fmt.Errorf("no datastore snapshot was recorded for this upgrade, so there is nothing to restore to. The stage-2 snapshot is taken before any component moves; an upgrade that failed before it has nothing to roll back")
@@ -244,10 +247,44 @@ func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
 	if err != nil {
 		return fmt.Errorf("finding the datastore snapshot to restore: %w. Nothing was stopped", err)
 	}
+	// The Plan manifests are removed BETWEEN the restore and the start, and
+	// between them for one reason: k3s applies every file in its auto-deploy
+	// directory when the server starts, so a manifest left on disk is handed
+	// to the deploy controller within seconds of the server coming back.
+	//
+	// Neither the restore nor anything else removes them. The Plan object was
+	// created after the snapshot was taken, so the restored datastore does not
+	// contain it — the FILE is what is left, and the file is enough: k3s
+	// recreates the object from it and the system-upgrade controller runs the
+	// upgrade again from there. Lab up, 2026-09-28: k3s came back on the
+	// starting bundle (1.1) at 11:31:00, re-created
+	// system-upgrade/kubenest-k3s-server owned by the Addon at 11:31:15,
+	// cordoned and drained the server at 11:31:28 and was on the target bundle
+	// (1.2) at 11:31:48 — the rollback undone, outside any maintenance window,
+	// with no operation record and no lock, and the drain cost the next arm of
+	// the gate two availability probes.
+	//
+	// A Plan's only purpose is to drive an upgrade, and after a rollback no
+	// upgrade may run, so after a rollback none may survive on disk. `rm -f`
+	// succeeds when a file is already gone, which it will be for an upgrade
+	// that failed before the kubernetes stage ever wrote one.
+	//
+	// Nothing the starting bundle needs is in these two files. A Plan left
+	// behind by an earlier successful upgrade is an object in the restored
+	// datastore and is untouched here, and the next upgrade writes its own
+	// files when it reaches the stage that needs them. Removing them by name
+	// rather than by pattern also keeps this from reaching anything else k3s
+	// auto-deploys.
+	//
+	// If it fails, the rollback stops here, with k3s still stopped: starting
+	// the server with the files in place replays the upgrade the operator just
+	// undid, which is exactly what this restore exists to prevent.
 	steps := []struct{ what, command string }{
 		{"stopping k3s", "sudo -n systemctl stop k3s"},
 		{"restoring the datastore", fmt.Sprintf(
 			"sudo -n k3s server --cluster-reset --cluster-reset-restore-path=%s/%s", snapshotDir, file)},
+		{"removing the upgrade's Plan manifests", fmt.Sprintf(
+			"sudo -n rm -f %s/%s.yaml %s/%s.yaml", k3s.ManifestDir, serverPlan, k3s.ManifestDir, agentPlan)},
 		{"starting k3s", "sudo -n systemctl start k3s"},
 	}
 	for i, step := range steps {
