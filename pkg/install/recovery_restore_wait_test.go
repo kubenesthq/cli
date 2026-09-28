@@ -81,8 +81,16 @@ type syncingVelero struct {
 	// location.
 	locationPhase   string
 	locationMessage string
+	// projectAbsentFor is how many times the cluster is asked about the
+	// namespace's Project before the operator has created it. Zero models a
+	// cluster whose operator has already written the CR.
+	projectAbsentFor int
 
 	listed int
+	// projectReads counts the looks at that Project: every read, and the read
+	// `kubectl annotate` makes before it patches. It is the only clock this
+	// fake has for "the operator has created it by now".
+	projectReads int
 	// opID is the operation id the restore wrote in its pause annotation on the
 	// Project, which is what its own acknowledgement has to carry.
 	opID string
@@ -139,8 +147,20 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 	case strings.Contains(command, "get deployment "+agent.DeploymentName+" -n "+backup.ProjectCRNamespace):
 		return sshx.Result{Stdout: `{"metadata":{"labels":{"helm.sh/chart":` + strconv.Quote(agent.ChartName+"-2.7.0") + `}}}`}, nil
 	case strings.Contains(command, "get project "+recoveryWaitNamespace+" -n "+backup.ProjectCRNamespace):
+		c.projectReads++
+		if !c.projectPresent() {
+			return notFound("projects.kubenest.io", recoveryWaitNamespace), nil
+		}
 		return sshx.Result{Stdout: c.holdDocument()}, nil
 	case strings.Contains(command, "annotate project "+recoveryWaitNamespace):
+		// kubectl annotate READS the object before it patches it, so annotating
+		// a Project the operator has not created yet is the NotFound the
+		// hardware produced: `kubectl annotate project s6-data -n
+		// kubenest-system ... exit 1`.
+		c.projectReads++
+		if !c.projectPresent() {
+			return notFound("projects.kubenest.io", recoveryWaitNamespace), nil
+		}
 		c.opID = pauseOpID(command)
 		return sshx.Result{}, nil
 
@@ -158,6 +178,12 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 	}
 	return sshx.Result{}, nil
 }
+
+// projectPresent reports whether the operator has created the Project of the
+// namespace by now: the first projectAbsentFor looks at it report NotFound, and
+// the object is there from the next one on. Counting LOOKS and not seconds is
+// the only clock a fake runner has.
+func (c *syncingVelero) projectPresent() bool { return c.projectReads > c.projectAbsentFor }
 
 // recordDocument is what a read of the operation record has to answer: the
 // document the CLI last wrote, at the resourceVersion the write returned. A
@@ -459,5 +485,157 @@ func TestARestoreThatFindsTheBackupListedDoesNotWait(t *testing.T) {
 	}
 	if len(s.Record.RecoveryNamespacesRestored) != restored {
 		t.Errorf("a resumed recovery recorded %v, and the namespaces it had already restored are listed twice", s.Record.RecoveryNamespacesRestored)
+	}
+}
+
+// TestTheRestoreWaitsForTheProjectItsOwnerCreates is the second half of the
+// hardware defect (lab s6, 2026-09-28). The restore's first change is the
+// reconcile-pause annotation on the namespace's Project, and on a cluster built
+// minutes earlier that Project does not exist yet: the control plane re-delivers
+// a cluster's projects once its new machine has registered, and the operator
+// then creates each Project CR from the desired state it holds. So the restore
+// has to wait for `get project s6-data -n kubenest-system` to answer before it
+// starts, rather than annotating an object that is not there.
+//
+// THE PLANTED NEGATIVE IS THIS SAME FAKE ON THE OLD CODE: the stage goes
+// straight to RunRestore, whose first change is the annotation, and kubectl
+// answers NotFound — "annotate project s6-data -n kubenest-system ... exit 1",
+// the failure the hardware produced, which names the tool rather than the
+// missing object.
+func TestTheRestoreWaitsForTheProjectItsOwnerCreates(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", projectAbsentFor: 2}
+	s, runner, clock := recoveryWaitSession(t, cluster)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the stage failed on a Project the operator created a moment later, which is the hardware defect: %v", err)
+	}
+
+	// It waited for the Project, and it said what it was waiting for: the
+	// namespace and the re-delivery that brings it back.
+	if clock.slept == 0 {
+		t.Fatal("the stage restored without once looking again, so nothing waited for the operator to create the Project")
+	}
+	if cluster.projectReads <= cluster.projectAbsentFor {
+		t.Fatalf("the Project was looked at %d time(s) and was absent on the first %d, so the run never saw the operator create it", cluster.projectReads, cluster.projectAbsentFor)
+	}
+	requireContains(t, "the wait's progress", stageOutput(t, s),
+		backup.ProjectCRNamespace+"/"+recoveryWaitNamespace, "re-delivers")
+
+	// And then it restored, with the pause on the Project the operator wrote.
+	if !containsString(s.Record.RecoveryNamespacesRestored, recoveryWaitNamespace) {
+		t.Errorf("the stage restored %v, and the namespace the backup covers (%s) is not among them", s.Record.RecoveryNamespacesRestored, recoveryWaitNamespace)
+	}
+	if !runner.ranAny("annotate project " + recoveryWaitNamespace) {
+		t.Errorf("the restore never paused %s, so no restore ran after the wait:\n%s", recoveryWaitNamespace, runner.ranAll())
+	}
+}
+
+// TestTheRestoreFailsNamingTheNamespaceWhenTheProjectNeverArrives is what
+// happens when the control plane never re-delivers the project: the bound runs
+// out and the operator is told which namespace came back empty and that running
+// the same command again is the resume.
+//
+// THE PLANTED NEGATIVE IS WHAT THE HARDWARE SAID: on the old code the stage
+// fails with the raw kubectl annotate failure, which names neither the
+// namespace as a whole nor the fact that nothing was restored for it, and reads
+// as a bug in the CLI rather than a project that has not arrived.
+func TestTheRestoreFailsNamingTheNamespaceWhenTheProjectNeverArrives(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", projectAbsentFor: 1000}
+	s, runner, clock := recoveryWaitSession(t, cluster)
+	start := clock.now
+
+	err := stageRecoveryRestore(context.Background(), s)
+	if err == nil {
+		t.Fatal("the stage reported success on a namespace whose Project never arrived")
+	}
+	if strings.Contains(err.Error(), "annotate project") {
+		t.Fatalf("the failure is the raw kubectl annotate failure the hardware produced, which names the tool rather than the Project that never arrived: %v", err)
+	}
+	requireContains(t, "the failure", err.Error(),
+		recoveryWaitNamespace, backup.ProjectCRNamespace,
+		"never arrived on the rebuilt cluster",
+		"nothing was restored for namespace "+recoveryWaitNamespace,
+		"identical command")
+
+	// The wait was bounded, not endless.
+	deadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		t.Fatalf("the 1.2 manifest has no component-ready deadline: %v", err)
+	}
+	if clock.now.Before(start.Add(deadline)) {
+		t.Errorf("the wait gave up after %s of a %s bound, so it did not wait for the project as long as the bundle allows", clock.now.Sub(start), deadline)
+	}
+
+	// And NOTHING was restored: no pause, no Restore, no namespace recorded.
+	// The namespace is not even recorded as not-restored, because the failure is
+	// resumable: the same command waits for the project again and restores then.
+	if runner.ranAny("annotate", "delete ", "apply -f -", "create -f -", "replace -f -") {
+		t.Errorf("a recovery whose wait for the project ran out still changed the cluster:\n%s", runner.ranAll())
+	}
+	for i, input := range runner.inputs {
+		if len(input) == 0 {
+			continue
+		}
+		if strings.Contains(string(input), `"kind":"Restore"`) || strings.Contains(string(input), "kind: Restore") {
+			t.Errorf("a Velero Restore was created (input %d) although the namespace's Project never arrived:\n%s", i, input)
+		}
+	}
+	if len(s.Record.RecoveryNamespacesRestored) != 0 {
+		t.Errorf("namespaces were recorded as restored (%v) although the wait for the project ran out", s.Record.RecoveryNamespacesRestored)
+	}
+	if len(s.Record.RecoveryNamespacesNotRestored) != 0 {
+		t.Errorf("the namespace was recorded as not restorable (%v), and a resume would then leave it held instead of restoring it", s.Record.RecoveryNamespacesNotRestored)
+	}
+}
+
+// TestARestoreWhoseProjectIsAlreadyThereDoesNotWait guards the other direction:
+// a cluster whose operator has already written the Project — and every resume —
+// restores without spending a look's sleep on it. A wait that always spent its
+// bound would make every resume of a healthy recovery slower than the recovery
+// itself.
+func TestARestoreWhoseProjectIsAlreadyThereDoesNotWait(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available"}
+	s, runner, clock := recoveryWaitSession(t, cluster)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the stage failed although the Project its restore pauses was already on the cluster: %v", err)
+	}
+	if clock.slept != 0 {
+		t.Errorf("the stage slept %d time(s) although both the backup and the Project were there on the first look", clock.slept)
+	}
+	if cluster.projectReads == 0 {
+		t.Error("the stage never looked for the Project, so it cannot have known it was there before pausing it")
+	}
+	if !containsString(s.Record.RecoveryNamespacesRestored, recoveryWaitNamespace) {
+		t.Errorf("the stage restored %v, and the namespace the backup covers (%s) is not among them", s.Record.RecoveryNamespacesRestored, recoveryWaitNamespace)
+	}
+	if !runner.ranAny("annotate project " + recoveryWaitNamespace) {
+		t.Errorf("the restore never paused %s, so no restore ran:\n%s", recoveryWaitNamespace, runner.ranAll())
+	}
+}
+
+// TestAResumedRunDoesNotWaitForAProjectItAlreadyRestored is the third shape of
+// the same wait: a namespace this operation has already restored is skipped
+// before anything looks for its Project, so a resume neither waits for a
+// project nothing will use nor touches the cluster again. The same command is
+// what the operator runs to carry on after a failure, so a wait in front of the
+// skip would make every resume pay the bundle's whole bound.
+func TestAResumedRunDoesNotWaitForAProjectItAlreadyRestored(t *testing.T) {
+	cluster := &syncingVelero{locationPhase: "Available", projectAbsentFor: 1000}
+	s, runner, clock := recoveryWaitSession(t, cluster)
+	s.Record.RecoveryNamespacesRestored = []string{recoveryWaitNamespace}
+	before := len(runner.ran)
+
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("a resumed recovery waited for the Project of a namespace it had already restored: %v", err)
+	}
+	if clock.slept != 0 {
+		t.Errorf("a resumed recovery slept %d time(s) on a namespace it had already restored", clock.slept)
+	}
+	if again := strings.Join(runner.ran[before:], "\n"); strings.Contains(again, "project "+recoveryWaitNamespace) || strings.Contains(again, "annotate") {
+		t.Errorf("a resumed recovery touched the Project of a namespace it had already restored:\n%s", again)
+	}
+	if len(s.Record.RecoveryNamespacesRestored) != 1 {
+		t.Errorf("a resumed recovery recorded %v, and the namespace it had already restored is listed twice", s.Record.RecoveryNamespacesRestored)
 	}
 }

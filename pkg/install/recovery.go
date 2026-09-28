@@ -602,36 +602,99 @@ func (s *Session) recoveryBundleVersion() string {
 // refusal it produces repeats what the last look found plus what Velero says
 // about the location — because "the backup is not on this cluster" is what sent
 // a reader on the hardware to look for a backup that was never the problem.
+//
+// The loop itself is recoveryWait's, shared with the wait for the projects the
+// restore pauses: one clock, one bound, one shape.
 func (s *Session) waitForRecoveryBackup(ctx context.Context, r k3s.Runner, name, namespace string, deadline time.Duration) error {
-	if deadline <= 0 {
-		return errors.New("waiting for Velero to list the backup was given no deadline: every wait in this CLI is bounded by the bundle's limits, and a default here would be an unbounded one")
-	}
-	clock := recoveryRestoreSync
 	backups := backup.NewVeleroBackups(r)
-	stop := clock.Now().Add(deadline)
-	for {
-		_, err := backups.NamedBackup(ctx, namespace, name)
-		if err == nil {
-			s.Logf("  velero lists backup %s: the restore can start", name)
-			return nil
-		}
-		look := "velero's backup-sync controller has not listed it yet"
-		if !errors.Is(err, backup.ErrNoBackup) {
-			look = fmt.Sprintf("velero could not be asked for it: %v", err)
-		}
-		location := s.recoveryStorageLocationReport(ctx, r)
+	// location is what the last look found Velero saying about the storage
+	// location, kept between the progress line and the refusal so that one look
+	// reads it once.
+	var location string
+	wait := recoveryWait{
+		Name:     fmt.Sprintf("velero to list backup %s in namespace %s", name, backup.Namespace),
+		Deadline: deadline,
+		Look: func(ctx context.Context) (bool, string, error) {
+			_, err := backups.NamedBackup(ctx, namespace, name)
+			if err == nil {
+				return true, "", nil
+			}
+			location = s.recoveryStorageLocationReport(ctx, r)
+			if errors.Is(err, backup.ErrNoBackup) {
+				return false, "velero's backup-sync controller has not listed it yet", nil
+			}
+			return false, fmt.Sprintf("velero could not be asked for it: %v", err), nil
+		},
 		// A WAIT THAT PRINTS NOTHING IS A CLI THAT LOOKS HUNG, and this one can
 		// run for the bundle's whole component-ready deadline. Every look
 		// reports the backup and what Velero currently says about the location
 		// it would sync through.
-		s.Logf("  waiting for Velero to list backup %s in namespace %s: %s (last look: %s)", name, backup.Namespace, location, look)
-		if !clock.Now().Before(stop) {
-			return fmt.Errorf("velero has not listed backup %s within %s (limits.timeouts.component-ready), so the restore did not start and no namespace was touched: %s; %s. The bucket holds this backup, and velero's backup-sync controller copies a bucket's backups onto a cluster on its own schedule (its default backup-sync period is one minute) and only after the storage location has validated. Nothing was changed by waiting. Run the recovery again once velero lists the backup — a resume re-runs this stage and does not repeat the stages before it — or restore the workload by hand with `kubenest backup restore --namespace %s --from %s --replace --accept-data-age --confirm`", name, deadline, location, look, namespace, name)
-		}
-		if err := clock.Sleep(ctx, clock.Poll); err != nil {
-			return fmt.Errorf("waiting for Velero to list backup %s in namespace %s: %w", name, backup.Namespace, err)
-		}
+		Report: func(observation string) {
+			s.Logf("  waiting for Velero to list backup %s in namespace %s: %s (last look: %s)", name, backup.Namespace, location, observation)
+		},
+		Refuse: func(observation string) error {
+			return fmt.Errorf("velero has not listed backup %s within %s (limits.timeouts.component-ready), so the restore did not start and no namespace was touched: %s; %s. The bucket holds this backup, and velero's backup-sync controller copies a bucket's backups onto a cluster on its own schedule (its default backup-sync period is one minute) and only after the storage location has validated. Nothing was changed by waiting. Run the recovery again once velero lists the backup — a resume re-runs this stage and does not repeat the stages before it — or restore the workload by hand with `kubenest backup restore --namespace %s --from %s --replace --accept-data-age --confirm`", name, deadline, location, observation, namespace, name)
+		},
 	}
+	if err := wait.run(ctx); err != nil {
+		return err
+	}
+	s.Logf("  velero lists backup %s: the restore can start", name)
+	return nil
+}
+
+// waitForRecoveryProject waits, bounded, until the operator has created the
+// Project of a namespace this restore is about to restore.
+//
+// THE PROJECT HAS TO BE THERE BEFORE THE RESTORE STARTS, BECAUSE THE RESTORE'S
+// FIRST CHANGE IS A PAUSE ON THAT PROJECT. A namespace restore's first write is
+// `kubenest.io/reconcile-paused` on the namespace's Project, and on a cluster
+// built minutes ago that CR is created by the operator from the control plane's
+// desired state: the control plane re-delivers a cluster's projects once its
+// new machine has registered (the register stage above), and the operator then
+// writes each Project CR. On lab s6 (2026-09-28) the restore reached the
+// annotation first and stage 16 failed with `kubectl annotate project s6-data
+// ... exit 1: Error from server (NotFound)`, which names the tool rather than
+// the object that had not arrived.
+//
+// THE LOOK IS THE READ THE RESTORE MAKES ITSELF — `get project <namespace> -n
+// kubenest-system`, through the same reader pkg/backup uses to judge whether a
+// pause was acknowledged (a missing object is reported as no project and no
+// error). A wait with its own idea of what "the project is here" means could
+// pass and then be told by the pause that it is not, which is the failure this
+// wait exists to remove.
+//
+// NOTHING IS MARKED NOT-RESTORED WHEN THE BOUND RUNS OUT. The namespace is
+// untouched and the failure is resumable: the same command re-runs this stage,
+// waits for the project again and restores then. Recording it as not restored
+// would make the resume leave it held for good.
+func (s *Session) waitForRecoveryProject(ctx context.Context, r k3s.Runner, namespace string, deadline time.Duration) error {
+	cluster := backup.NewK3sCluster(r)
+	wait := recoveryWait{
+		Name:     fmt.Sprintf("the project of namespace %s in %s", namespace, backup.ProjectCRNamespace),
+		Deadline: deadline,
+		Look: func(ctx context.Context) (bool, string, error) {
+			hold, err := cluster.ProjectHold(ctx, namespace)
+			if err != nil {
+				return false, "", err
+			}
+			if hold == nil {
+				return false, "the operator has not created it yet", nil
+			}
+			return true, "", nil
+		},
+		Report: func(observation string) {
+			s.Logf("  waiting for Project %s/%s on the rebuilt cluster: %s. The control plane re-delivers this cluster's projects once the new machine registers, and its operator then creates the Project CR from the desired state it holds; the restore pauses that CR before it restores the namespace's data", backup.ProjectCRNamespace, namespace, observation)
+		},
+		Refuse: func(observation string) error {
+			return fmt.Errorf("Project %s/%s never arrived on the rebuilt cluster within %s (limits.timeouts.component-ready): %s, so nothing was restored for namespace %s. The control plane re-delivers a cluster's projects once its new machine has registered, and the operator creates each Project CR in %s from the desired state it then holds — until it does, a restore of this namespace has nothing to pause. Run the identical command again once the Project is there: a resume re-runs this stage and does not repeat the stages before it, and namespace %s is restored then", backup.ProjectCRNamespace, namespace, deadline, observation, namespace, backup.ProjectCRNamespace, namespace)
+		},
+	}
+	if err := wait.run(ctx); err != nil {
+		return err
+	}
+	s.Logf("  Project %s/%s is on the rebuilt cluster: its namespace can be restored", backup.ProjectCRNamespace, namespace)
+	return nil
 }
 
 // recoveryStorageLocationReport describes the BackupStorageLocation kubenest
@@ -699,6 +762,62 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// recoveryWait is one bounded wait in this package: the look that answers it,
+// the progress line a continuing wait prints, and the refusal the bound
+// produces.
+//
+// IT EXISTS SO EVERY BOUNDED WAIT HERE SHARES ONE CLOCK. The clock is
+// injectable only through recoveryRestoreSync, so a wait that grew its own loop
+// would be a second copy of the clock logic to keep in step with the tests —
+// and a bound nobody can test is a bound nobody can trust. What is being waited
+// for stays with the caller: the caller's Look answers that, and its Report and
+// Refuse render the same observation the two waits need to say differently.
+type recoveryWait struct {
+	// Name is the thing being waited for, as a reader of an error or a progress
+	// line has to recognise it.
+	Name string
+	// Deadline bounds the wait. It is always a limit from the bundle manifest,
+	// never a number invented here.
+	Deadline time.Duration
+	// Look asks once whether the thing waited for is here, and describes what
+	// this look found. An error is the look itself failing to be carried out,
+	// which is an OBSERVATION and not a verdict: an API server restarting must
+	// not end a wait the deadline would have let recover. Only the deadline
+	// ends it.
+	Look func(ctx context.Context) (bool, string, error)
+	// Report prints the progress line one continuing look produces. A wait that
+	// prints nothing is a CLI that looks hung, and these waits can run for the
+	// bundle's whole component-ready deadline.
+	Report func(observation string)
+	// Refuse builds the failure the deadline produces, from the last look.
+	Refuse func(observation string) error
+}
+
+// run drives the wait on the recovery clock.
+func (w recoveryWait) run(ctx context.Context) error {
+	if w.Deadline <= 0 {
+		return fmt.Errorf("waiting for %s was given no deadline: every wait in this CLI is bounded by the bundle's limits, and a default here would be an unbounded one", w.Name)
+	}
+	clock := recoveryRestoreSync
+	stop := clock.Now().Add(w.Deadline)
+	for {
+		here, observation, err := w.Look(ctx)
+		if err == nil && here {
+			return nil
+		}
+		if err != nil {
+			observation = fmt.Sprintf("%s could not be read: %v", w.Name, err)
+		}
+		w.Report(observation)
+		if !clock.Now().Before(stop) {
+			return w.Refuse(observation)
+		}
+		if err := clock.Sleep(ctx, clock.Poll); err != nil {
+			return fmt.Errorf("waiting for %s: %w", w.Name, err)
+		}
 	}
 }
 
@@ -788,6 +907,20 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 				}
 				continue
 			}
+		}
+		// THE RESTORE CANNOT START UNTIL THE PROJECT IT PAUSES IS THERE. The
+		// first change a namespace restore makes is the reconcile-pause
+		// annotation on that namespace's Project, and on the rebuilt cluster the
+		// operator creates that CR from the control plane's desired state only
+		// after the control plane has re-delivered the cluster's projects to the
+		// new machine (which the register stage above triggers). On lab s6
+		// (2026-09-28) stage 16 reached the annotation first and failed with
+		// `kubectl annotate project s6-data ... exit 1: Error from server
+		// (NotFound)`, and the namespace stayed un-restored. The bound is the
+		// same bundle deadline the wait for Velero's backup takes, and the
+		// failure names the namespace and resumes with the same command.
+		if err := s.waitForRecoveryProject(ctx, server, namespace, syncDeadline); err != nil {
+			return err
 		}
 		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
 		opts := backup.RestoreOptions{
