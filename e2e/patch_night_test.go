@@ -65,6 +65,7 @@ import (
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/install"
+	"kubenest.io/cli/pkg/interlock"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
@@ -1332,12 +1333,18 @@ func TestS3PatchNightGate(t *testing.T) {
 		for _, node := range nodes[1:] {
 			agentBootBefore[node.address] = pnBootID(t, ctx, node.runner)
 		}
-		// kured's period is the chart's an-hour default, so the reboot can take
-		// up to a period after the opening; the six-hour window keeps the wait
-		// inside it. While an agent is DOWN its boot id cannot be read at all,
-		// and an unreadable host is "keep waiting", never a value — which is
-		// why the polling uses the tolerant read.
-		deadline := opening.Add(75 * time.Minute)
+		// kured's period is the chart's an-hour default, and each node's
+		// kured checks on its own hourly tick. The FIRST agent reboots within
+		// a period of the opening, but the SECOND can find the lock held on its
+		// first tick inside the window and then waits a whole period for the
+		// next: on lab w3 (2026-09-28) the first agent rebooted 19 minutes after
+		// the opening and the second 70 minutes after it, five minutes inside
+		// the 75-minute bound this wait used to have. "One at a time" costs up
+		// to two periods, so the wait is two periods and slack; the six-hour
+		// window keeps it inside. While an agent is DOWN its boot id cannot be
+		// read at all, and an unreadable host is "keep waiting", never a value
+		// — which is why the polling uses the tolerant read.
+		deadline := opening.Add(2*time.Hour + 15*time.Minute)
 		seen := map[string]string{}
 		for time.Now().Before(deadline) {
 			done := true
@@ -1372,6 +1379,25 @@ func TestS3PatchNightGate(t *testing.T) {
 			if pnRebootPending(t, ctx, nodes[i].runner) {
 				t.Errorf("agent %s still carries the reboot marker after rebooting: its pending state did not clear", node.address)
 			}
+		}
+		// THE LAST REBOOT IS NOT OVER WHEN ITS BOOT ID CHANGES. kured holds its
+		// lock until its pod on the rebooted node is back and has uncordoned it,
+		// and the server's manual reboot below refuses while any node holds it:
+		// on lab w3 (2026-09-28) that arm started 12 seconds after the second
+		// agent's new boot id and was refused with "kured's lock is held by
+		// kubenest-lab-w3-3". So the patch night ends when the lock is free.
+		lockDeadline := time.Now().Add(10 * time.Minute)
+		for {
+			_, lock, err := interlock.Holding(ctx, server, pnNodeName(t, ctx, server))
+			if err == nil && (lock.NodeID == "" || interlock.Expired(lock, time.Now())) {
+				t.Logf("[%s] kured's lock is free again: the patch night is over", pnNow())
+				break
+			}
+			if time.Now().After(lockDeadline) {
+				t.Errorf("kured's lock is still held %s after the last agent rebooted (holder %q, err %v): the patch night did not finish", 10*time.Minute, lock.NodeID, err)
+				break
+			}
+			time.Sleep(10 * time.Second)
 		}
 		// The serialisation, from the outside: the watcher sampled the API
 		// server every two seconds throughout.
