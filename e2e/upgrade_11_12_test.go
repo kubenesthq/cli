@@ -734,6 +734,11 @@ data:
 		}
 	})
 
+	// The datastore restore above restarted k3s, and the readiness gate
+	// refuses an upgrade until every node has been Ready for the dwell (lab
+	// up, 2026-09-28: "became Ready only 1m1s ago"). Waited out, not weakened.
+	waitForNodeDwell(t, ctx, server, toBundle)
+
 	// Steps 1b and 2: a `--wait` run from before the window opens, holding
 	// nothing while it waits, performing the clean hop, with the workload
 	// measured throughout.
