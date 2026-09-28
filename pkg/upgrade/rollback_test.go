@@ -106,6 +106,9 @@ func TestRestoringWithoutASnapshotIsRefused(t *testing.T) {
 // nothing but "Starting k3s v1.35.7+k3s1" from a restore that had failed.
 func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
 	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "ls -1 "+snapshotDir) {
+			return sshx.Result{Stdout: "pre-upgrade-1-2-20260928t092620-kubenest-lab-up-1-1790587580\n"}, nil
+		}
 		if strings.Contains(command, "--cluster-reset") {
 			return sshx.Result{ExitCode: 1, Stderr: strings.Join([]string{
 				`time="2026-09-28T09:27:29Z" level=info msg="Starting k3s v1.35.7+k3s1 (cd43afc7)"`,

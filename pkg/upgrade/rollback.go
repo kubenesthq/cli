@@ -176,32 +176,82 @@ func RevertComponents(ctx context.Context, r k3s.Runner, from *manifest.Manifest
 	return nil
 }
 
+// snapshotDir is where k3s keeps its local datastore snapshots.
+const snapshotDir = "/var/lib/rancher/k3s/server/db/snapshots"
+
+// snapshotFile finds the file k3s wrote for a snapshot saved as name.
+//
+// k3s names the file <name>-<node name>-<unix time>, so the name the upgrade
+// asked for is a prefix of the file, never the file (lab up, 2026-09-28: the
+// rollback asked k3s to restore the bare name and k3s answered "snapshot path
+// does not exist"). The exact name is accepted as well, for a record that
+// already holds the file. Two files for one name are refused: which one this
+// upgrade took cannot be told.
+func snapshotFile(ctx context.Context, r k3s.Runner, name string) (string, error) {
+	res, err := r.Run(ctx, "sudo -n ls -1 "+snapshotDir)
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", fmt.Errorf("listing %s: exit %d: %s", snapshotDir, res.ExitCode, firstLine(res.Stderr))
+	}
+	var matches []string
+	for _, file := range strings.Fields(res.Stdout) {
+		if file == name {
+			return file, nil
+		}
+		if strings.HasPrefix(file, name+"-") {
+			matches = append(matches, file)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("no datastore snapshot named %s is in %s on this server", name, snapshotDir)
+	default:
+		return "", fmt.Errorf("%d datastore snapshots in %s start with %s (%s), so which one this upgrade took cannot be told",
+			len(matches), snapshotDir, name, strings.Join(matches, ", "))
+	}
+}
+
 // RestoreSnapshot puts the datastore back to the stage-2 snapshot.
 //
 // This is k3s's own cluster-reset-restore path: the server stops, restores,
 // and comes back with the cluster's objects as they were. It is deliberately
 // not automatic anywhere — an operator asks for it, having been told what it
 // costs.
+//
+// The snapshot is found on disk BEFORE anything stops, so a snapshot that is
+// missing or ambiguous is refused while the cluster still runs.
 func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
 	if snapshot == "" {
 		return fmt.Errorf("no datastore snapshot was recorded for this upgrade, so there is nothing to restore to. The stage-2 snapshot is taken before any component moves; an upgrade that failed before it has nothing to roll back")
 	}
+	file, err := snapshotFile(ctx, r, snapshot)
+	if err != nil {
+		return fmt.Errorf("finding the datastore snapshot to restore: %w. Nothing was stopped", err)
+	}
 	steps := []struct{ what, command string }{
 		{"stopping k3s", "sudo -n systemctl stop k3s"},
 		{"restoring the datastore", fmt.Sprintf(
-			"sudo -n k3s server --cluster-reset --cluster-reset-restore-path=/var/lib/rancher/k3s/server/db/snapshots/%s", snapshot)},
+			"sudo -n k3s server --cluster-reset --cluster-reset-restore-path=%s/%s", snapshotDir, file)},
 		{"starting k3s", "sudo -n systemctl start k3s"},
 	}
-	for _, step := range steps {
+	for i, step := range steps {
 		res, err := r.Run(ctx, step.command)
+		stopped := ""
+		if i > 0 {
+			stopped = ". k3s is stopped on this server: start it with `sudo systemctl start k3s` once the reason above is dealt with"
+		}
 		if err != nil {
-			return fmt.Errorf("%s: %w", step.what, err)
+			return fmt.Errorf("%s: %w%s", step.what, err, stopped)
 		}
 		// cluster-reset exits non-zero in some k3s versions after a
 		// successful restore because it terminates the server it just
 		// reset; the message is what distinguishes the two.
 		if res.ExitCode != 0 && !strings.Contains(res.Stdout+res.Stderr, "has been reset") {
-			return fmt.Errorf("%s: exit %d: %s", step.what, res.ExitCode, k3sReason(res.Stdout+"\n"+res.Stderr))
+			return fmt.Errorf("%s: exit %d: %s%s", step.what, res.ExitCode, k3sReason(res.Stdout+"\n"+res.Stderr), stopped)
 		}
 	}
 	return nil

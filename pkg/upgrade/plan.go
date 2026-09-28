@@ -166,7 +166,12 @@ func stageBackup(ctx context.Context, s *Session) error {
 	if res.ExitCode != 0 {
 		return stages.NewComponentError("k3s", fmt.Errorf("taking the datastore snapshot: exit %d: %s", res.ExitCode, firstLine(res.Stderr)))
 	}
-	s.Record.Snapshot = name
+	// k3s writes <name>-<node>-<unix time>; the rollback restores the file.
+	file, err := snapshotFile(ctx, server, name)
+	if err != nil {
+		return stages.NewComponentError("k3s", fmt.Errorf("finding the datastore snapshot k3s just saved: %w", err))
+	}
+	s.Record.Snapshot = file
 	s.Record.SnapshotAt = s.now().UTC()
 
 	// The workload backup is Velero's, and it is optional in exactly one
@@ -178,7 +183,7 @@ func stageBackup(ctx context.Context, s *Session) error {
 		return stages.NewComponentError("velero", err)
 	}
 	if unconfigured {
-		s.Logf("  no backup target is configured, so no workload backup was taken. The datastore snapshot %s was, and that is what a rollback restores", name)
+		s.Logf("  no backup target is configured, so no workload backup was taken. The datastore snapshot %s was, and that is what a rollback restores", file)
 		return s.saveRecord()
 	}
 	if err := backup.TakeBackup(ctx, server, s.To, name, s.Reporter); err != nil {
