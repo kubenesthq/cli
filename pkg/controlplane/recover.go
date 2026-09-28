@@ -144,13 +144,13 @@ func RecoverySecrets(kitSecrets map[string]string) (Secrets, error) {
 // either case this is not our object, and overwriting it would point a running
 // control plane at another instance's database or silently change the keys that
 // read its stored configuration.
-func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets, resumed bool) (Secrets, error) {
+func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets, ours bool) (Secrets, error) {
 	present, err := readInstallSecret(ctx, r)
 	if err != nil {
 		return Secrets{}, err
 	}
 	if present != nil {
-		return adoptOrRefuse(present, sec, resumed)
+		return adoptOrRefuse(present, sec, ours)
 	}
 	nsDoc := []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + Namespace + "\n")
 	if res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(nsDoc)); err != nil {
@@ -171,7 +171,7 @@ func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets, resum
 		// here: re-read and decide from what is there rather than reporting an
 		// unknown failure.
 		if again, readErr := readInstallSecret(ctx, r); readErr == nil && again != nil {
-			return adoptOrRefuse(again, sec, resumed)
+			return adoptOrRefuse(again, sec, ours)
 		}
 		return Secrets{}, fmt.Errorf("creating secret %s/%s: exit %d: %s", Namespace, SecretName, res.ExitCode, firstLineOf(res.Stderr))
 	}
@@ -206,11 +206,22 @@ var kitDerived = []struct {
 // first run's password, and a new signing key would invalidate every session
 // while a new database password would stop the backend authenticating at all.
 //
-// SO A RESUME ADOPTS THEM. `resumed` says this operation's journal records that
-// it already ran this stage on this host, which is the only case where adopting
-// is safe: on a FIRST run a present Secret is somebody else's, whatever it
-// contains, and is refused.
-func adoptOrRefuse(present map[string]string, want Secrets, resumed bool) (Secrets, error) {
+// SO A RESUME ADOPTS THEM, AND `ours` IS THE OWNERSHIP TEST.
+//
+// It answers "does THIS OPERATION own the objects on this cluster", NOT "did
+// this stage complete": a stage that failed in a later attempt clears its own
+// completion, so a run that completed this stage, then failed it twice on its
+// own bugs, would have been told its own Secret was somebody else's — which is
+// what happened on hardware on 2026-09-28. The caller answers with the
+// journal's record of having BUILT this host (the stage that installed k3s
+// under this same journal): if this operation installed the machine's
+// Kubernetes, every object inside that cluster came from it. A first run cannot
+// reach this stage on a host that already runs Kubernetes, because preflight
+// refuses existing Kubernetes unless this journal is the one that put it there.
+//
+// On a FIRST run a present Secret is somebody else's, whatever it contains, and
+// is refused.
+func adoptOrRefuse(present map[string]string, want Secrets, ours bool) (Secrets, error) {
 	var differs []string
 	for _, field := range kitDerived {
 		got, ok := present[field.name]
@@ -226,8 +237,8 @@ func adoptOrRefuse(present map[string]string, want Secrets, resumed bool) (Secre
 		return Secrets{}, fmt.Errorf("secret %s/%s already exists on this host and is NOT the one this kit describes: %s differ (values are never printed). Those fields come from the recovery kit, so a Secret that disagrees with them belongs to another instance or another kit, and adopting it would point this recovery at a different control plane. Nothing was changed",
 			Namespace, SecretName, strings.Join(differs, ", "))
 	}
-	if !resumed {
-		return Secrets{}, fmt.Errorf("secret %s/%s already exists on this host and this is not a resume of the operation that wrote it: a recovery writes only its own key material onto a FRESH machine, and a control plane that is already running here keeps its own keys, its own databases and the sessions they sign. Nothing was changed. If this host really is the machine this recovery is for, re-run the identical command so it resumes the operation that wrote that Secret",
+	if !ours {
+		return Secrets{}, fmt.Errorf("secret %s/%s already exists on this host and this operation did not build this cluster: a recovery writes only its own key material onto a FRESH machine, and a control plane that is already running here keeps its own keys, its own databases and the sessions they sign. Nothing was changed. If this host really is the machine this recovery is for, run the identical command from the laptop whose journal records installing it",
 			Namespace, SecretName)
 	}
 	adopted := want

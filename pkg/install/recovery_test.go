@@ -1166,3 +1166,50 @@ func TestTheCheckpointStageWaitsForTheDatabasePod(t *testing.T) {
 		t.Fatal("waiting for the database pod with no deadline was accepted")
 	}
 }
+
+// TestTheOwnershipTestSurvivesAFailedLaterAttempt is the measured journal shape
+// of the 2026-09-28 hardware run: the first attempt completed k3s-server and
+// recovery-control-plane, and the two resumes that followed FAILED
+// recovery-control-plane (on the create-only Secret and then on the all-fields
+// comparison). The journal therefore no longer records that stage as completed,
+// and a resume that asked "did recovery-control-plane complete?" would refuse
+// its own Secret for ever.
+func TestTheOwnershipTestSurvivesAFailedLaterAttempt(t *testing.T) {
+	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c33", "org-1", "inst-1", nil)
+	opts := Options{
+		Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server",
+		Recovery: &RecoveryOptions{
+			RestoreFrom: "latest", Kit: "s3", FleetKey: f.fleet.SecretKeyString(),
+			OldHostFenced: true, Kind: recoverykit.KindControlPlane,
+		},
+		ControlPlaneInstall: true, Name: "prod-1", Domain: "example.test",
+	}
+	s, _ := recoverySession(t, opts)
+	now := time.Now().UTC()
+	// The first attempt: it built the host and applied the chart.
+	for _, stage := range []string{StageK3sServer, StageRecoveryControlPlane} {
+		if err := s.Jnl.Append(Entry{Stage: stage, Status: StatusCompleted, At: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !s.recoveryOwnsHost() {
+		t.Fatal("a journal that installed this host's k3s does not count as owning the cluster")
+	}
+	// The resumes that failed this stage afterwards must not change that.
+	if err := s.Jnl.Append(Entry{Stage: StageRecoveryControlPlane, Status: StatusFailed, At: now.Add(time.Minute), Detail: "secret already exists"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, completed := s.Jnl.Completed(StageRecoveryControlPlane); completed {
+		t.Fatal("this fixture does not reproduce the hardware shape: the failed attempt left the stage recorded as completed")
+	}
+	if !s.recoveryOwnsHost() {
+		t.Fatal("a failed later attempt cost this operation ownership of the cluster it built, so a resume would refuse its own install Secret")
+	}
+
+	// And a journal that never installed k3s does NOT own anything: a first run
+	// finding a Secret on a host it did not build must refuse it.
+	fresh, _ := recoverySession(t, opts)
+	if fresh.recoveryOwnsHost() {
+		t.Fatal("an operation that never installed this host's k3s claimed to own the objects in its cluster")
+	}
+}
