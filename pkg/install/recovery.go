@@ -30,6 +30,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/converge"
+	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/recovery"
 	"kubenest.io/cli/pkg/recoverykit"
@@ -581,6 +582,126 @@ func (s *Session) recoveryBundleVersion() string {
 	return s.Opts.Bundle
 }
 
+// waitForRecoveryBackup waits, bounded, until Velero lists the backup this
+// recovery restores.
+//
+// IT WAITS FOR THE BACKUP AND NOT FOR THE STORAGE LOCATION. A location that is
+// Available says Velero can reach the bucket; it does not say Velero has copied
+// anything out of it, and on a cluster that was just built the two moments are
+// minutes apart (lab s6, 2026-09-28). What the restore needs is the Backup
+// object, and the object is what this looks for.
+//
+// THE READ IS THE SAME ONE THE ELIGIBILITY CHECK IN THE STAGE BELOW MAKES, on
+// purpose: a wait with its own idea of what "the backup is on this cluster"
+// means could pass the wait and then be told by the check that it is not there,
+// which is the failure this wait exists to remove.
+//
+// An error that is not "no such backup" is an OBSERVATION, not a verdict: an
+// API server restarting, or a location Velero is rewriting, must not end a wait
+// the deadline would have let recover. Only the deadline ends it, and the
+// refusal it produces repeats what the last look found plus what Velero says
+// about the location — because "the backup is not on this cluster" is what sent
+// a reader on the hardware to look for a backup that was never the problem.
+func (s *Session) waitForRecoveryBackup(ctx context.Context, r k3s.Runner, name, namespace string, deadline time.Duration) error {
+	if deadline <= 0 {
+		return errors.New("waiting for Velero to list the backup was given no deadline: every wait in this CLI is bounded by the bundle's limits, and a default here would be an unbounded one")
+	}
+	clock := recoveryRestoreSync
+	backups := backup.NewVeleroBackups(r)
+	stop := clock.Now().Add(deadline)
+	for {
+		_, err := backups.NamedBackup(ctx, namespace, name)
+		if err == nil {
+			s.Logf("  velero lists backup %s: the restore can start", name)
+			return nil
+		}
+		look := "velero's backup-sync controller has not listed it yet"
+		if !errors.Is(err, backup.ErrNoBackup) {
+			look = fmt.Sprintf("velero could not be asked for it: %v", err)
+		}
+		location := s.recoveryStorageLocationReport(ctx, r)
+		// A WAIT THAT PRINTS NOTHING IS A CLI THAT LOOKS HUNG, and this one can
+		// run for the bundle's whole component-ready deadline. Every look
+		// reports the backup and what Velero currently says about the location
+		// it would sync through.
+		s.Logf("  waiting for Velero to list backup %s in namespace %s: %s (last look: %s)", name, backup.Namespace, location, look)
+		if !clock.Now().Before(stop) {
+			return fmt.Errorf("velero has not listed backup %s within %s (limits.timeouts.component-ready), so the restore did not start and no namespace was touched: %s; %s. The bucket holds this backup, and velero's backup-sync controller copies a bucket's backups onto a cluster on its own schedule (its default backup-sync period is one minute) and only after the storage location has validated. Nothing was changed by waiting. Run the recovery again once velero lists the backup — a resume re-runs this stage and does not repeat the stages before it — or restore the workload by hand with `kubenest backup restore --namespace %s --from %s --replace --accept-data-age --confirm`", name, deadline, location, look, namespace, name)
+		}
+		if err := clock.Sleep(ctx, clock.Poll); err != nil {
+			return fmt.Errorf("waiting for Velero to list backup %s in namespace %s: %w", name, backup.Namespace, err)
+		}
+	}
+}
+
+// recoveryStorageLocationReport describes the BackupStorageLocation kubenest
+// manages, for a progress line and for the refusal the deadline produces: its
+// name and Velero's phase for it, Velero's own message when it left one, and
+// when Velero last validated it. A location that cannot be read at all is
+// reported as that, never as a missing one, because the two call for different
+// afternoons.
+func (s *Session) recoveryStorageLocationReport(ctx context.Context, r k3s.Runner) string {
+	state, err := backup.ReadStorageLocation(ctx, r)
+	if err != nil {
+		return fmt.Sprintf("backupstoragelocation %s could not be read: %v", backup.StorageLocationName, err)
+	}
+	phase := state.Phase
+	if phase == "" {
+		// Velero writes no phase until it has run a validation cycle, and
+		// "Available" is exactly what that is not.
+		phase = "not validated yet"
+	}
+	report := fmt.Sprintf("backupstoragelocation %s is %s", state.Name, phase)
+	if state.Message != "" {
+		report += fmt.Sprintf(" (%s)", state.Message)
+	}
+	if !state.LastValidationTime.IsZero() {
+		report += fmt.Sprintf(", last validated %s", state.LastValidationTime.UTC().Format(time.RFC3339))
+	}
+	return report
+}
+
+// recoveryRestoreClock is the clock a bounded wait in this package runs on, in
+// the shape pkg/backup's RestoreDeps already carries (Now, Poll, Sleep). It is a
+// package variable for the same reason those fields exist: a wait that slept in
+// real time could only be tested by spending the ten minutes the bundle allows
+// it, and a bound nobody can test is a bound nobody can trust.
+type recoveryRestoreClock struct {
+	// Now is the current time, UTC.
+	Now func() time.Time
+	// Poll is how long one wait sleeps between two observations.
+	Poll time.Duration
+	// Sleep waits for the given duration, or until the context is cancelled.
+	Sleep func(ctx context.Context, d time.Duration) error
+}
+
+// recoveryRestoreSync is that clock, with the values this CLI waits on in
+// production: a five-second poll, the same one pkg/backup's restore uses, and a
+// sleep that returns as soon as the operator cancels. A test in this package
+// replaces it with a clock it advances itself.
+var recoveryRestoreSync = recoveryRestoreClock{
+	Now:   func() time.Time { return time.Now().UTC() },
+	Poll:  5 * time.Second,
+	Sleep: sleepContext,
+}
+
+// sleepContext waits for d, or until the context is cancelled. Every wait this
+// CLI drives is interruptible: an operator who stops an install must not be
+// held for the rest of a ten-minute bound.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // stageRecoveryRestore restores every namespace the recovery set's backup
 // covers (PLAN 7.9 step 5).
 //
@@ -615,6 +736,31 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 	}
 	if len(namespaces) == 0 {
 		return fmt.Errorf("the recovery set's backup %q records no namespace coverage, so there is nothing this stage could restore. A backup whose expected set was never recorded cannot be shown to cover anything — restore the workload by hand with `kubenest backup restore --namespace <ns> --from %s --replace --accept-data-age --confirm`", sel.Backup.Name, sel.Backup.Name)
+	}
+	// A BACKUP THE BUCKET HOLDS IS NOT YET AN OBJECT ON A CLUSTER THAT WAS JUST
+	// BUILT, and asking RunRestore for it before Velero has listed it fails the
+	// whole recovery with "is not on this cluster" — which is what stage 16 did
+	// on lab s6 (2026-09-28), against a backup that was never the problem.
+	// Velero's backup-sync controller copies a bucket's backups onto a cluster
+	// on its own schedule (its default backup-sync period is one minute) and
+	// only after the storage location has validated; on that cluster the
+	// location first reported Available, with its last synced time, at
+	// 11:36:58Z, and the backup appeared with it. So wait, bounded, for the
+	// backup to be listed.
+	//
+	// THE DEADLINE IS THE BUNDLE'S, like every other wait in this CLI: a
+	// cluster's component becoming ready is what component-ready bounds, and no
+	// number is invented here.
+	syncDeadline, err := s.Bundle.Limits.Timeouts.For("component-ready")
+	if err != nil {
+		return fmt.Errorf("the bundle declares no component-ready deadline, which is the bound this stage gives Velero's backup-sync controller to list the recovery set's backup: %w", err)
+	}
+	// The read is scoped to one covered namespace because the eligibility
+	// reader judges a backup for a namespace; whether Velero has listed the
+	// backup is a question about the cluster, and the same object is what the
+	// per-namespace judgement below reads.
+	if err := s.waitForRecoveryBackup(ctx, server, sel.Backup.Name, namespaces[0], syncDeadline); err != nil {
+		return err
 	}
 	deps := backup.RestoreDeps{
 		Cluster: backup.NewK3sCluster(server),

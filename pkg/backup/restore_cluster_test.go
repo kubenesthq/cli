@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"kubenest.io/cli/pkg/sshx"
 )
@@ -150,6 +151,9 @@ func TestEveryClusterCommandParsesUnderTheRemoteShell(t *testing.T) {
 	c.ClaimBinding(ctx, "payments", "data-0")
 	c.NodeReady(ctx, "lab-w3-1")
 	c.ControllerOwner(ctx, "payments", "replicaset", "web-6d9f")
+	// The package-level readers a stage outside this package calls: they build
+	// a command like every method above and are covered by the same check.
+	ReadStorageLocation(ctx, r)
 	// Every change.
 	c.AnnotateProject(ctx, "payments", PauseAnnotationKey, "0f3a57c")
 	c.ClearProjectAnnotation(ctx, "payments", PauseAnnotationKey)
@@ -179,5 +183,96 @@ func TestEveryClusterCommandParsesUnderTheRemoteShell(t *testing.T) {
 		if out, err := exec.Command(bash, "-n", "-c", command).CombinedOutput(); err != nil {
 			t.Errorf("the remote shell cannot parse this command, so kubectl would never run it:\n  %s\n  %v: %s", command, err, strings.TrimSpace(string(out)))
 		}
+	}
+}
+
+// A STORAGE LOCATION'S VERDICT IS NOT A BACKUP'S EXISTENCE, and the two
+// questions have to be answerable apart. On lab s6 (2026-09-28) a recovery
+// asked for a backup the bucket held before Velero's backup-sync controller had
+// copied it onto the cluster it had just been installed on: the location
+// validated and synced (the measured cluster reported it Available with
+// status.lastSyncedTime at 11:36:58Z), and the object the recovery asked for
+// was therefore not on the cluster yet, though nothing was wrong with it.
+//
+// SO THE READER HAS TO RETURN WHAT VELERO SAID, in Velero's own terms: the
+// phase, the message it left when it could not reach the store (AccessDenied
+// and a refused connection are different afternoons), and when it last
+// validated. The document below is that measured shape.
+func TestReadStorageLocationReportsThePhaseTheMessageAndTheTimes(t *testing.T) {
+	const document = `{"metadata":{"name":"default"},"status":{` +
+		`"phase":"Unavailable",` +
+		`"message":"AccessDenied: Access Denied: failed to list objects",` +
+		`"lastValidationTime":"2026-09-28T11:30:00Z",` +
+		`"lastSyncedTime":"2026-09-28T11:36:58Z"}}`
+	r := &fakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if !strings.Contains(command, "get backupstoragelocation default -n velero") {
+			t.Errorf("unscripted read: %s", command)
+			return sshx.Result{ExitCode: 1, Stderr: "unscripted"}, nil
+		}
+		return sshx.Result{Stdout: document}, nil
+	}}
+	state, err := ReadStorageLocation(context.Background(), r)
+	if err != nil {
+		t.Fatalf("ReadStorageLocation: %v", err)
+	}
+	if state.Name != "default" || state.Phase != "Unavailable" {
+		t.Errorf("read %s as %q/%q, want the location named default and the phase Velero wrote", state.Name, state.Name, state.Phase)
+	}
+	if !strings.Contains(state.Message, "AccessDenied") {
+		t.Errorf("the message Velero left is not reported (%q), so an unreachable store reads as an unexplained phase", state.Message)
+	}
+	if got := state.LastValidationTime.UTC().Format(time.RFC3339); got != "2026-09-28T11:30:00Z" {
+		t.Errorf("lastValidationTime = %s, want the time Velero recorded (2026-09-28T11:30:00Z)", got)
+	}
+	if got := state.LastSyncedTime.UTC().Format(time.RFC3339); got != "2026-09-28T11:36:58Z" {
+		t.Errorf("lastSyncedTime = %s, want the time Velero recorded (2026-09-28T11:36:58Z)", got)
+	}
+}
+
+// NOT VALIDATED IS NOT AVAILABLE, AND AN ABSENT TIME IS NOT A TIME. Velero
+// writes no phase until it has run a validation cycle and no times until it can
+// reach the store, and a reader that filled either in would clear a location —
+// and a backup behind it — for a cluster whose Velero has looked at nothing
+// yet. An unreadable timestamp is treated the same way: the caller's refusal
+// has to repeat what Velero said, never a date Velero did not write.
+func TestReadStorageLocationDoesNotInventPhaseOrTimes(t *testing.T) {
+	const document = `{"metadata":{},"status":{"lastValidationTime":"not-a-time"}}`
+	r := &fakeRunner{Respond: func(command string) (sshx.Result, error) {
+		return sshx.Result{Stdout: document}, nil
+	}}
+	state, err := ReadStorageLocation(context.Background(), r)
+	if err != nil {
+		t.Fatalf("ReadStorageLocation: %v", err)
+	}
+	if state.Phase != "" {
+		t.Errorf("a location Velero has not validated reports phase %q, so an unvalidated location reads as a usable one", state.Phase)
+	}
+	if !state.LastValidationTime.IsZero() || !state.LastSyncedTime.IsZero() {
+		t.Errorf("times Velero did not write were read as %s / %s", state.LastValidationTime, state.LastSyncedTime)
+	}
+	// The name is the one kubenest manages even when the object did not carry
+	// it: the caller names the location in a refusal, and "" would name nothing.
+	if state.Name != StorageLocationName {
+		t.Errorf("the location reads as %q, want %q", state.Name, StorageLocationName)
+	}
+}
+
+// A LOCATION THAT IS NOT ON THE CLUSTER IS AN ERROR, NEVER AN AVAILABLE ONE. A
+// fresh cluster has no location until the target stage has written it, and a
+// reader that turned that into an empty-but-successful state would let a caller
+// describe a store Velero has never seen as one it is happy with.
+func TestReadStorageLocationFailsWhenTheLocationIsNotThere(t *testing.T) {
+	r := &fakeRunner{Respond: func(command string) (sshx.Result, error) {
+		return sshx.Result{ExitCode: 1, Stderr: `Error from server (NotFound): backupstoragelocations.velero.io "default" not found`}, nil
+	}}
+	state, err := ReadStorageLocation(context.Background(), r)
+	if err == nil {
+		t.Fatal("a cluster with no default BackupStorageLocation was read as a location in good standing")
+	}
+	if !strings.Contains(err.Error(), "default") {
+		t.Errorf("the failure does not name the location it could not read: %v", err)
+	}
+	if state.Phase != "" || state.Name != "" {
+		t.Errorf("a failed read came back with a state: %+v", state)
 	}
 }

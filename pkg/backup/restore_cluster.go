@@ -1635,6 +1635,90 @@ func (v *veleroBackups) coverageRecord(ctx context.Context, name string) (*cover
 	return &record, nil
 }
 
+// StorageLocationState is one BackupStorageLocation as Velero reports it: the
+// verdict of the last validation cycle Velero ran against the store, and when
+// it ran.
+//
+// Phase is Velero's own word, not this CLI's: "Available" once Velero has
+// reached the store with the configuration and credentials it was given,
+// "Unavailable" when it cannot, and empty before it has validated anything.
+// WHETHER A LOCATION IS AVAILABLE IS NOT WHETHER A BACKUP IS ON THIS CLUSTER:
+// on a cluster that was just built the location validates long before Velero's
+// backup-sync controller has copied the bucket's backups in (lab s6,
+// 2026-09-28), and a location that cannot be reached is one reason a backup
+// never appears. Message is Velero's own explanation of a phase that is not
+// Available, and it is what tells AccessDenied from a refused connection. The
+// times are read as Velero writes them: a zero value means Velero recorded
+// none, which is a real state and is never filled in with "now".
+type StorageLocationState struct {
+	// Name is the location's name — kubenest manages one, StorageLocationName.
+	Name string
+	// Phase is Velero's verdict of the store.
+	Phase string
+	// Message is Velero's own explanation, empty when it reported none.
+	Message string
+	// LastValidationTime is when Velero last validated the location, and
+	// LastSyncedTime when it last listed the bucket through it.
+	LastValidationTime time.Time
+	LastSyncedTime     time.Time
+}
+
+// ReadStorageLocation reads the one BackupStorageLocation kubenest manages
+// (StorageLocationName) out of Velero's namespace, with the message Velero left
+// when it could not validate it.
+//
+// It is deliberately not the eligibility reader above: that one maps every
+// location to a phase for judging a backup, and a bare phase cannot say whether
+// Velero has validated anything yet, nor repeat what Velero said when it could
+// not reach the store — which is the part that names the fix.
+func ReadStorageLocation(ctx context.Context, r k3s.Runner) (StorageLocationState, error) {
+	out, err := k3s.Kubectl(ctx, r, "get backupstoragelocation "+StorageLocationName+" -n "+Namespace+" -o json")
+	if err != nil {
+		return StorageLocationState{}, fmt.Errorf("reading BackupStorageLocation %s/%s: %w", Namespace, StorageLocationName, err)
+	}
+	var document struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Status struct {
+			Phase              string `json:"phase"`
+			Message            string `json:"message"`
+			LastValidationTime string `json:"lastValidationTime"`
+			LastSyncedTime     string `json:"lastSyncedTime"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil {
+		return StorageLocationState{}, fmt.Errorf("parsing BackupStorageLocation %s/%s: %w", Namespace, StorageLocationName, err)
+	}
+	state := StorageLocationState{
+		Name:    document.Metadata.Name,
+		Phase:   document.Status.Phase,
+		Message: document.Status.Message,
+	}
+	if state.Name == "" {
+		// The caller names the location in a refusal, and "" names nothing.
+		state.Name = StorageLocationName
+	}
+	state.LastValidationTime = veleroTime(document.Status.LastValidationTime)
+	state.LastSyncedTime = veleroTime(document.Status.LastSyncedTime)
+	return state, nil
+}
+
+// veleroTime parses one of Velero's RFC3339 status timestamps. An absent or
+// unreadable one is reported as NO time rather than as some other instant: a
+// caller's refusal has to repeat what Velero said, and a time Velero did not
+// write would be worse than silence.
+func veleroTime(raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return at
+}
+
 // judgeBackup turns one Velero Backup object into BackupFacts scoped to the
 // namespace the restore is about.
 //
