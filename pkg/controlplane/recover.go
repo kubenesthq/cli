@@ -293,14 +293,20 @@ func readInstallSecret(ctx context.Context, r k3s.Runner) (map[string]string, er
 // into, which is the state the restore needs; present with rows means the load
 // happened; present with no rows is neither, and is refused rather than guessed
 // at.
+// podPGPassword sets PGPASSWORD inside the database pod from the pod's own
+// credential, so no command this CLI sends carries it in an argv. The chart's
+// PostgreSQL mounts it as a file (POSTGRES_PASSWORD_FILE); POSTGRES_PASSWORD is
+// read first for an image that sets the variable instead. Without it psql and
+// pg_restore stop at "Password for user kubenest:" (S11 on lab demo,
+// 2026-09-28). It is meant for a single-quoted `bash -c` in the pod.
+const podPGPassword = `PGPASSWORD="${POSTGRES_PASSWORD:-$(cat "${POSTGRES_PASSWORD_FILE:-/dev/null}")}"`
+
 func DatabaseHasControlPlaneData(ctx context.Context, r k3s.Runner) (bool, string, error) {
 	pod, err := DatabasePod(ctx, r)
 	if err != nil {
 		return false, "", err
 	}
-	// PGPASSWORD comes from the pod's own container environment: the chart's
-	// credential is there, and this command never carries it in its argv.
-	query := "PGPASSWORD=\"$POSTGRES_PASSWORD\" psql -U " + postgresUser + " -d " + postgresDatabase + " -tAc \"SELECT count(*) FROM organization\""
+	query := podPGPassword + " psql -U " + postgresUser + " -d " + postgresDatabase + " -tAc \"SELECT count(*) FROM organization\""
 	res, err := r.RunInput(ctx, "sudo -n k3s kubectl exec -i -n "+Namespace+" "+pod+" -- bash -c '"+query+"'", strings.NewReader(""))
 	if err != nil {
 		return false, "", fmt.Errorf("asking the control plane's database whether it already holds a restored control plane: %w", err)
@@ -456,7 +462,7 @@ func RestoreCheckpoint(ctx context.Context, r k3s.Runner, checkpointKey string, 
 	if err != nil {
 		return err
 	}
-	command := "sudo -n k3s kubectl exec -i -n " + Namespace + " " + pod + " -- pg_restore --no-owner --no-privileges --exit-on-error -U " + postgresUser + " -d " + postgresDatabase
+	command := "sudo -n k3s kubectl exec -i -n " + Namespace + " " + pod + " -- bash -c '" + podPGPassword + " exec pg_restore --no-owner --no-privileges --exit-on-error -U " + postgresUser + " -d " + postgresDatabase + "'"
 	res, err := r.RunInput(ctx, command, bytes.NewReader(plaintext))
 	if err != nil {
 		return fmt.Errorf("loading the checkpoint at %s into %s: %w", checkpointKey, pod, err)
