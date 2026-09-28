@@ -1,7 +1,6 @@
 package install_test
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -117,17 +116,4 @@ func TestTheRegisterStageSendsTheBundleItIsInstalling(t *testing.T) {
 			"is answered from the newest released bundle — not the operator 1.2 declares",
 			body.BundleVersion)
 	}
-}
-
-// runStage runs one stage of the install plan. It is the only way an external
-// test package can drive a stage the package keeps unexported.
-func runStage(t *testing.T, s *install.Session, name string) error {
-	t.Helper()
-	for _, stage := range install.Plan(s) {
-		if stage.Name == name {
-			return stage.Run(context.Background())
-		}
-	}
-	t.Fatalf("the install plan has no %s stage", name)
-	return nil
 }
