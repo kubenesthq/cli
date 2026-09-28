@@ -144,37 +144,103 @@ func RecoverySecrets(kitSecrets map[string]string) (Secrets, error) {
 // either case this is not our object, and overwriting it would point a running
 // control plane at another instance's database or silently change the keys that
 // read its stored configuration.
-func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets) error {
+func EnsureRecoverySecrets(ctx context.Context, r k3s.Runner, sec Secrets, resumed bool) (Secrets, error) {
 	present, err := readInstallSecret(ctx, r)
 	if err != nil {
-		return err
+		return Secrets{}, err
 	}
 	if present != nil {
-		return compareInstallSecret(present, sec)
+		return adoptOrRefuse(present, sec, resumed)
 	}
 	nsDoc := []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + Namespace + "\n")
 	if res, err := r.RunInput(ctx, "sudo -n k3s kubectl apply -f -", bytes.NewReader(nsDoc)); err != nil {
-		return fmt.Errorf("creating namespace %s: %w", Namespace, err)
+		return Secrets{}, fmt.Errorf("creating namespace %s: %w", Namespace, err)
 	} else if res.ExitCode != 0 {
-		return fmt.Errorf("creating namespace %s: exit %d: %s", Namespace, res.ExitCode, firstLineOf(res.Stderr))
+		return Secrets{}, fmt.Errorf("creating namespace %s: exit %d: %s", Namespace, res.ExitCode, firstLineOf(res.Stderr))
 	}
 	doc, err := secretManifest(sec)
 	if err != nil {
-		return err
+		return Secrets{}, err
 	}
 	res, err := r.RunInput(ctx, "sudo -n k3s kubectl create -f -", bytes.NewReader(doc))
 	if err != nil {
-		return fmt.Errorf("writing secret %s/%s: %w", Namespace, SecretName, err)
+		return Secrets{}, fmt.Errorf("writing secret %s/%s: %w", Namespace, SecretName, err)
 	}
 	if res.ExitCode != 0 {
 		// Losing a race with ourselves (a concurrent second recovery) lands
-		// here: re-read and compare rather than reporting an unknown failure.
+		// here: re-read and decide from what is there rather than reporting an
+		// unknown failure.
 		if again, readErr := readInstallSecret(ctx, r); readErr == nil && again != nil {
-			return compareInstallSecret(again, sec)
+			return adoptOrRefuse(again, sec, resumed)
 		}
-		return fmt.Errorf("creating secret %s/%s: exit %d: %s", Namespace, SecretName, res.ExitCode, firstLineOf(res.Stderr))
+		return Secrets{}, fmt.Errorf("creating secret %s/%s: exit %d: %s", Namespace, SecretName, res.ExitCode, firstLineOf(res.Stderr))
 	}
-	return nil
+	return sec, nil
+}
+
+// kitDerived are the fields a recovery takes from the KIT, and they are the
+// test of "is this Secret ours": the same kit must produce the same
+// ENCRYPTION_KEY, the same AGENT_JWT_SECRET and the same authority. A Secret
+// whose kit-derived fields differ belongs to another kit or another instance,
+// and no rule may adopt it.
+var kitDerived = []struct {
+	name string
+	get  func(Secrets) string
+}{
+	{keyEncryptionKey, func(s Secrets) string { return s.EncryptionKey }},
+	{keyAgentJWTSecret, func(s Secrets) string { return s.AgentJWTSecret }},
+	{keyGatewayCACertificate, func(s Secrets) string { return s.GatewayCACertificate }},
+	{keyGatewayCAPrivateKey, func(s Secrets) string { return s.GatewayCAPrivateKey }},
+}
+
+// adoptOrRefuse decides what a PRESENT install Secret means.
+//
+// THE SECRET'S FIELDS ARE NOT ALL THE SAME KIND. The kit-derived four must
+// match exactly — they are the identity the fleet pinned. The OTHER three are
+// generated per run: the user signing key, the database password and the
+// chart's bootstrap administrator password. They are generated freshly by every
+// `RecoverySecrets` call, so a resume that compared them would refuse its own
+// Secret for ever (found on hardware 2026-09-28, one step after the create-only
+// write was fixed) — and, worse, writing new ones would be a DIFFERENT
+// DATABASE: the Postgres pod has already initialised its data volume with the
+// first run's password, and a new signing key would invalidate every session
+// while a new database password would stop the backend authenticating at all.
+//
+// SO A RESUME ADOPTS THEM. `resumed` says this operation's journal records that
+// it already ran this stage on this host, which is the only case where adopting
+// is safe: on a FIRST run a present Secret is somebody else's, whatever it
+// contains, and is refused.
+func adoptOrRefuse(present map[string]string, want Secrets, resumed bool) (Secrets, error) {
+	var differs []string
+	for _, field := range kitDerived {
+		got, ok := present[field.name]
+		switch {
+		case !ok:
+			differs = append(differs, field.name+" (absent)")
+		case got != field.get(want):
+			differs = append(differs, field.name)
+		}
+	}
+	if len(differs) > 0 {
+		sort.Strings(differs)
+		return Secrets{}, fmt.Errorf("secret %s/%s already exists on this host and is NOT the one this kit describes: %s differ (values are never printed). Those fields come from the recovery kit, so a Secret that disagrees with them belongs to another instance or another kit, and adopting it would point this recovery at a different control plane. Nothing was changed",
+			Namespace, SecretName, strings.Join(differs, ", "))
+	}
+	if !resumed {
+		return Secrets{}, fmt.Errorf("secret %s/%s already exists on this host and this is not a resume of the operation that wrote it: a recovery writes only its own key material onto a FRESH machine, and a control plane that is already running here keeps its own keys, its own databases and the sessions they sign. Nothing was changed. If this host really is the machine this recovery is for, re-run the identical command so it resumes the operation that wrote that Secret",
+			Namespace, SecretName)
+	}
+	adopted := want
+	if value, ok := present[keyJWTSecret]; ok {
+		adopted.JWTSecret = value
+	}
+	if value, ok := present[keyPostgresPassword]; ok {
+		adopted.PostgresPassword = value
+	}
+	if value, ok := present[keyAdminPassword]; ok {
+		adopted.AdminPassword = value
+	}
+	return adopted, nil
 }
 
 // readInstallSecret reads the control plane's install Secret, or nil when it is
@@ -203,36 +269,6 @@ func readInstallSecret(ctx context.Context, r k3s.Runner) (map[string]string, er
 		values[key] = string(raw)
 	}
 	return values, nil
-}
-
-// compareInstallSecret reports whether a present Secret is the one this
-// recovery would write, naming the KEYS that differ and never their values.
-func compareInstallSecret(present map[string]string, want Secrets) error {
-	expected := map[string]string{
-		keyJWTSecret:            want.JWTSecret,
-		keyAgentJWTSecret:       want.AgentJWTSecret,
-		keyEncryptionKey:        want.EncryptionKey,
-		keyPostgresPassword:     want.PostgresPassword,
-		keyAdminPassword:        want.AdminPassword,
-		keyGatewayCACertificate: want.GatewayCACertificate,
-		keyGatewayCAPrivateKey:  want.GatewayCAPrivateKey,
-	}
-	var differs []string
-	for key, value := range expected {
-		got, ok := present[key]
-		switch {
-		case !ok:
-			differs = append(differs, key+" (absent)")
-		case got != value:
-			differs = append(differs, key)
-		}
-	}
-	if len(differs) == 0 {
-		return nil
-	}
-	sort.Strings(differs)
-	return fmt.Errorf("secret %s/%s already exists on this host and is NOT the one this recovery writes: %s differ (values are never printed). A recovery writes only its own key material onto a fresh machine — this Secret belongs to a control plane that is already running here, or to a different kit, and overwriting it would point that control plane at a different database or change the keys that read its stored configuration. Nothing was changed",
-		Namespace, SecretName, strings.Join(differs, ", "))
 }
 
 // DatabaseHasControlPlaneData reports whether the database already holds a

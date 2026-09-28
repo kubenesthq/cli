@@ -87,14 +87,92 @@ func recoveryTestSecrets() Secrets {
 func TestAStoppedRecoveryResumesPastItsOwnInstallSecret(t *testing.T) {
 	runner := &secretRunner{}
 	sec := recoveryTestSecrets()
-	if err := EnsureRecoverySecrets(context.Background(), runner, sec); err != nil {
+	if _, err := EnsureRecoverySecrets(context.Background(), runner, sec, false); err != nil {
 		t.Fatalf("the first run could not write its own Secret: %v", err)
 	}
 	if runner.held == nil {
 		t.Fatal("the first run created nothing, so the test proves nothing about a resume")
 	}
-	if err := EnsureRecoverySecrets(context.Background(), runner, sec); err != nil {
+	// The resume runs with FRESH per-run values, which is what the server does
+	// every time it renders them: only the kit-derived fields can be compared.
+	fresh := recoveryTestSecrets()
+	fresh.JWTSecret = "VALUE-a-second-user-signing-key"
+	fresh.PostgresPassword = "VALUE-a-second-database-password"
+	fresh.AdminPassword = "VALUE-a-second-administrator-password"
+	before := len(runner.ran)
+	adopted, err := EnsureRecoverySecrets(context.Background(), runner, fresh, true)
+	if err != nil {
 		t.Fatalf("the resume refused the Secret the first attempt wrote: %v", err)
+	}
+	// It ADOPTS what is on the host, which is what the running database and the
+	// running backend already use.
+	if adopted.PostgresPassword != sec.PostgresPassword || adopted.JWTSecret != sec.JWTSecret || adopted.AdminPassword != sec.AdminPassword {
+		t.Fatalf("the resume adopted generated fields that are not the ones on the host: postgres %v, jwt %v, admin %v (compared by equality with the first run's)",
+			adopted.PostgresPassword == sec.PostgresPassword, adopted.JWTSecret == sec.JWTSecret, adopted.AdminPassword == sec.AdminPassword)
+	}
+	if adopted.EncryptionKey != sec.EncryptionKey || adopted.AgentJWTSecret != sec.AgentJWTSecret {
+		t.Fatal("the resume adopted a kit-derived field from the host instead of the kit")
+	}
+	// AND THE CHART VALUES CARRY THE ADOPTED ONES: a different value would be a
+	// different content-addressed revision, a rolling update, and a backend
+	// that cannot authenticate to the database it was initialised with.
+	values, err := Values(Settings{Domain: "example.test", AdminEmail: "admin@example.test"}, adopted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(values, sec.PostgresPassword) {
+		t.Fatal("the chart values do not carry the database password the host already holds: a resume would roll the backend with a password its database does not accept")
+	}
+	if strings.Contains(values, fresh.PostgresPassword) {
+		t.Fatal("the chart values carry a freshly generated database password instead of the adopted one")
+	}
+	// Nothing was rewritten BY THE RESUME: only the commands it issued are
+	// inspected, because the first run's create is still in the record.
+	for _, command := range runner.ran[before:] {
+		if strings.Contains(command, "kubectl create") || strings.Contains(command, "kubectl apply") {
+			t.Fatalf("the resume wrote the Secret again: %s", command)
+		}
+	}
+}
+
+// TestAKitDerivedFieldThatDiffersIsRefusedOnResume: the comparison that IS the
+// "is this ours" test survives the split. A Secret whose ENCRYPTION_KEY is not
+// this kit's belongs to another instance, and a resume must not adopt it.
+func TestAKitDerivedFieldThatDiffersIsRefusedOnResume(t *testing.T) {
+	runner := &secretRunner{}
+	other := recoveryTestSecrets()
+	other.EncryptionKey = "VALUE-another-instances-encryption-key"
+	runner.held = base64Map(map[string]string{
+		keyJWTSecret:            other.JWTSecret,
+		keyAgentJWTSecret:       other.AgentJWTSecret,
+		keyEncryptionKey:        other.EncryptionKey,
+		keyPostgresPassword:     other.PostgresPassword,
+		keyAdminPassword:        other.AdminPassword,
+		keyGatewayCACertificate: other.GatewayCACertificate,
+		keyGatewayCAPrivateKey:  other.GatewayCAPrivateKey,
+	})
+	_, err := EnsureRecoverySecrets(context.Background(), runner, recoveryTestSecrets(), true)
+	if err == nil {
+		t.Fatal("a resume adopted a Secret whose kit-derived key material is not this kit's")
+	}
+	if !strings.Contains(err.Error(), keyEncryptionKey) {
+		t.Fatalf("the refusal does not name the differing key: %v", err)
+	}
+}
+
+// TestAPresentSecretOnAFirstRunIsRefused: adopting is only for a resume. On a
+// first run a present Secret is somebody else's.
+func TestAPresentSecretOnAFirstRunIsRefused(t *testing.T) {
+	runner := &secretRunner{}
+	runner.held = base64Map(map[string]string{
+		keyJWTSecret: "VALUE-x", keyAgentJWTSecret: recoveryTestSecrets().AgentJWTSecret,
+		keyEncryptionKey:    recoveryTestSecrets().EncryptionKey,
+		keyPostgresPassword: "VALUE-x", keyAdminPassword: "VALUE-x",
+		keyGatewayCACertificate: recoveryTestSecrets().GatewayCACertificate,
+		keyGatewayCAPrivateKey:  recoveryTestSecrets().GatewayCAPrivateKey,
+	})
+	if _, err := EnsureRecoverySecrets(context.Background(), runner, recoveryTestSecrets(), false); err == nil {
+		t.Fatal("a first run adopted a Secret that was already on the host")
 	}
 }
 
@@ -115,7 +193,7 @@ func TestAForeignInstallSecretIsRefused(t *testing.T) {
 		keyGatewayCACertificate: foreign.GatewayCACertificate,
 		keyGatewayCAPrivateKey:  foreign.GatewayCAPrivateKey,
 	}
-	err := EnsureRecoverySecrets(context.Background(), runner, recoveryTestSecrets())
+	_, err := EnsureRecoverySecrets(context.Background(), runner, recoveryTestSecrets(), true)
 	if err == nil {
 		t.Fatal("a Secret belonging to another control plane was accepted")
 	}
