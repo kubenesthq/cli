@@ -90,6 +90,18 @@ type namespaceInventory struct {
 	} `json:"items"`
 }
 
+// projectInventory is the slice of `kubectl get projects -n kubenest-system
+// -o json` the recoverable coverage needs. A Project's NAME is the namespace's
+// name — ProjectHold in restore_cluster.go reads a Project by the namespace it
+// holds — so the names alone are what the intersection needs.
+type projectInventory struct {
+	Items []struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+	} `json:"items"`
+}
+
 // claimInventory is the slice of `kubectl get persistentvolumeclaims
 // --all-namespaces -o json` the record needs, including creationTimestamp,
 // which is how a claim created after the capture started is kept out of the
@@ -301,21 +313,64 @@ func create(ctx context.Context, r k3s.Runner, what string, doc []byte) error {
 	return nil
 }
 
-// CoveredNamespaces names, sorted, the namespaces backup's expected-coverage
-// record says it covers. That record is the only thing that can say what a
-// backup holds, so a backup without one covers nothing a recovery could
-// restore, and this returns none rather than an error.
-func CoveredNamespaces(ctx context.Context, r k3s.Runner, backup string) ([]string, error) {
+// RecoverableCoverage is what a recovery can restore from one backup: the
+// namespaces its expected-coverage record covers that a recovery is able to
+// restore, and whether the backup has an expected-coverage record at all.
+type RecoverableCoverage struct {
+	// Namespaces are the covered namespaces that have a Project in
+	// kubenest-system, sorted.
+	Namespaces []string
+	// Recorded reports whether the backup has an expected-coverage record at
+	// all. A run that records the backup separately reports "no record" from
+	// "a record that names no restorable namespace", and the two are not the
+	// same fact.
+	Recorded bool
+}
+
+// RecoverableNamespaces reads one backup's expected-coverage record and names,
+// sorted, the namespaces in it that a recovery can restore.
+//
+// A RECOVERY RESTORES A NAMESPACE BY PAUSING ITS PROJECT FIRST — the namespace
+// restore writes kubenest.io/reconcile-paused on Project <namespace> in
+// kubenest-system before it touches the namespace — and a --replace restore of
+// a namespace the install itself built would delete a namespace the recovery's
+// own install just created. So the covered namespaces whose name is not a
+// Project in kubenest-system are LEFT OUT: they are the platform namespaces
+// every install builds for itself (cert-manager, openebs, velero and the
+// rest), restoring one is not something a recovery does, and naming one in a
+// recovery set fails the recovery on it — lab s6, 2026-09-28, stage 16
+// recovery-restore could not annotate Project kubenest-system/cert-manager,
+// because no such Project exists.
+//
+// The record is the only thing that can say what a backup holds, so a backup
+// without one covers nothing a recovery could restore: that returns no
+// namespaces and Recorded false, never an error. A Projects listing that fails
+// IS an error, because an empty answer here is read as "nothing to restore".
+func RecoverableNamespaces(ctx context.Context, r k3s.Runner, backup string) (RecoverableCoverage, error) {
 	record, err := (&veleroBackups{runner: r}).coverageRecord(ctx, backup)
 	if err != nil || record == nil {
-		return nil, err
+		return RecoverableCoverage{}, err
 	}
-	names := make([]string, 0, len(record.Namespaces))
+	covered := make(map[string]bool, len(record.Namespaces))
 	for _, ns := range record.Namespaces {
 		if ns.Name != "" {
-			names = append(names, ns.Name)
+			covered[ns.Name] = true
+		}
+	}
+	out, err := k3s.Kubectl(ctx, r, "get projects -n "+ProjectCRNamespace+" -o json")
+	if err != nil {
+		return RecoverableCoverage{}, fmt.Errorf("list the Projects in %s for backup %s's recoverable coverage: %w", ProjectCRNamespace, backup, err)
+	}
+	var projects projectInventory
+	if err := json.Unmarshal([]byte(out), &projects); err != nil {
+		return RecoverableCoverage{}, fmt.Errorf("parsing `kubectl get projects -n %s -o json`: %w", ProjectCRNamespace, err)
+	}
+	names := make([]string, 0, len(projects.Items))
+	for _, item := range projects.Items {
+		if name := item.Metadata.Name; covered[name] {
+			names = append(names, name)
 		}
 	}
 	sort.Strings(names)
-	return names, nil
+	return RecoverableCoverage{Namespaces: names, Recorded: true}, nil
 }

@@ -297,9 +297,10 @@ the control plane runs in the management cluster that --server addresses.`,
 			// The backup is in the bucket; now it has to be FINDABLE. A
 			// completed backup that no recovery set names is a backup nobody
 			// can select on the day it matters.
-			// What the backup covers is what makes it restorable: a recovery
-			// restores exactly the namespaces the set records for its backup.
-			coverage, err := backup.CoveredNamespaces(cmd.Context(), client, name)
+			// What a recovery can restore is what makes it restorable, so the
+			// set records the namespaces a recovery can actually restore from
+			// this backup, not every namespace its coverage record lists.
+			coverage, err := backup.RecoverableNamespaces(cmd.Context(), client, name)
 			if err != nil {
 				return err
 			}
@@ -375,7 +376,7 @@ func envFirst(names ...string) string {
 // than failing: the backup itself succeeded, and the honest report is that
 // nothing will be able to find it. That report is loud, because a bucket full
 // of unselectable backups is the failure this is meant to prevent.
-func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupName string, coverage []string) error {
+func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupName string, coverage backup.RecoverableCoverage) error {
 	journalPath, err := install.JournalPath(clusterName)
 	if err != nil {
 		return err
@@ -432,12 +433,12 @@ func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupNa
 	default:
 		return fmt.Errorf("reading the recovery set at %s: %w", key, err)
 	}
-	set, err = withRecordedBackup(set, backupName, coverage, time.Now().UTC())
+	set, err = withRecordedBackup(set, backupName, coverage.Namespaces, time.Now().UTC())
 	if err != nil {
 		return err
 	}
-	if len(coverage) == 0 {
-		fmt.Fprintf(out, "warning: backup %s has no expected-coverage record, so the recovery set names it without coverage and a recovery will not restore any namespace from it\n", backupName)
+	if len(coverage.Namespaces) == 0 {
+		warnEmptyCoverage(out, backupName, coverage)
 	}
 	body, err := set.Document()
 	if err != nil {
@@ -450,10 +451,34 @@ func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupNa
 	return nil
 }
 
+// warnEmptyCoverage says which of the two reasons a backup the set is being
+// told about will restore no namespace: it has no expected-coverage record at
+// all, or it has one that names no namespace a recovery can restore.
+//
+// THE TWO ARE NOT THE SAME FAILURE, so the words have to separate them: "no
+// record" says the backup's expected set was never written at all, while a
+// record that names no restorable namespace says it was written and holds only
+// namespaces a recovery does not restore — the platform namespaces the install
+// builds for itself. Reporting the second as the first sends the operator
+// looking for a record that is there.
+func warnEmptyCoverage(out io.Writer, backupName string, coverage backup.RecoverableCoverage) {
+	if !coverage.Recorded {
+		fmt.Fprintf(out, "warning: backup %s has no expected-coverage record, so the recovery set names it without coverage and a recovery will not restore any namespace from it\n", backupName)
+		return
+	}
+	fmt.Fprintf(out, "warning: backup %s's expected-coverage record names no namespace with a Project in %s, so the recovery set names it without coverage and a recovery will not restore any namespace from it. Only the platform namespaces the install builds for itself (cert-manager, openebs) have no Project, and a recovery restores a namespace through its Project\n", backupName, backup.ProjectCRNamespace)
+}
+
 // withRecordedBackup is the set once backupName, covering the namespaces in
-// coverage, is recorded in it as completed. The coverage is not decoration: a
-// recovery restores exactly the namespaces its chosen backup covers, and a
-// backup recorded without any is one it selects and then restores nothing from.
+// coverage, is recorded in it as completed.
+//
+// The coverage is the namespaces a recovery can restore from this backup
+// (backup.RecoverableNamespaces), not every namespace the backup's
+// expected-coverage record lists: a recovery restores a namespace by pausing
+// its Project, so the platform namespaces the install builds for itself are
+// not ones it can restore, and recording them makes the recovery fail on the
+// first of them. Coverage is not decoration either: a backup recorded without
+// any is one a recovery selects and then restores nothing from.
 func withRecordedBackup(set *recoverykit.Set, backupName string, coverage []string, at time.Time) (*recoverykit.Set, error) {
 	set, err := set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: at, Coverage: coverage})
 	if err != nil {
