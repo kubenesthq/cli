@@ -4,7 +4,7 @@
 #   core.k3s             v1.35.7+k3s1 -> v1.35.8+k3s1   (the same minor: F18
 #                        grants a temporary exception instead of moving to 1.36;
 #                        see the `kubernetes:` block below)
-#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.1           (the candidate chart,
+#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.2           (the candidate chart,
 #                        from the candidate channel and by digest — see
 #                        `sources:` and `digests:` below. It is the chart that
 #                        carries 1.2's new health producers, the reboot-hold
@@ -72,11 +72,11 @@
 #                            install-instructions chart_ref from it). The stable
 #                            path, oci://ghcr.io/kubenesthq/charts/kubenest-operator-2,
 #                            still serves 2.6.17/d8475a8 and is untouched by a
-#                            candidate cut. The candidate package was PRIVATE
-#                            when this bundle was authored (an anonymous
-#                            `helm pull` is refused until an org admin flips its
-#                            visibility once), so a lab installs it from the op3
-#                            checkout; the digest below is what the bytes are.
+#                            candidate cut. The candidate package is public:
+#                            an anonymous fetch of its manifest was verified on
+#                            2026-09-29, so a cluster installs it from the
+#                            registry like any other chart; the digest below is
+#                            what the bytes are.
 
 bundle: "1.2"
 
@@ -126,9 +126,9 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.7.0-rc.1           # kubenest-operator-2 chart (the agent IS the operator, decision G).
-                                       # 1.2's pin, and the FIRST candidate pin in the catalog.
-                                       # The chart is cut from op3 ab4c3f7 (its appVersion) and
+  kubenest-agent: 2.7.0-rc.2           # kubenest-operator-2 chart (the agent IS the operator, decision G).
+                                       # 1.2's pin, and the catalog's first candidate pin.
+                                       # The chart is cut from op3 c79248b (its appVersion) and
                                        # published to the CANDIDATE channel — a separate OCI
                                        # repository, oci://ghcr.io/kubenesthq/candidate/
                                        # kubenest-operator-2 — never to the stable path, so a
@@ -149,14 +149,13 @@ core:
                                        # health groups whose producer is absent, which is the
                                        # 2.6.10 shape the hub refuses.
                                        #
-                                       # THE CANDIDATE PACKAGE WAS PRIVATE WHEN THIS WAS AUTHORED.
-                                       # An anonymous `helm pull` from the candidate repository is
-                                       # refused until an org admin makes the package public once
-                                       # (the publish workflow's visibility step warned it could not).
-                                       # A lab therefore installs the chart from the op3 checkout;
-                                       # promotion (T7.5) is what puts an equivalent chart back on
-                                       # the stable path, and nothing here advertises the candidate
-                                       # to a candidate-free catalog.
+                                       # WHY rc.2 AND NOT rc.1. 2.7.0-rc.1 (image ab4c3f7) has
+                                       # the same templates, but its operator never activates a
+                                       # maintenance window while every node is held (op3 90c0ed4),
+                                       # so the patch-night scenario S3 cannot pass on it, and it
+                                       # reads every 1.2 cluster as `unknown` in fleet health
+                                       # (kn-hyl7.1, op3 c79248b). rc.2 moves only the image; op3
+                                       # 884e4db is the cut.
                                        #
                                        # The history below is 1.1's pin comment, unchanged. It
                                        # describes 2.6.17 and the charts before it; read it as the
@@ -385,11 +384,11 @@ sources:
   kubenest-agent: oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2
 
 # WHAT THE BUNDLE WAS CUT FROM, BY DIGEST. A version names a release; a digest
-# names bytes. The candidate chart's archive digest, read back from the publish
-# run (op3 chart workflow, 2026-09-27), is the only record of which bytes
-# 2.7.0-rc.1 is in this catalog.
+# names bytes. The candidate chart's digest, read back from the publish run (op3
+# chart workflow run 36573031344, 2026-09-29) and matched by an anonymous `helm
+# pull`, is the only record of which bytes 2.7.0-rc.2 is in this catalog.
 digests:
-  kubenest-agent: sha256:08b6746116c62c75880ccb2f5179182a0f1f69cf293ab5dcdda9efcd80c914f4
+  kubenest-agent: sha256:32aa48fed0909e32fb90c91cc5c38371bb75352a24207fc969380aea63797226
 
 # THE KUBERNETES MINOR, AND WHY IT IS NOT MOVING. Decision B (2026-08-20) says
 # track upstream stable minus one minor. Upstream stable is 1.37 (released

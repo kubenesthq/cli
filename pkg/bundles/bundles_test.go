@@ -128,8 +128,8 @@ func TestTheEmbeddedCatalogCarriesBundle12(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if agent != "2.7.0-rc.1" {
-		t.Errorf("bundle 1.2 pins kubenest-agent %s, want the candidate 2.7.0-rc.1", agent)
+	if agent != "2.7.0-rc.2" {
+		t.Errorf("bundle 1.2 pins kubenest-agent %s, want the candidate 2.7.0-rc.2", agent)
 	}
 	// The declarations. 1.2 is installable and is not security-only (it consumes
 	// the support window), and its window names the eras and the bundles.

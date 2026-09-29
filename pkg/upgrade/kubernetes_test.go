@@ -124,7 +124,7 @@ func TestTheAgentUpgradeMovesTheChartSourceAsWellAsTheVersion(t *testing.T) {
 		wantVersion string
 	}{
 		{"1.1", "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2", "2.6.17"},
-		{"1.2", "oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2", "2.7.0-rc.1"},
+		{"1.2", "oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2", "2.7.0-rc.2"},
 	} {
 		t.Run(tc.bundle, func(t *testing.T) {
 			m, err := bundles.Manifest(tc.bundle)
