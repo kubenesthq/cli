@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"time"
 )
@@ -118,12 +119,20 @@ func NewSet(kit *Kit, versions map[string]string, kitDigest string, now time.Tim
 // WithBackup returns the set with one backup recorded. A backup that did not
 // complete is refused rather than recorded: the set is the list of things a
 // recovery may start from, and a failed one is not one of them.
+//
+// A backup the set already names is not recorded twice. The cluster's operator
+// adds every eligible backup to the set too (op3 pkg/restoredrill, kn-ke7k),
+// often before `kubenest backup now` gets back to it, and its entry carries
+// Velero's own completion time, so the entry already there is the one kept.
 func (s *Set) WithBackup(b Backup) (*Set, error) {
 	if !b.Completed() {
 		return nil, fmt.Errorf("backup %s ended as %q: only a completed backup may be recorded in a recovery set", b.Name, b.Status)
 	}
 	out := *s
-	out.Backups = append(append([]Backup(nil), s.Backups...), b)
+	out.Backups = append([]Backup(nil), s.Backups...)
+	if !slices.ContainsFunc(out.Backups, func(have Backup) bool { return have.Name == b.Name }) {
+		out.Backups = append(out.Backups, b)
+	}
 	cp := copySecrets(s.Checksums)
 	out.Checksums = cp
 	return &out, nil

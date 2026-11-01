@@ -380,6 +380,16 @@ func TestIncompleteBackupIsNeverEligible(t *testing.T) {
 	if !ok || latest.Name != "daily-good" {
 		t.Errorf("latest = %+v (found=%v), want daily-good", latest, ok)
 	}
+	// The operator records eligible backups too (kn-ke7k), so `backup now` can
+	// find its own backup already named. Seen on lab s6, 2026-11-01: the set
+	// named manual-20261101-083105 twice, with two completion times.
+	again, err := good.WithBackup(Backup{Name: "daily-good", Status: "Completed", CompletedAt: testNow, Coverage: []string{"app"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Backups) != 1 || !again.Backups[0].CompletedAt.Equal(testNow.Add(-time.Hour)) {
+		t.Errorf("recording daily-good a second time gave %+v, want the one entry already there", again.Backups)
+	}
 
 	complete := *good
 	complete.Complete = true
