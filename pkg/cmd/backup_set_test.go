@@ -165,3 +165,44 @@ func hasNamespace(names []string, want string) bool {
 	}
 	return false
 }
+
+// judgedBackups answers NamedBackup with the facts a test chooses, per
+// namespace.
+type judgedBackups map[string]backup.BackupFacts
+
+func (j judgedBackups) TerminalBackups(context.Context, string) ([]backup.BackupFacts, error) {
+	return nil, nil
+}
+
+func (j judgedBackups) NamedBackup(_ context.Context, namespace, _ string) (backup.BackupFacts, error) {
+	facts, ok := j[namespace]
+	if !ok {
+		return backup.BackupFacts{}, backup.ErrNoBackup
+	}
+	return facts, nil
+}
+
+// Velero reports Completed for a backup that skipped a volume whose pod was not
+// running. Lab s6, 2026-11-01: manual-20261101-083207 held no copy of
+// s6-data/data and `backup now` still recorded it with coverage [s6-data].
+// Only a backup every covered namespace can be restored from is recorded.
+func TestBackupNowRecordsOnlyARecoveryPointEveryCoveredNamespaceCanUse(t *testing.T) {
+	good := backup.BackupFacts{Name: "manual-1", Phase: "Completed", StorageLocationPhase: "Available"}
+	ctx := context.Background()
+	if err := refuseAnIneligibleRecoveryPoint(ctx, judgedBackups{"app": good, "shop": good}, "manual-1", []string{"app", "shop"}); err != nil {
+		t.Fatalf("a backup with every covered namespace eligible was refused: %v", err)
+	}
+
+	// PLANTED NEGATIVE: the lab's shape — Completed, but one claim has no copy.
+	missing := good
+	missing.Missing = []backup.VolumeRef{{Namespace: "shop", Name: "data"}}
+	err := refuseAnIneligibleRecoveryPoint(ctx, judgedBackups{"app": good, "shop": missing}, "manual-1", []string{"app", "shop"})
+	if err == nil || !strings.Contains(err.Error(), "incomplete-coverage") || !strings.Contains(err.Error(), "shop/data") {
+		t.Fatalf("a backup with no copy of shop/data was recorded, or refused without naming it: %v", err)
+	}
+
+	// PLANTED NEGATIVE: a judgement that cannot be made is a refusal too.
+	if err := refuseAnIneligibleRecoveryPoint(ctx, judgedBackups{"app": good}, "manual-1", []string{"app", "shop"}); err == nil {
+		t.Fatal("a backup whose namespace shop could not be judged was recorded")
+	}
+}

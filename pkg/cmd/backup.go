@@ -304,6 +304,9 @@ the control plane runs in the management cluster that --server addresses.`,
 			if err != nil {
 				return err
 			}
+			if err := refuseAnIneligibleRecoveryPoint(cmd.Context(), backup.NewVeleroBackups(client), name, coverage.Namespaces); err != nil {
+				return err
+			}
 			if err := recordRecoverySet(cmd.Context(), out, conn.Cluster, name, coverage); err != nil {
 				return err
 			}
@@ -362,6 +365,39 @@ func envFirst(names ...string) string {
 		}
 	}
 	return ""
+}
+
+// refuseAnIneligibleRecoveryPoint stops a backup reaching the recovery set
+// unless every namespace it would be recorded as covering is eligible:
+// completed, coverage known, no volume copy missing or failed, and the storage
+// location Available. That is the rule the recovery applies per namespace and
+// the operator applies to the backups it records (op3 pkg/restoredrill,
+// kn-ke7k), so the set holds only what a recovery can restore.
+//
+// VELERO'S PHASE IS NOT ENOUGH. On lab s6 (2026-11-01) manual-20261101-083207
+// ran while its namespace's Deployment was rolling over; Velero skipped the
+// volume, whose pod was not running, and still reported Completed with no
+// warning. Recorded with coverage, it was a recovery point that restores the
+// namespace without its data.
+func refuseAnIneligibleRecoveryPoint(ctx context.Context, source backup.BackupSource, name string, namespaces []string) error {
+	for _, namespace := range namespaces {
+		facts, err := source.NamedBackup(ctx, namespace, name)
+		if err != nil {
+			return fmt.Errorf("backup %s completed, but whether it can restore namespace %s could not be judged, so it was not recorded in the recovery set: %w", name, namespace, err)
+		}
+		if reason := facts.IneligibleReason(); reason != "" {
+			var volumes []string
+			for _, v := range append(append([]backup.VolumeRef(nil), facts.Missing...), facts.Failed...) {
+				volumes = append(volumes, v.Namespace+"/"+v.Name)
+			}
+			detail := ""
+			if len(volumes) > 0 {
+				detail = " (no good copy of " + strings.Join(volumes, ", ") + ")"
+			}
+			return fmt.Errorf("backup %s completed but is not a recovery point for namespace %s: %s%s, so it was not recorded in the recovery set. Take another backup once every workload in %s is running", name, namespace, reason, detail, namespace)
+		}
+	}
+	return nil
 }
 
 // recordRecoverySet adds one completed backup to the cluster's recovery set,
