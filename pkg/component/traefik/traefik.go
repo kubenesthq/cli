@@ -41,9 +41,9 @@ const (
 
 // Values is the chart values document the platform installs Traefik with.
 // Declared as one literal so a reviewer reads the entire ingress posture in
-// one place. Key structure follows chart 41.x (verified against
-// `helm show values traefik/traefik --version 41.4.0`; the platform values
-// render unchanged across 41.2.0 -> 41.4.0 apart from the image tag).
+// one place. Key structure follows charts 41.x and 42.x (the platform values
+// render unchanged across 41.2.0, 41.4.0 and 42.2.0 apart from the image tag
+// and chart labels; 0.9 still pins 41.2.0, so both majors must keep working).
 const Values = `# KubeNest platform ingress posture (kn-pgu).
 providers:
   kubernetesGateway:

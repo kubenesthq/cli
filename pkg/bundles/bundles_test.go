@@ -215,14 +215,14 @@ func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
 }
 
-// SECURITY FLOOR (kn-b49n). Traefik chart 41.4.0 ships Traefik v3.7.12, the
-// lowest version with no open Traefik advisory. The pin this replaced, 41.2.0,
-// shipped v3.7.10, against which seven were open — among them
-// GHSA-5w68-77r2-r64c, a CRITICAL complete authentication bypass in the
-// digestAuth middleware. That one is reachable on a platform cluster rather
-// than theoretical: the chart installs middlewares.traefik.io and pkg/component
-// /traefik runs Traefik with --providers.kubernetescrd, so any project
-// namespace can create the Middleware that triggers it.
+// SECURITY FLOOR (kn-b49n, raised by kn-pofx/kn-0btw). Traefik chart 42.1.1
+// is the first to ship Traefik v3.7.16, the lowest version with no open
+// Traefik advisory (verified 2026-11-01). The pin this replaced, 41.4.0,
+// shipped v3.7.12, against which eighteen were open — among them
+// GHSA-f52w-8j3h-j724, a rootless HTTP/1 request-target that bypasses
+// path-scoped routing and middleware, reachable on any platform entrypoint.
+// The platform-1.2.yaml comment on the pin lists the rest and which of them
+// a platform cluster can reach.
 //
 // The floor applies to the CURRENT bundle only. Older bundles keep the pins
 // that were current when they were cut — that is what platform-0.9.yaml's
@@ -252,12 +252,12 @@ func TestCurrentBundleTraefikPinIsAtOrAboveTheSecurityFloor(t *testing.T) {
 	if _, err := fmt.Sscanf(pin, "%d.%d.%d", &major, &minor, &patch); err != nil {
 		t.Fatalf("bundle %s pins traefik to %q, which is not a chart version: %v", current, pin, err)
 	}
-	const floorMajor, floorMinor, floorPatch = 41, 4, 0
+	const floorMajor, floorMinor, floorPatch = 42, 1, 1
 	below := major < floorMajor ||
 		(major == floorMajor && minor < floorMinor) ||
 		(major == floorMajor && minor == floorMinor && patch < floorPatch)
 	if below {
 		t.Errorf("bundle %s pins traefik chart %s, below the %d.%d.%d security floor "+
-			"(Traefik v3.7.12) — see kn-b49n", current, pin, floorMajor, floorMinor, floorPatch)
+			"(Traefik v3.7.16) — see kn-0btw", current, pin, floorMajor, floorMinor, floorPatch)
 	}
 }
