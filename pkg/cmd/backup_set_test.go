@@ -29,7 +29,7 @@ func TestABackupRecordedWithItsCoverageIsOneARecoveryRestores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	set, err := withRecordedBackup(baseline, "manual-1", []string{"app", "shop"}, time.Now().UTC())
+	set, err := withRecordedBackup(baseline, "manual-1", backup.RecoverableCoverage{Namespaces: []string{"app", "shop"}}, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestABackupNowRecordsOnlyTheNamespacesARecoveryCanRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	set, err := withRecordedBackup(baseline, "manual-1", coverage.Namespaces, time.Now().UTC())
+	set, err := withRecordedBackup(baseline, "manual-1", coverage, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +111,17 @@ func TestABackupNowRecordsOnlyTheNamespacesARecoveryCanRestore(t *testing.T) {
 	}
 	if skip != "" {
 		t.Fatalf("a recovery from this set would skip its restore: %q", skip)
+	}
+	// The set carries the record itself: a rebuilt cluster has no other copy
+	// to judge the backup's volumes against (kn-jl7n).
+	var carried struct {
+		Backup     string `json:"backup"`
+		Namespaces []struct {
+			Name string `json:"name"`
+		} `json:"namespaces"`
+	}
+	if err := json.Unmarshal(chosen.CoverageRecord, &carried); err != nil || carried.Backup != "manual-1" || len(carried.Namespaces) != 4 {
+		t.Errorf("the set's entry for manual-1 does not carry its coverage record (got %q, %v)", chosen.CoverageRecord, err)
 	}
 	if strings.Join(chosen.Coverage, ",") != "s6-data,shop" {
 		t.Errorf("the set records %v for %s, want only the namespaces a recovery can restore", chosen.Coverage, chosen.Name)

@@ -167,8 +167,25 @@ func recordExpectedCoverage(ctx context.Context, r k3s.Runner, name string) erro
 	if err != nil {
 		return fmt.Errorf("encode the expected coverage record for %s: %w", name, err)
 	}
+	doc, err := coverageRecordDoc(name, created.Metadata.UID, string(payload))
+	if err != nil {
+		return err
+	}
+	if err := create(ctx, r, "coverage record for backup "+name, doc); err != nil {
+		if strings.Contains(err.Error(), "AlreadyExists") {
+			// First writer wins. A record that already exists was enumerated
+			// when this backup started and must not be replaced by a later one.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
 
-	doc, err := yaml.Marshal(map[string]any{
+// coverageRecordDoc is the record's ConfigMap: the labels both writers set,
+// owned by the Backup so Velero's TTL takes it with the backup.
+func coverageRecordDoc(name, uid, payload string) ([]byte, error) {
+	return yaml.Marshal(map[string]any{
 		"apiVersion": "v1",
 		"kind":       "ConfigMap",
 		"metadata": map[string]any{
@@ -184,23 +201,11 @@ func recordExpectedCoverage(ctx context.Context, r k3s.Runner, name string) erro
 				"apiVersion": "velero.io/v1",
 				"kind":       "Backup",
 				"name":       name,
-				"uid":        created.Metadata.UID,
+				"uid":        uid,
 			}},
 		},
-		"data": map[string]string{coverageRecordKey: string(payload)},
+		"data": map[string]string{coverageRecordKey: payload},
 	})
-	if err != nil {
-		return err
-	}
-	if err := create(ctx, r, "coverage record for backup "+name, doc); err != nil {
-		if strings.Contains(err.Error(), "AlreadyExists") {
-			// First writer wins. A record that already exists was enumerated
-			// when this backup started and must not be replaced by a later one.
-			return nil
-		}
-		return err
-	}
-	return nil
 }
 
 // expectedCoverage enumerates the namespaces and claims a backup is expected to
@@ -325,6 +330,9 @@ type RecoverableCoverage struct {
 	// "a record that names no restorable namespace", and the two are not the
 	// same fact.
 	Recorded bool
+	// Record is the expected-coverage record itself, which the recovery set
+	// carries so a rebuilt cluster can judge the backup (RestoreCoverageRecord).
+	Record json.RawMessage
 }
 
 // RecoverableNamespaces reads one backup's expected-coverage record and names,
@@ -372,5 +380,42 @@ func RecoverableNamespaces(ctx context.Context, r k3s.Runner, backup string) (Re
 		}
 	}
 	sort.Strings(names)
-	return RecoverableCoverage{Namespaces: names, Recorded: true}, nil
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return RecoverableCoverage{}, fmt.Errorf("encode backup %s's coverage record for the recovery set: %w", backup, err)
+	}
+	return RecoverableCoverage{Namespaces: names, Recorded: true, Record: raw}, nil
+}
+
+// RestoreCoverageRecord puts a backup's expected-coverage record, as the
+// recovery set carries it, back on a rebuilt cluster, so the per-namespace
+// judgement measures Velero's synced copies against what the backup was
+// expected to hold.
+//
+// It REPLACES whatever record is there. On a rebuilt cluster the record's
+// ConfigMap died with the old host, and any record present now was enumerated
+// after the fact against claims created after the backup — an expected set
+// with no volumes in it, which passes every check without making one
+// (kn-jl7n).
+func RestoreCoverageRecord(ctx context.Context, r k3s.Runner, name string, record json.RawMessage) error {
+	var parsed coverageRecord
+	if err := json.Unmarshal(record, &parsed); err != nil {
+		return fmt.Errorf("the recovery set's coverage record for backup %s is not readable: %w", name, err)
+	}
+	if parsed.Backup != name {
+		return fmt.Errorf("the recovery set's coverage record for backup %s names backup %q", name, parsed.Backup)
+	}
+	uid, err := k3s.Kubectl(ctx, r, "get backup "+name+" -n "+Namespace+" -o jsonpath='{.metadata.uid}'")
+	if err != nil {
+		return fmt.Errorf("read backup %s to own its coverage record: %w", name, err)
+	}
+	uid = strings.Trim(strings.TrimSpace(uid), "'")
+	if uid == "" {
+		return fmt.Errorf("backup %s in %s has no UID, so its coverage record cannot be owned by it", name, Namespace)
+	}
+	doc, err := coverageRecordDoc(name, uid, string(record))
+	if err != nil {
+		return err
+	}
+	return apply(ctx, r, "coverage record for backup "+name, doc)
 }

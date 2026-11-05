@@ -17,6 +17,8 @@ import (
 	"kubenest.io/cli/pkg/recovery"
 	"kubenest.io/cli/pkg/recoverykit"
 	"kubenest.io/cli/pkg/sshx"
+
+	"gopkg.in/yaml.v3"
 )
 
 // THE HARDWARE DEFECT THESE TESTS ARE ABOUT (lab s6, 2026-09-28). Stage 16 ran
@@ -115,6 +117,29 @@ type syncingVelero struct {
 	// read of it has to answer with.
 	record []byte
 	rv     int
+	// setRecord is the coverage record the recovery set's entry carries; nil
+	// means recoveryWaitRecord with no volumes. omitSetRecord publishes the
+	// entry with none at all.
+	setRecord     json.RawMessage
+	omitSetRecord bool
+	// coverage is the coverage record the CLI applied to this cluster. Until it
+	// applies one, the cluster holds the record its new operator wrote after the
+	// fact: the namespace, with no volumes (kn-jl7n).
+	coverage json.RawMessage
+}
+
+// recoveryWaitRecord is a coverage record for the backup the recovery restores,
+// naming the given volumes of its namespace.
+func recoveryWaitRecord(volumes ...string) json.RawMessage {
+	refs := []map[string]any{}
+	for _, volume := range volumes {
+		refs = append(refs, map[string]any{"namespace": recoveryWaitNamespace, "name": volume, "uid": volume + "-uid"})
+	}
+	record, _ := json.Marshal(map[string]any{
+		"backup":     recoveryWaitBackup,
+		"namespaces": []map[string]any{{"name": recoveryWaitNamespace, "uid": "namespace-uid", "volumes": refs}},
+	})
+	return record
 }
 
 // mount wires the fake to the session's runner.
@@ -156,6 +181,20 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 			return notFound("configmaps", name), nil
 		}
 		return sshx.Result{Stdout: string(doc)}, nil
+
+	// The coverage record the recovery puts back from the set, owned by the
+	// synced Backup.
+	case strings.Contains(command, "get backup "+recoveryWaitBackup+" -n "+backup.Namespace+" -o jsonpath='{.metadata.uid}'"):
+		return sshx.Result{Stdout: "backup-uid"}, nil
+	case strings.Contains(command, "kubectl apply -f -") && strings.Contains(string(lastInput(runner)), backup.CoverageRecordName(recoveryWaitBackup)):
+		var applied struct {
+			Data map[string]string `yaml:"data"`
+		}
+		if err := yaml.Unmarshal(lastInput(runner), &applied); err != nil {
+			return sshx.Result{ExitCode: 1, Stderr: err.Error()}, nil
+		}
+		c.coverage = json.RawMessage(applied.Data["coverage.json"])
+		return sshx.Result{}, nil
 
 	// The backup the recovery restores. The bucket holds it; whether Velero has
 	// listed it is exactly what the stage under test has to wait for.
@@ -298,16 +337,9 @@ func (c *syncingVelero) locationDocument() string {
 // backup: the namespace it covers, with no volumes, because a namespace with
 // nothing to copy is still covered and eligible.
 func (c *syncingVelero) coverageDocument() string {
-	record, err := json.Marshal(map[string]any{
-		"backup": recoveryWaitBackup,
-		"namespaces": []map[string]any{{
-			"name":    recoveryWaitNamespace,
-			"uid":     "namespace-uid",
-			"volumes": []map[string]any{},
-		}},
-	})
-	if err != nil {
-		return "{}"
+	record := c.coverage
+	if record == nil {
+		record = recoveryWaitRecord()
 	}
 	doc, err := json.Marshal(map[string]any{"data": map[string]string{"coverage.json": string(record)}})
 	if err != nil {
@@ -418,11 +450,16 @@ func pauseOpID(command string) string {
 func recoveryWaitSession(t *testing.T, cluster *syncingVelero) (*Session, *recordingRunner, *fakeRestoreClock) {
 	t.Helper()
 	f := newRecoveryFixture(t, "01a02362-f8a3-7dd6-aa07-2f10ed7a5c50", "org-1", "inst-1", nil)
+	setRecord := cluster.setRecord
+	if setRecord == nil && !cluster.omitSetRecord {
+		setRecord = recoveryWaitRecord()
+	}
 	f.publish(t, f.bind, "20260928T113029Z-cccccccc", f.secrets, nil, true, recoverykit.Backup{
-		Name:        recoveryWaitBackup,
-		CompletedAt: time.Date(2026, 9, 28, 11, 30, 29, 0, time.UTC),
-		Coverage:    []string{recoveryWaitNamespace},
-		Status:      "Completed",
+		Name:           recoveryWaitBackup,
+		CompletedAt:    time.Date(2026, 9, 28, 11, 30, 29, 0, time.UTC),
+		Coverage:       []string{recoveryWaitNamespace},
+		Status:         "Completed",
+		CoverageRecord: setRecord,
 	})
 	sel, err := recovery.Select(context.Background(), f.bucket, recoveryTestScope, f.request())
 	if err != nil {
@@ -678,8 +715,14 @@ func TestTheRestoreFailsNamingTheNamespaceWhenTheProjectNeverArrives(t *testing.
 	// And NOTHING was restored: no pause, no Restore, no namespace recorded.
 	// The namespace is not even recorded as not-restored, because the failure is
 	// resumable: the same command waits for the project again and restores then.
-	if runner.ranAny("annotate", "delete ", "apply -f -", "create -f -", "replace -f -") {
+	// The one write is the backup's coverage record, put back from the set.
+	if runner.ranAny("annotate", "delete ", "create -f -", "replace -f -") {
 		t.Errorf("a recovery whose wait for the project ran out still changed the cluster:\n%s", runner.ranAll())
+	}
+	for _, input := range runner.inputs {
+		if len(input) > 0 && !strings.Contains(string(input), backup.CoverageRecordName(recoveryWaitBackup)) {
+			t.Errorf("a recovery whose wait for the project ran out applied something other than the coverage record:\n%s", input)
+		}
 	}
 	for i, input := range runner.inputs {
 		if len(input) == 0 {
@@ -959,5 +1002,39 @@ func TestAnOlderRecoveryActivationReadsTheRestoreFromTheProject(t *testing.T) {
 	}
 	if !containsString(s.Record.RecoveryNamespacesActivated, recoveryWaitNamespace) {
 		t.Errorf("the activation recorded %v, and the namespace it activated is not among them", s.Record.RecoveryNamespacesActivated)
+	}
+}
+
+// TestARecoveryJudgesTheBackupAgainstTheRecordTheSetCarries is kn-jl7n. The
+// backup's coverage record died with the old host, and the rebuilt cluster's
+// operator wrote one after the fact with no volumes in it, which passes "no
+// missing or failed volume" without checking anything. The recovery puts the
+// set's own copy back and judges against that.
+//
+// PLANTED NEGATIVES: the set's record names s6-data/data and the backup holds
+// no copy of it, so the namespace is held; and an entry that carries no
+// record cannot be judged, so it is held too. The positive is every other test
+// in this file, whose set record names no volumes and restores.
+func TestARecoveryJudgesTheBackupAgainstTheRecordTheSetCarries(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cluster *syncingVelero
+		reason  string
+	}{
+		{"a volume the backup never copied", &syncingVelero{locationPhase: "Available", setRecord: recoveryWaitRecord("data")}, "incomplete-coverage"},
+		{"no record in the set", &syncingVelero{locationPhase: "Available", omitSetRecord: true}, "carries no coverage record"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runner, _ := recoveryWaitSession(t, tc.cluster)
+			if err := stageRecoveryRestore(context.Background(), s); err != nil {
+				t.Fatalf("the stage failed instead of holding the namespace: %v", err)
+			}
+			if containsString(s.Record.RecoveryNamespacesRestored, recoveryWaitNamespace) || runner.ranAny("annotate project "+recoveryWaitNamespace) {
+				t.Fatalf("namespace %s was restored from a backup whose volumes were judged against nothing:\n%s", recoveryWaitNamespace, runner.ranAll())
+			}
+			if !containsString(s.Record.RecoveryNamespacesNotRestored, recoveryWaitNamespace) || !strings.Contains(s.Record.RecoveryRestoreSkipReason, tc.reason) {
+				t.Errorf("namespace %s is not held with reason %q: held %v, reason %q", recoveryWaitNamespace, tc.reason, s.Record.RecoveryNamespacesNotRestored, s.Record.RecoveryRestoreSkipReason)
+			}
+		})
 	}
 }

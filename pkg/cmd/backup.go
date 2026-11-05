@@ -469,7 +469,7 @@ func recordRecoverySet(ctx context.Context, out io.Writer, clusterName, backupNa
 	default:
 		return fmt.Errorf("reading the recovery set at %s: %w", key, err)
 	}
-	set, err = withRecordedBackup(set, backupName, coverage.Namespaces, time.Now().UTC())
+	set, err = withRecordedBackup(set, backupName, coverage, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -515,8 +515,8 @@ func warnEmptyCoverage(out io.Writer, backupName string, coverage backup.Recover
 // not ones it can restore, and recording them makes the recovery fail on the
 // first of them. Coverage is not decoration either: a backup recorded without
 // any is one a recovery selects and then restores nothing from.
-func withRecordedBackup(set *recoverykit.Set, backupName string, coverage []string, at time.Time) (*recoverykit.Set, error) {
-	set, err := set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: at, Coverage: coverage})
+func withRecordedBackup(set *recoverykit.Set, backupName string, coverage backup.RecoverableCoverage, at time.Time) (*recoverykit.Set, error) {
+	set, err := set.WithBackup(recoverykit.Backup{Name: backupName, Status: "Completed", CompletedAt: at, Coverage: coverage.Namespaces, CoverageRecord: coverage.Record})
 	if err != nil {
 		return nil, err
 	}

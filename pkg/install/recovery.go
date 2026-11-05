@@ -907,6 +907,18 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 	if err := s.waitForRecoveryBackup(ctx, server, sel.Backup.Name, namespaces[0], syncDeadline); err != nil {
 		return err
 	}
+	// THE EXPECTED SET COMES FROM THE RECOVERY SET, NOT FROM THIS CLUSTER. The
+	// backup's coverage record died with the old host, and a record this
+	// cluster's operator wrote since was enumerated against claims created
+	// after the backup: no volumes, so it passes every check without making
+	// one (kn-jl7n). An entry with no record cannot be judged, so nothing is
+	// restored from it.
+	noRecord := ""
+	if len(sel.Backup.CoverageRecord) == 0 {
+		noRecord = fmt.Sprintf("the recovery set carries no coverage record for backup %s, so its volume copies cannot be checked", sel.Backup.Name)
+	} else if err := backup.RestoreCoverageRecord(ctx, server, sel.Backup.Name, sel.Backup.CoverageRecord); err != nil {
+		return err
+	}
 	deps := recoveryRestoreDeps(server)
 	for _, namespace := range namespaces {
 		if containsString(s.Record.RecoveryNamespacesRestored, namespace) {
@@ -919,15 +931,23 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		// (the cluster does not exist yet); this is where the rest is knowable.
 		// An INELIGIBLE backup is skipped with its reason, never failed: the
 		// namespaces stay held and the report says why.
-		if facts, err := backup.NewVeleroBackups(server).NamedBackup(ctx, namespace, sel.Backup.Name); err == nil {
-			if reason := facts.IneligibleReason(); reason != "" {
-				s.Logf("  NOT restoring namespace %s: %s", namespace, reason)
-				markNotRestored(s, namespace, reason)
-				if err := s.saveRecord(); err != nil {
-					return err
-				}
-				continue
+		// A judgement that cannot be made stops the stage: a namespace is
+		// never restored unjudged, and the same command resumes here.
+		reason := noRecord
+		if reason == "" {
+			facts, err := backup.NewVeleroBackups(server).NamedBackup(ctx, namespace, sel.Backup.Name)
+			if err != nil {
+				return fmt.Errorf("judging backup %s for namespace %s: %w", sel.Backup.Name, namespace, err)
 			}
+			reason = facts.IneligibleReason()
+		}
+		if reason != "" {
+			s.Logf("  NOT restoring namespace %s: %s", namespace, reason)
+			markNotRestored(s, namespace, reason)
+			if err := s.saveRecord(); err != nil {
+				return err
+			}
+			continue
 		}
 		// THE RESTORE CANNOT START UNTIL THE PROJECT IT PAUSES IS THERE. The
 		// first change a namespace restore makes is the reconcile-pause

@@ -62,6 +62,12 @@ type Backup struct {
 	CompletedAt time.Time `json:"completed_at"`
 	Coverage    []string  `json:"coverage,omitempty"`
 	Status      string    `json:"status"`
+	// CoverageRecord is the backup's expected-coverage record (coverage.json),
+	// verbatim, as it stood when the backup was judged eligible. The record's
+	// ConfigMap dies with the host and the velero namespace is never backed up,
+	// so this copy is the only one a rebuilt cluster can judge the backup's
+	// volume copies against (kn-jl7n).
+	CoverageRecord json.RawMessage `json:"coverage_record,omitempty"`
 }
 
 // Completed reports whether this backup finished. A partial or failed upload
