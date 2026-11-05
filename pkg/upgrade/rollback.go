@@ -173,7 +173,21 @@ func RevertComponents(ctx context.Context, r k3s.Runner, from *manifest.Manifest
 			return err
 		}
 	}
-	return nil
+	return revertAgent(ctx, r, from, rep, log)
+}
+
+// revertAgent takes the operator back to the starting bundle's chart. The agent
+// is its own upgrade stage rather than a core component, so the loop above
+// never touched it, and a cluster recorded as rolled back kept the target
+// bundle's operator (kn-oymc). It rewrites the agent's manifest file, which is
+// what k3s re-applies on every start, and waits for that operator to run.
+func revertAgent(ctx context.Context, r k3s.Runner, from *manifest.Manifest, rep converge.Reporter, log func(string, ...any)) error {
+	version, err := from.Core.Version("kubenest-agent")
+	if err != nil || version == "" {
+		return nil
+	}
+	log("  reverting kubenest-agent to %s", version)
+	return stages.NewComponentError("kubenest-agent", upgradeAgentChart(ctx, r, from, version, rep))
 }
 
 // revertComponent reinstalls one component at the starting bundle's pin AND

@@ -198,3 +198,50 @@ const agentValues11 = "kubenest:\n  jwtSecret: placeholder-jwt\n  clusterId: 01a
 var agentManifest11 = "apiVersion: helm.cattle.io/v1\nkind: HelmChart\nmetadata:\n  name: operator\n  namespace: kube-system\nspec:\n" +
 	"  chart: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2\n  version: 2.6.17\n  targetNamespace: kubenest-system\n" +
 	"  failurePolicy: abort\n  valuesContent: |\n    kubenest:\n      jwtSecret: placeholder-jwt\n      clusterId: 01a1a9c1-0000-0000-0000-000000000000\n"
+
+// A ROLLBACK PUTS THE OPERATOR BACK (kn-oymc). The agent is its own upgrade
+// stage, so the components revert never touched it, and k3s re-applies the
+// agent's manifest file on every start: a rollback that left the file at the
+// target bundle left a cluster recorded as 1.1 running the 1.2 operator.
+func TestARollbackRewritesTheAgentManifestToTheStartingBundle(t *testing.T) {
+	from, err := bundles.Manifest("1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := from.Core.Version("kubenest-agent")
+	movedTo12 := strings.Replace(strings.Replace(agentManifest11,
+		"oci://ghcr.io/kubenesthq/charts/", "oci://ghcr.io/kubenesthq/candidate/", 1), "version: 2.6.17", "version: 2.7.0-rc.4", 1)
+	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case command == "sudo -n cat "+agent.ManifestPath:
+			return sshx.Result{Stdout: movedTo12}, nil
+		case strings.Contains(command, agent.ManifestPath+".tmp"),
+			command == "sudo -n chmod 600 "+agent.ManifestPath:
+			return sshx.Result{}, nil
+		case command == agentProbeCmd():
+			return sshx.Result{Stdout: agentDeploymentJSON(agent.ChartName+"-"+want, 2, 2, 1, 1, 1)}, nil
+		}
+		t.Fatalf("unscripted command: %q", command)
+		return sshx.Result{}, nil
+	}}
+
+	if err := revertAgent(context.Background(), r, from, converge.NewTextReporter(io.Discard), func(string, ...any) {}); err != nil {
+		t.Fatalf("reverting the agent: %v", err)
+	}
+	inputs := r.Inputs()
+	if len(inputs) != 1 {
+		t.Fatalf("the revert wrote %d manifest(s), want the agent's manifest rewritten once", len(inputs))
+	}
+	var written struct {
+		Spec struct {
+			Chart   string `yaml:"chart"`
+			Version string `yaml:"version"`
+		} `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(inputs[0], &written); err != nil {
+		t.Fatal(err)
+	}
+	if written.Spec.Version != want || written.Spec.Chart != "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2" {
+		t.Errorf("the reverted manifest names %s:%s, want bundle 1.1's stable chart at %s", written.Spec.Chart, written.Spec.Version, want)
+	}
+}

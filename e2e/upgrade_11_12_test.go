@@ -625,6 +625,7 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 				t.Errorf("%s is pinned at %s after the rollback, want the starting bundle's %s", component, got, want)
 			}
 		}
+		w12RequireAgentAt(t, ctx, server, fromBundleNow, "after the component rollback")
 		record, err := client.BundleRecord(ctx, clusterID)
 		if err != nil {
 			t.Fatal(err)
@@ -796,6 +797,7 @@ data:
 			}
 		}
 		t.Logf("[%s] both nodes are still on the starting bundle's k3s %s after the dwell", w12Now(), fromK3s)
+		w12RequireAgentAt(t, ctx, server, fetchBundle(t, client, env.from), "after the datastore restore and its dwell")
 	})
 
 	// The datastore restore above restarted k3s, and the readiness gate
@@ -892,24 +894,7 @@ data:
 		// HelmChart object went back to the starting bundle's operator, with
 		// the upgrade reporting success. Both the pin and the running operator
 		// are read after that restart.
-		wantAgent, err := toBundle.Core.Version("kubenest-agent")
-		if err != nil {
-			t.Fatal(err)
-		}
-		pinned, err := k3s.Kubectl(ctx, server, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.version}'")
-		if err != nil {
-			t.Fatalf("reading the agent's HelmChart: %v", err)
-		}
-		if got := strings.Trim(strings.TrimSpace(pinned), "'"); got != wantAgent {
-			t.Errorf("the agent's HelmChart pins %s after the upgrade, want %s: the operator was moved back", got, wantAgent)
-		}
-		chartLabel, err := k3s.Kubectl(ctx, server, "get deployment "+agent.DeploymentName+" -n kubenest-system -o jsonpath='{.metadata.labels.helm\\.sh/chart}'")
-		if err != nil {
-			t.Fatalf("reading the operator deployment: %v", err)
-		}
-		if got := strings.Trim(strings.TrimSpace(chartLabel), "'"); got != agent.ChartName+"-"+wantAgent {
-			t.Errorf("the running operator is from chart %s after the upgrade, want %s-%s", got, agent.ChartName, wantAgent)
-		}
+		w12RequireAgentAt(t, ctx, server, toBundle, "after the upgrade")
 
 		// T7.3, THE HOST STEP. Every node runs the 1.2 APT policy, read back as
 		// the host's effective configuration rather than the file; the server
@@ -955,6 +940,32 @@ data:
 			}
 		}
 	})
+}
+
+// w12RequireAgentAt fails unless the agent's HelmChart pins the bundle's
+// operator AND the running operator Deployment is from that chart (kn-oymc). It
+// is read after k3s has restarted, because k3s re-applies its manifest files on
+// start and a chart moved on the object alone is moved back then.
+func w12RequireAgentAt(t *testing.T, ctx context.Context, r k3s.Runner, bundle *manifest.Manifest, when string) {
+	t.Helper()
+	want, err := bundle.Core.Version("kubenest-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := k3s.Kubectl(ctx, r, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.version}'")
+	if err != nil {
+		t.Fatalf("reading the agent's HelmChart: %v", err)
+	}
+	if got := strings.Trim(strings.TrimSpace(pinned), "'"); got != want {
+		t.Errorf("the agent's HelmChart pins %s %s, want bundle %s's %s", got, when, bundle.Bundle, want)
+	}
+	label, err := k3s.Kubectl(ctx, r, "get deployment "+agent.DeploymentName+" -n kubenest-system -o jsonpath='{.metadata.labels.helm\\.sh/chart}'")
+	if err != nil {
+		t.Fatalf("reading the operator deployment: %v", err)
+	}
+	if got := strings.Trim(strings.TrimSpace(label), "'"); got != agent.ChartName+"-"+want {
+		t.Errorf("the running operator is from chart %s %s, want %s-%s", got, when, agent.ChartName, want)
+	}
 }
 
 // w12RebootHold is one node's kubenest.io/auto-reboot label.

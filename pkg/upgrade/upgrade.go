@@ -393,6 +393,15 @@ func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
 		if err := RestoreSnapshot(ctx, server, plan.Snapshot); err != nil {
 			return err
 		}
+		// THE SNAPSHOT RESTORES OBJECTS, NOT FILES (kn-oymc). k3s re-applies
+		// its manifest files when the restore restarts it, and the upgrade
+		// had rewritten them to the target bundle, so every moved chart —
+		// the operator included — would move forward again on the restored
+		// cluster. Putting the files back is the components revert.
+		s.Logf("  putting the platform's manifests back to bundle %s", s.Record.FromBundle)
+		if err := RevertComponents(ctx, server, s.From, s.Reporter, s.Logf); err != nil {
+			return err
+		}
 		// The one residual worth naming: a PVC created during the upgrade
 		// window is gone from the restored cluster while its volume still
 		// exists on disk. Harmless until someone needs the space and cannot
