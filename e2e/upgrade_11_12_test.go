@@ -52,6 +52,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -63,7 +64,9 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/cmd"
+	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/config"
+	"kubenest.io/cli/pkg/hostpolicy"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -810,6 +813,7 @@ data:
 		watch, stopWatch := w12StartHoldWatch(ctx, client, server, clusterID)
 		defer stopWatch()
 
+		holdsBefore := w12RebootHolds(t, ctx, server)
 		probe := pollWorkload(t, server, []string{env.server + ":30080", env.agent + ":30080"})
 		writer := &t31StampingWriter{}
 		started := time.Now()
@@ -881,7 +885,68 @@ data:
 			t.Fatalf("reading the workload from the Kubernetes API: %v", err)
 		}
 		t.Logf("[%s] the Kubernetes API separately reports %q ready replicas", w12Now(), strings.Trim(strings.TrimSpace(apiOut), "'"))
+
+		// T7.3, THE HOST STEP. Every node runs the 1.2 APT policy, read back as
+		// the host's effective configuration rather than the file; the server
+		// keeps its reboot hold; and the agent's hold is what it was before the
+		// run, so it can still reboot in its window.
+		for _, node := range connectAllNodes(t, env.upgradeEnv) {
+			effective, err := hostpolicy.ReadEffective(ctx, node.Runner)
+			if err != nil {
+				t.Fatalf("reading the effective APT policy on %s: %v", node.Address, err)
+			}
+			if problem := effective.NonCompliance(); problem != "" {
+				t.Errorf("%s does not run the 1.2 APT policy after the upgrade: %s", node.Address, problem)
+			}
+		}
+		holdsAfter := w12RebootHolds(t, ctx, server)
+		for name, after := range holdsAfter {
+			before := holdsBefore[name]
+			switch {
+			case after.server && after.value != day2.NoAutoRebootValue:
+				t.Errorf("server %s carries %s=%q after the upgrade, want %s", name, day2.NoAutoRebootLabel, after.value, day2.NoAutoRebootValue)
+			case !after.server && after != before:
+				t.Errorf("agent %s carries %s=%q (set %v) after the upgrade, want its pre-operation %q (set %v)", name, day2.NoAutoRebootLabel, after.value, after.set, before.value, before.set)
+			}
+		}
 	})
+}
+
+// w12RebootHold is one node's kubenest.io/auto-reboot label.
+type w12RebootHold struct {
+	server bool
+	set    bool
+	value  string
+}
+
+// w12RebootHolds reads every node's reboot hold, keyed by node name.
+func w12RebootHolds(t *testing.T, ctx context.Context, r k3s.Runner) map[string]w12RebootHold {
+	t.Helper()
+	out, err := k3s.Kubectl(ctx, r, "get nodes -o json")
+	if err != nil {
+		t.Fatalf("reading the nodes' reboot holds: %v", err)
+	}
+	var nodes struct {
+		Items []struct {
+			Metadata struct {
+				Name   string            `json:"name"`
+				Labels map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &nodes); err != nil {
+		t.Fatalf("parsing the nodes: %v", err)
+	}
+	holds := map[string]w12RebootHold{}
+	for _, item := range nodes.Items {
+		_, isServer := item.Metadata.Labels["node-role.kubernetes.io/control-plane"]
+		value, set := item.Metadata.Labels[day2.NoAutoRebootLabel]
+		holds[item.Metadata.Name] = w12RebootHold{server: isServer, set: set, value: value}
+	}
+	if len(holds) != 2 {
+		t.Fatalf("expected two nodes, read %d", len(holds))
+	}
+	return holds
 }
 
 // w12ClusterID resolves a cluster name to its control-plane id, reporting
