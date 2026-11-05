@@ -64,6 +64,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/cmd"
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/day2"
 	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/hostpolicy"
@@ -886,6 +887,30 @@ data:
 		}
 		t.Logf("[%s] the Kubernetes API separately reports %q ready replicas", w12Now(), strings.Trim(strings.TrimSpace(apiOut), "'"))
 
+		// THE OPERATOR STAYS MOVED (kn-oymc). The Kubernetes stage restarts
+		// k3s, which re-applies its manifest files; a chart moved only on the
+		// HelmChart object went back to the starting bundle's operator, with
+		// the upgrade reporting success. Both the pin and the running operator
+		// are read after that restart.
+		wantAgent, err := toBundle.Core.Version("kubenest-agent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pinned, err := k3s.Kubectl(ctx, server, "get helmchart "+agent.ReleaseName()+" -n kube-system -o jsonpath='{.spec.version}'")
+		if err != nil {
+			t.Fatalf("reading the agent's HelmChart: %v", err)
+		}
+		if got := strings.Trim(strings.TrimSpace(pinned), "'"); got != wantAgent {
+			t.Errorf("the agent's HelmChart pins %s after the upgrade, want %s: the operator was moved back", got, wantAgent)
+		}
+		chartLabel, err := k3s.Kubectl(ctx, server, "get deployment "+agent.DeploymentName+" -n kubenest-system -o jsonpath='{.metadata.labels.helm\\.sh/chart}'")
+		if err != nil {
+			t.Fatalf("reading the operator deployment: %v", err)
+		}
+		if got := strings.Trim(strings.TrimSpace(chartLabel), "'"); got != agent.ChartName+"-"+wantAgent {
+			t.Errorf("the running operator is from chart %s after the upgrade, want %s-%s", got, agent.ChartName, wantAgent)
+		}
+
 		// T7.3, THE HOST STEP. Every node runs the 1.2 APT policy, read back as
 		// the host's effective configuration rather than the file; the server
 		// keeps its reboot hold; and the agent's hold is what it was before the
@@ -899,14 +924,34 @@ data:
 				t.Errorf("%s does not run the 1.2 APT policy after the upgrade: %s", node.Address, problem)
 			}
 		}
-		holdsAfter := w12RebootHolds(t, ctx, server)
+		// The operator holds every node too, while a newly delivered window
+		// applies, and lifts the agents once it is active; this test delivered
+		// a window just before the run and the upgrade restarted the operator.
+		// So the agent's hold CONVERGES back to its pre-operation value, bounded
+		// at ten minutes; a hold that never clears is the failure.
+		settleStart := time.Now()
+		var holdsAfter map[string]w12RebootHold
+		for {
+			holdsAfter = w12RebootHolds(t, ctx, server)
+			settled := true
+			for name, after := range holdsAfter {
+				if !after.server && after != holdsBefore[name] {
+					settled = false
+				}
+			}
+			if settled || time.Since(settleStart) > 10*time.Minute {
+				break
+			}
+			time.Sleep(15 * time.Second)
+		}
+		t.Logf("[%s] reboot holds read %s after the upgrade finished: %+v", w12Now(), time.Since(settleStart).Round(time.Second), holdsAfter)
 		for name, after := range holdsAfter {
 			before := holdsBefore[name]
 			switch {
 			case after.server && after.value != day2.NoAutoRebootValue:
 				t.Errorf("server %s carries %s=%q after the upgrade, want %s", name, day2.NoAutoRebootLabel, after.value, day2.NoAutoRebootValue)
 			case !after.server && after != before:
-				t.Errorf("agent %s carries %s=%q (set %v) after the upgrade, want its pre-operation %q (set %v)", name, day2.NoAutoRebootLabel, after.value, after.set, before.value, before.set)
+				t.Errorf("agent %s still carries %s=%q (set %v) 10m after the upgrade, want its pre-operation %q (set %v): it can never reboot automatically", name, day2.NoAutoRebootLabel, after.value, after.set, before.value, before.set)
 			}
 		}
 	})

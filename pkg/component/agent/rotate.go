@@ -92,6 +92,62 @@ func ReplaceJWTSecret(manifest []byte, token string) ([]byte, string, error) {
 	return out, namespace, nil
 }
 
+// MoveChart moves the agent to another chart version — and to another chart
+// source when source is set — by rewriting the agent's manifest on the node.
+//
+// THE FILE, NOT THE OBJECT (kn-oymc). k3s's deploy controller owns the
+// HelmChart this manifest declares and re-applies the file whenever k3s
+// starts. A `kubectl patch` of the HelmChart moved the operator only until the
+// upgrade's own Kubernetes stage restarted k3s: then the file put the previous
+// chart back, and a 1.1 -> 1.2 upgrade reported success with the 1.1 operator
+// running (lab w1, 2026-11-05). valuesContent carries the agent's credentials
+// and is written back exactly as it was read.
+func MoveChart(ctx context.Context, r k3s.Runner, version, source string) error {
+	res, err := r.Run(ctx, "sudo -n cat "+ManifestPath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", ManifestPath, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("reading %s: exit %d: the cluster has no agent manifest to move", ManifestPath, res.ExitCode)
+	}
+	moved, err := setChart([]byte(res.Stdout), version, source)
+	if err != nil {
+		return err
+	}
+	if err := k3s.WriteManifest(ctx, r, manifestName, moved); err != nil {
+		return err
+	}
+	return restrict(ctx, r, ManifestPath)
+}
+
+// setChart sets spec.version, and spec.chart when source is set, in the agent's
+// manifest and leaves every other field as it was.
+func setChart(manifest []byte, version, source string) ([]byte, error) {
+	if version == "" {
+		return nil, fmt.Errorf("refusing to move the agent chart to an empty version")
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(manifest, &doc); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", ManifestPath, err)
+	}
+	if kind, _ := doc["kind"].(string); kind != "HelmChart" {
+		return nil, fmt.Errorf("%s is kind %q, not HelmChart: this is not the agent's manifest", ManifestPath, kind)
+	}
+	spec, ok := doc["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%s has no spec", ManifestPath)
+	}
+	spec["version"] = version
+	if source != "" {
+		spec["chart"] = source
+	}
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("rendering %s: %w", ManifestPath, err)
+	}
+	return out, nil
+}
+
 // DeliverJWT reads the agent's manifest off a server node, replaces the JWT in
 // place, writes it back at 0600 and waits for the operator to become Available.
 //

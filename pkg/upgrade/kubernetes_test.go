@@ -12,6 +12,8 @@ import (
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/sshx"
+
+	"gopkg.in/yaml.v3"
 )
 
 // agentProbeCmd is the command the agent upgrade probe runs for the operator
@@ -140,7 +142,10 @@ func TestTheAgentUpgradeMovesTheChartSourceAsWellAsTheVersion(t *testing.T) {
 			}
 			r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 				switch {
-				case strings.HasPrefix(command, agentPatchCmd()):
+				case command == "sudo -n cat "+agent.ManifestPath:
+					return sshx.Result{Stdout: agentManifest11}, nil
+				case strings.Contains(command, agent.ManifestPath+".tmp"),
+					command == "sudo -n chmod 600 "+agent.ManifestPath:
 					return sshx.Result{}, nil
 				case command == agentProbeCmd():
 					return sshx.Result{Stdout: agentDeploymentJSON(agent.ChartName+"-"+version, 2, 2, 1, 1, 1)}, nil
@@ -154,25 +159,42 @@ func TestTheAgentUpgradeMovesTheChartSourceAsWellAsTheVersion(t *testing.T) {
 				t.Fatalf("upgrading the agent to bundle %s: %v", tc.bundle, err)
 			}
 
-			var patch string
+			// THE FILE IS WHAT MOVES (kn-oymc): k3s re-applies its manifest
+			// on every start, so a patched HelmChart is put back by the
+			// Kubernetes stage's own restart.
+			inputs := r.Inputs()
+			if len(inputs) != 1 {
+				t.Fatalf("the agent upgrade wrote %d manifest(s), want the agent's manifest rewritten once; it ran:\n%s", len(inputs), strings.Join(r.Commands(), "\n"))
+			}
+			var written struct {
+				Spec struct {
+					Chart         string `yaml:"chart"`
+					Version       string `yaml:"version"`
+					ValuesContent string `yaml:"valuesContent"`
+				} `yaml:"spec"`
+			}
+			if err := yaml.Unmarshal(inputs[0], &written); err != nil {
+				t.Fatal(err)
+			}
+			if written.Spec.Chart != tc.wantChart || written.Spec.Version != tc.wantVersion {
+				t.Errorf("the manifest names %s:%s, want %s:%s", written.Spec.Chart, written.Spec.Version, tc.wantChart, tc.wantVersion)
+			}
+			if written.Spec.ValuesContent != agentValues11 {
+				t.Errorf("the agent's values changed:\n%s\nwant\n%s", written.Spec.ValuesContent, agentValues11)
+			}
 			for _, command := range r.Commands() {
 				if strings.Contains(command, "patch helmchart") {
-					patch = command
-				}
-			}
-			if patch == "" {
-				t.Fatalf("the agent upgrade never patched the HelmChart; it ran:\n%s", strings.Join(r.Commands(), "\n"))
-			}
-			for _, want := range []string{tc.wantChart, tc.wantVersion} {
-				if !strings.Contains(patch, want) {
-					t.Errorf("the patch does not carry %s: %s", want, patch)
+					t.Errorf("the upgrade patched the HelmChart object, which k3s's next start reverts: %s", command)
 				}
 			}
 		})
 	}
 }
 
-// agentPatchCmd is the command the upgrade runs to move the agent's HelmChart.
-func agentPatchCmd() string {
-	return "sudo -n k3s kubectl patch helmchart " + agent.ReleaseName() + " -n kube-system --type merge"
-}
+// agentValues11 and agentManifest11 are the agent manifest a 1.1 install writes,
+// with placeholder credentials.
+const agentValues11 = "kubenest:\n  jwtSecret: placeholder-jwt\n  clusterId: 01a1a9c1-0000-0000-0000-000000000000\n"
+
+var agentManifest11 = "apiVersion: helm.cattle.io/v1\nkind: HelmChart\nmetadata:\n  name: operator\n  namespace: kube-system\nspec:\n" +
+	"  chart: oci://ghcr.io/kubenesthq/charts/kubenest-operator-2\n  version: 2.6.17\n  targetNamespace: kubenest-system\n" +
+	"  failurePolicy: abort\n  valuesContent: |\n    kubenest:\n      jwtSecret: placeholder-jwt\n      clusterId: 01a1a9c1-0000-0000-0000-000000000000\n"
