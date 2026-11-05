@@ -210,48 +210,27 @@ func TestHelmChartRejectsChartContentWithRepoOrChart(t *testing.T) {
 
 // helm-controller's default failurePolicy is reinstall: a failed upgrade is
 // answered with `helm uninstall` of the whole release followed by a fresh
-// install (observed twice on hardware 2026-09-25). A HelmChart that sets
-// FailurePolicy renders spec.failurePolicy; one that leaves it unset must
-// render no such key at all, so every existing chart's manifest stays
-// byte-identical.
-func TestHelmChartRendersFailurePolicy(t *testing.T) {
-	set, err := HelmChart{
-		Name:            "kubenest-control-plane",
-		ChartContent:    "UEsDBAoAAAAAAA==",
-		TargetNamespace: "kubenest-system",
-		FailurePolicy:   "abort",
-	}.Manifest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var withPolicy struct {
-		Spec map[string]any `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(set, &withPolicy); err != nil {
-		t.Fatal(err)
-	}
-	if withPolicy.Spec["failurePolicy"] != "abort" {
-		t.Errorf("spec.failurePolicy = %v, want abort", withPolicy.Spec["failurePolicy"])
-	}
-
-	unset, err := HelmChart{
-		Name:            "openebs-lvm-localpv",
-		Repo:            "https://openebs.github.io/lvm-localpv",
-		Chart:           "lvm-localpv",
-		Version:         "1.10.0",
-		TargetNamespace: "openebs",
-	}.Manifest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var withoutPolicy struct {
-		Spec map[string]any `yaml:"spec"`
-	}
-	if err := yaml.Unmarshal(unset, &withoutPolicy); err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := withoutPolicy.Spec["failurePolicy"]; ok {
-		t.Errorf("spec.failurePolicy = %v on a HelmChart that never set one; an unset policy must leave the manifest unchanged", got)
+// install (observed twice on hardware 2026-09-25). No KubeNest chart wants
+// that: every HelmChart, whichever chart source it uses, renders abort.
+func TestEveryHelmChartAbortsOnFailure(t *testing.T) {
+	for _, hc := range []HelmChart{
+		{Name: "kubenest-control-plane", ChartContent: "UEsDBAoAAAAAAA==", TargetNamespace: "kubenest-system"},
+		{Name: "openebs-lvm-localpv", Repo: "https://openebs.github.io/lvm-localpv", Chart: "lvm-localpv", Version: "1.10.0", TargetNamespace: "openebs"},
+		{Name: "kubenest-agent", Chart: "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2", Version: "2.7.0", TargetNamespace: "kubenest-system"},
+	} {
+		out, err := hc.Manifest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Spec map[string]any `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(out, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if doc.Spec["failurePolicy"] != "abort" {
+			t.Errorf("%s: spec.failurePolicy = %v, want abort", hc.Name, doc.Spec["failurePolicy"])
+		}
 	}
 }
 
