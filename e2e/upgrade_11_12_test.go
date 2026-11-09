@@ -798,13 +798,17 @@ data:
 		if len(kubelets) != 2 {
 			t.Fatalf("expected two nodes, got %v", kubelets)
 		}
+		onStart := true
 		for _, got := range kubelets {
 			if got != fromK3s {
-				t.Errorf("a node runs %s after the rollback and a %s dwell, want the starting bundle's %s: the upgrade's own Plan re-ran after the restore and the rollback did not hold",
-					got, postRollbackPlanDwell, fromK3s)
+				onStart = false
+				t.Errorf("a node runs %s after the rollback and a %s dwell, want the starting bundle's %s: either the upgrade's own Plan re-ran after the restore, or the target binary was already in place when the datastore was restored (kubelets in node order: %v)",
+					got, postRollbackPlanDwell, fromK3s, kubelets)
 			}
 		}
-		t.Logf("[%s] both nodes are still on the starting bundle's k3s %s after the dwell", w12Now(), fromK3s)
+		if onStart {
+			t.Logf("[%s] both nodes are still on the starting bundle's k3s %s after the dwell", w12Now(), fromK3s)
+		}
 		w12RequireAgentAt(t, ctx, server, fetchBundle(t, client, env.from), "after the datastore restore and its dwell")
 	})
 
