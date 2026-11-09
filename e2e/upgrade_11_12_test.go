@@ -503,6 +503,14 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 	w12WaitForWorkload(t, ctx, server)
 	w12ApplyDrillEvidence(t, ctx, server)
 
+	// The reboot holds on the untouched starting cluster, before any arm runs.
+	// The --wait arm's hold check is judged against these, not against a read
+	// taken after the rollback arms: on lab-w1d (2026-11-05) those arms had
+	// already left the agent held, so "back to its value before the run" passed
+	// without the hold ever clearing (kn-oymc).
+	holdsAtStart := w12RebootHolds(t, ctx, server)
+	t.Logf("[%s] reboot holds on the starting cluster: %+v", w12Now(), holdsAtStart)
+
 	// The readiness gate requires every node Ready for limits.timeouts
 	// node-ready before an upgrade starts, so the dwell is waited out here
 	// rather than weakened — the same reason TestUpgradeGate waits it.
@@ -817,6 +825,12 @@ data:
 		defer stopWatch()
 
 		holdsBefore := w12RebootHolds(t, ctx, server)
+		for name, start := range holdsAtStart {
+			if !start.server && holdsBefore[name] != start {
+				t.Errorf("agent %s carries %s=%q (set %v) before the --wait run but %q (set %v) on the starting cluster: an earlier arm left its hold changed",
+					name, day2.NoAutoRebootLabel, holdsBefore[name].value, holdsBefore[name].set, start.value, start.set)
+			}
+		}
 		probe := pollWorkload(t, server, []string{env.server + ":30080", env.agent + ":30080"})
 		writer := &t31StampingWriter{}
 		started := time.Now()
@@ -912,15 +926,16 @@ data:
 		// The operator holds every node too, while a newly delivered window
 		// applies, and lifts the agents once it is active; this test delivered
 		// a window just before the run and the upgrade restarted the operator.
-		// So the agent's hold CONVERGES back to its pre-operation value, bounded
-		// at ten minutes; a hold that never clears is the failure.
+		// So the agent's hold CONVERGES back to its value on the starting
+		// cluster, bounded at ten minutes; a hold that never clears is the
+		// failure.
 		settleStart := time.Now()
 		var holdsAfter map[string]w12RebootHold
 		for {
 			holdsAfter = w12RebootHolds(t, ctx, server)
 			settled := true
 			for name, after := range holdsAfter {
-				if !after.server && after != holdsBefore[name] {
+				if !after.server && after != holdsAtStart[name] {
 					settled = false
 				}
 			}
@@ -931,12 +946,12 @@ data:
 		}
 		t.Logf("[%s] reboot holds read %s after the upgrade finished: %+v", w12Now(), time.Since(settleStart).Round(time.Second), holdsAfter)
 		for name, after := range holdsAfter {
-			before := holdsBefore[name]
+			before := holdsAtStart[name]
 			switch {
 			case after.server && after.value != day2.NoAutoRebootValue:
 				t.Errorf("server %s carries %s=%q after the upgrade, want %s", name, day2.NoAutoRebootLabel, after.value, day2.NoAutoRebootValue)
 			case !after.server && after != before:
-				t.Errorf("agent %s still carries %s=%q (set %v) 10m after the upgrade, want its pre-operation %q (set %v): it can never reboot automatically", name, day2.NoAutoRebootLabel, after.value, after.set, before.value, before.set)
+				t.Errorf("agent %s still carries %s=%q (set %v) 10m after the upgrade, want its starting %q (set %v): it can never reboot automatically", name, day2.NoAutoRebootLabel, after.value, after.set, before.value, before.set)
 			}
 		}
 	})
