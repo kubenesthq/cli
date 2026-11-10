@@ -707,29 +707,32 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		t.Logf("[%s] the component rollback put the %s pins back", w12Now(), env.from)
 	})
 
-	// Step 4: a failure AFTER the point of no return. The stage that takes the
-	// cluster past it is the kubernetes stage, so the failure is injected
-	// THERE: the target's real k3s pin is kept — the Plan is written and
-	// system-upgrade-controller starts working — and its per-node deadline is
-	// made impossible, so the stage starts and never converges. From there the
-	// only way back is the datastore snapshot, which is the whole claim this
-	// branch exists to make.
-	t.Run("a failure after the point of no return is recovered by the datastore restore", func(t *testing.T) {
-		poisoned := fetchBundle(t, client, env.to)
-		poisoned.Limits.Timeouts["upgrade-per-node"] = time.Second
-
-		s := w12Session(t, env, client, env.from, env.to, poisoned, w12UpgradeJournalPath(t, env))
+	// Step 4: an upgrade that stopped AFTER the point of no return, with EVERY
+	// node already on the target Kubernetes (kn-eov5). The real stages run
+	// through the kubernetes stage with the bundle's real deadlines, and the
+	// run stops there, as one does when verify fails or the laptop dies. The
+	// kubernetes stage writes the agents' Plan only once the servers' Plan has
+	// converged, so an injected kubernetes-stage failure always stops at the
+	// server: on 2026-11-10 (w1-combined) the agent never left the starting
+	// version in 15 minutes, and the restore's agent half had nothing to do.
+	// The server-only race was covered that morning (w1-fix). From here the
+	// only way back is the datastore snapshot, and the restore must put back
+	// the server's binary AND the agent's.
+	t.Run("an upgrade stopped after the point of no return with every node upgraded is recovered by the datastore restore", func(t *testing.T) {
+		s := w12Session(t, env, client, env.from, env.to, nil, w12UpgradeJournalPath(t, env))
 		defer s.Close()
-		_, runErr := stages.Execute(ctx, s, upgrade.Plan(s))
-		if runErr == nil {
-			t.Fatal("a kubernetes stage with a one-second per-node deadline must fail")
+		all := upgrade.Plan(s)
+		through := -1
+		for i, stage := range all {
+			if stage.Name == upgrade.StageKubernetes {
+				through = i
+			}
 		}
-		var stageErr *stages.StageError
-		if !errorsAs(runErr, &stageErr) {
-			t.Fatalf("want a *StageError, got %T: %v", runErr, runErr)
+		if through < 0 {
+			t.Fatalf("the upgrade plan has no %s stage: %v", upgrade.StageKubernetes, all)
 		}
-		if stageErr.Stage != upgrade.StageKubernetes {
-			t.Fatalf("failed at %q, want %s: this branch is the post-point-of-no-return one", stageErr.Stage, upgrade.StageKubernetes)
+		if _, err := stages.Execute(ctx, s, all[:through+1]); err != nil {
+			t.Fatalf("the stages through %s failed, so the cluster is not in the every-node-upgraded state this arm restores from: %v", upgrade.StageKubernetes, err)
 		}
 		plan := s.RollbackPlan()
 		if plan.Mechanism != upgrade.MechanismRestore {
@@ -738,48 +741,28 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		if plan.Snapshot == "" || plan.SnapshotAt.IsZero() {
 			t.Fatalf("the plan names snapshot %q taken %v: the stage-2 snapshot is what the recovery restores", plan.Snapshot, plan.SnapshotAt)
 		}
-		t.Logf("[%s] failed at the point of no return; the recovery plan restores snapshot %s taken %s",
+		t.Logf("[%s] stopped past the point of no return; the recovery plan restores snapshot %s taken %s",
 			w12Now(), plan.Snapshot, plan.SnapshotAt.Format(time.RFC3339))
 
 		targetK3s, err := toBundle.Core.Version("k3s")
 		if err != nil {
 			t.Fatal(err)
 		}
-		// THE ROLLBACK STARTS ONLY ONCE EVERY NODE RUNS THE TARGET BINARY
-		// (kn-eov5). The stage's own failure leaves the Plans running, and on
-		// lab-w1d (2026-11-05) the restore won the race against the Plans' jobs,
-		// while on lab w1 (2026-11-09) a job won and a node stayed on the target
-		// version. On 2026-11-10 waiting for the server alone left the agent
-		// unreplaced, so the agent's half of the restore never ran. Waiting for
-		// both nodes makes every run the hard case on both: the restore must put
-		// the server's binary back and the agents' too.
-		var lastRead string
-		allOnTarget := false
-		for waitUntil := time.Now().Add(15 * time.Minute); time.Now().Before(waitUntil); time.Sleep(10 * time.Second) {
-			got, err := k3s.Kubectl(ctx, server, `get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
-			if err != nil {
-				continue
-			}
-			lastRead = strings.Trim(strings.TrimSpace(got), "'")
-			versions := strings.Fields(lastRead)
-			allOnTarget = len(versions) == 2
-			for _, v := range versions {
-				allOnTarget = allOnTarget && v == targetK3s
-			}
-			if allOnTarget {
-				break
-			}
+		got, err := k3s.Kubectl(ctx, server, `get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if !allOnTarget {
-			t.Fatalf("both nodes did not report the target k3s %s within 15 minutes of the failed stage (last read: %q), so this arm cannot show the restore putting every starting binary back", targetK3s, lastRead)
+		versions := strings.Fields(strings.Trim(strings.TrimSpace(got), "'"))
+		if len(versions) != 2 || versions[0] != targetK3s || versions[1] != targetK3s {
+			t.Fatalf("after the kubernetes stage the nodes report %v, want both on %s: this arm needs a replaced binary on the server and on the agent", versions, targetK3s)
 		}
 		t.Logf("[%s] both nodes run the target k3s %s; the rollback now has a replaced binary to put back on the server and on the agent", w12Now(), targetK3s)
 
 		// Kubernetes state written SINCE the snapshot: a ConfigMap created now.
 		// The restore must lose it, which is the observable form of "what was
 		// written since the snapshot".
-		// The failure left k3s restarting on the server; the marker is written
-		// once the API answers again, or its absence proves nothing.
+		// The kubernetes stage restarted k3s on the server; the marker is
+		// written once the API answers again, or its absence proves nothing.
 		w12WaitForKubectl(t, ctx, server)
 		marker := fmt.Sprintf("gate-after-snapshot-%d", time.Now().Unix())
 		if err := kubectlApplyDoc(ctx, server, fmt.Sprintf(`apiVersion: v1
@@ -809,7 +792,7 @@ data:
 		// WITH the acknowledgement: the documented disaster-recovery procedure.
 		var confirm bytes.Buffer
 		started := time.Now()
-		runErr = w12RunCLI(&confirm, w12RollbackArgs(env, "--confirm")...)
+		runErr := w12RunCLI(&confirm, w12RollbackArgs(env, "--confirm")...)
 		recovery := time.Since(started)
 		if runErr != nil {
 			t.Fatalf("the datastore restore failed after %s: %v\n%s", recovery.Round(time.Second), runErr, confirm.String())
