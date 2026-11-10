@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -251,15 +252,37 @@ func snapshotFile(ctx context.Context, r k3s.Runner, name string) (string, error
 // The snapshot is found on disk BEFORE anything stops, so a snapshot that is
 // missing or ambiguous is refused while the cluster still runs.
 //
-// It also removes the upgrade's Plan manifests from k3s's auto-deploy
-// directory before it starts the server again; the step below says why.
-func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
+// While the server is stopped it also puts back the files the snapshot does
+// not hold and k3s reads when it starts: the starting bundle's k3s binary, the
+// upgrade's Plan manifests (removed), and the agent's manifest. The steps
+// below say why each one.
+func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string, from *manifest.Manifest) error {
 	if snapshot == "" {
 		return fmt.Errorf("no datastore snapshot was recorded for this upgrade, so there is nothing to restore to. The stage-2 snapshot is taken before any component moves; an upgrade that failed before it has nothing to roll back")
 	}
+	startK3s, err := from.Core.Version("k3s")
+	if err != nil {
+		return fmt.Errorf("bundle %s: %w. Nothing was stopped", from.Bundle, err)
+	}
+	startAgent, _ := from.Core.Version("kubenest-agent")
 	file, err := snapshotFile(ctx, r, snapshot)
 	if err != nil {
 		return fmt.Errorf("finding the datastore snapshot to restore: %w. Nothing was stopped", err)
+	}
+	command := func(command string) func() error {
+		return func() error {
+			res, err := r.Run(ctx, command)
+			if err != nil {
+				return err
+			}
+			// cluster-reset exits non-zero in some k3s versions after a
+			// successful restore because it terminates the server it just
+			// reset; the message is what distinguishes the two.
+			if res.ExitCode != 0 && !strings.Contains(res.Stdout+res.Stderr, "has been reset") {
+				return fmt.Errorf("exit %d: %s", res.ExitCode, k3sReason(res.Stdout+"\n"+res.Stderr))
+			}
+			return nil
+		}
 	}
 	// The Plan manifests are removed BETWEEN the restore and the start, and
 	// between them for one reason: k3s applies every file in its auto-deploy
@@ -293,28 +316,84 @@ func RestoreSnapshot(ctx context.Context, r k3s.Runner, snapshot string) error {
 	// If it fails, the rollback stops here, with k3s still stopped: starting
 	// the server with the files in place replays the upgrade the operator just
 	// undid, which is exactly what this restore exists to prevent.
-	steps := []struct{ what, command string }{
-		{"stopping k3s", "sudo -n systemctl stop k3s"},
-		{"restoring the datastore", fmt.Sprintf(
-			"sudo -n k3s server --cluster-reset --cluster-reset-restore-path=%s/%s", snapshotDir, file)},
-		{"removing the upgrade's Plan manifests", fmt.Sprintf(
-			"sudo -n rm -f %s/%s.yaml %s/%s.yaml", k3s.ManifestDir, serverPlan, k3s.ManifestDir, agentPlan)},
-		{"starting k3s", "sudo -n systemctl start k3s"},
+	//
+	// THE BINARY GOES BACK BEFORE THE RESET (kn-eov5). The server Plan's job
+	// replaces /usr/local/bin/k3s, and neither the snapshot nor the restore
+	// puts it back. Lab w1, 2026-11-09: after a restore a node ran kubelet
+	// v1.35.8+k3s1 with no Plan left to explain it, on a cluster recorded as
+	// back on the bundle that pins v1.35.7+k3s1. Installing it first also means
+	// the starting version is the one that restores the snapshot it wrote.
+	//
+	// THE AGENT'S MANIFEST GOES BACK BEFORE THE START (kn-z2ev). k3s re-applies
+	// it on start, and the upgrade had moved it to the target operator, so the
+	// target operator ran on the restored cluster until the components revert
+	// moved it back. Lab w1, 2026-11-09: in that window the target operator
+	// held the agent from automatic reboots, and the starting operator has no
+	// code to lift the hold. The components revert still rewrites the file and
+	// waits for the operator; here the file only has to be right before k3s
+	// reads it.
+	stopped := ". k3s is stopped on this server: start it with `sudo systemctl start k3s` once the reason above is dealt with"
+	steps := []struct {
+		what string
+		run  func() error
+	}{
+		{"stopping k3s", command("sudo -n systemctl stop k3s")},
+		{"putting back the k3s " + startK3s + " binary", func() error {
+			_, err := k3s.InstallBinary(ctx, r, startK3s)
+			return err
+		}},
+		{"restoring the datastore", command(fmt.Sprintf(
+			"sudo -n k3s server --cluster-reset --cluster-reset-restore-path=%s/%s", snapshotDir, file))},
+		{"removing the upgrade's Plan manifests", command(fmt.Sprintf(
+			"sudo -n rm -f %s/%s.yaml %s/%s.yaml", k3s.ManifestDir, serverPlan, k3s.ManifestDir, agentPlan))},
+		{"putting back the kubenest-agent " + startAgent + " manifest", func() error {
+			if startAgent == "" {
+				return nil
+			}
+			return agent.MoveChart(ctx, r, startAgent, from.Sources["kubenest-agent"])
+		}},
+		{"starting k3s", command("sudo -n systemctl start k3s")},
 	}
 	for i, step := range steps {
-		res, err := r.Run(ctx, step.command)
-		stopped := ""
-		if i > 0 {
-			stopped = ". k3s is stopped on this server: start it with `sudo systemctl start k3s` once the reason above is dealt with"
-		}
-		if err != nil {
+		if err := step.run(); err != nil {
+			if i == 0 {
+				return fmt.Errorf("%s: %w", step.what, err)
+			}
 			return fmt.Errorf("%s: %w%s", step.what, err, stopped)
 		}
-		// cluster-reset exits non-zero in some k3s versions after a
-		// successful restore because it terminates the server it just
-		// reset; the message is what distinguishes the two.
-		if res.ExitCode != 0 && !strings.Contains(res.Stdout+res.Stderr, "has been reset") {
-			return fmt.Errorf("%s: exit %d: %s%s", step.what, res.ExitCode, k3sReason(res.Stdout+"\n"+res.Stderr), stopped)
+	}
+	return nil
+}
+
+// RestoreAgentBinaries puts the starting bundle's k3s binary back on every
+// agent node after a datastore restore (kn-eov5). The agent Plan's job
+// replaced it there as the server Plan's did on the server, and the restore
+// ran on the server only. A node already on the starting version is left
+// alone; a replaced one has its k3s-agent service restarted to run it.
+func RestoreAgentBinaries(ctx context.Context, nodes []Node, from *manifest.Manifest, log func(string, ...any)) error {
+	version, err := from.Core.Version("k3s")
+	if err != nil {
+		return err
+	}
+	for _, n := range nodes {
+		if n.Server {
+			continue
+		}
+		replaced, err := k3s.InstallBinary(ctx, n.Runner, version)
+		if err != nil {
+			return fmt.Errorf("agent node %s: %w", n.Address, err)
+		}
+		if !replaced {
+			continue
+		}
+		log("  agent node %s: put back the k3s %s binary", n.Address, version)
+		res, err := n.Runner.Run(ctx, "sudo -n systemctl restart k3s-agent")
+		if err != nil {
+			return fmt.Errorf("agent node %s: restarting k3s-agent: %w", n.Address, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("agent node %s: restarting k3s-agent: exit %d: %s. The k3s %s binary is in place; start it with `sudo systemctl restart k3s-agent`",
+				n.Address, res.ExitCode, firstLine(res.Stderr), version)
 		}
 	}
 	return nil

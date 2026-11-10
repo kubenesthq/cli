@@ -678,6 +678,29 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		t.Logf("[%s] failed at the point of no return; the recovery plan restores snapshot %s taken %s",
 			w12Now(), plan.Snapshot, plan.SnapshotAt.Format(time.RFC3339))
 
+		targetK3s, err := toBundle.Core.Version("k3s")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// THE ROLLBACK STARTS ONLY ONCE THE SERVER RUNS THE TARGET BINARY
+		// (kn-eov5). The stage's own failure leaves the Plan running, and on
+		// lab-w1d (2026-11-05) the restore won the race against the Plan's job,
+		// while on lab w1 (2026-11-09) the job won and a node stayed on the
+		// target version. Waiting for the server to report the target makes
+		// every run the hard case: the restore must put the binary back.
+		serverOnTarget := false
+		for waitUntil := time.Now().Add(10 * time.Minute); time.Now().Before(waitUntil); time.Sleep(10 * time.Second) {
+			got, err := k3s.Kubectl(ctx, server, `get nodes -l node-role.kubernetes.io/control-plane=true -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
+			if err == nil && strings.Trim(strings.TrimSpace(got), "'") == targetK3s {
+				serverOnTarget = true
+				break
+			}
+		}
+		if !serverOnTarget {
+			t.Fatalf("the server did not report the target k3s %s within 10 minutes of the failed stage, so this arm cannot show the restore putting the starting binary back", targetK3s)
+		}
+		t.Logf("[%s] the server runs the target k3s %s; the rollback now has a replaced binary to put back", w12Now(), targetK3s)
+
 		// Kubernetes state written SINCE the snapshot: a ConfigMap created now.
 		// The restore must lose it, which is the observable form of "what was
 		// written since the snapshot".
@@ -771,10 +794,6 @@ data:
 		// removed from one the deploy controller has not read yet.
 		time.Sleep(postRollbackPlanDwell)
 
-		targetK3s, err := toBundle.Core.Version("k3s")
-		if err != nil {
-			t.Fatal(err)
-		}
 		plans := w12PlanVersions(t, ctx, server)
 		t.Logf("[%s] %s after the rollback the %s namespace holds the Plans %v; the upgrade's target k3s is %s",
 			w12Now(), postRollbackPlanDwell, w12PlanNamespace, plans, targetK3s)

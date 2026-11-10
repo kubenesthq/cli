@@ -6,14 +6,38 @@ import (
 	"testing"
 	"time"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 )
 
+// restoreFrom is the starting bundle a rollback goes back to: the k3s and
+// operator the restore puts back.
+func restoreFrom(t *testing.T) *manifest.Manifest {
+	return parseManifest(t, "bundle: \"1.1\"\ncore:\n  k3s: v1.35.7+k3s1\n  kubenest-agent: 2.6.17\nsources:\n  kubenest-agent: oci://ghcr.io/kubenesthq/charts/kubenest-operator\nlimits:\n  timeouts:\n    node-ready: 2s\n")
+}
+
+// targetAgentManifest is the agent's manifest as the upgrade left it: moved
+// to the target bundle's operator.
+const targetAgentManifest = `apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: kubenest-agent
+  namespace: kube-system
+spec:
+  chart: oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2
+  version: 2.7.0-rc.5
+  valuesContent: |
+    kubenest:
+      jwtSecret: unchanged
+`
+
 // snapshotHost is a server whose snapshots directory holds files: it answers
 // the snapshot save, the directory listing, the service stop and start, the
-// cluster-reset and Velero's (empty) storage-location list.
+// cluster-reset and Velero's (empty) storage-location list. Its k3s binary is
+// already the starting bundle's, and its agent manifest is the target's.
 func snapshotHost(files ...string) *componenttest.FakeRunner {
 	return &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		switch {
@@ -30,6 +54,10 @@ func snapshotHost(files ...string) *componenttest.FakeRunner {
 				}
 			}
 			return sshx.Result{ExitCode: 1, Stderr: `level=fatal msg="etcd: snapshot path does not exist: ` + snapshotDir + "/" + name + `"`}, nil
+		case strings.Contains(command, "k3s --version"):
+			return sshx.Result{Stdout: "k3s version v1.35.7+k3s1 (cd43afc7)\n"}, nil
+		case strings.Contains(command, "cat "+agent.ManifestPath):
+			return sshx.Result{Stdout: targetAgentManifest}, nil
 		}
 		return sshx.Result{}, nil
 	}}
@@ -74,7 +102,7 @@ func TestTheUpgradeRecordsTheSnapshotFileK3sWrote(t *testing.T) {
 func TestARollbackRestoresTheFileABareRecordedNameNamed(t *testing.T) {
 	wrote := "pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791"
 	runner := snapshotHost(wrote)
-	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311"); err != nil {
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err != nil {
 		t.Fatalf("the restore could not find the file k3s wrote for the recorded name: %v", err)
 	}
 	if !ranCommand(runner, "--cluster-reset-restore-path="+snapshotDir+"/"+wrote) {
@@ -86,7 +114,7 @@ func TestARollbackRestoresTheFileABareRecordedNameNamed(t *testing.T) {
 // cluster for a restore that cannot happen is an outage for nothing.
 func TestARollbackWithNoSnapshotOnDiskIsRefusedWithoutStoppingK3s(t *testing.T) {
 	runner := snapshotHost("etcd-snapshot-kubenest-lab-up-1-1790580000")
-	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311")
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t))
 	if err == nil {
 		t.Fatal("a restore of a snapshot that is not on disk was reported as done")
 	}
@@ -104,7 +132,7 @@ func TestARollbackRefusesTwoSnapshotsForOneName(t *testing.T) {
 		"pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791",
 		"pre-upgrade-1-2-20260928t100311-kubenest-lab-up-2-1790589792",
 	)
-	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311"); err == nil {
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err == nil {
 		t.Fatal("a name matching two snapshot files was restored anyway")
 	}
 	if ranCommand(runner, "systemctl stop k3s") {

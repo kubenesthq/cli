@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
+	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/component/componenttest"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
@@ -96,7 +98,7 @@ func assertTheHostStepIsLeftInPlace(t *testing.T, report string) {
 // A restore with no snapshot is refused rather than attempted: there is
 // nothing to go back to, and saying so is more useful than failing partway.
 func TestRestoringWithoutASnapshotIsRefused(t *testing.T) {
-	err := RestoreSnapshot(nil, nil, "")
+	err := RestoreSnapshot(nil, nil, "", nil)
 	if err == nil {
 		t.Fatal("want a refusal")
 	}
@@ -120,9 +122,9 @@ func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
 				`time="2026-09-28T09:27:30Z" level=fatal msg="starting kubernetes: preparing server: bootstrap data already found and encrypted with different token"`,
 			}, "\n")}, nil
 		}
-		return sshx.Result{}, nil
+		return snapshotHost().Respond(command)
 	}}
-	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t092620")
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t092620", restoreFrom(t))
 	if err == nil {
 		t.Fatal("a cluster-reset that exited 1 without resetting was reported as a success")
 	}
@@ -151,7 +153,7 @@ func TestAFailedDatastoreRestoreNamesK3sReason(t *testing.T) {
 func TestARestoreRemovesTheUpgradePlanManifestsBeforeItStartsK3s(t *testing.T) {
 	wrote := "pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791"
 	runner := snapshotHost(wrote)
-	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311"); err != nil {
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err != nil {
 		t.Fatalf("the restore failed: %v", err)
 	}
 
@@ -209,7 +211,7 @@ func TestARestoreThatCannotRemoveThePlanManifestsDoesNotStartK3s(t *testing.T) {
 		return host.Respond(command)
 	}}
 
-	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311")
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t))
 	if err == nil {
 		t.Fatal("a restore whose Plan removal failed was reported as done")
 	}
@@ -221,6 +223,150 @@ func TestARestoreThatCannotRemoveThePlanManifestsDoesNotStartK3s(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "k3s is stopped on this server") {
 		t.Errorf("the failure does not tell the operator the server is stopped and how to bring it back: %v", err)
+	}
+}
+
+// requireOrder fails the test unless each fragment appears in commands, each
+// after the one before it.
+func requireOrder(t *testing.T, commands []string, fragments ...string) {
+	t.Helper()
+	at := -1
+	for _, fragment := range fragments {
+		next := -1
+		for i := at + 1; i < len(commands); i++ {
+			if strings.Contains(commands[i], fragment) {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			t.Fatalf("no %q after position %d; the commands were:\n%s", fragment, at, strings.Join(commands, "\n"))
+		}
+		at = next
+	}
+}
+
+// upgradedBinaryHost is snapshotHost whose k3s binary the upgrade's Plan job
+// already replaced with the target version. It reports the starting version
+// once something installs a binary.
+func upgradedBinaryHost(wrote string) *componenttest.FakeRunner {
+	host := snapshotHost(wrote)
+	var mu sync.Mutex
+	version := "v1.35.8+k3s1"
+	return &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.Contains(command, "install -m 0755"):
+			version = "v1.35.7+k3s1"
+			return sshx.Result{}, nil
+		case strings.Contains(command, "k3s --version"):
+			return sshx.Result{Stdout: "k3s version " + version + " (abc)\n"}, nil
+		}
+		return host.Respond(command)
+	}}
+}
+
+// The server Plan's job replaces the k3s binary, and the snapshot does not hold
+// it. Lab w1, 2026-11-09: after a restore a node ran kubelet v1.35.8+k3s1, with
+// no Plan left, on a cluster recorded as back on the bundle pinning
+// v1.35.7+k3s1 (kn-eov5). So the restore installs the starting version's
+// binary while k3s is stopped, before the reset, and starts that one.
+func TestARestorePutsBackTheStartingK3sBinaryBeforeTheReset(t *testing.T) {
+	wrote := "pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791"
+	runner := upgradedBinaryHost(wrote)
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+	requireOrder(t, runner.Commands(), "systemctl stop k3s", "install -m 0755", "--cluster-reset", "systemctl start k3s")
+	if !ranCommand(runner, "releases/download/v1.35.7%2Bk3s1") {
+		t.Errorf("the binary was not fetched from the starting version's release: %v", runner.Commands())
+	}
+	if !ranCommand(runner, "sha256sum -c") {
+		t.Errorf("the downloaded binary was installed without checking the release's checksum: %v", runner.Commands())
+	}
+}
+
+// A server whose binary is already the starting version downloads nothing.
+func TestARestoreLeavesAStartingVersionBinaryAlone(t *testing.T) {
+	runner := snapshotHost("pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791")
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+	if ranCommand(runner, "curl") {
+		t.Errorf("the restore downloaded k3s for a server already on the starting version: %v", runner.Commands())
+	}
+}
+
+// A binary that cannot be put back stops the rollback before the reset, with
+// k3s stopped: restoring and starting under the target binary is the defect.
+func TestARestoreThatCannotPutBackTheBinaryDoesNotResetOrStart(t *testing.T) {
+	host := upgradedBinaryHost("pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791")
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		if strings.Contains(command, "curl") {
+			return sshx.Result{ExitCode: 22, Stderr: "curl: (22) The requested URL returned error: 404"}, nil
+		}
+		return host.Respond(command)
+	}}
+	err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t))
+	if err == nil {
+		t.Fatal("a restore that could not put the starting binary back was reported as done")
+	}
+	if ranCommand(runner, "--cluster-reset") || ranCommand(runner, "systemctl start k3s") {
+		t.Errorf("the restore went on under the target binary: %v", runner.Commands())
+	}
+	if !strings.Contains(err.Error(), "k3s is stopped on this server") {
+		t.Errorf("the failure does not tell the operator the server is stopped: %v", err)
+	}
+}
+
+// k3s re-applies the agent's manifest when it starts, and the upgrade had moved
+// it to the target operator. Lab w1, 2026-11-09: that operator ran on the
+// restored cluster and held the agent from automatic reboots, and the starting
+// operator cannot lift the hold (kn-z2ev). So the restore writes the starting
+// bundle's chart into the manifest after the reset and before the start,
+// keeping every other field.
+func TestARestoreWritesTheStartingAgentManifestBeforeItStartsK3s(t *testing.T) {
+	runner := snapshotHost("pre-upgrade-1-2-20260928t100311-kubenest-lab-up-1-1790589791")
+	if err := RestoreSnapshot(context.Background(), runner, "pre-upgrade-1-2-20260928t100311", restoreFrom(t)); err != nil {
+		t.Fatalf("the restore failed: %v", err)
+	}
+	write := "install -m 0600 /dev/stdin " + agent.ManifestPath + ".tmp"
+	requireOrder(t, runner.Commands(), "--cluster-reset", write, "systemctl start k3s")
+	var written string
+	for _, e := range runner.Executions() {
+		if strings.Contains(e.Command, write) {
+			written = string(e.Stdin)
+		}
+	}
+	for _, want := range []string{"version: 2.6.17", "chart: oci://ghcr.io/kubenesthq/charts/kubenest-operator", "jwtSecret: unchanged"} {
+		if !strings.Contains(written, want) {
+			t.Errorf("the agent manifest written before the start lacks %q:\n%s", want, written)
+		}
+	}
+}
+
+// After the restore every agent node whose binary the agent Plan replaced gets
+// the starting one back and its service restarted; a node already on the
+// starting version and the server are left alone (kn-eov5).
+func TestRestoreAgentBinariesPutsBackOnlyReplacedAgentBinaries(t *testing.T) {
+	server := upgradedBinaryHost("unused")
+	moved := upgradedBinaryHost("unused")
+	kept := snapshotHost()
+	nodes := []Node{
+		{Address: "10.0.1.10", Server: true, Runner: server},
+		{Address: "10.0.1.11", Runner: moved},
+		{Address: "10.0.1.12", Runner: kept},
+	}
+	if err := RestoreAgentBinaries(context.Background(), nodes, restoreFrom(t), func(string, ...any) {}); err != nil {
+		t.Fatalf("putting the agent binaries back failed: %v", err)
+	}
+	requireOrder(t, moved.Commands(), "install -m 0755", "systemctl restart k3s-agent")
+	if ranCommand(kept, "curl") || ranCommand(kept, "restart") {
+		t.Errorf("an agent already on the starting version was touched: %v", kept.Commands())
+	}
+	if len(server.Commands()) != 0 {
+		t.Errorf("the server is the restore's job, not this one's: %v", server.Commands())
 	}
 }
 

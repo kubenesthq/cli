@@ -12,6 +12,7 @@ import (
 	"kubenest.io/cli/pkg/component/traefik"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
+	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/storage"
 )
 
@@ -51,11 +52,17 @@ func stageVerify(ctx context.Context, s *Session) error {
 }
 
 func verifyNodes(ctx context.Context, s *Session, server k3s.Runner) error {
-	target, err := s.To.Core.Version("k3s")
+	return s.waitNodesOn(ctx, server, s.To)
+}
+
+// waitNodesOn converges on every node of the session being Ready,
+// schedulable and on bundle's k3s version.
+func (s *Session) waitNodesOn(ctx context.Context, server k3s.Runner, bundle *manifest.Manifest) error {
+	target, err := bundle.Core.Version("k3s")
 	if err != nil {
 		return err
 	}
-	deadline, err := s.To.Limits.Timeouts.For("node-ready")
+	deadline, err := bundle.Limits.Timeouts.For("node-ready")
 	if err != nil {
 		return err
 	}

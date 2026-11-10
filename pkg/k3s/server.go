@@ -214,6 +214,61 @@ func runInstaller(ctx context.Context, r Runner, version string, args []string) 
 	return nil
 }
 
+// BinaryPath is where get.k3s.io installs k3s, and where the
+// system-upgrade controller's upgrade job replaces it.
+const BinaryPath = "/usr/local/bin/k3s"
+
+// InstallBinary puts k3s at version in BinaryPath and changes nothing else on
+// the node. It reports whether it replaced the binary; a node whose binary
+// already reports version is left alone.
+//
+// It exists for the rollback after the point of no return (kn-eov5). The
+// upgrade's Plan job replaces only this one file, so going back means
+// replacing it again. get.k3s.io is not the way to do that: it rewrites the
+// systemd unit from its arguments, and a rollback does not know the flags the
+// node was installed with.
+//
+// The release asset is checked against the release's own sha256 file before
+// it is installed, as get.k3s.io does. The node must not be running k3s from
+// this file when the caller expects the change to take effect: the caller
+// stops or restarts the service.
+func InstallBinary(ctx context.Context, r Runner, version string) (bool, error) {
+	installed, current, err := installedVersion(ctx, r, "k3s")
+	if err != nil {
+		return false, err
+	}
+	if installed && current == version {
+		return false, nil
+	}
+	base := "https://github.com/k3s-io/k3s/releases/download/" + strings.ReplaceAll(version, "+", "%2B")
+	script := strings.Join([]string{
+		`set -eu`,
+		`case "$(uname -m)" in x86_64|amd64) asset=k3s; sums=sha256sum-amd64.txt;; aarch64|arm64) asset=k3s-arm64; sums=sha256sum-arm64.txt;; *) echo "no k3s release asset for architecture $(uname -m)" >&2; exit 3;; esac`,
+		`dir=$(mktemp -d)`,
+		`curl -sfL -o "$dir/$asset" ` + shellQuote(base) + `/"$asset"`,
+		`curl -sfL -o "$dir/sums" ` + shellQuote(base) + `/"$sums"`,
+		`(cd "$dir" && grep " $asset\$" sums | sha256sum -c --status) || { echo "the downloaded $asset does not match the release's $sums" >&2; exit 4; }`,
+		`sudo -n install -m 0755 "$dir/$asset" ` + BinaryPath,
+		`rm -f "$dir/$asset" "$dir/sums"`,
+		`rmdir "$dir"`,
+	}, "\n")
+	res, err := r.Run(ctx, script)
+	if err != nil {
+		return false, fmt.Errorf("installing the k3s %s binary: %w", version, err)
+	}
+	if res.ExitCode != 0 {
+		return false, fmt.Errorf("installing the k3s %s binary: exit %d: %s", version, res.ExitCode, firstLine(res.Stderr))
+	}
+	_, now, err := installedVersion(ctx, r, "k3s")
+	if err != nil {
+		return false, err
+	}
+	if now != version {
+		return false, fmt.Errorf("installed the k3s %s binary at %s, but it reports %q", version, BinaryPath, now)
+	}
+	return true, nil
+}
+
 // installedVersion reports whether k3s is present and at what version.
 func installedVersion(ctx context.Context, r Runner, binary string) (bool, string, error) {
 	res, err := r.Run(ctx, fmt.Sprintf("command -v %s >/dev/null 2>&1 && %s --version 2>/dev/null | head -1 || true", binary, binary))

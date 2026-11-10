@@ -390,7 +390,10 @@ func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
 		}
 	case MechanismRestore:
 		s.Logf("  restoring datastore snapshot %s", plan.Snapshot)
-		if err := RestoreSnapshot(ctx, server, plan.Snapshot); err != nil {
+		if err := RestoreSnapshot(ctx, server, plan.Snapshot, s.From); err != nil {
+			return err
+		}
+		if err := RestoreAgentBinaries(ctx, s.Nodes, s.From, s.Logf); err != nil {
 			return err
 		}
 		// THE SNAPSHOT RESTORES OBJECTS, NOT FILES (kn-oymc). k3s re-applies
@@ -400,6 +403,12 @@ func (s *Session) Rollback(ctx context.Context, plan RollbackPlan) error {
 		// cluster. Putting the files back is the components revert.
 		s.Logf("  putting the platform's manifests back to bundle %s", s.Record.FromBundle)
 		if err := RevertComponents(ctx, server, s.From, s.Reporter, s.Logf); err != nil {
+			return err
+		}
+		// Every node back on the starting Kubernetes version, Ready and
+		// schedulable, observed rather than assumed from the binaries put
+		// back (kn-eov5).
+		if err := s.waitNodesOn(ctx, server, s.From); err != nil {
 			return err
 		}
 		// The one residual worth naming: a PVC created during the upgrade
