@@ -84,6 +84,11 @@ type w12Env struct {
 	// from and to are the bundles the hop is between. They are read from the
 	// environment because 1.2 is not in the catalog yet.
 	from, to string
+	// prior, when set, is the bundle the fixture is installed at. The real CLI
+	// then upgrades it to from out of this test's HOME before any arm runs, so
+	// every later upgrade is the cluster's NEXT one from that HOME
+	// (kn-t73-upgrade-host-step-apt-jp0a.1).
+	prior string
 	// skipInstall says the fixture was installed OUTSIDE this test, with the
 	// released CLI, which is the fidelity a released-to-candidate hop wants.
 	skipInstall bool
@@ -98,6 +103,7 @@ func w12Environment(t *testing.T) w12Env {
 		upgradeEnv:  upgradeEnvironment(t),
 		from:        envOr("KUBENEST_UPGRADE_FROM_BUNDLE", "1.1"),
 		to:          envOr("KUBENEST_UPGRADE_TO_BUNDLE", "1.2"),
+		prior:       os.Getenv("KUBENEST_UPGRADE_PRIOR_BUNDLE"),
 		skipInstall: os.Getenv("KUBENEST_UPGRADE_SKIP_INSTALL") != "",
 	}
 	zone := envOr("KUBENEST_GATE_WINDOW_TZ", "Asia/Kolkata")
@@ -125,6 +131,9 @@ func w12CatalogGate(t *testing.T, ctx context.Context, client *api.Client, env w
 	}
 	if !serves[env.from] {
 		t.Fatalf("the catalog does not serve the starting bundle %s, so the fixture this gate expects cannot be installed", env.from)
+	}
+	if env.prior != "" && !serves[env.prior] {
+		t.Fatalf("KUBENEST_UPGRADE_PRIOR_BUNDLE=%s is not served by the catalog, so the fixture cannot be installed there", env.prior)
 	}
 	if !serves[env.to] {
 		t.Skipf("the catalog does not serve bundle %s yet: T7.2 adds it (with the newer k3s patch release the S2 precondition names) and this gate is that transition's acceptance. Set KUBENEST_UPGRADE_TO_BUNDLE to a candidate the catalog serves, or re-run once T7.2 lands", env.to)
@@ -429,9 +438,13 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, toBundle := w12CatalogGate(t, ctx, client, env)
+	fromBundle, toBundle := w12CatalogGate(t, ctx, client, env)
 	w12Home(t, env)
 
+	installAt := env.from
+	if env.prior != "" {
+		installAt = env.prior
+	}
 	installedHere := false
 	t.Run("the two-node workload cluster is on the starting bundle", func(t *testing.T) {
 		_, existing := w12ClusterID(ctx, client, env.cluster)
@@ -440,15 +453,15 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if record.BundleVersion != env.from {
+			if record.BundleVersion != installAt {
 				t.Skipf("the registered cluster %s is on bundle %s, not %s: this gate proves the %s → %s hop and cannot pose it from another starting point",
-					env.cluster, record.BundleVersion, env.from, env.from, env.to)
+					env.cluster, record.BundleVersion, installAt, env.from, env.to)
 			}
-			t.Logf("[%s] adopting the registered cluster %s, installed outside this test at bundle %s (the released-CLI fixture the bead asks for)", w12Now(), env.cluster, env.from)
+			t.Logf("[%s] adopting the registered cluster %s, installed outside this test at bundle %s (the released-CLI fixture the bead asks for)", w12Now(), env.cluster, installAt)
 			return
 		}
 		if env.skipInstall {
-			t.Fatalf("KUBENEST_UPGRADE_SKIP_INSTALL is set but no cluster named %s is registered: install the fixture with the released %s CLI and register it, or unset the variable", env.cluster, env.from)
+			t.Fatalf("KUBENEST_UPGRADE_SKIP_INSTALL is set but no cluster named %s is registered: install the fixture with the released %s CLI and register it, or unset the variable", env.cluster, installAt)
 		}
 		// Each host's by-id path carries its own volume's serial, so on real
 		// hosts the two nodes name two different devices (kn-hku7). Without
@@ -459,19 +472,19 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 			devices = storage.Devices{PerHost: map[string]string{env.server: env.storageDevice, env.agent: agentDevice}}
 		}
 		opts := install.Options{
-			Bundle: env.from, Name: env.cluster, HATier: "single-server",
+			Bundle: installAt, Name: env.cluster, HATier: "single-server",
 			Servers: []string{env.server}, Agents: []string{env.agent},
 			SSHUser: env.sshUser, SSHKey: env.sshKey,
 			StorageDevices: devices,
 		}
-		s, _ := session(t, env.gateEnv, t.TempDir()+"/install.json", fetchBundle(t, client, env.from), opts)
+		s, _ := session(t, env.gateEnv, t.TempDir()+"/install.json", fetchBundle(t, client, installAt), opts)
 		defer s.Close()
 		if _, err := install.Execute(ctx, s, install.Plan(s)); err != nil {
-			t.Fatalf("installing the fixture at %s: %v", env.from, err)
+			t.Fatalf("installing the fixture at %s: %v", installAt, err)
 		}
 		installedHere = true
 		t.Logf("[%s] installed %s at bundle %s (a hardware run wanting the released-to-candidate fidelity should install this with the released %s CLI and set KUBENEST_UPGRADE_SKIP_INSTALL=1)",
-			w12Now(), env.cluster, env.from, env.from)
+			w12Now(), env.cluster, installAt, installAt)
 	})
 	if t.Failed() {
 		return
@@ -502,6 +515,56 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 	}
 	w12WaitForWorkload(t, ctx, server)
 	w12ApplyDrillEvidence(t, ctx, server)
+
+	// THE CLUSTER'S NEXT UPGRADE FROM THE SAME HOME
+	// (kn-t73-upgrade-host-step-apt-jp0a.1). With a prior bundle set, the real
+	// CLI upgrades the fixture to from out of this test's HOME, so every later
+	// arm is a second upgrade from it. A journal this success left behind would
+	// make the next arm's journal a different request, and it would be refused.
+	if env.prior != "" {
+		t.Run("the real CLI upgrades the fixture from the prior bundle and leaves no upgrade journal", func(t *testing.T) {
+			waitForNodeDwell(t, ctx, server, fromBundle)
+			holdsBefore := w12RebootHolds(t, ctx, server)
+			var out bytes.Buffer
+			if err := w12RunCLI(&out, w12UpgradeArgs(env, env.from, "--now")...); err != nil {
+				t.Fatalf("the %s → %s upgrade failed: %v\n%s", env.prior, env.from, err, out.String())
+			}
+			record, err := client.BundleRecord(ctx, clusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.BundleVersion != env.from {
+				t.Fatalf("after the %s → %s upgrade the record says %s", env.prior, env.from, record.BundleVersion)
+			}
+			w12RequireAgentAt(t, ctx, server, fromBundle, "after the prior upgrade")
+			path := w12UpgradeJournalPath(t, env)
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("the succeeded %s → %s upgrade left its journal at %s (stat: %v): the cluster's next upgrade from this HOME is refused as a different request", env.prior, env.from, path, err)
+			}
+			t.Logf("[%s] the %s → %s upgrade succeeded and left no journal at %s", w12Now(), env.prior, env.from, path)
+			// The upgrade restarted the operator, and the --wait arm judges the
+			// agent's hold against the starting read below, so the hold settles
+			// back first.
+			for settle := time.Now(); ; time.Sleep(15 * time.Second) {
+				after := w12RebootHolds(t, ctx, server)
+				settled := true
+				for name, a := range after {
+					if !a.server && a != holdsBefore[name] {
+						settled = false
+					}
+				}
+				if settled {
+					break
+				}
+				if time.Since(settle) > 10*time.Minute {
+					t.Fatalf("an agent's reboot hold did not return to its value before the %s → %s upgrade within 10m: before %+v, now %+v", env.prior, env.from, holdsBefore, after)
+				}
+			}
+		})
+		if t.Failed() {
+			return
+		}
+	}
 
 	// The reboot holds on the untouched starting cluster, before any arm runs.
 	// The --wait arm's hold check is judged against these, not against a read
@@ -682,24 +745,35 @@ func TestWorkloadUpgrade11To12(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// THE ROLLBACK STARTS ONLY ONCE THE SERVER RUNS THE TARGET BINARY
-		// (kn-eov5). The stage's own failure leaves the Plan running, and on
-		// lab-w1d (2026-11-05) the restore won the race against the Plan's job,
-		// while on lab w1 (2026-11-09) the job won and a node stayed on the
-		// target version. Waiting for the server to report the target makes
-		// every run the hard case: the restore must put the binary back.
-		serverOnTarget := false
-		for waitUntil := time.Now().Add(10 * time.Minute); time.Now().Before(waitUntil); time.Sleep(10 * time.Second) {
-			got, err := k3s.Kubectl(ctx, server, `get nodes -l node-role.kubernetes.io/control-plane=true -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
-			if err == nil && strings.Trim(strings.TrimSpace(got), "'") == targetK3s {
-				serverOnTarget = true
+		// THE ROLLBACK STARTS ONLY ONCE EVERY NODE RUNS THE TARGET BINARY
+		// (kn-eov5). The stage's own failure leaves the Plans running, and on
+		// lab-w1d (2026-11-05) the restore won the race against the Plans' jobs,
+		// while on lab w1 (2026-11-09) a job won and a node stayed on the target
+		// version. On 2026-11-10 waiting for the server alone left the agent
+		// unreplaced, so the agent's half of the restore never ran. Waiting for
+		// both nodes makes every run the hard case on both: the restore must put
+		// the server's binary back and the agents' too.
+		var lastRead string
+		allOnTarget := false
+		for waitUntil := time.Now().Add(15 * time.Minute); time.Now().Before(waitUntil); time.Sleep(10 * time.Second) {
+			got, err := k3s.Kubectl(ctx, server, `get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'`)
+			if err != nil {
+				continue
+			}
+			lastRead = strings.Trim(strings.TrimSpace(got), "'")
+			versions := strings.Fields(lastRead)
+			allOnTarget = len(versions) == 2
+			for _, v := range versions {
+				allOnTarget = allOnTarget && v == targetK3s
+			}
+			if allOnTarget {
 				break
 			}
 		}
-		if !serverOnTarget {
-			t.Fatalf("the server did not report the target k3s %s within 10 minutes of the failed stage, so this arm cannot show the restore putting the starting binary back", targetK3s)
+		if !allOnTarget {
+			t.Fatalf("both nodes did not report the target k3s %s within 15 minutes of the failed stage (last read: %q), so this arm cannot show the restore putting every starting binary back", targetK3s, lastRead)
 		}
-		t.Logf("[%s] the server runs the target k3s %s; the rollback now has a replaced binary to put back", w12Now(), targetK3s)
+		t.Logf("[%s] both nodes run the target k3s %s; the rollback now has a replaced binary to put back on the server and on the agent", w12Now(), targetK3s)
 
 		// Kubernetes state written SINCE the snapshot: a ConfigMap created now.
 		// The restore must lose it, which is the observable form of "what was
@@ -827,6 +901,20 @@ data:
 		}
 		if onStart {
 			t.Logf("[%s] both nodes are still on the starting bundle's k3s %s after the dwell", w12Now(), fromK3s)
+		}
+		// The binary on each host, read on the host: a kubelet version is what
+		// the node reported, and this is what it will start next time.
+		for _, node := range connectAllNodes(t, env.upgradeEnv) {
+			res, err := node.Runner.Run(ctx, k3s.BinaryPath+" --version")
+			if err != nil || res.ExitCode != 0 {
+				t.Errorf("reading the k3s binary's version on %s: %v %s", node.Address, err, res.Stderr)
+				continue
+			}
+			if !strings.Contains(res.Stdout, fromK3s) {
+				t.Errorf("the k3s binary on %s is %q after the rollback, want the starting bundle's %s", node.Address, strings.TrimSpace(res.Stdout), fromK3s)
+				continue
+			}
+			t.Logf("[%s] the k3s binary on %s is the starting bundle's %s", w12Now(), node.Address, fromK3s)
 		}
 		w12RequireAgentAt(t, ctx, server, fetchBundle(t, client, env.from), "after the datastore restore and its dwell")
 	})
