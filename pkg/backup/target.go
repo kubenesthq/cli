@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
@@ -64,6 +66,10 @@ type Target struct {
 
 	AccessKeyID     string
 	SecretAccessKey string
+	// KnownSiblingPrefixes comes from the control plane's recorded cluster-kit
+	// locations for this bucket. S3 may deny a root listing while allowing two
+	// real cluster prefixes, so the scope check must probe those names directly.
+	KnownSiblingPrefixes []string
 
 	// Client is the S3 client the scope check and the pre-flight read use. It
 	// is built from this same struct's coordinates and credentials (S3Client),
@@ -320,15 +326,41 @@ func (t Target) OperationCopy(recipient string) (operation.Copy, error) {
 // without surrounding slashes.
 func (t Target) ownPrefix() string { return strings.Trim(t.Prefix, "/") }
 
+// SiblingPrefixes selects the real peer prefixes recorded for the same S3
+// endpoint and bucket. Kit records from another store cannot describe a
+// sibling here. Historical kit locations count: their objects may still be
+// present even after that cluster moves its active target.
+func SiblingPrefixes(t Target, locations []api.RecoveryKitLocation) []string {
+	var peers []string
+	seen := map[string]bool{}
+	endpoint := strings.TrimSuffix(EndpointURL(t.Endpoint), "/")
+	for _, location := range locations {
+		prefix := strings.Trim(location.Prefix, "/")
+		if prefix == "" || prefix == t.ownPrefix() || location.Bucket != t.Bucket || strings.TrimSuffix(EndpointURL(location.Endpoint), "/") != endpoint || seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		peers = append(peers, prefix)
+	}
+	sort.Strings(peers)
+	return peers
+}
+
 // foreignPrefixes are the prefixes this cluster's credential must be REFUSED
-// on: the control plane's, and a directory beside this cluster's own that
-// belongs to no one.
+// on: the control plane's, a synthetic sibling, and recorded real peers.
 func (t Target) foreignPrefixes() []string {
 	// path.Join cleans away the "." that path.Dir yields for a top-level
 	// prefix, so the sibling is always a clean directory name — the same
 	// string a policy author writes, and the same one the signature covers.
 	sibling := path.Join(path.Dir(t.ownPrefix()), siblingProbe)
-	return []string{ControlPlanePrefix, sibling + "/"}
+	foreign := []string{ControlPlanePrefix, sibling + "/"}
+	for _, peer := range t.KnownSiblingPrefixes {
+		peer = strings.Trim(peer, "/")
+		if peer != "" && peer != t.ownPrefix() {
+			foreign = append(foreign, peer+"/")
+		}
+	}
+	return foreign
 }
 
 // ScopeFindings is what VerifyScope found past the scope it requires: the

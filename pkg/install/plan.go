@@ -1077,6 +1077,11 @@ func stageBackupTarget(ctx context.Context, s *Session) error {
 	if err != nil {
 		return err
 	}
+	peers, err := stageKnownSiblingPrefixes(ctx, s, target)
+	if err != nil {
+		return fmt.Errorf("checking recorded sibling backup prefixes before configuring the target: %w", err)
+	}
+	target.KnownSiblingPrefixes = peers
 	// Before anything depends on the target: what the bucket does and does not
 	// protect. Warns, never refuses — an unknown Crest storage choice must not
 	// block an install.
@@ -1105,6 +1110,23 @@ func stageBackupTarget(ctx context.Context, s *Session) error {
 		}
 	}
 	return nil
+}
+
+// stageKnownSiblingPrefixes supplies real peer names to VerifyScope. A
+// recovery uses the already selected kit and must work while its control plane
+// is down; a new install must read the fleet records or refuse configuration.
+func stageKnownSiblingPrefixes(ctx context.Context, s *Session, target backup.Target) ([]string, error) {
+	if s.Opts.Recovery != nil {
+		return nil, nil
+	}
+	if s.API == nil || s.orgID == "" || s.Jnl == nil || s.Jnl.ClusterID == "" {
+		return nil, errors.New("the control-plane cluster identity is unavailable, so sibling backup prefixes cannot be checked")
+	}
+	locations, err := s.API.KitLocationsForOtherClusters(ctx, s.orgID, s.Jnl.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	return backup.SiblingPrefixes(target, locations), nil
 }
 
 // stageRecoveryKit writes, uploads and verifies this cluster's recovery kit —

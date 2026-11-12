@@ -17,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/sshx"
 )
 
@@ -853,6 +854,69 @@ func TestSetTargetRefusesCredentialThatReadsAnotherPrefix(t *testing.T) {
 		t.Error("a target with no --prefix must be refused: no policy can grant the bucket root without granting control-plane/")
 	} else if !strings.Contains(err.Error(), "--prefix") {
 		t.Errorf("the refusal must name the fix: %v", err)
+	}
+}
+
+func TestVerifyScopeRefusesARecordedSiblingWhenRootListingIsDenied(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeBucket(t, func(key string) bool {
+		return strings.HasPrefix(key, "prod-1/") || strings.HasPrefix(key, "prod-2/")
+	})
+	store.allowUnprefixedList = false
+	store.objects["prod-2/recovery-kits/existing-kit"] = []byte("existing")
+	target := scopedTarget(t, store.URL())
+	target.KnownSiblingPrefixes = []string{"prod-2"}
+
+	if _, err := target.VerifyScope(ctx, target.Client); err == nil || !strings.Contains(err.Error(), "prod-2/") {
+		t.Fatalf("a principal that reaches the recorded sibling must be refused naming that prefix: %v", err)
+	}
+	if !store.sawPrefix("prefix=prod-2%2F") {
+		t.Error("the scope check never asked the store for the real sibling prefix")
+	}
+	runner := &fakeRunner{}
+	if _, err := Configure(ctx, runner, testManifest(), target.Target, nil); err == nil {
+		t.Error("Configure accepted the shared principal")
+	}
+	if got := runner.Commands(); len(got) != 0 {
+		t.Errorf("Configure changed the cluster before refusing the shared principal: %v", got)
+	}
+	readOnly := newFakeBucket(t, func(key string) bool {
+		return strings.HasPrefix(key, "prod-1/") || key == "prod-2/scope-check.json"
+	})
+	readOnly.allowUnprefixedList = false
+	readTarget := scopedTarget(t, readOnly.URL())
+	readTarget.KnownSiblingPrefixes = []string{"prod-2"}
+	if _, err := readTarget.VerifyScope(ctx, readTarget.Client); err == nil || !strings.Contains(err.Error(), "GetObject prod-2/") {
+		t.Errorf("a credential able to read a sibling while its listing is denied must be refused: %v", err)
+	}
+
+	narrow := newFakeBucket(t, func(key string) bool { return strings.HasPrefix(key, "prod-1/") })
+	narrow.allowUnprefixedList = false
+	good := scopedTarget(t, narrow.URL())
+	good.KnownSiblingPrefixes = []string{"prod-2"}
+	if _, err := good.VerifyScope(ctx, good.Client); err != nil {
+		t.Errorf("a credential confined to its own prefix was refused: %v", err)
+	}
+	good.KnownSiblingPrefixes = nil
+	if _, err := good.VerifyScope(ctx, good.Client); err != nil {
+		t.Errorf("a bucket with no recorded sibling was refused: %v", err)
+	}
+}
+
+func TestSiblingPrefixesUseOnlyPeerKitsInTheSameStore(t *testing.T) {
+	target := testTarget()
+	target.Endpoint = "store.example"
+	target.Bucket = "shared"
+	target.Prefix = "clusters/a"
+	locations := []api.RecoveryKitLocation{
+		{Endpoint: "https://store.example", Bucket: "shared", Prefix: "clusters/b"},
+		{Endpoint: "store.example", Bucket: "shared", Prefix: "clusters/a"},
+		{Endpoint: "store.example", Bucket: "another", Prefix: "clusters/c"},
+		{Endpoint: "elsewhere.example", Bucket: "shared", Prefix: "clusters/d"},
+	}
+	got := SiblingPrefixes(target, locations)
+	if len(got) != 1 || got[0] != "clusters/b" {
+		t.Errorf("sibling prefixes = %v, want the same-store peer only", got)
 	}
 }
 

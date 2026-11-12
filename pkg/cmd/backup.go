@@ -256,6 +256,18 @@ unconfigured — loud, but never blocking.`,
 				return err
 			}
 			target.Client = client
+			// The bucket-root listing may be denied even to a principal that
+			// reaches another real cluster prefix. Read those names from the
+			// control plane before SSH or any backup configuration is changed.
+			control, err := controlPlaneClient()
+			if err != nil {
+				return fmt.Errorf("checking sibling backup prefixes before set-target: %w", err)
+			}
+			peers, err := setTargetSiblingPrefixes(cmd.Context(), control, conn.Cluster, target)
+			if err != nil {
+				return fmt.Errorf("checking sibling backup prefixes before set-target: %w", err)
+			}
+			target.KnownSiblingPrefixes = peers
 
 			out := cmd.OutOrStdout()
 			bundle, ssh, err := conn.dial(cmd)
@@ -311,6 +323,25 @@ unconfigured — loud, but never blocking.`,
 	fs.StringVar(&target.Region, "region", "", "bucket region (required)")
 	fs.StringVar(&target.Prefix, "prefix", "", "directory within the bucket (optional)")
 	return cmd
+}
+
+func setTargetSiblingPrefixes(ctx context.Context, control *api.Client, clusterName string, target backup.Target) ([]string, error) {
+	clusterID, err := resolveCluster(ctx, control, clusterName)
+	if err != nil {
+		return nil, err
+	}
+	cluster, err := control.GetCluster(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	if cluster.OrgID == "" {
+		return nil, fmt.Errorf("cluster %s has no organisation id, so its peers cannot be checked", clusterName)
+	}
+	locations, err := control.KitLocationsForOtherClusters(ctx, cluster.OrgID, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	return backup.SiblingPrefixes(target, locations), nil
 }
 
 func newBackupNowCommand() *cobra.Command {

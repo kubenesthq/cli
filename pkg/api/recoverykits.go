@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"time"
@@ -33,6 +34,16 @@ type RecoveryKitRecord struct {
 	S3Location         map[string]any `json:"s3_location,omitempty"`
 }
 
+// RecoveryKitLocation is the non-secret bucket coordinate returned by a
+// recorded cluster kit. It lives here so API reads do not import the kit
+// package, which would create a cycle through operation's API client.
+type RecoveryKitLocation struct {
+	Endpoint string `json:"endpoint"`
+	Bucket   string `json:"bucket"`
+	Region   string `json:"region"`
+	Prefix   string `json:"prefix"`
+}
+
 // RecordRecoveryKit tells the control plane that a kit exists, by fingerprint.
 //
 // kind is the kit's scope. A cluster kit posts under its cluster, which the
@@ -55,4 +66,46 @@ func (c *Client) RecordRecoveryKit(ctx context.Context, orgID, clusterID, kind s
 	}
 	req.Header.Set("Content-Type", "application/json")
 	return c.do(req, nil)
+}
+
+// KitLocationsForOtherClusters reads the non-secret locations of every kit
+// recorded for other clusters in this organisation. The scope check uses these
+// coordinates to probe actual peer prefixes even when the S3 principal denies
+// an unprefixed ListBucket. An unreadable record is an error: silently dropping
+// one would turn a missing permission into a passing credential check.
+func (c *Client) KitLocationsForOtherClusters(ctx context.Context, orgID, ownClusterID string) ([]RecoveryKitLocation, error) {
+	endpoint := "/api/v1/orgs/" + url.PathEscape(orgID) + "/recovery-kits/locations"
+	status, body, err := c.Get(ctx, endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("reading recovery-kit locations before checking backup credential scope: %w", err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("reading recovery-kit locations returned HTTP %d; cannot prove backup credential isolation", status)
+	}
+	var records struct {
+		Data *[]struct {
+			ClusterID  string               `json:"cluster_id"`
+			S3Location *RecoveryKitLocation `json:"s3_location"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &records); err != nil {
+		return nil, fmt.Errorf("decoding recovery-kit locations: %w", err)
+	}
+	if records.Data == nil {
+		return nil, fmt.Errorf("recovery-kit locations response has no data array; cannot prove backup credential isolation")
+	}
+	var locations []RecoveryKitLocation
+	for _, record := range *records.Data {
+		if record.ClusterID == "" {
+			return nil, fmt.Errorf("recovery-kit location has no cluster id; cannot prove backup credential isolation")
+		}
+		if record.ClusterID == ownClusterID {
+			continue
+		}
+		if record.S3Location == nil || record.S3Location.Endpoint == "" || record.S3Location.Bucket == "" || record.S3Location.Prefix == "" {
+			return nil, fmt.Errorf("cluster %s has a recovery kit without a complete S3 location; cannot prove backup credential isolation", record.ClusterID)
+		}
+		locations = append(locations, *record.S3Location)
+	}
+	return locations, nil
 }
