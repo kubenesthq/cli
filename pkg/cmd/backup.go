@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
@@ -27,38 +28,95 @@ import (
 // everyday verb, including its three follow-on commands --resume, --activate
 // and --abort.
 
-// backupConn is how a backup command reaches its cluster in wave 1: the same
-// SSH transport as platform install. Once the installer's per-cluster record
-// lands (kn-7k8), --cluster alone will resolve the server address and the
-// bundle, and the transport flags become optional overrides.
+// backupConn is how a backup command reaches its cluster: the same SSH
+// transport as platform install. --cluster alone is enough when this machine is
+// logged in to the control plane, which records the cluster's hosts and bundle
+// (resolve); --server and --bundle-manifest are overrides, and with both given
+// the control plane is never asked.
 type backupConn struct {
 	Cluster    string
 	Servers    []string
 	SSHUser    string
 	SSHKey     string
 	BundlePath string
+	// sshPort is the port the cluster record holds for the first server, when
+	// resolve read the server from the record. Zero is ssh_config, then 22.
+	sshPort int
 }
 
 func (c *backupConn) register(cmd *cobra.Command) {
 	fs := cmd.Flags()
 	fs.StringVar(&c.Cluster, "cluster", "", "cluster name (required)")
-	fs.StringArrayVar(&c.Servers, "server", nil, "control-plane node address (repeat for every server; required until the cluster record resolves it)")
-	fs.StringVar(&c.SSHUser, "ssh-user", "", "SSH user on the server node")
+	fs.StringArrayVar(&c.Servers, "server", nil, "control-plane node address (repeat for every server; read from the cluster record when omitted)")
+	fs.StringVar(&c.SSHUser, "ssh-user", "", "SSH user on the server node; the host inventory's user when the server comes from the cluster record")
 	fs.StringVar(&c.SSHKey, "ssh-key", "", "SSH private key file; defaults to ssh-agent or ~/.ssh/config")
-	fs.StringVar(&c.BundlePath, "bundle-manifest", "", "path to the cluster's bundle manifest (required until the cluster record resolves it)")
+	fs.StringVar(&c.BundlePath, "bundle-manifest", "", "path to the cluster's bundle manifest (the control plane's copy of the recorded bundle when omitted)")
 }
 
+// validate checks what no lookup can supply. --server and --bundle-manifest
+// are not required here: resolve reads whichever is missing from the cluster's
+// record, and refuses, naming both flags, when there is no record to read.
 func (c *backupConn) validate() error {
 	if c.Cluster == "" {
 		return fmt.Errorf("--cluster is required")
 	}
-	if len(c.Servers) == 0 {
-		return fmt.Errorf("at least one --server is required: the cluster record that will resolve --cluster to addresses is not built yet")
-	}
-	if c.BundlePath == "" {
-		return fmt.Errorf("--bundle-manifest is required: schedules, retention and deadlines all come from the bundle manifest, never from defaults in this binary")
-	}
 	return nil
+}
+
+// resolve returns the bundle manifest and fills c.Servers, reading from the
+// cluster's record on the control plane whatever the operator did not pass:
+// the active server hosts, the SSH user and port the inventory holds for the
+// first of them (unless --ssh-user was given), and the bundle the record names.
+//
+// THIS IS WHAT MAKES A PRINTED COMMAND RUNNABLE AS PRINTED. The node verbs read
+// the cluster from the same record and never take --server or
+// --bundle-manifest, so the restore commands they print carry neither; on lab
+// w3 (2026-09-28) such a command stopped at "at least one --server is
+// required" (kn-t54).
+//
+// A FLAG THAT WAS GIVEN WINS, and with both given the control plane is not
+// contacted: a restore has to work on a cluster whose control plane is the
+// thing that just died, from the flags alone.
+func (c *backupConn) resolve(ctx context.Context, connect func() (*api.Client, error)) (*manifest.Manifest, error) {
+	if len(c.Servers) > 0 && c.BundlePath != "" {
+		return manifest.Load(c.BundlePath)
+	}
+	client, err := connect()
+	if err != nil {
+		return nil, fmt.Errorf("cluster %s's record cannot be read, so it cannot supply what --server and --bundle-manifest would: %w. Pass --server and --bundle-manifest, or log in to the control plane that records the cluster", c.Cluster, err)
+	}
+	id, err := resolveCluster(ctx, client, c.Cluster)
+	if err != nil {
+		return nil, err
+	}
+	record, err := client.BundleRecord(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("reading cluster %s's record: %w", c.Cluster, err)
+	}
+	if len(c.Servers) == 0 {
+		for _, h := range record.Hosts {
+			if h.Role != "server" || h.LifecycleState != "active" || h.SSHAddress == "" {
+				continue
+			}
+			if len(c.Servers) == 0 {
+				if c.SSHUser == "" {
+					c.SSHUser = h.SSHUser
+				}
+				c.sshPort = h.SSHPort
+			}
+			c.Servers = append(c.Servers, h.SSHAddress)
+		}
+		if len(c.Servers) == 0 {
+			return nil, fmt.Errorf("cluster %s's record holds no active server with an SSH address, so there is no server to reach: pass --server", c.Cluster)
+		}
+	}
+	if c.BundlePath != "" {
+		return manifest.Load(c.BundlePath)
+	}
+	if record.BundleVersion == "" {
+		return nil, fmt.Errorf("cluster %s's record names no bundle version, so its manifest is unknown: pass --bundle-manifest", c.Cluster)
+	}
+	return fetchManifest(ctx, client, record.BundleVersion)
 }
 
 // validateControlPlane is the control-plane run's own required set, and it is
@@ -88,11 +146,11 @@ func (c *backupConn) validateControlPlane() error {
 
 // dial loads the manifest and opens the SSH connection. The caller closes.
 func (c *backupConn) dial(cmd *cobra.Command) (*manifest.Manifest, *sshx.Client, error) {
-	bundle, err := manifest.Load(c.BundlePath)
+	bundle, err := c.resolve(cmd.Context(), controlPlaneClient)
 	if err != nil {
 		return nil, nil, err
 	}
-	ep, err := sshx.Resolve(c.Servers[0], sshx.Options{User: c.SSHUser, KeyPath: c.SSHKey})
+	ep, err := sshx.Resolve(c.Servers[0], sshx.Options{User: c.SSHUser, KeyPath: c.SSHKey, Port: c.sshPort})
 	if err != nil {
 		return nil, nil, err
 	}

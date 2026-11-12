@@ -10,7 +10,6 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/install"
-	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/upgrade"
@@ -295,11 +294,11 @@ func (b *backupRestore) dial(ctx context.Context, conn backupConn) (backup.Resto
 	if err := conn.validate(); err != nil {
 		return backup.RestoreDeps{}, nil, err
 	}
-	bundle, err := manifest.Load(conn.BundlePath)
+	bundle, err := conn.resolve(ctx, controlPlaneClient)
 	if err != nil {
 		return backup.RestoreDeps{}, nil, err
 	}
-	ep, err := sshx.Resolve(conn.Servers[0], sshx.Options{User: conn.SSHUser, KeyPath: conn.SSHKey})
+	ep, err := sshx.Resolve(conn.Servers[0], sshx.Options{User: conn.SSHUser, KeyPath: conn.SSHKey, Port: conn.sshPort})
 	if err != nil {
 		return backup.RestoreDeps{}, nil, err
 	}

@@ -212,9 +212,11 @@ func workloadName(owners []struct {
 // --latest: a restore names the backup it restores, and after a node loss the
 // only honest answer is the newest ELIGIBLE one — a newer backup that is not
 // eligible is passed over with the reason, which is exactly what the operator
-// has to see before accepting an older one. The environment flags a restore
-// also needs (the server, the bundle manifest, the SSH key) are the operator's
-// own, already in their shell.
+// has to see before accepting an older one. It names no --server and no
+// --bundle-manifest, because the node verbs that print it take neither: `backup
+// restore` reads both from the cluster record those verbs read (kn-t54; lab w3,
+// 2026-09-28, where a printed command without them was refused). The SSH key is
+// the operator's own: ssh-agent, ~/.ssh/config, or --ssh-key.
 func RestoreCommands(cluster string, volumes []BoundLocalVolume) []string {
 	groups := map[string][]BoundLocalVolume{}
 	var keys []string

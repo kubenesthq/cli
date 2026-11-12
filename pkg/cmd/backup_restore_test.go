@@ -10,9 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
+	"kubenest.io/cli/pkg/config"
 	"kubenest.io/cli/pkg/k3s"
 	"kubenest.io/cli/pkg/manifest"
+	"kubenest.io/cli/pkg/node"
 )
 
 // T4.1's command surface: the flag refusals, and the plan rendered from a fake
@@ -447,3 +450,109 @@ func (s *stubCluster) Apply(context.Context, string, []byte) error { return errS
 func (s *stubCluster) Delete(context.Context, string) error { return errStubChanged }
 
 var errStubChanged = fmt.Errorf("the test did not expect the command to change anything")
+
+// loginToRecordControlPlane logs a fresh HOME in to a control plane that holds
+// one cluster record (testCluster, with these hosts, at bundle 1.1), the way
+// an operator who has just run a node verb is logged in.
+func loginToRecordControlPlane(t *testing.T, hosts []api.HostRecord) {
+	t.Helper()
+	isolateHome(t)
+	url := rebootControlPlane(t, hosts, "").BaseURL()
+	if err := config.Save(&config.Config{ControlPlaneURL: url}); err != nil {
+		t.Fatal(err)
+	}
+	creds, err := config.LoadCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds.Set(url, "knp_test")
+	if err := config.SaveCredentials(creds); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// kn-t54's first cause. `node replace` and `node remove` print the restore that
+// brings a stranded workload's claims back, and the node verbs never take
+// --server or --bundle-manifest: they read the cluster from the control plane's
+// record. The printed command therefore carries neither, and `backup restore`
+// has to find both the same way. Run AS PRINTED (plus the operator's own SSH
+// key, which here does not exist), it must get as far as the transport, which
+// it cannot reach without a server and a bundle; on lab w3 (2026-09-28) it
+// stopped at "at least one --server is required".
+func TestARestoreCommandANodeVerbPrintsRunsAsPrinted(t *testing.T) {
+	loginToRecordControlPlane(t, []api.HostRecord{
+		{HostID: "h-agent", Role: "agent", SSHAddress: "10.0.0.7", SSHUser: "worker", LifecycleState: "active"},
+		{HostID: "h-server", Role: "server", SSHAddress: "10.0.0.5", SSHUser: "ubuntu", LifecycleState: "active"},
+	})
+	printed := node.RestoreCommands(testCluster, []node.BoundLocalVolume{
+		{PV: "pv-a", Namespace: "payments", PVC: "data-a", Workload: "Deployment/web"},
+		{PV: "pv-b", Namespace: "payments", PVC: "data-b", Workload: "Deployment/web"},
+	})
+	if len(printed) != 1 {
+		t.Fatalf("one workload's two claims printed %d restore commands: %q", len(printed), printed)
+	}
+	fields := strings.Fields(strings.SplitN(printed[0], "   #", 2)[0])
+	if len(fields) < 3 || fields[0] != "kubenest" || fields[1] != "backup" || fields[2] != "restore" {
+		t.Fatalf("the printed line is not a `kubenest backup restore` command: %q", printed[0])
+	}
+	missingKey := filepath.Join(t.TempDir(), "no-such-key")
+	err := runBackupRestore(t, append(fields[3:], "--confirm", "--ssh-key", missingKey)...)
+	if err == nil {
+		t.Fatal("a run whose SSH key does not exist cannot have connected to anything")
+	}
+	if !strings.Contains(err.Error(), missingKey) {
+		t.Errorf("the restore command a node verb printed stopped before the transport, so it cannot be run as printed: %v", err)
+	}
+}
+
+// What the record supplies when the flags are absent: the ACTIVE server (never
+// an agent, never a removed host), the SSH user and port the inventory records
+// for it, and the bundle the record names, read from the control plane. A flag
+// the operator gave wins, and with both given the control plane is never asked:
+// a restore has to work while the control plane is the thing that is down.
+func TestABackupConnectionResolvesTheServerAndBundleFromTheClusterRecord(t *testing.T) {
+	client := rebootControlPlane(t, []api.HostRecord{
+		{HostID: "h-gone", Role: "server", SSHAddress: "10.0.0.4", SSHUser: "old", LifecycleState: "removed"},
+		{HostID: "h-agent", Role: "agent", SSHAddress: "10.0.0.7", SSHUser: "worker", LifecycleState: "active"},
+		{HostID: "h-server", Role: "server", SSHAddress: "10.0.0.5", SSHUser: "ubuntu", SSHPort: 2222, LifecycleState: "active"},
+	}, "")
+	connect := func() (*api.Client, error) { return client, nil }
+
+	conn := backupConn{Cluster: testCluster}
+	bundle, err := conn.resolve(context.Background(), connect)
+	if err != nil {
+		t.Fatalf("resolving from the record: %v", err)
+	}
+	if len(conn.Servers) != 1 || conn.Servers[0] != "10.0.0.5" {
+		t.Errorf("servers = %q, want only the active server 10.0.0.5", conn.Servers)
+	}
+	if conn.SSHUser != "ubuntu" || conn.sshPort != 2222 {
+		t.Errorf("SSH user/port = %q/%d, want the inventory's ubuntu/2222 for that server", conn.SSHUser, conn.sshPort)
+	}
+	if bundle == nil || bundle.Bundle != "1.1" {
+		t.Errorf("bundle = %+v, want the record's bundle 1.1 from the control plane", bundle)
+	}
+
+	given := backupConn{Cluster: testCluster, Servers: []string{"10.9.9.9"}, SSHUser: "root", BundlePath: restoreCmdManifest(t)}
+	bundle, err = given.resolve(context.Background(), func() (*api.Client, error) {
+		t.Error("both flags were given, and the control plane was asked anyway")
+		return nil, fmt.Errorf("not reachable")
+	})
+	if err != nil {
+		t.Fatalf("explicit flags: %v", err)
+	}
+	if given.Servers[0] != "10.9.9.9" || given.SSHUser != "root" || bundle.Bundle != "1.2" {
+		t.Errorf("explicit flags were overridden: servers %q user %q bundle %q", given.Servers, given.SSHUser, bundle.Bundle)
+	}
+
+	down := backupConn{Cluster: testCluster}
+	_, err = down.resolve(context.Background(), func() (*api.Client, error) { return nil, fmt.Errorf("not logged in") })
+	if err == nil {
+		t.Fatal("with no flags and no control plane there is nothing to resolve from, and it must be refused")
+	}
+	for _, want := range []string{"--server", "--bundle-manifest"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %s, the flag that fixes it: %v", want, err)
+		}
+	}
+}
