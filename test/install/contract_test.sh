@@ -21,7 +21,7 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 INSTALL_SH="${ROOT}/install.sh"
-BUILD_YML="${ROOT}/.github/workflows/build.yml"
+BUILD_YML="${BUILD_YML_OVERRIDE:-${ROOT}/.github/workflows/build.yml}"
 REPO="kubenesthq/cli"
 
 fails=0
@@ -141,6 +141,59 @@ if in_workflow -F -- "--certificate-oidc-issuer $inst_issuer"; then
   ok "the OIDC issuer matches on both sides"
 else
   bad "the OIDC issuer in install.sh ($inst_issuer) does not appear in build.yml"
+fi
+
+# A release may sign and upload the candidate, but must never rebuild it.
+# Inspect JOB bodies, so a build in the candidate job cannot satisfy the
+# release job's download requirement or hide a release-time go build.
+job_body() {
+  printf '%s\n' "$WORKFLOW" | awk -v job="$1" '
+    $0 == "  " job ":" { inside=1; next }
+    inside && /^  [[:alnum:]_-]+:/ { exit }
+    inside { print }
+  '
+}
+candidate_job="$(job_body candidate)"
+release_job="$(job_body release)"
+if [ -n "$candidate_job" ] && printf '%s\n' "$candidate_job" | grep -qF 'actions/upload-artifact@'; then
+  ok "candidate job uploads the already-built release bytes"
+else
+  bad "candidate job must upload the binaries, checksums and command metadata once"
+fi
+if [ -n "$release_job" ] && printf '%s\n' "$release_job" | grep -qF 'actions/download-artifact@'; then
+  ok "release job downloads the candidate artifact"
+else
+  bad "release job must download the candidate artifact that passed the gate"
+fi
+if printf '%s\n' "$release_job" | grep -Eq '(^|[[:space:]])go[[:space:]]+(build|run)([[:space:]]|$)' \
+   || printf '%s\n' "$release_job" | grep -qF 'actions/setup-go@'; then
+  bad "release job recompiles or installs a compiler instead of promoting prebuilt bytes"
+else
+  ok "release job has no Go build, go run or setup-go step"
+fi
+if printf '%s\n' "$release_job" | grep -qF 'scripts/tests/release-matches-candidate.sh'; then
+  ok "release job checks published bytes against the gate record"
+else
+  bad "release job does not run the candidate-to-release digest checker"
+fi
+if printf '%s\n' "$candidate_job" | grep -qF 'actions/attest-build-provenance@' \
+   && ! printf '%s\n' "$release_job" | grep -qF 'actions/attest-build-provenance@'; then
+  ok "build provenance is issued by the candidate build, not promotion"
+else
+  bad "build provenance must attach to the candidate build, not the no-build release job"
+fi
+if in_workflow -F 'workflow_dispatch:' && ! in_workflow -E '^[[:space:]]+tags:[[:space:]]*$'; then
+  ok "a tag push alone cannot trigger a release rebuild or publish"
+else
+  bad "release must require an explicit dispatch, not an automatic tag-push job"
+fi
+# shellcheck disable=SC2016
+if printf '%s\n' "$candidate_job" | grep -qF 'pkg/version.Version=${TAG}' \
+   && printf '%s\n' "$candidate_job" | grep -qF 'pkg/version.Commit=${COMMIT}' \
+   && printf '%s\n' "$release_job" | grep -qF 'candidate-build.json'; then
+  ok "candidate bytes carry the final version and release checks their build identity"
+else
+  bad "candidate build must stamp final version/commit and release must check its build record"
 fi
 
 echo

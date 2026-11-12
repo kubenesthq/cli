@@ -1,44 +1,87 @@
 name: Release
 
-# Tag-triggered release: cross-platform binaries, SHA-256 checksums, a keyless
-# cosign signature over the checksums, and SLSA build provenance for every
-# binary. This CLI installs software onto production hosts as root — an
-# unsigned curl-able binary is not defensible, so every artifact is verifiable
-# back to this workflow run.
-
+# Manual two-step release: build and attest one candidate at its final version,
+# then promote that exact artifact from a tag at the same commit. A tag push alone
+# never publishes or recompiles anything.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build a candidate or promote one that passed the host gate
+        type: choice
+        options: [candidate, promote]
+        required: true
+      version:
+        description: Final v2.1.x version stamped into the candidate binaries
+        type: string
+        required: true
+      candidate_run_id:
+        description: Candidate workflow run ID (promotion only)
+        type: string
+        required: false
+      gate_workspace_ref:
+        description: Full commit SHA of badri/kubenest-workspace containing the passed gate record
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  release:
+  validate-request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the right ref and inputs
+        env:
+          OPERATION: ${{ inputs.operation }}
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          GATE_REF: ${{ inputs.gate_workspace_ref }}
+        run: |
+          [[ "$VERSION" =~ ^v2\.1\.[0-9]+$ ]] || { echo "version must be v2.1.x"; exit 1; }
+          case "$OPERATION" in
+            candidate)
+              [ "$GITHUB_REF_TYPE" = branch ] || { echo "candidate build needs a branch ref"; exit 1; }
+              ;;
+            promote)
+              [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" = "$VERSION" ] || {
+                echo "promotion must be dispatched on the matching version tag"; exit 1;
+              }
+              [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "candidate run ID missing"; exit 1; }
+              [[ "$GATE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "gate workspace commit SHA missing"; exit 1; }
+              ;;
+            *) echo "unknown operation"; exit 1 ;;
+          esac
+
+  candidate:
+    needs: validate-request
+    if: inputs.operation == 'candidate'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write      # create the GitHub release
-      id-token: write      # keyless signing + provenance (OIDC)
-      attestations: write  # SLSA provenance
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - name: Test before releasing
-        run: go vet ./... && go test -race ./...
+      - name: Test candidate source
+        run: go vet ./... && go test -race -count=1 ./...
 
       - name: Build binaries
         env:
+          VERSION: ${{ inputs.version }}
           CGO_ENABLED: "0"
         run: |
-          TAG=${GITHUB_REF##*/}
-          COMMIT=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="$VERSION"
+          COMMIT="${GITHUB_SHA:0:7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           LDFLAGS="-s -w \
             -X kubenest.io/cli/pkg/version.Version=${TAG} \
             -X kubenest.io/cli/pkg/version.Commit=${COMMIT} \
@@ -52,101 +95,249 @@ jobs:
                 -o "dist/kubenest-${TAG}-${os}-${arch}${ext}" ./cmd/kubenest
             done
           done
+          case "$(dist/kubenest-${TAG}-linux-amd64 --version)" in
+            "kubenest version $TAG (commit $COMMIT, built "*) ;;
+            *) echo "candidate binary did not receive the final version and commit"; exit 1 ;;
+          esac
 
-      # The command tree as JSON, from the same tree the binaries are built
-      # from. kubenest-docs' CLI-example guard compares its pages against the
-      # RELEASED CLI's command metadata (PLAN section 7.12), and this is how the
-      # metadata gets there without a docs run building Go. It lands in dist/,
-      # so the `files: dist/*` upload ships it as a release asset, and it is
-      # covered by checksums.txt -- which is what the release signature covers.
-      #
-      # It also closes the gap between the assets and what the binary believes:
-      # the first release cut from this workflow and the version stamped in the
-      # metadata come from the same COMMIT and TAG, because both are read here.
       - name: Command metadata
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          TAG=${GITHUB_REF##*/}
-          COMMIT=$(git rev-parse --short HEAD)
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="$VERSION"
+          COMMIT="${GITHUB_SHA:0:7}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go run -ldflags="-s -w \
             -X kubenest.io/cli/pkg/version.Version=${TAG} \
             -X kubenest.io/cli/pkg/version.Commit=${COMMIT} \
             -X kubenest.io/cli/pkg/version.Date=${DATE}" \
             ./cmd/gen-command-metadata > dist/command-metadata.json
-          python3 -c 'import json, sys
+          python3 - <<'PY'
+          import json, os
           doc = json.load(open("dist/command-metadata.json"))
-          assert doc["cli_version"] != "dev", "the release metadata carries a dev version"
-          assert doc["commands"], "the release metadata carries no commands"'
+          assert doc["cli_version"] == os.environ["VERSION"]
+          assert doc["commands"]
+          PY
 
-      - name: Checksums
-        run: cd dist && sha256sum * > checksums.txt
-
-      # PINNED TO THE VERSION install.sh PINS. The signer and the verifier must
-      # be one implementation: cosign v3 REMOVED sign-blob's --output-signature
-      # and --output-certificate and verify-blob's --signature/--certificate, so
-      # a v2 signer and a v3 verifier cannot agree on an artifact at all. That
-      # mismatch is what shipped here — this workflow emitted a detached
-      # .sig/.pem pair while install.sh downloaded checksums.txt.sigstore.json
-      # and verified it with --bundle, so the installer 404'd on every release
-      # this workflow produced. Bump this and COSIGN_VERSION in install.sh
-      # together, never one alone.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          cosign-release: v3.1.3
-
-      # ONE ARTIFACT: the Sigstore bundle. It carries the signature, the Fulcio
-      # certificate and the Rekor entry in a single file, which is what
-      # install.sh's `cosign verify-blob --bundle` reads. There is deliberately
-      # no detached .sig/.pem alongside it — cosign v3's sign-blob cannot
-      # produce them, and a second format is a second thing to keep in sync.
-      #
-      # It lands in dist/, so the `files: dist/*` upload below ships it as a
-      # release asset. An unuploaded bundle is the same 404 as no bundle.
-      - name: Sign checksums (keyless)
+      - name: Checksums and candidate build identity
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          cosign sign-blob --yes dist/checksums.txt \
-            --bundle dist/checksums.txt.sigstore.json
+          (cd dist && sha256sum * > checksums.txt)
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          checksums = pathlib.Path("dist/checksums.txt").read_bytes()
+          record = {
+              "version": os.environ["VERSION"],
+              "commit": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "checksums_sha256": hashlib.sha256(checksums).hexdigest(),
+          }
+          pathlib.Path("dist/candidate-build.json").write_text(
+              json.dumps(record, sort_keys=True) + "\n"
+          )
+          PY
+          (cd dist && sha256sum -c checksums.txt)
 
+      # This attests the build in THIS candidate run. Promotion does not issue
+      # a new build attestation for bytes it merely copies.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/kubenest-*
 
-      - name: Create release
+      - name: Preserve exact candidate bytes
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-candidate-${{ inputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    needs: validate-request
+    if: inputs.operation == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download gated candidate artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-candidate-${{ inputs.version }}
+          run-id: ${{ inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+
+      - name: Read passed gate record from its pinned workspace commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: badri/kubenest-workspace
+          ref: ${{ inputs.gate_workspace_ref }}
+          token: ${{ secrets.RELEASE_WORKSPACE_READ_TOKEN }}
+          path: gate-workspace
+          persist-credentials: false
+
+      - name: Install gate-record parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/t75-verify"
+          "$RUNNER_TEMP/t75-verify/bin/pip" install --disable-pip-version-check PyYAML==6.0.2
+          echo "$RUNNER_TEMP/t75-verify/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the downloaded bytes against the passed gate record
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          (cd dist && sha256sum -c checksums.txt)
+          python3 - <<'PY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import yaml
+
+          root = Path("gate-workspace").resolve()
+          manifest_path = root / "scripts/gate/candidate.yaml"
+          manifest = yaml.safe_load(manifest_path.read_text())
+          report_ref = manifest.get("gate_report")
+          assert isinstance(report_ref, str) and report_ref, "passed gate report missing"
+          report_path = (manifest_path.parent / report_ref).resolve()
+          assert report_path.is_relative_to(root), "gate report escapes pinned workspace"
+          report = json.loads(report_path.read_text())
+          verifier_path = root / "scripts/gate/release_matches_candidate.py"
+          spec = importlib.util.spec_from_file_location("release_matches_candidate", verifier_path)
+          verifier = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(verifier)
+          artifacts = verifier.validate(manifest, report)
+          by_id = {item["id"]: item["digest"] for item in artifacts}
+
+          dist = Path("dist")
+          build = json.loads((dist / "candidate-build.json").read_text())
+          tag = os.environ["VERSION"]
+          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert manifest["identity"]["cli_version"] == tag
+          assert commit.startswith(manifest["identity"]["cli_commit"])
+          assert build["version"] == tag and build["commit"] == commit
+          assert str(build["run_id"]) == os.environ["CANDIDATE_RUN_ID"]
+          checksums = (dist / "checksums.txt").read_bytes()
+          assert hashlib.sha256(checksums).hexdigest() == build["checksums_sha256"]
+
+          files = {"cli-command-metadata": "command-metadata.json",
+                   "cli-checksums": "checksums.txt"}
+          for platform in ("linux", "darwin", "windows"):
+              for arch in ("amd64", "arm64"):
+                  suffix = ".exe" if platform == "windows" else ""
+                  files[f"cli-{platform}-{arch}"] = f"kubenest-{tag}-{platform}-{arch}{suffix}"
+          listed = [line.split("  ", 1)[1] for line in checksums.decode().splitlines()]
+          assert len(listed) == 7 and set(listed) == set(files.values()) - {"checksums.txt"}
+          assert {path.name for path in dist.iterdir()} == set(files.values()) | {"candidate-build.json"}
+          for artifact_id, name in files.items():
+              expected = by_id[artifact_id]
+              actual = "sha256:" + hashlib.sha256((dist / name).read_bytes()).hexdigest()
+              assert actual == expected, f"{artifact_id} differs from the gated digest"
+          metadata = json.loads((dist / "command-metadata.json").read_text())
+          assert metadata["cli_version"] == tag and metadata["commands"]
+          public_report = {key: report[key] for key in (
+              "status", "identity", "artifacts", "lanes",
+              "configurations", "skipped_configurations", "measurements",
+          )}
+          (dist / "gate-report.json").write_text(
+              json.dumps(public_report, sort_keys=True, indent=2) + "\n"
+          )
+          print("candidate artifact matches the passing gate record and tag commit")
+          PY
+
+      - name: Verify candidate build attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for asset in dist/kubenest-*; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" >/dev/null
+          done
+
+      - name: Install crane for OCI digest checks
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          curl -fsSL -o "$RUNNER_TEMP/release-tools/crane.tgz" \
+            https://github.com/google/go-containerregistry/releases/download/v0.22.1/go-containerregistry_Linux_x86_64.tar.gz
+          echo "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0  $RUNNER_TEMP/release-tools/crane.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/release-tools/crane.tgz" -C "$RUNNER_TEMP/release-tools" crane
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+
+      - name: Authenticate OCI digest reader
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_REGISTRY_READ_TOKEN || github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" |
+            crane auth login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign checksums (keyless)
+        run: |
+          cosign sign-blob --yes dist/checksums.txt \
+            --bundle dist/checksums.txt.sigstore.json
+
+      - name: Refuse an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "release already exists; refusing to replace its assets"
+            exit 1
+          fi
+
+      # A prerelease is not the default installer target. It gives the digest
+      # checker public stable-location URLs before the final promotion switch.
+      - name: Publish verified bytes as a prerelease
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          tag_name: ${{ inputs.version }}
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
           files: dist/*
           body: |
-            ## KubeNest CLI ${{ github.ref_name }}
+            ## KubeNest CLI ${{ inputs.version }}
 
-            Binaries for Linux, macOS and Windows (amd64/arm64) are attached,
-            with SHA-256 checksums, a Sigstore signature and SLSA build
-            provenance.
+            These binaries were built and attested in the candidate run at the
+            tag's commit. This workflow downloaded the gated bytes, checked
+            their digests, signed checksums.txt, and published them without
+            recompilation. Build provenance attests the candidate build; the
+            release-tag Sigstore signature attests these published checksums.
+            gate-report.json carries the passed configuration results, skipped
+            configurations and measurements from the pinned gate record.
 
             ### Verify what you downloaded
 
-            ```bash
-            # 1. Integrity: the binary matches its checksum
-            sha256sum -c --ignore-missing checksums.txt
+                sha256sum -c --ignore-missing checksums.txt
+                cosign verify-blob checksums.txt \
+                  --bundle checksums.txt.sigstore.json \
+                  --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/build\.yml@refs/tags/v.*$' \
+                  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+                gh attestation verify kubenest-${{ inputs.version }}-linux-amd64 --repo ${{ github.repository }}
 
-            # 2. Authenticity: the checksums were signed by this repo's release
-            #    workflow. Needs cosign v3 (v2's verify-blob cannot read this
-            #    bundle format). The identity flags are the whole point: without
-            #    them you have only proved that somebody signed it.
-            cosign verify-blob checksums.txt \
-              --bundle checksums.txt.sigstore.json \
-              --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/build\.yml@refs/tags/v.*$' \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Verify published bytes against the gate record
+        run: |
+          sh gate-workspace/scripts/tests/release-matches-candidate.sh \
+            --candidate gate-workspace/scripts/gate/candidate.yaml --check
 
-            # 3. Provenance: the binary was built by this workflow from this commit
-            gh attestation verify kubenest-${{ github.ref_name }}-linux-amd64 --repo ${{ github.repository }}
-            ```
-
-            ### Install
-
-            ```bash
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kubenest-${{ github.ref_name }}-linux-amd64
-            chmod +x kubenest-${{ github.ref_name }}-linux-amd64
-            sudo mv kubenest-${{ github.ref_name }}-linux-amd64 /usr/local/bin/kubenest
-            kubenest --version
-            ```
+      - name: Promote the verified prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: gh release edit "$VERSION" --prerelease=false --latest
