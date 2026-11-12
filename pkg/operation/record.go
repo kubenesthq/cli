@@ -381,6 +381,12 @@ type Record struct {
 	// travels inside the JSON so the mirror route can refuse a record revision
 	// older than the one it already holds without re-reading the ConfigMap.
 	Revision string `json:"revision,omitempty"`
+	// Parked are the operations parked under this record, oldest first: earlier
+	// operations of the same caller, each stopped awaiting a later step of its
+	// own, whose records were moved to their own objects so this one could take
+	// the live record (Store.AcquireAfter). They keep the lock held, terminal
+	// or not, until TakeOver puts each one back.
+	Parked []string `json:"parked,omitempty"`
 }
 
 // State is the record's lifecycle state.

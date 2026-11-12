@@ -350,7 +350,15 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the live record could not be read (%v)", ErrTakeOverRefused, err)
 	}
-	if live == nil || live.Record.OperationID != opID {
+	// A PARKED OPERATION (AcquireAfter) IS TAKEN BACK INTO THE LIVE RECORD, by
+	// this same compare-and-swap, once the record it waits behind is terminal.
+	// Before that the record is that other operation's, and it is refused.
+	parkedUnder := live != nil && live.Record.OperationID != opID && slices.Contains(live.Record.Parked, opID)
+	switch {
+	case parkedUnder && !live.Record.Terminal:
+		return nil, fmt.Errorf("%w: operation %s is parked under operation %s (%s, at stage %s), which holds the record until it is finished: finish or abort %s first",
+			ErrTakeOverRefused, opID, live.Record.OperationID, live.Record.Request.Kind, live.Record.Stage, live.Record.OperationID)
+	case !parkedUnder && (live == nil || live.Record.OperationID != opID):
 		return nil, fmt.Errorf("%w: operation %s has no live record — it was finished or a later operation replaced it", ErrTakeOverRefused, opID)
 	}
 	switch rec.Executor.State {
@@ -395,6 +403,9 @@ func TakeOver(ctx context.Context, s *Store, opID string) (*Handle, error) {
 		Heartbeat: now,
 	}
 	next.UpdatedAt = now
+	if parkedUnder {
+		next.Parked = slices.DeleteFunc(slices.Clone(live.Record.Parked), func(id string) bool { return id == opID })
+	}
 	rv, err := s.replace(ctx, Name, &next, live.ResourceVersion)
 	if err != nil {
 		return nil, fmt.Errorf("%w: claiming the record: %v", ErrTakeOverRefused, err)

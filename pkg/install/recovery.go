@@ -23,7 +23,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -982,6 +984,13 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 			AcceptDataAge: true,
 			Bundle:        s.Bundle,
 			OnOperation:   func(id string) { restoredOp = id },
+			// THE NAMESPACES RESTORED BEFORE THIS ONE STILL AWAIT ACTIVATION,
+			// and the newest of them holds the cluster's operation record. This
+			// restore parks it instead of being refused by it, and each of them
+			// keeps the record held against any other operation until the
+			// activate stage finishes it (lab s6, 2026-11-12,
+			// kn-ship-1-2-closeout-lzjb.5).
+			ParkOver: slices.Collect(maps.Values(s.Record.RecoveryRestoreOperations)),
 		}
 		if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
 			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
@@ -1100,7 +1109,12 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 	if err != nil {
 		return fmt.Errorf("the bundle declares no component-ready timeout, so waiting for a project to appear has no deadline and this stage will not guess one: %w", err)
 	}
-	for _, namespace := range s.workloadSelection().Backup.Coverage {
+	// THE LAST NAMESPACE RESTORED IS ACTIVATED FIRST. Its restore holds the
+	// cluster's operation record with every earlier one parked under it, and a
+	// parked restore is taken back only once the record it waits behind is
+	// finished. The restore stage restored in coverage order, so this walks the
+	// coverage backwards.
+	for _, namespace := range slices.Backward(s.workloadSelection().Backup.Coverage) {
 		if containsString(s.Record.RecoveryNamespacesActivated, namespace) {
 			s.Logf("  %s was already activated by this recovery", namespace)
 			continue
@@ -1135,7 +1149,10 @@ func stageRecoveryActivate(ctx context.Context, s *Session) error {
 		if err := result.Err(); err != nil {
 			return fmt.Errorf("the project of restored namespace %s is not there, so it is not activated: %w. Its data is restored and the cluster is safe; re-running this install resumes here", ns, err)
 		}
-		if err := cluster.AnnotateProject(ctx, ns, backup.ActivateAnnotationKey, s.recoveryOpID); err != nil {
+		// The value is the journalled operation on a resume, where the ownership
+		// stage that holds it in memory is skipped: op3 releases nothing for an
+		// empty one (reconcile_hold.go).
+		if err := cluster.AnnotateProject(ctx, ns, backup.ActivateAnnotationKey, s.recoveryActivationValue()); err != nil {
 			return stages.NewComponentError("kubenest-agent", fmt.Errorf("activating project %s: %w", ns, err))
 		}
 		s.Logf("  activated %s: %s=%s on project %s/%s", ns, backup.ActivateAnnotationKey, s.recoveryActivationValue(), backup.ProjectCRNamespace, ns)

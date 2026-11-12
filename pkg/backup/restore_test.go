@@ -3,9 +3,11 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -2773,6 +2775,43 @@ func TestNamespaceRestoreActivation(t *testing.T) {
 	}
 	if after != nil && after.Result != string(operation.ResultSucceeded) {
 		t.Errorf("the record closed as %q, want succeeded", after.Result)
+	}
+}
+
+// TestParkOverParksOnlyARestoreAwaitingActivation is the contract the
+// lost-server recovery restores its namespaces under
+// (kn-ship-1-2-closeout-lzjb.5): a run takes the record from a restore its
+// ParkOver names only when that restore stopped at `restored — awaiting
+// activation`, and the parked restore stays listed on the record. A named
+// restore that stopped anywhere else has not put its data back, and refuses the
+// run as any restore holding the record does.
+func TestParkOverParksOnlyARestoreAwaitingActivation(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	run := RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}
+
+	interrupted := newRestoreFixture(t, facts)
+	interrupted.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	if out, err := runRestorePlan(t, interrupted, run, ""); err == nil {
+		t.Fatalf("a restore whose Velero restore never completes must fail:\n%s", out)
+	}
+	stopped := interrupted.kube.recordFor(operation.Name).OperationID
+	next := run
+	next.ParkOver = []string{stopped}
+	if _, err := runRestorePlan(t, interrupted, next, ""); !errors.Is(err, operation.ErrLocked) || !strings.Contains(err.Error(), stopped) {
+		t.Fatalf("a run naming an interrupted restore in ParkOver returned %v; want the record's refusal naming %s", err, stopped)
+	}
+
+	restored := newRestoreFixture(t, facts)
+	if out, err := runRestorePlan(t, restored, run, ""); err != nil {
+		t.Fatalf("the first restore failed: %v\n%s", err, out)
+	}
+	waiting := restored.kube.recordFor(operation.Name).OperationID
+	next.ParkOver = []string{waiting}
+	if out, err := runRestorePlan(t, restored, next, ""); err != nil {
+		t.Fatalf("a run naming a restore awaiting activation in ParkOver was refused: %v\n%s", err, out)
+	}
+	if live := restored.kube.recordFor(operation.Name); live.OperationID == waiting || !slices.Equal(live.Parked, []string{waiting}) {
+		t.Errorf("the record is %s with %v parked, want the new restore with %s parked under it", live.OperationID, live.Parked, waiting)
 	}
 }
 

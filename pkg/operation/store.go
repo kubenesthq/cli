@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -196,7 +197,7 @@ func (s *Store) Find(ctx context.Context, opID string) (*Stored, error) {
 
 // Acquire takes the lock: it creates the record, or replaces one that a
 // previous operation left marked terminal, and refuses while another operation
-// is live. The refusal is the lock.
+// is live or parked (AcquireAfter). The refusal is the lock.
 //
 // Nothing else in this package submits a remote action, so the record exists
 // before the operation's first side effect by construction.
@@ -207,6 +208,26 @@ func (s *Store) Find(ctx context.Context, opID string) (*Stored, error) {
 // its safety gates against the state at that moment, so an interrupted wait
 // holds nothing and can simply be started again (PLAN 7.2).
 func (s *Store) Acquire(ctx context.Context, req Request) (*Handle, error) {
+	return s.AcquireAfter(ctx, req, nil)
+}
+
+// AcquireAfter is Acquire for an operation that comes after earlier operations
+// of the SAME caller, each stopped awaiting a later step of its own. mayPark
+// names them; nil names none, which is Acquire.
+//
+// A LOST-SERVER RECOVERY IS THAT CALLER (PLAN 7.9 steps 5 and 6). It restores
+// every namespace before it activates any, and each namespace restore is an
+// operation that stops at `restored — awaiting activation` still holding the
+// record, so Acquire refused the second namespace behind the first (S6, lab
+// s6, 2026-11-12, kn-ship-1-2-closeout-lzjb.5).
+//
+// The record it parks is copied unchanged to its own object, the name its
+// history copy takes, and listed in the new record's Parked. THE LOCK STAYS
+// HELD FOR IT: a record that lists parked operations refuses Acquire even once
+// it is terminal, and TakeOver puts a parked operation back in the live record
+// once the record it waits behind is terminal. Only a STOPPED executor is
+// parked, because a running one may still be writing the record it would lose.
+func (s *Store) AcquireAfter(ctx context.Context, req Request, mayPark func(*Record) bool) (*Handle, error) {
 	now := s.now()
 	rec := &Record{
 		OperationID: NewOperationID(),
@@ -242,9 +263,23 @@ func (s *Store) Acquire(ctx context.Context, req Request) (*Handle, error) {
 		}
 		h.rv = rv
 	case live.Record.Terminal:
-		// The old record is finished. Replacing it carries the
-		// resourceVersion it was read at, so a concurrent replacement is a 409
-		// and the 409 is the refusal.
+		// The old record is finished, but what is parked under it is not.
+		// Replacing it carries the resourceVersion it was read at, so a
+		// concurrent replacement is a 409 and the 409 is the refusal.
+		if err := s.refuseParked(ctx, live.Record, mayPark); err != nil {
+			return nil, err
+		}
+		rec.Parked = live.Record.Parked
+		rv, err := s.replace(ctx, Name, rec, live.ResourceVersion)
+		if err != nil {
+			return nil, err
+		}
+		h.rv = rv
+	case mayPark != nil && live.Record.Executor.State == ExecutorStopped && mayPark(live.Record):
+		if err := s.copyHistory(ctx, live.Record); err != nil {
+			return nil, err
+		}
+		rec.Parked = append(slices.Clone(live.Record.Parked), live.Record.OperationID)
 		rv, err := s.replace(ctx, Name, rec, live.ResourceVersion)
 		if err != nil {
 			return nil, err
@@ -409,6 +444,27 @@ func (s *Store) refusedByOther(ctx context.Context, what string) error {
 	default:
 		return locked(live.Record)
 	}
+}
+
+// refuseParked refuses while an operation parked under rec still waits and
+// mayPark does not name it. The refusal names that operation from its own
+// record, the way locked names a live one; a parked record that cannot be read
+// refuses too, because a record nobody can see is never permission.
+func (s *Store) refuseParked(ctx context.Context, rec *Record, mayPark func(*Record) bool) error {
+	for _, id := range rec.Parked {
+		parked, err := s.read(ctx, HistoryPrefix+id)
+		if err != nil {
+			return err
+		}
+		if parked == nil {
+			return fmt.Errorf("%w: operation %s is parked under operation %s and its record %s/%s%s is missing, so nothing can take it back. Establish what that operation left on the cluster, then remove it from the parked list of %s/%s by hand",
+				ErrLocked, id, rec.OperationID, Namespace, HistoryPrefix, id, Namespace, Name)
+		}
+		if mayPark == nil || !mayPark(parked.Record) {
+			return locked(parked.Record)
+		}
+	}
+	return nil
 }
 
 // locked is the refusal that names the other operator.

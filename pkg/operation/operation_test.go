@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -937,6 +938,73 @@ func TestCompletionCopiesHistoryUnderTheOperationIDAndNeverRenames(t *testing.T)
 	if found.Record.Result != string(ResultSucceeded) {
 		t.Fatalf("the history copy's result is %q", found.Record.Result)
 	}
+}
+
+// TestAParkedOperationKeepsTheLockUntilItIsTakenBackAndFinished is AcquireAfter,
+// the lock a lost-server recovery restores its namespaces under
+// (kn-ship-1-2-closeout-lzjb.5). A stopped operation the caller names is parked
+// so the caller's next operation can take the live record, and the lock stays
+// held for it: Acquire is refused while it waits, even after the record it is
+// parked under is terminal, until a take-over puts it back and it finishes.
+//
+// PLANTED NEGATIVES: a running executor is never parked, because it may still
+// be writing the record it would lose; an operation the caller does not name is
+// never parked; and a parked operation is not taken back while the record it
+// waits behind is still live.
+func TestAParkedOperationKeepsTheLockUntilItIsTakenBackAndFinished(t *testing.T) {
+	k := newFakeKube(t)
+	s := newStore(t, k, "ana@laptop")
+	ctx := context.Background()
+
+	first := acquire(t, s, testRequest("host-1"))
+	ours := func(rec *Record) bool { return rec.OperationID == first.OperationID() }
+	if _, err := s.AcquireAfter(ctx, testRequest("host-2"), ours); !errors.Is(err, ErrLocked) {
+		t.Fatalf("parking a RUNNING executor returned %v, want ErrLocked", err)
+	}
+	if err := s.Stop(ctx, first); err != nil {
+		t.Fatalf("stopping the first executor: %v", err)
+	}
+	if _, err := s.AcquireAfter(ctx, testRequest("host-2"), func(*Record) bool { return false }); !errors.Is(err, ErrLocked) {
+		t.Fatalf("parking an operation the caller does not name returned %v, want ErrLocked", err)
+	}
+
+	second, err := s.AcquireAfter(ctx, testRequest("host-2"), ours)
+	if err != nil {
+		t.Fatalf("the caller's next operation was refused behind its own stopped one: %v", err)
+	}
+	if live := k.liveRecord(Name); live.OperationID != second.OperationID() || !slices.Equal(live.Parked, []string{first.OperationID()}) {
+		t.Fatalf("the live record is %s with %v parked, want %s with %s parked", live.OperationID, live.Parked, second.OperationID(), first.OperationID())
+	}
+	// The parked operation is an object of its own, still stopped and unfinished,
+	// so it can be found and taken back.
+	if parked := k.liveRecord(HistoryPrefix + first.OperationID()); parked.Terminal || parked.Executor.State != ExecutorStopped {
+		t.Fatalf("the parked operation's record is terminal=%t executor=%s, want it stopped and unfinished", parked.Terminal, parked.Executor.State)
+	}
+
+	if _, err := s.Acquire(ctx, testRequest("host-3")); !errors.Is(err, ErrLocked) {
+		t.Fatalf("Acquire behind a live record with an operation parked under it returned %v, want ErrLocked", err)
+	}
+	if _, err := TakeOver(ctx, s, first.OperationID()); !errors.Is(err, ErrTakeOverRefused) || !strings.Contains(err.Error(), second.OperationID()) {
+		t.Fatalf("taking back a parked operation while the record it waits behind is live returned %v, want a refusal naming %s", err, second.OperationID())
+	}
+	if err := s.Complete(ctx, second, ResultSucceeded); err != nil {
+		t.Fatalf("completing the second operation: %v", err)
+	}
+	if _, err := s.Acquire(ctx, testRequest("host-3")); !errors.Is(err, ErrLocked) || !strings.Contains(err.Error(), first.OperationID()) {
+		t.Fatalf("Acquire behind a terminal record with %s parked under it returned %v, want ErrLocked naming it", first.OperationID(), err)
+	}
+
+	back, err := TakeOver(ctx, s, first.OperationID())
+	if err != nil {
+		t.Fatalf("taking back the parked operation once the record it waited behind was terminal: %v", err)
+	}
+	if live := k.liveRecord(Name); live.OperationID != first.OperationID() || live.Terminal || len(live.Parked) != 0 {
+		t.Fatalf("after the take-over the live record is %s terminal=%t parked=%v, want %s back, unfinished, with nothing parked", live.OperationID, live.Terminal, live.Parked, first.OperationID())
+	}
+	if err := s.Complete(ctx, back, ResultSucceeded); err != nil {
+		t.Fatalf("completing the operation that was parked: %v", err)
+	}
+	acquire(t, s, testRequest("host-3"))
 }
 
 // TestInterruptedInventoryWriteStaysVisibleAsPending: completion distinguishes

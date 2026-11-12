@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -524,6 +525,15 @@ type RestoreOptions struct {
 	// callback rather than a return value because the id exists only once the
 	// record has been claimed, and there are many paths back from there.
 	OnOperation func(id string)
+	// ParkOver names the caller's own earlier namespace restores, each stopped
+	// at `restored — awaiting activation`. This run parks the one holding the
+	// record instead of being refused by it (operation.Store.AcquireAfter), and
+	// the record stays held for it until its activation. The lost-server
+	// recovery restores every namespace before activating any (PLAN 7.9 steps 5
+	// and 6), so each of its restores after the first comes behind these. Empty
+	// for an operator's own restore, which a restore awaiting activation still
+	// refuses.
+	ParkOver []string
 }
 
 // recovery is the two recovery flags as pkg/operation's Recovery, where their
@@ -1318,7 +1328,7 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 	}
 	recovery := r.opts.recovery()
 	if recovery.ID() == "" {
-		handle, err := r.deps.Store.Acquire(ctx, r.request())
+		handle, err := r.deps.Store.AcquireAfter(ctx, r.request(), r.parkable)
 		if err != nil {
 			return err
 		}
@@ -1328,6 +1338,12 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 		return nil
 	}
 	return r.resumeRecord(ctx, recovery)
+}
+
+// parkable reports whether a record holding the lock is one of the restores
+// ParkOver names, stopped where a restore stops once its data is back.
+func (r *restoreRun) parkable(rec *operation.Record) bool {
+	return rec.Stage == RestoredStage && slices.Contains(r.opts.ParkOver, rec.OperationID)
 }
 
 // resumeRecord reconciles an interrupted restore before repeating anything.
