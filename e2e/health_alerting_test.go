@@ -24,14 +24,14 @@
 //	  not applicable, `kubenest health` exits 0 within 30 s of a report, its
 //	  --json carries the table's clusters, states and reasons, and with an empty
 //	  outbox the live worker keeps the heartbeat beating;
-//	then, one at a time with recovery in between, each fault produces ONE alert
-//	  and ONE resolve at the receiver, in order, with one stable incident_id,
+//	then, one at a time with recovery in between, each of the plan's seven faults
+//	  produces ONE alert and ONE resolve on its check at the receiver, in order,
+//	  with one stable incident_id,
 //	  each within three delivery cycles of the verdict behind it (a retry of the
 //	  same intent is allowed: S10 does not prove exactly-once delivery):
 //	    stop the agent                  reporting/CLUSTER_SILENT, critical
 //	    fill the data disk              NOT RUNNABLE, fails by name (see below)
 //	    age the restore drill           backup/RESTORE_DRILL_STALE
-//	    a collector fails (planted)     backup/COLLECTION_FAILED, unknown, exit 3
 //	    break the S3 snapshot upload    datastore/DATASTORE_SNAPSHOT_FAILED while
 //	                                    the local snapshot stays fresh
 //	    fail the receiver, restart the backend, restore the receiver: the backlog's
@@ -42,6 +42,9 @@
 //	                                    delivery-cycle deadline while the sweeper
 //	                                    keeps sweeping, and the switch notifies
 //	    stop the backend entirely       no beat after the stop; the switch notifies
+//	between the drill and S3 faults, a planted collector failure makes backup
+//	  unknown/COLLECTION_FAILED with its reason and exits 3; agent/AGENT_ERRORS
+//	  can accompany it without counting as a second fault alert;
 //	no request reached the receivers malformed, and the gate ran under 60 minutes.
 //
 // WHERE THE PLAN AND THE PRODUCT DISAGREE (measured at kubenest-backend d1e9029,
@@ -96,12 +99,12 @@
 //	export KUBENEST_CONTROL_PLANE=https://api.<cp-ip>.sslip.io KUBENEST_CLI_TOKEN=knp_...
 //	export KUBENEST_CONTROL_PLANE_CA=<pem> KUBENEST_GATE_CLUSTER=<cluster>
 //	export KUBENEST_GATE_RECEIVER_HOST=<lab-host-public-ip>:18090
-//	cd kubenest-cli && go test -tags e2e -count=1 -v -timeout 90m ./e2e/ -run TestHealthAlertingS10
+//	cd kubenest-cli && go test -tags e2e -count=1 -v -timeout 120m ./e2e/ -run TestHealthAlertingS10
 //
 // PASS LIMITS (plan section 4, bead kn-9pgx): exit codes exact; `kubenest health`
 // exits 0 within 30 s of the last report; each alert and resolve within three
 // delivery cycles of its verdict; the heartbeat stops within two sweep
-// intervals; one alert and one resolve per fault; the whole gate under 60
+// intervals; one alert and one resolve per check for the seven faults; the whole gate under 60
 // minutes. The intervals are the backend's defaults, which the chart does not
 // override (app/core/config.py).
 //
@@ -321,6 +324,27 @@ func s10OneAlertOneResolve(events []s10Event, cluster string) (string, error) {
 		return "", fmt.Errorf("incident %s fired and never received its resolve", incident)
 	}
 	return incident, nil
+}
+
+// Count the fault's check independently: another check can alert during the
+// same sweep without becoming a second incident for this fault.
+func s10OneAlertOneResolveForCheck(events []s10Event, cluster, check string) (string, error) {
+	var selected []s10Event
+	for _, e := range events {
+		if e.Check == check {
+			selected = append(selected, e)
+		}
+	}
+	return s10OneAlertOneResolve(selected, cluster)
+}
+
+func s10SelectDelivered(events []s10Event, cluster, state, incident, check string) (s10Event, bool) {
+	for _, e := range events {
+		if e.Delivered && e.Cluster == cluster && e.State == state && e.Check == check && (incident == "" || e.Incident == incident) {
+			return e, true
+		}
+	}
+	return s10Event{}, false
 }
 
 // s10Unresolved names, in firing order, every incident for one cluster with a
@@ -859,7 +883,7 @@ func (s *s10Run) requireEmptyOutbox(t *testing.T) {
 	})
 }
 
-// awaitAlert waits for a DELIVERED request in state for the faulted cluster
+// awaitAlert waits for a DELIVERED request on the faulted check and cluster
 // (and incident, when given) from index from on. Meanwhile it watches the
 // check, to time the verdict the delivery follows.
 func (s *s10Run) awaitAlert(t *testing.T, from int, state, incident, check string, within time.Duration) (s10Event, time.Time) {
@@ -877,11 +901,9 @@ func (s *s10Run) awaitAlert(t *testing.T, from int, state, incident, check strin
 			}
 		}
 		received := s.recv.eventsFrom(from)
-		for _, e := range received {
-			if e.Delivered && e.Cluster == s.clusterID && e.State == state && (incident == "" || e.Incident == incident) {
-				got = e
-				return true, ""
-			}
+		if e, ok := s10SelectDelivered(received, s.clusterID, state, incident, check); ok {
+			got = e
+			return true, ""
 		}
 		return false, fmt.Sprintf("%d request(s) received since the fault", len(received))
 	})
@@ -906,10 +928,12 @@ func s10DeliveredWithinLimit(t *testing.T, what string, e s10Event, verdictAt ti
 type s10Fault struct {
 	check                     string
 	reasons                   []string
+	companionCheck            string // planted negatives may also report an agent error
 	inject                    func(t *testing.T)
 	during                    func(t *testing.T, alert s10Event)
 	recover                   func(t *testing.T)
 	fireWithin, resolveWithin time.Duration
+	fireWithinAfterInject     func() time.Duration
 }
 
 func (s *s10Run) fault(t *testing.T, f s10Fault) {
@@ -917,7 +941,11 @@ func (s *s10Run) fault(t *testing.T, f s10Fault) {
 	s.requireHealthy(t)
 	from := len(s.recv.eventsFrom(0))
 	f.inject(t)
-	firing, firedAt := s.awaitAlert(t, from, s10Firing, "", f.check, f.fireWithin)
+	fireWithin := f.fireWithin
+	if f.fireWithinAfterInject != nil {
+		fireWithin = f.fireWithinAfterInject()
+	}
+	firing, firedAt := s.awaitAlert(t, from, s10Firing, "", f.check, fireWithin)
 	if firing.Check != f.check || !slices.Contains(f.reasons, firing.Reason) {
 		t.Errorf("the alert is %s/%s, want %s with one of %v", firing.Check, firing.Reason, f.check, f.reasons)
 	}
@@ -929,10 +957,25 @@ func (s *s10Run) fault(t *testing.T, f s10Fault) {
 	resolved, resolvedAt := s.awaitAlert(t, from, s10Resolved, firing.Incident, f.check, f.resolveWithin)
 	s10DeliveredWithinLimit(t, "the resolve", resolved, resolvedAt)
 	s.requireHealthy(t)
-	if incident, err := s10OneAlertOneResolve(s.recv.eventsFrom(from), s.clusterID); err != nil {
+	events := s.recv.eventsFrom(from)
+	if f.companionCheck != "" {
+		companions := 0
+		for _, e := range events {
+			if e.Delivered && e.Cluster == s.clusterID && e.Check == f.companionCheck && e.State == s10Firing {
+				companions++
+				t.Logf("companion %s/%s incident %s fired; its resolve is %t", e.Check, e.Reason, e.Incident,
+					slices.ContainsFunc(events, func(candidate s10Event) bool {
+						return candidate.Delivered && candidate.Cluster == s.clusterID && candidate.Incident == e.Incident && candidate.State == s10Resolved
+					}))
+			}
+		}
+		if companions == 0 {
+			t.Logf("no %s companion alert was delivered with the %s planted negative", f.companionCheck, f.check)
+		}
+	} else if incident, err := s10OneAlertOneResolveForCheck(events, s.clusterID, f.check); err != nil {
 		t.Error(err)
 	} else {
-		t.Logf("one alert and one resolve, incident %s", incident)
+		t.Logf("one alert and one resolve on %s, incident %s", f.check, incident)
 	}
 }
 
@@ -1110,9 +1153,10 @@ func (s *s10Run) failACollector(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.fault(t, s10Fault{
-		check:   "backup",
-		reasons: []string{"COLLECTION_FAILED"},
-		inject:  func(t *testing.T) { s.swapDrillResult(t, original, invalid) },
+		check:          "backup",
+		reasons:        []string{"COLLECTION_FAILED"},
+		companionCheck: "agent", // op3 reports the group collection error in agent.errors too.
+		inject:         func(t *testing.T) { s.swapDrillResult(t, original, invalid) },
 		during: func(t *testing.T, _ s10Event) {
 			d := s.detail(t)
 			c, ok := s10CheckIn(d, "backup")
@@ -1130,8 +1174,8 @@ func (s *s10Run) failACollector(t *testing.T) {
 				t.Fatalf("reading the fleet: %v", err)
 			}
 			worst := healthGateWorstState(fleet.Clusters)
-			if _, code := healthGateRun(t, "health"); code != healthExitCodeMap[worst] {
-				t.Errorf("kubenest health exited %d for a fleet whose worst state is %s, want %d", code, worst, healthExitCodeMap[worst])
+			if _, code := healthGateRun(t, "health"); code != healthExitCodeMap["unknown"] {
+				t.Errorf("kubenest health exited %d for a fleet whose worst state is %s, want %d", code, worst, healthExitCodeMap["unknown"])
 			} else {
 				t.Logf("kubenest health exits %d: the fleet's worst state is %s", code, worst)
 			}
@@ -1142,24 +1186,31 @@ func (s *s10Run) failACollector(t *testing.T) {
 	})
 }
 
-// snapshot forces a datastore snapshot the way the CLI does (pkg/backup/datastore.go).
-func (s *s10Run) snapshot(t *testing.T, mustSucceed bool) {
-	t.Helper()
+// snapshot forces a recovery snapshot the way the CLI does (pkg/backup/datastore.go).
+func (s *s10Run) snapshot() error {
 	res, err := s.server.Run(context.Background(), "sudo -n k3s etcd-snapshot save --name kubenest-s10-"+randomSuffix())
 	if err != nil {
-		t.Fatalf("running k3s etcd-snapshot save: %v", err)
+		return fmt.Errorf("running k3s etcd-snapshot save: %w", err)
 	}
-	switch {
-	case res.ExitCode != 0 && mustSucceed:
-		t.Fatalf("k3s etcd-snapshot save failed with the bucket restored: exit %d: %s", res.ExitCode, firstLineOfE2E(res.Stderr))
-	case res.ExitCode != 0:
-		t.Logf("k3s etcd-snapshot save with the upload broken exited %d", res.ExitCode)
+	if res.ExitCode != 0 {
+		return fmt.Errorf("k3s etcd-snapshot save failed with the bucket restored: exit %d: %s", res.ExitCode, firstLineOfE2E(res.Stderr))
 	}
+	return nil
 }
 
-// breakTheSnapshotUpload points the upload at a bucket that does not exist. k3s
-// reads the Secret at each snapshot (pkg/backup/datastore.go), so the local
-// snapshot is still taken and only the off-cluster side fails.
+// k3s's scheduled snapshot saves locally before initializing the S3 client.
+// An on-demand save initializes S3 first and would refuse a missing bucket
+// without taking any local snapshot or recording the failed upload.
+func s10NextScheduledSnapshot(clock string) (time.Duration, error) {
+	parsed, err := time.Parse("04:05", strings.TrimSpace(clock))
+	if err != nil {
+		return 0, err
+	}
+	return time.Hour - time.Duration(parsed.Minute())*time.Minute - time.Duration(parsed.Second())*time.Second, nil
+}
+
+// breakTheSnapshotUpload leaves the bucket broken through k3s's next hourly
+// scheduled snapshot. That path records a fresh local snapshot and an S3 error.
 func (s *s10Run) breakTheSnapshotUpload(t *testing.T) {
 	secret := "-n kube-system patch secret " + s10SnapshotSecret
 	original := s.kubectl(t, s.server, "-n kube-system get secret "+s10SnapshotSecret+" -o jsonpath={.data.etcd-s3-bucket}")
@@ -1168,45 +1219,69 @@ func (s *s10Run) breakTheSnapshotUpload(t *testing.T) {
 	}
 	broken := base64.StdEncoding.EncodeToString([]byte("kubenest-s10-no-such-bucket-" + randomSuffix()))
 	bucket := func(b64 string) string { return fmt.Sprintf(`{"data":{"etcd-s3-bucket":%q}}`, b64) }
+	before, _ := s10CheckIn(s.detail(t), "datastore")
+	previousLocal := s10DetailTime(before.Detail, "local_snapshot_at")
+	var untilTick time.Duration
+	recovered := false
 	s.fault(t, s10Fault{
 		check:   "datastore",
-		reasons: []string{"DATASTORE_SNAPSHOT_FAILED", "SNAPSHOT_STALE"},
+		reasons: []string{"DATASTORE_SNAPSHOT_FAILED"},
 		inject: func(t *testing.T) {
 			t.Cleanup(func() {
 				if err := s.patch(s.server, secret, bucket(original)); err != nil {
 					t.Errorf("restoring the snapshot bucket: %v", err)
+					return
+				}
+				if !recovered {
+					if err := s.snapshot(); err != nil {
+						t.Errorf("recovering the datastore snapshot after an interrupted arm: %v", err)
+					}
 				}
 			})
 			if err := s.patch(s.server, secret, bucket(broken)); err != nil {
 				t.Fatalf("breaking the snapshot upload: %v", err)
 			}
-			s.snapshot(t, false)
+			res, err := s.server.Run(context.Background(), "date +%M:%S")
+			if err != nil {
+				t.Fatalf("reading the snapshot host's clock: %v", err)
+			}
+			if res.ExitCode != 0 {
+				t.Fatalf("reading the snapshot host's clock: exit %d: %s", res.ExitCode, firstLineOfE2E(res.Stderr))
+			}
+			untilTick, err = s10NextScheduledSnapshot(res.Stdout)
+			if err != nil {
+				t.Fatalf("parsing the snapshot host's clock: %v", err)
+			}
+			t.Logf("the snapshot bucket is broken at host clock %s; the next hourly scheduled snapshot is in %s", strings.TrimSpace(res.Stdout), untilTick)
 		},
-		during: func(t *testing.T, alert s10Event) {
+		during: func(t *testing.T, _ s10Event) {
 			c, _ := s10CheckIn(s.detail(t), "datastore")
 			local := s10DetailTime(c.Detail, "local_snapshot_at")
 			off := s10DetailTime(c.Detail, "offcluster_snapshot_at")
 			t.Logf("datastore %s: local snapshot %s, off-cluster %s", c.ReasonCode, local.Format(time.RFC3339), off.Format(time.RFC3339))
-			if local.IsZero() || time.Since(local) > s10SnapshotMaxAge {
-				t.Errorf("the local snapshot is not fresh (%s): the fault must break only the upload", local.Format(time.RFC3339))
+			if local.IsZero() || !local.After(previousLocal) || time.Since(local) > s10SnapshotMaxAge {
+				t.Errorf("the local snapshot (%s) is not fresh and newer than the pre-fault snapshot (%s)", local.Format(time.RFC3339), previousLocal.Format(time.RFC3339))
 			}
-			if !off.IsZero() && !off.Before(local) {
+			if off.IsZero() || !off.Before(local) {
 				t.Errorf("the off-cluster snapshot (%s) is not older than the local one (%s)", off.Format(time.RFC3339), local.Format(time.RFC3339))
 			}
-			if alert.Reason == "DATASTORE_SNAPSHOT_FAILED" {
-				failure, _ := c.Detail["last_failure"].(map[string]any)
-				if location, _ := failure["location"].(string); location == "" || strings.HasPrefix(location, "file://") {
-					t.Errorf("the recorded failure's location is %q, want the off-cluster upload's", location)
-				}
+			failure, _ := c.Detail["last_failure"].(map[string]any)
+			if location, _ := failure["location"].(string); location == "" || strings.HasPrefix(location, "file://") {
+				t.Errorf("the recorded failure's location is %q, want the off-cluster upload's", location)
 			}
 		},
 		recover: func(t *testing.T) {
 			if err := s.patch(s.server, secret, bucket(original)); err != nil {
 				t.Fatalf("restoring the snapshot bucket: %v", err)
 			}
-			s.snapshot(t, true)
+			if err := s.snapshot(); err != nil {
+				t.Fatal(err)
+			}
+			recovered = true
 		},
-		fireWithin:    2*time.Minute + s10ReportInterval + s10DeliveryLimit + time.Minute,
+		fireWithinAfterInject: func() time.Duration {
+			return untilTick + 5*time.Second + s10ReportInterval + s10SweepInterval + s10DeliveryLimit + time.Minute
+		},
 		resolveWithin: 2*time.Minute + s10ReportInterval + s10DeliveryLimit + time.Minute,
 	})
 }
@@ -1271,7 +1346,7 @@ func (s *s10Run) failTheReceiver(t *testing.T) {
 	resolved, resolvedAt := s.awaitAlert(t, from, s10Resolved, firing.Incident, "backup", s10ReportInterval+s10DeliveryLimit+2*time.Minute)
 	s10DeliveredWithinLimit(t, "the resolve", resolved, resolvedAt)
 	s.requireHealthy(t)
-	if _, err := s10OneAlertOneResolve(s.recv.eventsFrom(from), s.clusterID); err != nil {
+	if _, err := s10OneAlertOneResolveForCheck(s.recv.eventsFrom(from), s.clusterID, "backup"); err != nil {
 		t.Error(err)
 	}
 	s.requireEmptyOutbox(t)
@@ -1598,6 +1673,63 @@ func TestS10LedgerAcceptsOneAlertThenOneResolve(t *testing.T) {
 	}, "c1")
 	if err != nil || got != "inc-a" {
 		t.Fatalf("got (%q, %v), want (inc-a, nil)", got, err)
+	}
+}
+
+func TestS10AlertSelectionUsesTheFaultsCheck(t *testing.T) {
+	events := []s10Event{
+		{Incident: "agent-a", Check: "agent", State: s10Firing, Cluster: "c1", Delivered: true},
+		{Incident: "backup-a", Check: "backup", State: s10Firing, Cluster: "c1", Delivered: true},
+	}
+	got, ok := s10SelectDelivered(events, "c1", s10Firing, "", "backup")
+	if !ok || got.Incident != "backup-a" {
+		t.Fatalf("selected (%+v, %t), want the backup incident", got, ok)
+	}
+	if _, ok := s10SelectDelivered(events, "c1", s10Firing, "", "datastore"); ok {
+		t.Fatal("an alert for another check cannot satisfy the datastore wait")
+	}
+	events = append(events,
+		s10Event{Incident: "backup-a", Check: "agent", State: s10Resolved, Cluster: "c1", Delivered: true},
+		s10Event{Incident: "backup-a", Check: "backup", State: s10Resolved, Cluster: "c1", Delivered: true})
+	if got, ok := s10SelectDelivered(events, "c1", s10Resolved, "backup-a", "backup"); !ok || got.Check != "backup" {
+		t.Fatalf("selected (%+v, %t), want the backup resolve", got, ok)
+	}
+}
+
+func TestS10LedgerCountsTheFaultCheckOnly(t *testing.T) {
+	events := []s10Event{
+		{Incident: "agent-a", Check: "agent", State: s10Firing, Cluster: "c1", Delivered: true},
+		{Incident: "backup-a", Check: "backup", State: s10Firing, Cluster: "c1", Delivered: true},
+		{Incident: "agent-a", Check: "agent", State: s10Resolved, Cluster: "c1", Delivered: true},
+		{Incident: "backup-a", Check: "backup", State: s10Resolved, Cluster: "c1", Delivered: true},
+	}
+	got, err := s10OneAlertOneResolveForCheck(events, "c1", "backup")
+	if err != nil || got != "backup-a" {
+		t.Fatalf("got (%q, %v), want backup-a and no error", got, err)
+	}
+	events = append(events,
+		s10Event{Incident: "backup-b", Check: "backup", State: s10Firing, Cluster: "c1", Delivered: true},
+		s10Event{Incident: "backup-b", Check: "backup", State: s10Resolved, Cluster: "c1", Delivered: true})
+	if _, err := s10OneAlertOneResolveForCheck(events, "c1", "backup"); err == nil {
+		t.Fatal("a second incident on the fault check must be refused")
+	}
+}
+
+func TestS10NextScheduledSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		clock string
+		want  time.Duration
+	}{
+		{"57:30", 2*time.Minute + 30*time.Second},
+		{"00:03", 59*time.Minute + 57*time.Second},
+	} {
+		got, err := s10NextScheduledSnapshot(tc.clock)
+		if err != nil || got != tc.want {
+			t.Errorf("host clock %s: got (%s, %v), want %s", tc.clock, got, err, tc.want)
+		}
+	}
+	if _, err := s10NextScheduledSnapshot("not-a-clock"); err == nil {
+		t.Fatal("a malformed host clock must not become an immediate snapshot wait")
 	}
 }
 
