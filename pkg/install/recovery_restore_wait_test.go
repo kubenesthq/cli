@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,6 +140,12 @@ type syncingVelero struct {
 	// has one of each.
 	namespace string
 	more      []*syncingVelero
+
+	// fault, when set, sees every command before the cluster answers it and
+	// may break it: the crash windows a recovery has to survive are injected at
+	// the command that marks them. input is the document the command streams,
+	// meaningful only for a command that streams one.
+	fault func(command string, input []byte) faultKind
 }
 
 // name is the namespace this fake answers for.
@@ -185,11 +194,17 @@ func recoveryWaitRecord(volumes ...string) json.RawMessage {
 }
 
 // recoveryWaitRecordOf is the coverage record of the backup covering every one
-// of the namespaces, with no volume expected in any of them.
-func recoveryWaitRecordOf(namespaces []string) json.RawMessage {
+// of the namespaces, expecting the volumes named for each (none when absent).
+// A volume expected here has no copy in the fake's backup, which is what makes
+// its namespace ineligible.
+func recoveryWaitRecordOf(namespaces []string, volumes map[string][]string) json.RawMessage {
 	covered := []map[string]any{}
 	for _, ns := range namespaces {
-		covered = append(covered, map[string]any{"name": ns, "uid": "namespace-uid", "volumes": []map[string]any{}})
+		refs := []map[string]any{}
+		for _, volume := range volumes[ns] {
+			refs = append(refs, map[string]any{"namespace": ns, "name": volume, "uid": volume + "-uid"})
+		}
+		covered = append(covered, map[string]any{"name": ns, "uid": "namespace-uid", "volumes": refs})
 	}
 	record, _ := json.Marshal(map[string]any{"backup": recoveryWaitBackup, "namespaces": covered})
 	return record
@@ -200,10 +215,43 @@ func (c *syncingVelero) mount(runner *recordingRunner) {
 	runner.respond = func(command string) (sshx.Result, error) { return c.answer(runner, command) }
 }
 
+// faultKind is what an injected fault does to one command.
+type faultKind int
+
+const (
+	// noFault answers the command as the cluster would.
+	noFault faultKind = iota
+	// failCommand fails the command before the cluster sees it.
+	failCommand
+	// loseReply carries the command out and loses its reply: a connection
+	// that drops after the API server applied a write.
+	loseReply
+)
+
+// errInjected is the transport failure an injected fault produces.
+var errInjected = errors.New("ssh: the connection to the server node was lost (injected)")
+
 func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Result, error) {
+	kind := noFault
+	if c.fault != nil {
+		kind = c.fault(command, lastInput(runner))
+	}
+	switch kind {
+	case failCommand:
+		return sshx.Result{}, errInjected
+	case loseReply:
+		if _, err := c.respond(runner, command); err != nil {
+			return sshx.Result{}, err
+		}
+		return sshx.Result{}, errInjected
+	}
+	return c.respond(runner, command)
+}
+
+func (c *syncingVelero) respond(runner *recordingRunner, command string) (sshx.Result, error) {
 	for _, other := range c.more {
 		if other.concerns(command) {
-			return other.answer(runner, command)
+			return other.respond(runner, command)
 		}
 	}
 	ns := c.name()
@@ -302,13 +350,18 @@ func (c *syncingVelero) answer(runner *recordingRunner, command string) (sshx.Re
 			// which is the change this fake exists to observe.
 			c.pauseLifted = true
 		case strings.Contains(command, backup.PauseAnnotationKey+"="):
+			// A new pause holds the project again, whatever lifted the last.
 			c.opID = pauseOpID(command)
+			c.pauseLifted = false
 		}
 		return sshx.Result{}, nil
 
 	// The namespace went with the host, so the restore recreates it, and the
 	// restore's own Velero Restore completes at once. A namespace read from
-	// then on finds what that Restore created.
+	// then on finds what that Restore created, until a later restore deletes it.
+	case strings.Contains(command, "delete namespace "+ns+" "):
+		c.restored = false
+		return sshx.Result{}, nil
 	case strings.Contains(command, "get namespace "+ns+" -o json"):
 		if !c.restored {
 			return notFound("namespaces", ns), nil
@@ -512,7 +565,7 @@ func recoveryWaitSession(t *testing.T, cluster *syncingVelero) (*Session, *recor
 	coverage := cluster.coverageNames()
 	setRecord := cluster.setRecord
 	if setRecord == nil && !cluster.omitSetRecord {
-		setRecord = recoveryWaitRecordOf(coverage)
+		setRecord = recoveryWaitRecordOf(coverage, nil)
 	}
 	f.publish(t, f.bind, "20260928T113029Z-cccccccc", f.secrets, nil, true, recoverykit.Backup{
 		Name:           recoveryWaitBackup,
@@ -1346,5 +1399,619 @@ func TestAnOperatorsRestoreIsRefusedWhileARecoveredNamespaceAwaitsActivation(t *
 	}
 	if _, err := deps.Store.Acquire(context.Background(), operation.Request{Kind: operation.KindRestoreNamespace, Cluster: s.recoveryName()}); err != nil {
 		t.Errorf("after the recovery activated every namespace, a new operation is still refused the record: %v", err)
+	}
+}
+
+// recoveryThirdNamespace is a third project, so a recovery has a namespace on
+// each side of the one a test breaks.
+const recoveryThirdNamespace = "s6-logs"
+
+// threeProjectCluster is a rebuilt cluster whose backup covers three projects,
+// each holding the CronJob the gate's sentinel runs on.
+func threeProjectCluster() (first, second, third *syncingVelero) {
+	second = &syncingVelero{namespace: recoveryGateNamespace, cronJob: recoveryActivateCronJob}
+	third = &syncingVelero{namespace: recoveryThirdNamespace, cronJob: recoveryActivateCronJob}
+	first = &syncingVelero{locationPhase: "Available", cronJob: recoveryActivateCronJob, more: []*syncingVelero{second, third}}
+	return first, second, third
+}
+
+// recordDoc decodes an operation record document as the CLI writes it: the
+// ConfigMap's name and the record it holds. Anything else decodes to nil.
+func recordDoc(doc []byte) (name string, rec *operation.Record) {
+	var cm struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Data map[string]string `json:"data"`
+	}
+	if json.Unmarshal(doc, &cm) != nil || cm.Data["record.json"] == "" {
+		return "", nil
+	}
+	rec = &operation.Record{}
+	if json.Unmarshal([]byte(cm.Data["record.json"]), rec) != nil {
+		return "", nil
+	}
+	return cm.Metadata.Name, rec
+}
+
+// recordSummary names a record's operation, stage and executor state.
+func recordSummary(rec *operation.Record) string {
+	if rec == nil {
+		return "absent"
+	}
+	return fmt.Sprintf("%s at %q, executor %s", rec.OperationID, rec.Stage, rec.Executor.State)
+}
+
+// liveID is the operation the fake's live record holds now.
+func (c *syncingVelero) liveID() string {
+	if _, rec := recordDoc(c.record); rec != nil {
+		return rec.OperationID
+	}
+	return ""
+}
+
+// takesRecordFor reports whether a command is the write that hands the live
+// record to a new operation restoring namespace: the compare-and-swap at the
+// start of that namespace's restore.
+func (c *syncingVelero) takesRecordFor(namespace, command string, input []byte) bool {
+	name, rec := recordDoc(input)
+	return isOperationRecordWrite(command) && rec != nil && name == operation.Name &&
+		rec.Request.Versions["namespace"] == namespace && rec.OperationID != c.liveID()
+}
+
+// editLive rewrites the fake's live operation record, as a write by another
+// executor would.
+func (c *syncingVelero) editLive(t *testing.T, edit func(*operation.Record)) {
+	t.Helper()
+	var cm map[string]any
+	if err := json.Unmarshal(c.record, &cm); err != nil {
+		t.Fatalf("decoding the live record: %v", err)
+	}
+	data, _ := cm["data"].(map[string]any)
+	raw, _ := data["record.json"].(string)
+	var rec operation.Record
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		t.Fatalf("decoding the live record's JSON: %v", err)
+	}
+	edit(&rec)
+	encoded, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data["record.json"] = string(encoded)
+	if c.record, err = json.Marshal(cm); err != nil {
+		t.Fatal(err)
+	}
+	c.rv++
+}
+
+// restoresOf counts the Velero Restores the runs created for one namespace.
+func restoresOf(runner *recordingRunner, namespace string) int {
+	count := 0
+	for _, input := range runner.inputs {
+		var doc struct {
+			Kind string `yaml:"kind"`
+			Spec struct {
+				IncludedNamespaces []string `yaml:"includedNamespaces"`
+			} `yaml:"spec"`
+		}
+		if yaml.Unmarshal(input, &doc) == nil && doc.Kind == "Restore" && slices.Contains(doc.Spec.IncludedNamespaces, namespace) {
+			count++
+		}
+	}
+	return count
+}
+
+// ranCount counts the commands the runs issued that contain fragment.
+func ranCount(runner *recordingRunner, fragment string) int {
+	count := 0
+	for _, command := range runner.ran {
+		if strings.Contains(command, fragment) {
+			count++
+		}
+	}
+	return count
+}
+
+// resumeFromJournal is what the next run of the identical command starts from:
+// the journal FILE in dir, and nothing the run before it held in memory. The
+// journal object a run holds is not that: SetState updates it before the save
+// that may fail.
+func resumeFromJournal(t *testing.T, s *Session, dir string) {
+	t.Helper()
+	jnl, err := OpenJournal(filepath.Join(dir, "journal.json"), s.Opts.Identity())
+	if err != nil {
+		t.Fatalf("opening the journal in %s again: %v", dir, err)
+	}
+	record, err := Recorded(jnl)
+	if err != nil {
+		t.Fatalf("reading the record back out of the journal: %v", err)
+	}
+	s.Jnl, s.Record, s.recoveryOpID = jnl, record, ""
+}
+
+// recoveryAttempt is one run of the identical recovery command over the two
+// stages these tests drive, as the install engine runs them: the restore stage
+// unless an earlier attempt completed it, then the activate stage.
+func recoveryAttempt(s *Session, restoreDone *bool) error {
+	return recoveryAttemptWithin(context.Background(), s, restoreDone)
+}
+
+// recoveryAttemptWithin is recoveryAttempt bounded by ctx, for a run that must
+// stop at once and would otherwise wait on the wall clock if it did not.
+func recoveryAttemptWithin(ctx context.Context, s *Session, restoreDone *bool) error {
+	if !*restoreDone {
+		if err := stageRecoveryRestore(ctx, s); err != nil {
+			return err
+		}
+		*restoreDone = true
+	}
+	return stageRecoveryActivate(ctx, s)
+}
+
+// journalIn moves the session's journal into a directory of its own and
+// returns it, so a test can read the journal back as a new process would, and
+// can fail exactly one save by making the directory unwritable at that instant.
+func journalIn(t *testing.T, s *Session) string {
+	t.Helper()
+	dir := t.TempDir()
+	jnl, err := OpenJournal(filepath.Join(dir, "journal.json"), s.Opts.Identity())
+	if err != nil {
+		t.Fatalf("opening the journal in %s: %v", dir, err)
+	}
+	s.Jnl = jnl
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	return dir
+}
+
+// requireRecoveredOnce is the end state a recovery must reach whatever
+// interrupted it: each namespace's data brought back by exactly one Velero
+// Restore; each namespace restore activated exactly once, its pause lifted once
+// and its CronJob put back once; each namespace recorded as activated once; and
+// the cluster's operation record terminal with nothing parked under it.
+func requireRecoveredOnce(t *testing.T, s *Session, runner *recordingRunner, cluster *syncingVelero, namespaces ...*syncingVelero) {
+	t.Helper()
+	for _, ns := range namespaces {
+		name := ns.name()
+		if got := restoresOf(runner, name); got != 1 {
+			t.Errorf("namespace %s was brought back by %d Velero Restores, want exactly 1", name, got)
+		}
+		if got := ranCount(runner, "annotate project "+name+" -n "+backup.ProjectCRNamespace+" "+backup.PauseAnnotationKey+"-"); got != 1 {
+			t.Errorf("the pause on %s was lifted %d times, want exactly 1", name, got)
+		}
+		if got := ranCount(runner, "patch cronjob "+recoveryActivateCronJob+" -n "+name+" "); got != 1 {
+			t.Errorf("CronJob %s/%s was put back %d times, want exactly 1", name, recoveryActivateCronJob, got)
+		}
+		activated := 0
+		for _, done := range s.Record.RecoveryNamespacesActivated {
+			if done == name {
+				activated++
+			}
+		}
+		if activated != 1 {
+			t.Errorf("namespace %s is recorded as activated %d times (%v), want exactly 1", name, activated, s.Record.RecoveryNamespacesActivated)
+		}
+	}
+	if op, terminal, parked := liveOperation(t, cluster); !terminal || len(parked) != 0 {
+		t.Errorf("the cluster's operation record ends as %s, terminal=%t, with %v parked under it", op, terminal, parked)
+	}
+}
+
+// THE REVIEW OF 3f398cb, FINDING 1 (2026-11-12, kn-ship-1-2-closeout-lzjb.5). A
+// namespace restore's operation exists in the cluster from the instant it takes
+// the record, and the install journal learned its id only after the whole
+// restore had returned. A run that stopped in between left an operation the
+// identical command could not name: it started that namespace again as a new
+// operation and was refused by the one it had lost, and every restore parked
+// under that one could never be activated.
+//
+// EACH CASE BREAKS THE SECOND OF THREE NAMESPACES at one boundary, then runs
+// the identical command again from the journal alone. The end state is the same
+// in every case.
+//
+// THE PLANTED NEGATIVE IS 3f398cb: the second run is refused by the operation
+// the first one lost, and in the last case the first run restores the
+// namespace although the journal could not name its operation.
+func TestARecoveryWhoseJournalMissedAnOperationFinishes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// fault breaks the second namespace's restore; dir is the journal's
+		// directory, which a fault makes unwritable to fail a save.
+		fault func(first, second *syncingVelero, dir string) func(string, []byte) faultKind
+		// changedNothing is set when the first run must stop before the second
+		// namespace's first change.
+		changedNothing bool
+	}{
+		{
+			name: "the journal save after the operation returned fails",
+			fault: func(first, second *syncingVelero, dir string) func(string, []byte) faultKind {
+				return func(command string, input []byte) faultKind {
+					// The restore's last write stops its executor at `restored —
+					// awaiting activation`; the journal save after the return fails.
+					if _, rec := recordDoc(input); isOperationRecordWrite(command) && rec != nil && rec.OperationID == second.opID &&
+						rec.Stage == backup.RestoredStage && rec.Executor.State == operation.ExecutorStopped {
+						_ = os.Chmod(dir, 0o500)
+					}
+					return noFault
+				}
+			},
+		},
+		{
+			name: "the reply to the record's compare-and-swap is lost",
+			fault: func(first, second *syncingVelero, _ string) func(string, []byte) faultKind {
+				lost := false
+				return func(command string, input []byte) faultKind {
+					if !lost && first.takesRecordFor(second.name(), command, input) {
+						lost = true
+						return loseReply
+					}
+					return noFault
+				}
+			},
+		},
+		{
+			name: "the journal save naming the operation fails",
+			fault: func(first, second *syncingVelero, dir string) func(string, []byte) faultKind {
+				return func(command string, input []byte) faultKind {
+					if first.takesRecordFor(second.name(), command, input) {
+						_ = os.Chmod(dir, 0o500)
+					}
+					return noFault
+				}
+			},
+			changedNothing: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second, third := threeProjectCluster()
+			s, runner, _ := recoveryWaitSession(t, first)
+			s.Record.RecoveryOperationID = recoveryActivateOpID
+			dir := journalIn(t, s)
+			first.fault = tc.fault(first, second, dir)
+
+			restoreDone := false
+			if err := recoveryAttempt(s, &restoreDone); err == nil {
+				t.Fatal("the first run finished although its second namespace's restore was broken")
+			}
+			if tc.changedNothing && runner.ranAny("annotate project "+second.name()+" ") {
+				t.Errorf("the restore of %s changed its Project although the journal could not name its operation:\n%s", second.name(), runner.ranAll())
+			}
+			first.fault = nil
+			if err := os.Chmod(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			resumeFromJournal(t, s, dir)
+			if err := recoveryAttempt(s, &restoreDone); err != nil {
+				t.Fatalf("the identical command failed after the interruption: %v", err)
+			}
+			requireRecoveredOnce(t, s, runner, first, first, second, third)
+		})
+	}
+}
+
+// THE REVIEW'S FINDING 2. Activation takes a namespace restore back as the live
+// record with its executor running. On 3f398cb an error right after that
+// returned without releasing the record, and a run that died there left it the
+// same way: the identical command was refused by that operation's own running
+// executor, and every restore parked under it stayed parked.
+//
+// THE PLANTED NEGATIVE IS 3f398cb: the second run is refused with "still
+// running" on the second namespace's operation.
+func TestARecoveryWhoseActivationWasInterruptedFinishes(t *testing.T) {
+	// takesBack reports whether a command is the write that takes the second
+	// namespace's restore back as the live record for its activation.
+	takesBack := func(first, second *syncingVelero, command string, input []byte) bool {
+		name, rec := recordDoc(input)
+		return isOperationRecordWrite(command) && rec != nil && name == operation.Name && rec.OperationID == second.opID &&
+			rec.Stage == backup.RestoredStage && rec.Executor.State == operation.ExecutorRunning && first.liveID() != second.opID
+	}
+	for _, tc := range []struct {
+		name  string
+		fault func(first, second *syncingVelero) func(string, []byte) faultKind
+		// released is set when the first run must hand the record back itself:
+		// an error, unlike a lost connection, leaves it able to.
+		released bool
+	}{
+		{
+			name:     "an error immediately after the take-over",
+			released: true,
+			fault: func(first, second *syncingVelero) func(string, []byte) faultKind {
+				armed := false
+				return func(command string, input []byte) faultKind {
+					if takesBack(first, second, command, input) {
+						armed = true
+						return noFault
+					}
+					if armed && strings.Contains(command, "get project "+second.name()+" ") {
+						armed = false
+						return failCommand
+					}
+					return noFault
+				}
+			},
+		},
+		{
+			name: "the reply to the take-over is lost",
+			fault: func(first, second *syncingVelero) func(string, []byte) faultKind {
+				lost := false
+				return func(command string, input []byte) faultKind {
+					if !lost && takesBack(first, second, command, input) {
+						lost = true
+						return loseReply
+					}
+					return noFault
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second, third := threeProjectCluster()
+			s, runner, _ := recoveryWaitSession(t, first)
+			s.recoveryOpID = recoveryActivateOpID
+			s.Record.RecoveryOperationID = recoveryActivateOpID
+			dir := journalIn(t, s)
+			first.fault = tc.fault(first, second)
+
+			restoreDone := false
+			if err := recoveryAttempt(s, &restoreDone); err == nil {
+				t.Fatal("the first run finished although the second namespace's activation was broken")
+			}
+			if !restoreDone {
+				t.Fatal("the first run stopped in the restore stage, so this test is not about activation")
+			}
+			if _, live := recordDoc(first.record); tc.released && (live == nil || live.Executor.State != operation.ExecutorStopped) {
+				t.Errorf("the failed activation did not hand back the record it claimed: the live record is %s", recordSummary(live))
+			}
+			first.fault = nil
+			resumeFromJournal(t, s, dir)
+			if err := recoveryAttempt(s, &restoreDone); err != nil {
+				t.Fatalf("the identical command failed after the interrupted activation: %v", err)
+			}
+			requireRecoveredOnce(t, s, runner, first, first, second, third)
+		})
+	}
+}
+
+// TestARecoveryWithAnIneligibleMiddleNamespaceActivatesTheOthers is the trace
+// the review followed and no test ran: the middle of three namespaces has no
+// copy of a volume its backup expected, so it is held and not restored; the
+// first and the last are restored, the last parking the first, and both are
+// activated, while nothing is written to the middle one's Project.
+func TestARecoveryWithAnIneligibleMiddleNamespaceActivatesTheOthers(t *testing.T) {
+	first, second, third := threeProjectCluster()
+	first.setRecord = recoveryWaitRecordOf(first.coverageNames(), map[string][]string{second.name(): {"data"}})
+	s, runner, _ := recoveryWaitSession(t, first)
+	s.recoveryOpID = recoveryActivateOpID
+	s.Record.RecoveryOperationID = recoveryActivateOpID
+
+	restoreDone := false
+	if err := recoveryAttempt(s, &restoreDone); err != nil {
+		t.Fatalf("a recovery with an ineligible middle namespace failed: %v", err)
+	}
+	requireRecoveredOnce(t, s, runner, first, first, third)
+	if !containsString(s.Record.RecoveryNamespacesNotRestored, second.name()) ||
+		containsString(s.Record.RecoveryNamespacesRestored, second.name()) || containsString(s.Record.RecoveryNamespacesActivated, second.name()) {
+		t.Errorf("the ineligible namespace %s is recorded as not-restored=%v restored=%v activated=%v; want held and nothing else",
+			second.name(), s.Record.RecoveryNamespacesNotRestored, s.Record.RecoveryNamespacesRestored, s.Record.RecoveryNamespacesActivated)
+	}
+	if restoresOf(runner, second.name()) != 0 || runner.ranAny("project "+second.name()+" ") {
+		t.Errorf("the recovery restored or touched the Project of %s, whose backup is ineligible:\n%s", second.name(), runner.ranAll())
+	}
+}
+
+// TestARecoveryTakesOverOnlyAnIdleEarlierRunOfItsOwn is the planted negative for
+// the take-over the identical command now makes on its own. It takes over a
+// running executor only when that executor is this operator's and the record
+// shows nothing of it in flight. Anything else is the operator's to assert, and
+// the command says how and changes nothing.
+func TestARecoveryTakesOverOnlyAnIdleEarlierRunOfItsOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		fault func(first, second *syncingVelero) func(string, []byte) faultKind
+		// then is what happens between the two runs.
+		then  func(t *testing.T, first *syncingVelero)
+		wants []string
+	}{
+		{
+			name: "an action is in flight",
+			fault: func(first, second *syncingVelero) func(string, []byte) faultKind {
+				gone := false
+				return func(command string, input []byte) faultKind {
+					if gone {
+						return failCommand
+					}
+					// The first write that marks one of the second namespace's
+					// actions submitted lands; then the connection is gone for
+					// good, so nothing can record the outcome or stop the executor.
+					name, rec := recordDoc(input)
+					if isOperationRecordWrite(command) && rec != nil && name == operation.Name && rec.Request.Versions["namespace"] == second.name() {
+						for _, action := range rec.Actions {
+							if action.Status == operation.ActionSubmitted {
+								gone = true
+								return loseReply
+							}
+						}
+					}
+					return noFault
+				}
+			},
+			wants: []string{"in flight", "--take-over", "--confirm"},
+		},
+		{
+			name: "another operator's executor holds it",
+			fault: func(first, second *syncingVelero) func(string, []byte) faultKind {
+				lost := false
+				return func(command string, input []byte) faultKind {
+					if !lost && first.takesRecordFor(second.name(), command, input) {
+						lost = true
+						return loseReply
+					}
+					return noFault
+				}
+			},
+			then: func(t *testing.T, first *syncingVelero) {
+				first.editLive(t, func(rec *operation.Record) { rec.Executor.Operator = "ops@another-laptop" })
+			},
+			wants: []string{"ops@another-laptop", "--take-over", "--confirm"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second := twoProjectCluster()
+			s, runner, _ := recoveryWaitSession(t, first)
+			s.Record.RecoveryOperationID = recoveryActivateOpID
+			dir := journalIn(t, s)
+			first.fault = tc.fault(first, second)
+
+			restoreDone := false
+			if err := recoveryAttempt(s, &restoreDone); err == nil {
+				t.Fatal("the first run finished although its second namespace's restore was broken")
+			}
+			first.fault = nil
+			if tc.then != nil {
+				tc.then(t, first)
+			}
+			_, before := recordDoc(first.record)
+			if before == nil || before.Executor.State != operation.ExecutorRunning {
+				t.Fatalf("the first run left the live record %s; this test needs one whose executor is still running", recordSummary(before))
+			}
+			resumeFromJournal(t, s, dir)
+			restoredBefore := restoresOf(runner, second.name())
+
+			// Bounded: a run that wrongly took the record over goes on to wait for
+			// a pause nobody wrote, on the wall clock.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err := recoveryAttemptWithin(ctx, s, &restoreDone)
+			if err == nil {
+				t.Fatal("the identical command took over a running executor it could not show was idle and its own")
+			}
+			for _, want := range append(tc.wants, before.OperationID) {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the refusal does not say %q, so the operator cannot tell what to do:\n%v", want, err)
+				}
+			}
+			_, after := recordDoc(first.record)
+			if after.OperationID != before.OperationID || after.Executor.Token != before.Executor.Token || len(after.TakeOvers) != len(before.TakeOvers) {
+				t.Errorf("the refusal changed the record: it was %s held by token %s with %d take-over(s), it is %s held by %s with %d",
+					before.OperationID, before.Executor.Token, len(before.TakeOvers), after.OperationID, after.Executor.Token, len(after.TakeOvers))
+			}
+			if got := restoresOf(runner, second.name()); got != restoredBefore {
+				t.Errorf("the refused run restored %s again (%d Velero Restores, %d before it)", second.name(), got, restoredBefore)
+			}
+		})
+	}
+}
+
+// TestAnAbortedParkedRestoreIsHeldByItsPauseAlone is the review's finding 3,
+// which is the abort policy of a single restore, kept as it is, applied to a
+// parked one. Aborting the last parked restore closes it, and the cluster's
+// operation record then holds nothing: the namespace is held by its Project's
+// pause and by nothing else. The test pins that, and that every message says
+// a step that can be taken — `--activate` refuses a closed operation.
+func TestAnAbortedParkedRestoreIsHeldByItsPauseAlone(t *testing.T) {
+	first, second := twoProjectCluster()
+	s, runner, clock := recoveryWaitSession(t, first)
+	s.recoveryOpID = recoveryActivateOpID
+	s.Record.RecoveryOperationID = recoveryActivateOpID
+	dir := journalIn(t, s)
+	if err := stageRecoveryRestore(context.Background(), s); err != nil {
+		t.Fatalf("the restore stage failed: %v", err)
+	}
+	server, err := s.Server()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps := recoveryRestoreDeps(server)
+	deps.Now = func() time.Time { return clock.now }
+	deps.Poll = time.Minute
+	deps.Sleep = recoveryRestoreSync.Sleep
+	run := func(opts backup.RestoreOptions) (string, error) {
+		var out bytes.Buffer
+		opts.Cluster, opts.Bundle = s.recoveryName(), s.Bundle
+		err := backup.RunRestore(context.Background(), &out, nil, opts, deps)
+		return out.String(), err
+	}
+
+	// The second namespace is activated by hand, and the first, parked under
+	// it, is aborted. An abort whose closing write fails releases its claim,
+	// so the same abort finishes it.
+	if _, err := run(backup.RestoreOptions{Namespace: second.name(), Activate: second.opID, Confirm: true, KeepDesired: true}); err != nil {
+		t.Fatalf("activating %s by hand: %v", second.name(), err)
+	}
+	aborted := first.opID
+	failed := false
+	first.fault = func(command string, input []byte) faultKind {
+		if _, rec := recordDoc(input); !failed && isOperationRecordWrite(command) && rec != nil && rec.OperationID == aborted && rec.Terminal {
+			failed = true
+			return failCommand
+		}
+		return noFault
+	}
+	if _, err := run(backup.RestoreOptions{Abort: aborted}); err == nil {
+		t.Fatal("the abort reported success although its closing write failed")
+	}
+	first.fault = nil
+	out, err := run(backup.RestoreOptions{Abort: aborted})
+	if err != nil {
+		t.Fatalf("the same abort, run again after its closing write failed, was refused: %v", err)
+	}
+
+	// THE RECORD HOLDS NOTHING NOW, which is the existing abort policy: a new
+	// operation may take it.
+	if op, terminal, parked := liveOperation(t, first); !terminal || len(parked) != 0 {
+		t.Fatalf("after the abort the record is %s, terminal=%t, with %v parked", op, terminal, parked)
+	}
+	other, err := deps.Store.Acquire(context.Background(), operation.Request{Kind: operation.KindUpgrade, Cluster: s.recoveryName()})
+	if err != nil {
+		t.Fatalf("after the abort another operation was refused the record: %v", err)
+	}
+	if err := deps.Store.Complete(context.Background(), other, operation.ResultSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	// WHAT HOLDS THE NAMESPACE IS ITS PAUSE: the abort neither lifted nor
+	// replaced it, and did not put the suspended CronJob back.
+	if first.pauseLifted || first.opID != aborted {
+		t.Errorf("the abort lifted or replaced the pause on %s (pause by %q, lifted=%t)", first.name(), first.opID, first.pauseLifted)
+	}
+	if ranCount(runner, "patch cronjob "+recoveryActivateCronJob+" -n "+first.name()+" ") != 0 {
+		t.Errorf("the abort put CronJob %s/%s back", first.name(), recoveryActivateCronJob)
+	}
+	if strings.Contains(out, "--activate "+aborted) {
+		t.Errorf("the abort advises --activate on the operation it just closed, which refuses it:\n%s", out)
+	}
+	requireContains(t, "the abort's advice", out, "kubenest backup restore --namespace "+first.name(), "--replace")
+
+	// The recovery, run again, does not activate the aborted restore, keeps its
+	// pause, and says what to do instead.
+	resumeFromJournal(t, s, dir)
+	err = stageRecoveryActivate(context.Background(), s)
+	if err == nil {
+		t.Fatal("the recovery activated a namespace whose restore was aborted")
+	}
+	if strings.Contains(err.Error(), "--activate "+aborted) {
+		t.Errorf("the recovery advises --activate on an aborted operation, which refuses it:\n%v", err)
+	}
+	requireContains(t, "the recovery's refusal", err.Error(), aborted, "kubenest backup restore --namespace "+first.name())
+	if first.pauseLifted {
+		t.Errorf("the recovery lifted the pause on %s, whose restore was aborted", first.name())
+	}
+
+	// The operator does what both messages say: restores the namespace again
+	// and activates that restore. The identical command then finishes.
+	if _, err := run(backup.RestoreOptions{Namespace: first.name(), From: recoveryWaitBackup, Replace: true, Confirm: true, AcceptDataAge: true}); err != nil {
+		t.Fatalf("restoring %s again by hand: %v", first.name(), err)
+	}
+	if first.opID == aborted {
+		t.Fatal("the restore by hand did not pause the project with its own operation")
+	}
+	if _, err := run(backup.RestoreOptions{Namespace: first.name(), Activate: first.opID, Confirm: true, KeepDesired: true}); err != nil {
+		t.Fatalf("activating the restore by hand: %v", err)
+	}
+	resumeFromJournal(t, s, dir)
+	if err := stageRecoveryActivate(context.Background(), s); err != nil {
+		t.Fatalf("after the operator restored and activated %s again, the identical command still failed: %v", first.name(), err)
+	}
+	if !containsString(s.Record.RecoveryNamespacesActivated, first.name()) {
+		t.Errorf("the recovery recorded %v, and %s is not among them", s.Record.RecoveryNamespacesActivated, first.name())
 	}
 }

@@ -965,41 +965,62 @@ func stageRecoveryRestore(ctx context.Context, s *Session) error {
 		if err := s.waitForRecoveryProject(ctx, server, namespace, syncDeadline); err != nil {
 			return err
 		}
-		s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
-		// THE OPERATION ID IS HANDED BACK, NOT READ OUT OF THE OUTPUT. The
-		// restore prints `next: kubenest backup restore --activate <id>`, and
-		// that line is for the operator: this stage needs the id to run that
-		// activation itself once the operator's own release is written, and
-		// the record is what a resume reads it from.
-		restoredOp := ""
+		earlier, err := s.earlierRestore(ctx, deps.Store, namespace, sel.Backup.Name)
+		if err != nil {
+			return err
+		}
+		// THE OPERATION ID IS HANDED BACK, NOT READ OUT OF THE OUTPUT, and it is
+		// written down THE MOMENT THE OPERATION TAKES THE RECORD, before its first
+		// change; a write that fails stops the restore there. Written after the
+		// restore returned, it was lost by a run that stopped in between, and the
+		// identical command was then refused by the operation it could not name
+		// (kn-ship-1-2-closeout-lzjb.5 review, finding 1). The activate stage
+		// needs the id to finish that operation, and a resume reads it from here.
 		opts := backup.RestoreOptions{
-			Cluster:   s.recoveryName(),
-			Namespace: namespace,
-			From:      sel.Backup.Name,
+			Cluster:     s.recoveryName(),
+			Namespace:   namespace,
+			Confirm:     true,
+			Bundle:      s.Bundle,
+			OnOperation: func(id string) error { return s.journalRestoreOperation(namespace, id) },
+		}
+		run := true
+		switch {
+		case earlier == nil:
+			s.Logf("  restoring namespace %s from %s", namespace, sel.Backup.Name)
+			opts.From = sel.Backup.Name
 			// The rebuild has no namespace yet, but --replace is the honest
 			// statement: the restore must not refuse because a namespace the
 			// desired state already created is in the way.
-			Replace:       true,
-			Confirm:       true,
-			AcceptDataAge: true,
-			Bundle:        s.Bundle,
-			OnOperation:   func(id string) { restoredOp = id },
+			opts.Replace = true
+			opts.AcceptDataAge = true
 			// THE NAMESPACES RESTORED BEFORE THIS ONE STILL AWAIT ACTIVATION,
 			// and the newest of them holds the cluster's operation record. This
 			// restore parks it instead of being refused by it, and each of them
 			// keeps the record held against any other operation until the
 			// activate stage finishes it (lab s6, 2026-11-12,
 			// kn-ship-1-2-closeout-lzjb.5).
-			ParkOver: slices.Collect(maps.Values(s.Record.RecoveryRestoreOperations)),
-		}
-		if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
-			return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
-		}
-		if restoredOp != "" {
-			if s.Record.RecoveryRestoreOperations == nil {
-				s.Record.RecoveryRestoreOperations = map[string]string{}
+			opts.ParkOver = slices.Collect(maps.Values(s.Record.RecoveryRestoreOperations))
+		case earlier.Terminal, earlier.Stage == backup.RestoredStage && earlier.Executor.State == operation.ExecutorStopped:
+			// Its data is back (a closed one here was activated by hand): the
+			// run before this one stopped before writing that down.
+			s.Logf("  namespace %s was restored by operation %s, which an earlier run of this recovery started; its data is back, so it is not restored again", namespace, earlier.OperationID)
+			run = false
+		default:
+			asserted, err := s.assertEarlierRun(earlier)
+			if err != nil {
+				return err
 			}
-			s.Record.RecoveryRestoreOperations[namespace] = restoredOp
+			if asserted {
+				opts.TakeOver = earlier.OperationID
+			} else {
+				opts.Resume = earlier.OperationID
+			}
+			s.Logf("  continuing the restore of namespace %s: operation %s, which an earlier run of this recovery started, stopped at %q", namespace, earlier.OperationID, earlier.Stage)
+		}
+		if run {
+			if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
+				return stages.NewComponentError("recovery-restore", fmt.Errorf("restoring namespace %s from backup %s: %w", namespace, sel.Backup.Name, err))
+			}
 		}
 		s.Record.RecoveryNamespacesRestored = append(s.Record.RecoveryNamespacesRestored, namespace)
 		if err := s.saveRecord(); err != nil {
@@ -1211,13 +1232,16 @@ func (s *Session) activateNamespaceRestore(ctx context.Context, deps backup.Rest
 		s.Logf("  %s carries no pause from a namespace restore, so that restore was activated already", ns)
 		return nil
 	}
-	done, err := restoreActivationDone(ctx, deps.Store, restoreOp)
+	stored, err := deps.Store.Find(ctx, restoreOp)
+	if err != nil {
+		return fmt.Errorf("reading the record of the namespace restore %s, which is what says whether it still needs activating: %w", restoreOp, err)
+	}
+	if stored.Record.Terminal {
+		return s.closedNamespaceRestore(ctx, deps, ns, stored.Record)
+	}
+	asserted, err := s.assertEarlierRun(stored.Record)
 	if err != nil {
 		return err
-	}
-	if done {
-		s.Logf("  the namespace restore of %s (operation %s) is complete: activation already ran, so it is not run again", ns, restoreOp)
-		return nil
 	}
 	opts := backup.RestoreOptions{
 		Cluster:   s.recoveryName(),
@@ -1235,6 +1259,9 @@ func (s *Session) activateNamespaceRestore(ctx context.Context, deps backup.Rest
 		KeepDesired: true,
 		Bundle:      s.Bundle,
 	}
+	if asserted {
+		opts.TakeOver = restoreOp
+	}
 	if err := backup.RunRestore(ctx, s.Out, nil, opts, deps); err != nil {
 		return stages.NewComponentError("recovery-restore", fmt.Errorf("activating the namespace restore of %s (operation %s): %w. Its data is back and the project is released by this recovery; run the same install again to resume here", ns, restoreOp, err))
 	}
@@ -1242,36 +1269,143 @@ func (s *Session) activateNamespaceRestore(ctx context.Context, deps backup.Rest
 	return nil
 }
 
-// restoreActivationDone reports whether the restore operation this recovery is
-// about to activate has already been activated.
+// closedNamespaceRestore handles a namespace whose restore operation is already
+// closed when the activate stage reaches it.
 //
-// THE ONE CASE A RESUME HAS TO RECOGNISE is an operation that is already
-// finished: activation closes its record, so a run that crashed after the
-// restore's activation and before the journal write that follows it finds a
-// TERMINAL record, and `--activate` refuses a terminal operation outright
-// ("there is nothing to do for it"). That refusal is right for an operator
-// asking again and wrong here, where the record is the proof the step is done.
-func restoreActivationDone(ctx context.Context, store *operation.Store, opID string) (bool, error) {
-	stored, err := store.Find(ctx, opID)
+// SUCCEEDED IS DONE: activation closes the operation, so a run that stopped
+// after the activation and before the journal write that follows it finds the
+// record closed, and `--activate` would refuse it ("there is nothing to do for
+// it"). Complete appends the outstanding writes to the result ("succeeded;
+// pending: …"), so success is recognised by the first word.
+//
+// ANY OTHER ENDING NEVER ACTIVATED, and `--activate` cannot reach a closed
+// operation. An operator's `--abort` is that ending: the abort keeps its pause,
+// and with the record closed the pause is all that holds the namespace
+// (kn-ship-1-2-closeout-lzjb.5 review, finding 3). So the pause decides. While
+// it is the closed operation's, this stops and says how to lift it; once it is
+// gone the namespace was resolved after the abort and there is nothing left to
+// activate; a pause by another operation is that operation's to finish.
+func (s *Session) closedNamespaceRestore(ctx context.Context, deps backup.RestoreDeps, ns string, rec *operation.Record) error {
+	if strings.HasPrefix(rec.Result, string(operation.ResultSucceeded)) {
+		s.Logf("  the namespace restore of %s (operation %s) is complete: activation already ran, so it is not run again", ns, rec.OperationID)
+		return nil
+	}
+	hold, err := deps.Cluster.ProjectHold(ctx, ns)
 	if err != nil {
-		return false, fmt.Errorf("reading the record of the namespace restore %s, which is what says whether it still needs activating: %w", opID, err)
+		return err
 	}
-	if !stored.Record.Terminal {
-		return false, nil
+	pausedBy := ""
+	if hold != nil {
+		pausedBy = hold.PausedBy
 	}
-	// Complete appends the outstanding writes to the result ("succeeded;
-	// pending: …"), so a successful operation is recognised by its first word
-	// rather than by the whole string.
-	if strings.HasPrefix(stored.Record.Result, string(operation.ResultSucceeded)) {
-		return true, nil
+	switch pausedBy {
+	case "":
+		s.Logf("  the namespace restore of %s (operation %s) ended %s without activation, and no restore's pause holds the project any more: it was resolved after that, so there is nothing left to activate", ns, rec.OperationID, rec.Result)
+		return nil
+	case rec.OperationID:
+		return fmt.Errorf("the namespace restore of %s (operation %s) ended %s without being activated, and its pause %s=%s is all that holds the project now. `--activate` cannot reach a closed operation; restore the namespace again and activate that restore, which lifts the pause:\n  kubenest backup restore --namespace %s --from %s --replace --accept-data-age --confirm\n  kubenest backup restore --activate <that restore's operation id>\nthen run this install again",
+			ns, rec.OperationID, rec.Result, backup.PauseAnnotationKey, rec.OperationID, ns, rec.Request.Versions["backup"])
+	default:
+		return fmt.Errorf("namespace %s is paused by operation %s, not by this recovery's restore %s, which ended %s: activate or abort %s, then run this install again", ns, pausedBy, rec.OperationID, rec.Result, pausedBy)
 	}
-	return false, fmt.Errorf("the namespace restore %s is terminal (%s), so it never reached its activation and this recovery must not close it over: %s. Its data is back and the namespace stays held; inspect the operation before activating it by hand", opID, stored.Record.Result, backupActivationAdvice(opID))
 }
 
-// backupActivationAdvice names the command that finishes a namespace restore by
-// hand, which is the same step this stage just could not take.
-func backupActivationAdvice(opID string) string {
-	return fmt.Sprintf("`kubenest backup restore --activate %s`", opID)
+// assertEarlierRun decides whether this recovery takes over, by assertion, one
+// of its own restore operations whose record still says its executor is
+// running: the state a run of this recovery leaves when it stops between
+// claiming the record and releasing it. Any other state needs no assertion, and
+// it returns false.
+//
+// PLAN 7.2 MAKES A TAKE-OVER THE OPERATOR'S ASSERTION, because the CLI cannot
+// see whether an executor is alive. The operator who runs the identical
+// recovery command makes it here only where being wrong cannot matter: the
+// executor is theirs, on this machine, and nothing of it is in flight. Every
+// action a restore takes is written down before it is sent, and the writing
+// needs the ownership token the take-over replaces, so an executor that is
+// somehow still alive can send nothing more once the take-over lands, and the
+// take-over's compare-and-swap fails if it wrote anything after the record was
+// read. The writes a restore does not record — suspending work, and
+// activation's own — are the ones a second executor repeats to the same
+// values. An action already submitted is the one thing the record cannot fence,
+// since its command may still be running; that, and an executor another
+// operator holds, stay the operator's to assert, and the refusal says how
+// (kn-ship-1-2-closeout-lzjb.5 review, findings 1 and 2).
+func (s *Session) assertEarlierRun(rec *operation.Record) (bool, error) {
+	if rec.Terminal || rec.Executor.State != operation.ExecutorRunning {
+		return false, nil
+	}
+	heartbeat := rec.Executor.Heartbeat.UTC().Format(time.RFC3339)
+	takeOver := fmt.Sprintf("`kubenest backup restore --take-over %s --confirm`", rec.OperationID)
+	if holder := rec.Executor.Operator; holder != recoveryOperator() {
+		return false, fmt.Errorf("operation %s is still marked running by %s (last heartbeat %s), not by %s who runs this recovery, and this recovery takes over only what an earlier run of its own left. If that executor has stopped, assert it with %s, then run this install again",
+			rec.OperationID, holder, heartbeat, recoveryOperator(), takeOver)
+	}
+	for _, action := range rec.Actions {
+		if action.Status != operation.ActionSubmitted {
+			continue
+		}
+		check := ""
+		if action.Observe != "" {
+			check = fmt.Sprintf(" (`%s` exits 0 when it holds)", action.Observe)
+		}
+		return false, fmt.Errorf("operation %s is still marked running by an earlier run of this recovery, and its action %s (stage %s) was in flight when that run stopped: submitted, with no outcome recorded, so its command may still be running. Establish %q by hand%s, then assert that the earlier run has stopped with %s and run this install again",
+			rec.OperationID, action.ID, action.Stage, action.Postcondition, check, takeOver)
+	}
+	s.Logf("  operation %s is still marked running by an earlier run of this recovery (%s, last heartbeat %s) with nothing in flight: this run takes it over, and the record says who did", rec.OperationID, rec.Executor.Operator, heartbeat)
+	return true, nil
+}
+
+// earlierRestore is the restore of namespace that an earlier run of this
+// recovery started and did not finish, so this run continues that operation
+// instead of starting a second one over it. It is nil when there is none.
+//
+// THE JOURNAL NAMES IT: the restore stage writes the id the moment the
+// operation takes the record, before its first change. If the run stopped
+// between the take and that write — the reply to the take lost, or the process
+// gone — the operation is recognised by its immutable request instead: the live
+// record is a restore of this namespace from this recovery's backup, the
+// request this recovery makes for it. Its id is written down before anything
+// else is done with it.
+//
+// A restore that ended without being activated (aborted, or failed past
+// resuming) is not continued: the namespace gets a new operation, as for a
+// namespace no run started.
+func (s *Session) earlierRestore(ctx context.Context, store *operation.Store, namespace, backupName string) (*operation.Record, error) {
+	op := s.Record.RecoveryRestoreOperations[namespace]
+	if op == "" {
+		live, err := store.Current(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if live == nil || live.Record.Terminal || !backup.RestoresNamespace(live.Record, s.recoveryName(), namespace, backupName) {
+			return nil, nil
+		}
+		op = live.Record.OperationID
+		s.Logf("  the cluster's operation record is %s, a restore of namespace %s from %s that this recovery's journal does not name: an earlier run took the record and stopped before it wrote the id down", op, namespace, backupName)
+		if err := s.journalRestoreOperation(namespace, op); err != nil {
+			return nil, err
+		}
+	}
+	stored, err := store.Find(ctx, op)
+	if errors.Is(err, operation.ErrNoRecord) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading operation %s, which an earlier run of this recovery started for namespace %s: %w", op, namespace, err)
+	}
+	if stored.Record.Terminal && !strings.HasPrefix(stored.Record.Result, string(operation.ResultSucceeded)) {
+		return nil, nil
+	}
+	return stored.Record, nil
+}
+
+// journalRestoreOperation writes down which operation restores namespace.
+func (s *Session) journalRestoreOperation(namespace, op string) error {
+	if s.Record.RecoveryRestoreOperations == nil {
+		s.Record.RecoveryRestoreOperations = map[string]string{}
+	}
+	s.Record.RecoveryRestoreOperations[namespace] = op
+	return s.saveRecord()
 }
 
 // markNotRestored records a namespace whose data was not restored, so the

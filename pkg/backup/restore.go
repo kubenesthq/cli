@@ -524,7 +524,12 @@ type RestoreOptions struct {
 	// and 6) — and the id is not knowable from the flags it passed. It is a
 	// callback rather than a return value because the id exists only once the
 	// record has been claimed, and there are many paths back from there.
-	OnOperation func(id string)
+	//
+	// IT RUNS BEFORE THE RUN'S FIRST CHANGE, and an error from it stops the run
+	// there, with the record released: a caller that writes the id down must
+	// never be left with a changed cluster it cannot name the operation of
+	// (kn-ship-1-2-closeout-lzjb.5 review, finding 1).
+	OnOperation func(id string) error
 	// ParkOver names the caller's own earlier namespace restores, each stopped
 	// at `restored — awaiting activation`. This run parks the one holding the
 	// record instead of being refused by it (operation.Store.AcquireAfter), and
@@ -650,10 +655,16 @@ type restoreRun struct {
 // hook, if one was given. It is called wherever this run learns which operation
 // it is driving: a new restore claims one, and a resume takes up the one its
 // earlier attempt claimed.
-func (r *restoreRun) takeOperationID(id string) {
-	if r.opts.OnOperation != nil && id != "" {
-		r.opts.OnOperation(id)
+func (r *restoreRun) takeOperationID(ctx context.Context, id string) error {
+	if r.opts.OnOperation == nil || id == "" {
+		return nil
 	}
+	if err := r.opts.OnOperation(id); err != nil {
+		err = fmt.Errorf("operation %s holds the record, and this run stopped before changing anything because the operation's id could not be handed back: %w", id, err)
+		r.release(ctx, err)
+		return err
+	}
+	return nil
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -1333,7 +1344,9 @@ func (r *restoreRun) openRecord(ctx context.Context) error {
 			return err
 		}
 		r.handle = handle
-		r.takeOperationID(handle.OperationID())
+		if err := r.takeOperationID(ctx, handle.OperationID()); err != nil {
+			return err
+		}
 		fmt.Fprintf(r.out, "  record:        %s (resume with `kubenest backup restore --resume %s` if this is interrupted)\n", handle.OperationID(), handle.OperationID())
 		return nil
 	}
@@ -1460,7 +1473,9 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 		return err
 	}
 	r.handle = handle
-	r.takeOperationID(handle.OperationID())
+	if err := r.takeOperationID(ctx, handle.OperationID()); err != nil {
+		return err
+	}
 	r.renderPlan()
 	return nil
 }
@@ -1628,9 +1643,12 @@ func (r *restoreRun) liveIdentities(ctx context.Context) (map[string]string, err
 // `restored — awaiting activation` and marks its executor stopped, so
 // `--activate`, `--resume` and `--abort` can take it over. A run that failed
 // does the same: the operation is resumable, which is only true if a successor
-// may take the record.
+// may take the record. That holds for `--activate` and `--abort` as well: a
+// claim they leave `running` is refused to every later command, their own
+// retry included (kn-ship-1-2-closeout-lzjb.5 review, finding 2). A record the
+// run already closed is left as it is.
 func (r *restoreRun) release(ctx context.Context, runErr error) {
-	if r.handle == nil {
+	if r.handle == nil || r.handle.Record().Terminal {
 		return
 	}
 	// An interrupted run is released too: its own context is cancelled by the
@@ -1647,8 +1665,14 @@ func (r *restoreRun) release(ctx context.Context, runErr error) {
 		return
 	}
 	if runErr != nil {
-		fmt.Fprintf(r.out, "  record:        %s released at %q; nothing was activated, and the project stays paused\n",
-			r.handle.OperationID(), oneLine(runErr.Error()))
+		left := "nothing was activated, and any pause this operation wrote stays on the project"
+		switch r.opts.Mode() {
+		case "activate":
+			left = "activation did not finish, so the project stays paused; the same --activate continues it"
+		case "abort":
+			left = "the abort did not finish, so the project stays paused; the same --abort finishes it"
+		}
+		fmt.Fprintf(r.out, "  record:        %s released at %q; %s\n", r.handle.OperationID(), oneLine(runErr.Error()), left)
 	}
 }
 
@@ -2848,7 +2872,10 @@ func (r *restoreRun) markAwaitingActivation(ctx context.Context) error {
 //
 // IT TAKES THE LOCK, which means it obeys the same ownership rules as any other
 // operation: a live executor still holding the record is a refusal, and a
-// take-over needs that executor stopped with its actions reconciled.
+// take-over needs that executor stopped with its actions reconciled. A caller
+// that sets TakeOver to the same id asserts that the executor still marked
+// running has stopped; the lost-server recovery does, for an activation an
+// earlier run of its own left behind with nothing in flight.
 func (r *restoreRun) activate(ctx context.Context) error {
 	if err := r.resolve(ctx); err != nil {
 		return err
@@ -2860,13 +2887,25 @@ func (r *restoreRun) activate(ctx context.Context) error {
 	if r.opts.Namespace == "" {
 		r.opts.Namespace = restoreNamespaceOf(record)
 	}
-	handle, err := operation.TakeOver(ctx, r.deps.Store, r.opts.Activate)
+	claim := operation.Recovery{Resume: r.opts.Activate}
+	if r.opts.TakeOver == r.opts.Activate {
+		claim = operation.Recovery{TakeOver: r.opts.TakeOver, Confirm: r.opts.Confirm}
+	}
+	handle, err := claim.Claim(ctx, r.deps.Store)
 	if err != nil {
 		return err
 	}
 	r.handle = handle
-	record = handle.Record()
+	if err := r.activateClaimed(ctx, handle); err != nil {
+		r.release(ctx, err)
+		return err
+	}
+	return nil
+}
 
+// activateClaimed is activation once its record is claimed.
+func (r *restoreRun) activateClaimed(ctx context.Context, handle *operation.Handle) error {
+	record := handle.Record()
 	hold, err := r.deps.Cluster.ProjectHold(ctx, r.opts.Namespace)
 	if err != nil {
 		return err
@@ -3135,10 +3174,20 @@ func (r *restoreRun) abort(ctx context.Context) error {
 	fmt.Fprintf(r.out, "  project:       %s/%s keeps %s=%s, so nothing reconciles over what is there\n",
 		ProjectCRNamespace, r.opts.Namespace, PauseAnnotationKey, r.opts.Abort)
 	if err := r.deps.Store.Complete(ctx, handle, operation.Result("aborted")); err != nil {
+		r.release(ctx, err)
 		return err
 	}
-	fmt.Fprintf(r.out, "  record:        %s marked aborted. The safety backup is kept; put the replicas and CronJobs you want back with\n", r.opts.Abort)
-	fmt.Fprintf(r.out, "                 kubenest backup restore --activate %s   (after checking the namespace is in a state you want)\n", r.opts.Abort)
+	// THE PAUSE IS ALL THAT HOLDS THE NAMESPACE NOW: the record is closed, so it
+	// holds nothing, and `--activate` refuses a closed operation. A pause is
+	// lifted by the activation of the restore that wrote it, so the way back is
+	// another restore and its activation.
+	fmt.Fprintf(r.out, "  record:        %s marked aborted; it no longer holds the cluster's operation record. The safety backup is kept.\n", r.opts.Abort)
+	fmt.Fprintf(r.out, "  next:          restore the namespace again and activate that restore, which lifts this pause:\n")
+	fmt.Fprintf(r.out, "                 kubenest backup restore --namespace %s --from %s --replace   (or --from kubenest-safety-%s, if this operation took one, for what was there before it)\n",
+		r.opts.Namespace, orUnknown(record.Request.Versions["backup"]), r.opts.Abort)
+	fmt.Fprintf(r.out, "                 kubenest backup restore --activate <that restore's operation id>\n")
+	fmt.Fprintf(r.out, "                 or, once the namespace is in the state you want, lift the pause by hand on a server: sudo k3s kubectl annotate project %s -n %s %s-\n",
+		r.opts.Namespace, ProjectCRNamespace, PauseAnnotationKey)
 	return nil
 }
 
@@ -3157,6 +3206,18 @@ func (r *restoreRun) restoreRecord(ctx context.Context, operationID string) (*op
 		return nil, fmt.Errorf("operation %s is a %s, not a restore", operationID, kind)
 	}
 	return stored.Record, nil
+}
+
+// RestoresNamespace reports whether rec is a namespace restore (mode 1) of
+// namespace from backupName on cluster. That is the immutable request a caller
+// recognises its own operation by when it never learned the operation's id:
+// the record was taken and the reply, or the caller's write of the id, was lost.
+func RestoresNamespace(rec *operation.Record, cluster, namespace, backupName string) bool {
+	return rec.Request.Kind == operation.KindRestoreNamespace &&
+		rec.Request.Cluster == cluster &&
+		rec.Request.Versions["mode"] == "namespace" &&
+		rec.Request.Versions["backup"] == backupName &&
+		restoreNamespaceOf(rec) == namespace
 }
 
 // restoreNamespaceOf reads the namespace a record is about. Mode 1 records it
