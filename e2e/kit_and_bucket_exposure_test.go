@@ -59,6 +59,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -706,10 +707,21 @@ func TestKitAndBucketExposure(t *testing.T) {
 		if _, _, err := cross.Client.List(ctx, backup.ControlPlanePrefix); !errors.Is(err, s3.ErrAccessDenied) {
 			t.Fatalf("the cross-cluster credential also reaches the control-plane prefix, obscuring which boundary refused it: %v", err)
 		}
+		peers, err := s1RecordedSiblingPrefixes(ctx, fleet, sessionOne.Jnl.ClusterID, cross)
+		if err != nil {
+			t.Fatalf("reading the recorded peer prefixes before checking set-target scope: %v", err)
+		}
+		peerPrefix := strings.Trim(kit.prefixB, "/")
+		if !slices.Contains(peers, peerPrefix) {
+			t.Fatalf("the control plane's recorded kit locations did not supply the other cluster's prefix %q; got %v", peerPrefix, peers)
+		}
+		cross.KnownSiblingPrefixes = peers
 		if _, err := cross.VerifyScope(ctx, cross.Client); err == nil {
 			t.Error("set-target accepted a credential demonstrated to reach both cluster prefixes")
 		} else if !strings.Contains(err.Error(), "ListObjectsV2") && !strings.Contains(err.Error(), "GetObject") {
 			t.Errorf("the cross-cluster refusal did not identify a successful foreign-prefix probe: %v", err)
+		} else if !strings.Contains(err.Error(), peerPrefix+"/") {
+			t.Errorf("the cross-cluster refusal did not name the recorded peer prefix %q: %v", peerPrefix, err)
 		}
 		for _, crossing := range []struct {
 			name    string
@@ -734,6 +746,24 @@ func TestKitAndBucketExposure(t *testing.T) {
 			})
 		}
 	})
+}
+
+// s1RecordedSiblingPrefixes follows backup set-target's peer lookup with the
+// cluster ID already recorded by the install journal. The live control plane,
+// rather than the test's expected prefix, supplies the probes to VerifyScope.
+func s1RecordedSiblingPrefixes(ctx context.Context, fleet *api.Client, clusterID string, target backup.Target) ([]string, error) {
+	cluster, err := fleet.GetCluster(ctx, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("reading cluster %s: %w", clusterID, err)
+	}
+	if cluster.OrgID == "" {
+		return nil, fmt.Errorf("cluster %s has no organisation id, so its peers cannot be checked", clusterID)
+	}
+	locations, err := fleet.KitLocationsForOtherClusters(ctx, cluster.OrgID, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	return backup.SiblingPrefixes(target, locations), nil
 }
 
 func assertKitStages(t *testing.T, session *install.Session) {
