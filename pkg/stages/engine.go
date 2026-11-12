@@ -171,6 +171,7 @@ func Execute(ctx context.Context, c Controller, sequence []Stage) (Result, error
 		emit(ctx, c, emitter, withStatus(event, StatusStarted, "", ""))
 		if err := journal.Append(Entry{
 			Stage: stage.Name, Status: StatusStarted, Component: stage.Component, RunID: c.RunID(),
+			ReadOnly: stage.ReadOnly,
 		}); err != nil {
 			return result, fmt.Errorf("write install journal: %w", err)
 		}
@@ -217,7 +218,7 @@ func Execute(ctx context.Context, c Controller, sequence []Stage) (Result, error
 			// path. A journal error here is reported alongside, not instead.
 			if jErr := journal.Append(Entry{
 				Stage: stage.Name, Status: StatusFailed, Component: stage.Component,
-				Detail: detail, RunID: c.RunID(),
+				Detail: detail, RunID: c.RunID(), ReadOnly: stage.ReadOnly,
 			}); jErr != nil {
 				c.Logf("warning: could not write the journal: %v", jErr)
 			}
@@ -236,6 +237,7 @@ func Execute(ctx context.Context, c Controller, sequence []Stage) (Result, error
 		emit(ctx, c, emitter, withStatus(event, StatusCompleted, "", ""))
 		if err := journal.Append(Entry{
 			Stage: stage.Name, Status: StatusCompleted, Component: stage.Component, RunID: c.RunID(),
+			ReadOnly: stage.ReadOnly,
 		}); err != nil {
 			return result, fmt.Errorf("write install journal: %w", err)
 		}

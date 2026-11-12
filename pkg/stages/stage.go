@@ -49,6 +49,15 @@ type Stage struct {
 	// a step whose output cannot be recovered from a previous process, and
 	// a verification that would not be one if it were skipped.
 	AlwaysRun bool
+	// ReadOnly marks a stage that changes nothing outside this process: no
+	// host, no cluster object, no record in the control plane or a bucket.
+	// Writing the operation's own journal does not count. AlwaysRun does not
+	// imply it: a lock or a hold re-runs on every resume and writes.
+	//
+	// The journal records it on every entry, and a journal in which every
+	// recorded stage is ReadOnly binds nothing (OpenJournal). Unset means "may
+	// write", which is the safe answer for a stage nobody has classified.
+	ReadOnly bool
 	// Run does the work. A nil Run is a stage that is not wired yet and the
 	// engine refuses to pretend otherwise.
 	Run StageFunc

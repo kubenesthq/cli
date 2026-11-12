@@ -538,13 +538,15 @@ func Plan(s *Session) []Stage {
 		return []Stage{
 			// Step 2's read, and step 2's four answers plus the fencing
 			// confirmation and the host's capacity. Both write nothing, so a
-			// refusal here has cost the operator nothing.
-			{Name: StageRecoverySelect, AlwaysRun: true, Run: bind(stageRecoverySelect)},
-			{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
+			// refusal here has cost the operator nothing. They are ReadOnly,
+			// so such a refusal does not bind the next recovery to the
+			// arguments it was refused with.
+			{Name: StageRecoverySelect, AlwaysRun: true, ReadOnly: true, Run: bind(stageRecoverySelect)},
+			{Name: StagePreflight, AlwaysRun: true, ReadOnly: true, Run: bind(stagePreflight)},
 			// AlwaysRun because it is the ONLY thing that selects the
 			// checkpoint, and it reads only: on a resume the journal skips it
 			// and the stage that loads the database finds no selection.
-			{Name: StageRecoveryPreflight, AlwaysRun: true, Run: bind(stageRecoveryPreflight)},
+			{Name: StageRecoveryPreflight, AlwaysRun: true, ReadOnly: true, Run: bind(stageRecoveryPreflight)},
 			// Step 1: ownership outside the cluster, recorded in the operation
 			// before the first change.
 			{Name: StageRecoveryOwnership, Run: bind(stageRecoveryOwnership)},

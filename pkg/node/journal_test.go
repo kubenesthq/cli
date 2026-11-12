@@ -2,10 +2,12 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/sshx"
 	"kubenest.io/cli/pkg/stages"
 )
@@ -211,4 +213,164 @@ func TestAFailedRunKeepsItsJournalAndTheIdenticalCommandResumesIt(t *testing.T) 
 		t.Fatalf("the resume failed: %v\n%s", resumeErr, f.out.String())
 	}
 	assertNoJournal(t, f)
+}
+
+// verbIdentity is the journal identity prepareNodeSession gives one node verb on
+// the fixture's cluster: the verb, the cluster, the bundle its record names, the
+// machine as the operator typed it, and no storage device.
+func verbIdentity(kind operation.Kind, machine string) stages.Identity {
+	return stages.Identity{Kind: string(kind), Cluster: "prod-1", Fields: map[string]string{
+		"bundle": "1.1", "machine": machine, "storage": "",
+	}}
+}
+
+// openAs is one CLI invocation in the fixture's world whose journal is opened
+// the way prepareNodeSession opens it, under the identity that invocation's
+// flags give. It returns the open error, which is where a binding journal
+// refuses.
+func (f *nodeFixture) openAs(t *testing.T, runID string, identity stages.Identity) (*Session, error) {
+	t.Helper()
+	journal, note, err := stages.OpenJournalReplacingFinished(f.journalPath, identity)
+	if err != nil {
+		return nil, err
+	}
+	if note != "" {
+		fmt.Fprintln(f.out, note)
+	}
+	next := *f.session
+	next.ID = runID
+	next.Jnl = journal
+	next.Window = openWindow()
+	return &next, nil
+}
+
+// refusedAt asserts that the journal on disk records the shape the hardware run
+// left: the resolve stage COMPLETED and a later check refused. Today's rule
+// already frees a journal in which no stage completed; this is the one it did
+// not.
+func refusedAt(t *testing.T, f *nodeFixture, stage string) {
+	t.Helper()
+	j, err := stages.ReadJournal(f.journalPath)
+	if err != nil {
+		t.Fatalf("the refused run left no journal: %v", err)
+	}
+	if _, ok := j.Completed("resolve"); !ok {
+		t.Errorf("resolve did not complete, so this is not the hardware shape: %+v", j.Entries)
+	}
+	if last, ok := j.LastFailure(); !ok || last.Stage != stage {
+		t.Errorf("the run was not refused by stage %s: %+v", stage, j.Entries)
+	}
+}
+
+// A REMOVE REFUSED BEFORE IT CHANGED ANYTHING DOES NOT BIND THE NEXT REMOVE.
+// Found on hardware by the S7 gate (lab w3, 2026-11-12, cli a462512):
+// `node remove --node A --now` was rightly refused because A holds bound local
+// volumes. Its resolve stage completed and its volumes stage refused, and both
+// only read. The next `node remove --node B --now`, for another node, was then
+// refused as "a different node-remove" until the journal was deleted by hand.
+func TestARemoveRefusedForItsVolumesDoesNotBindTheNextRemove(t *testing.T) {
+	const machineA, machineB = "10.0.3.8", "10.0.3.10"
+	b := agentHost()
+	b.HostID, b.SSHAddress, b.NodeUID, b.HostKeyFingerprint = "h-agt-b", machineB, "uid-agt-b", "SHA256:agent-b"
+	f := removeFixture(t, serverHost(), agentHost(), b)
+	f.server.setNodes(nodesJSON(t,
+		testNode{Name: testServerNode, UID: "uid-srv", Addresses: []string{testServerAddr}, Ready: true},
+		testNode{Name: testAgentNode, UID: "uid-agt", Addresses: []string{machineA}, Ready: true},
+		testNode{Name: "prod-1-agt-b", UID: "uid-agt-b", Addresses: []string{machineB}, Ready: true},
+	))
+	f.addHost(machineB, "SHA256:agent-b", nodesJSON(t))
+	f.boundLocalVolume(t, "db", "data-pg-0", "pg") // on A's node only
+
+	first, err := f.openAs(t, "run-1", verbIdentity(operation.KindNodeRemove, machineA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runRemove(&Remove{Session: first, Opts: RemoveOptions{Node: machineA, Now: true}}); err == nil || !strings.Contains(err.Error(), "--abandon-volumes") {
+		t.Fatalf("the remove of a node holding a bound local volume must be refused for that volume: %v", err)
+	}
+	refusedAt(t, f, StageRemoveVolumes)
+
+	second, err := f.openAs(t, "run-2", verbIdentity(operation.KindNodeRemove, machineB))
+	if err != nil {
+		t.Fatalf("a remove refused before it changed anything bound the next remove of another node: %v", err)
+	}
+	if _, err := f.runRemove(&Remove{Session: second, Opts: RemoveOptions{Node: machineB, Now: true}}); err != nil {
+		t.Fatalf("the remove of the other node failed: %v\n%s", err, f.out.String())
+	}
+	if got := f.lastState("h-agt-b"); got != string(StateRemoved) {
+		t.Errorf("node B is recorded as %q, want %q", got, StateRemoved)
+	}
+	if got := f.lastState("h-agt"); got != string(StateActive) {
+		t.Errorf("node A, whose removal was refused, is recorded as %q, want %q", got, StateActive)
+	}
+	assertNoJournal(t, f)
+}
+
+// THE PROTECTION THAT STAYS. A remove that took its lock, held the node, wrote
+// it down as removing and cordoned it, and then failed to drain, has left a
+// half-removed node behind. Its journal still binds: a remove of another node is
+// refused as a different operation, exactly as before.
+func TestARemoveThatChangedTheClusterStillBindsTheNextRemove(t *testing.T) {
+	f := removeFixture(t)
+	f.server.on("drain "+testAgentNode, fail(1, "error: cannot evict pod as it would violate the pod's disruption budget"))
+
+	first, err := f.openAs(t, "run-1", verbIdentity(operation.KindNodeRemove, "10.0.3.8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runRemove(&Remove{Session: first, Opts: RemoveOptions{Node: "10.0.3.8", Now: true}}); err == nil {
+		t.Fatal("the planted drain failure did not fail the run")
+	}
+	j, err := stages.ReadJournal(f.journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := j.Completed(StageRemoveCordon); !ok {
+		t.Fatalf("the run did not cordon the node, so it is not the changed cluster this test is about: %+v", j.Entries)
+	}
+
+	_, err = f.openAs(t, "run-2", verbIdentity(operation.KindNodeRemove, "10.0.3.10"))
+	if err == nil {
+		t.Fatal("the journal of a remove that cordoned its node was replaced by a remove of another node")
+	}
+	if !strings.Contains(err.Error(), "records a different") || !strings.Contains(err.Error(), "machine") {
+		t.Errorf("want the engine's identity refusal naming the machine, got %v", err)
+	}
+}
+
+// The other two node verbs alike: `node add` refused by its pre-flight checks
+// and `node replace` refused for the old machine's local volumes have each
+// completed read-only stages and changed nothing, so neither binds the next run
+// of its verb on the cluster to the machine it refused.
+func TestAnAddOrAReplaceRefusedBeforeItChangedAnythingDoesNotBindTheNextOne(t *testing.T) {
+	t.Run("add refused by its pre-flight checks", func(t *testing.T) {
+		f := newFixture(t, serverHost(), agentHost())
+		f.agent.on("/etc/os-release", ok("ID=ubuntu\nVERSION_ID=\"22.04\"\nPRETTY_NAME=\"Ubuntu 22.04.3 LTS\"\n"))
+		first, err := f.openAs(t, "run-1", verbIdentity(operation.KindNodeAdd, testAgentAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.runAdd(&Add{Session: first, Opts: AddOptions{Agent: testAgentAddr}}); err == nil {
+			t.Fatal("an unsupported Ubuntu release was accepted")
+		}
+		refusedAt(t, f, StageAddPreflight)
+		if _, err := f.openAs(t, "run-2", verbIdentity(operation.KindNodeAdd, "10.0.3.10")); err != nil {
+			t.Errorf("an add refused by its pre-flight checks bound the next add of another machine: %v", err)
+		}
+	})
+	t.Run("replace refused for the old machine's volumes", func(t *testing.T) {
+		f := replaceFixture(t, true, true)
+		f.strands(t, testAgentNode, strandedClaim{Namespace: "db", Workload: "pg", PVCs: []string{"data-pg-0"}})
+		first, err := f.openAs(t, "run-1", verbIdentity(operation.KindNodeReplace, "h-agt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.runReplace(NewReplace(first, ReplaceOptions{Node: "h-agt", With: testAgentAddr})); err == nil {
+			t.Fatal("a reachable machine holding local volumes was replaced")
+		}
+		refusedAt(t, f, StageReplaceVolumes)
+		if _, err := f.openAs(t, "run-2", verbIdentity(operation.KindNodeReplace, "10.0.3.10")); err != nil {
+			t.Errorf("a replace refused for its volumes bound the next replace of another machine: %v", err)
+		}
+	})
 }

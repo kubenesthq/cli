@@ -103,11 +103,15 @@ type Add struct {
 }
 
 // PlanAdd is the stage sequence the engine runs for one `node add`.
+//
+// Everything before the lock only reads, and says so (ReadOnly): an add refused
+// there changed nothing, so its journal does not bind the next add of another
+// machine.
 func PlanAdd(a *Add) []stages.Stage {
 	return []stages.Stage{
-		{Name: StageAddResolve, AlwaysRun: true, Run: a.stageResolve},
-		{Name: StageAddWindow, AlwaysRun: true, Run: a.stageWindow},
-		{Name: StageAddPreflight, AlwaysRun: true, Run: a.stagePreflight},
+		{Name: StageAddResolve, AlwaysRun: true, ReadOnly: true, Run: a.stageResolve},
+		{Name: StageAddWindow, AlwaysRun: true, ReadOnly: true, Run: a.stageWindow},
+		{Name: StageAddPreflight, AlwaysRun: true, ReadOnly: true, Run: a.stagePreflight},
 		{Name: StageAddLock, AlwaysRun: true, Run: a.stageLock},
 		{Name: StageAddJoining, Run: a.stageJoining},
 		{Name: StageAddHold, AlwaysRun: true, Run: a.stageHold},

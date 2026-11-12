@@ -47,13 +47,16 @@ const (
 // instance would stop describing anything.
 func controlPlaneRecoveryPlan(s *Session, bind stageBinder) []Stage {
 	return []Stage{
-		{Name: StageRecoverySelect, AlwaysRun: true, Run: bind(stageRecoverySelectControlPlane)},
-		{Name: StagePreflight, AlwaysRun: true, Run: bind(stagePreflight)},
+		// The three stages before ownership read the bucket, the control plane
+		// and the host, and write only this operation's journal (ReadOnly), so
+		// a recovery refused here does not bind the next one.
+		{Name: StageRecoverySelect, AlwaysRun: true, ReadOnly: true, Run: bind(stageRecoverySelectControlPlane)},
+		{Name: StagePreflight, AlwaysRun: true, ReadOnly: true, Run: bind(stagePreflight)},
 		// AlwaysRun because it is the ONLY thing that selects the checkpoint,
 		// and it reads only: on a resume the journal skips it and the stage
 		// that loads the database finds no selection (found on hardware
 		// 2026-09-28).
-		{Name: StageRecoveryPreflight, AlwaysRun: true, Run: bind(stageRecoveryPreflightControlPlane)},
+		{Name: StageRecoveryPreflight, AlwaysRun: true, ReadOnly: true, Run: bind(stageRecoveryPreflightControlPlane)},
 		{Name: StageRecoveryOwnership, Run: bind(stageRecoveryOwnership)},
 		{Name: StageK3sServer, Component: "k3s", Run: bind(stageK3sServer)},
 		{Name: StageK3sAgents, Component: "k3s", Run: bind(stageK3sAgents)},

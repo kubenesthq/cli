@@ -89,11 +89,15 @@ type Remove struct {
 }
 
 // PlanRemove is the stage sequence the engine runs for one `node remove`.
+//
+// Everything before the lock only reads, and says so (ReadOnly): a removal
+// refused there changed nothing, so its journal does not bind the next removal
+// of another node.
 func PlanRemove(r *Remove) []stages.Stage {
 	return []stages.Stage{
-		{Name: StageRemoveResolve, AlwaysRun: true, Run: r.stageResolve},
-		{Name: StageRemoveVolumes, AlwaysRun: true, Run: r.stageVolumes},
-		{Name: StageRemoveWindow, AlwaysRun: true, Run: r.stageWindow},
+		{Name: StageRemoveResolve, AlwaysRun: true, ReadOnly: true, Run: r.stageResolve},
+		{Name: StageRemoveVolumes, AlwaysRun: true, ReadOnly: true, Run: r.stageVolumes},
+		{Name: StageRemoveWindow, AlwaysRun: true, ReadOnly: true, Run: r.stageWindow},
 		{Name: StageRemoveLock, AlwaysRun: true, Run: r.stageLock},
 		{Name: StageRemoveHold, AlwaysRun: true, Run: r.stageHold},
 		{Name: StageRemoveRemoving, Run: r.stageRemoving},

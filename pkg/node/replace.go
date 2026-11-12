@@ -235,9 +235,14 @@ func (u unreachable) Close() error               { return nil }
 // what the order decides — and one operation holds it once
 // (Session.takeInterlock), so the second half does not take it again under the
 // other machine's name.
+//
+// Everything before the lock only reads the cluster and the machines, and says
+// so (ReadOnly): a replace refused there changed nothing, so its journal does
+// not bind the next replace. The order the reachability stage writes down goes
+// to this operation's own journal, which is not a change.
 func PlanReplace(r *Replace) []stages.Stage {
 	return []stages.Stage{
-		{Name: StageReplaceResolve, AlwaysRun: true, Run: r.stageResolve},
+		{Name: StageReplaceResolve, AlwaysRun: true, ReadOnly: true, Run: r.stageResolve},
 		// The window comes before the facts the ORDER depends on, and before the
 		// connection to the machine being replaced: a --wait run must wait while
 		// holding nothing and having dialled nobody, and it must read whether the
@@ -245,9 +250,9 @@ func PlanReplace(r *Replace) []stages.Stage {
 		// actually opens rather than hours earlier. The machine-identity gates
 		// still run first, so an operator outside the window who aimed at a server
 		// hears about the server.
-		{Name: StageReplaceWindow, AlwaysRun: true, Run: r.stageWindow},
-		{Name: StageReplaceReachability, AlwaysRun: true, Run: r.stageReachability},
-		{Name: StageReplaceVolumes, AlwaysRun: true, Run: r.stageVolumes},
+		{Name: StageReplaceWindow, AlwaysRun: true, ReadOnly: true, Run: r.stageWindow},
+		{Name: StageReplaceReachability, AlwaysRun: true, ReadOnly: true, Run: r.stageReachability},
+		{Name: StageReplaceVolumes, AlwaysRun: true, ReadOnly: true, Run: r.stageVolumes},
 		{Name: StageReplaceLock, AlwaysRun: true, Run: r.stageLock},
 	}
 }

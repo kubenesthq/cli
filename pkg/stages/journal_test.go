@@ -1,6 +1,7 @@
 package stages_test
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -309,5 +310,61 @@ func TestRemoveDeletesTheJournal(t *testing.T) {
 	// Removing twice is not an error: uninstall must be re-runnable.
 	if err := j.Remove(); err != nil {
 		t.Errorf("Remove must be idempotent: %v", err)
+	}
+}
+
+// ONLY A STAGE THAT MAY CHANGE SOMETHING BINDS THE NEXT OPERATION. Found on
+// hardware (S7, lab w3, 2026-11-12): a `node remove` completed its read-only
+// resolve stage, was refused by its read-only volumes stage, and its journal
+// then refused every other removal on the cluster. Stages declared ReadOnly do
+// not bind. Any other stage binds the moment it is entered, whether it
+// completed, failed, or stopped before it finished, which leaves the same record
+// a killed process does.
+func TestOnlyAStageThatMayWriteBindsTheNextOperation(t *testing.T) {
+	refused := errors.New("refused")
+	read := func(name string, err error) stages.Stage {
+		return stages.Stage{Name: name, ReadOnly: true, Run: func(context.Context) error { return err }}
+	}
+	write := func(name string, err error) stages.Stage {
+		return stages.Stage{Name: name, Run: func(context.Context) error { return err }}
+	}
+	cases := map[string]struct {
+		sequence []stages.Stage
+		binds    bool
+	}{
+		"refused by a read after a read completed": {
+			sequence: []stages.Stage{read("resolve", nil), read("volumes", refused), write("lock", nil)},
+		},
+		"a write failed": {
+			sequence: []stages.Stage{read("resolve", nil), write("lock", refused)},
+			binds:    true,
+		},
+		"a write stopped before it finished": {
+			sequence: []stages.Stage{read("resolve", nil), write("lock", stages.Paused("the window closed"))},
+			binds:    true,
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "journal.json")
+			first := stages.Identity{Kind: "node-remove", Cluster: "lab-w3", Fields: map[string]string{"machine": "A"}}
+			if _, err := stages.Execute(context.Background(), newController(t, &recorder{}, path, first), c.sequence); err == nil {
+				t.Fatal("the planted refusal or stop did not end the run")
+			}
+			second := stages.Identity{Kind: "node-remove", Cluster: "lab-w3", Fields: map[string]string{"machine": "B"}}
+			got, err := stages.OpenJournal(path, second)
+			if c.binds {
+				if err == nil || !strings.Contains(err.Error(), "records a different") {
+					t.Fatalf("a journal whose run entered a stage that may write must refuse a different operation, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a run that only read bound the next operation: %v", err)
+			}
+			if len(got.Entries) != 0 {
+				t.Errorf("the fresh journal must have no entries, got %+v", got.Entries)
+			}
+		})
 	}
 }

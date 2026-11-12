@@ -33,6 +33,11 @@ type Entry struct {
 	// RunID ties an entry to one installer process, so a resumed run is
 	// legible in the record rather than inferred from timestamps.
 	RunID string `json:"run_id,omitempty"`
+	// ReadOnly is the stage's declaration (Stage.ReadOnly) that it changes
+	// nothing outside this process. An entry without it, including every
+	// entry written before the field existed, counts as a stage that may have
+	// written.
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 // Identity is what makes a resume a resume rather than a different operation
@@ -176,16 +181,15 @@ func safeFileName(name string) string {
 // arguments is how a cluster ends up not matching its own record, and the
 // record is what every day-2 operation trusts.
 //
-// The refusal needs something to resume. A run that completed no stage
-// changed nothing — a maintenance-window refusal, for instance, writes the
-// journal's identity and then stops before the first stage — so its journal
-// must not bind the next run to an identity it never acted on. When the
-// stored identity differs and no stage has completed (hasCompletedStage,
-// the journal's own notion of completion), OpenJournal returns a fresh
-// journal for want at the same path instead; the first Append or Save
-// overwrites the file through the existing write path. Once a stage has
-// completed the journal IS the record of a cluster that changed, and the
-// identity binds.
+// The refusal needs something to protect. A run that changed nothing must not
+// bind the next run to an identity it never acted on: a maintenance-window
+// refusal writes the journal's identity and stops before the first stage, and a
+// `node remove` refused for the node's local volumes completed only stages that
+// read (found on hardware, S7, 2026-11-12). When the stored identity differs and
+// the journal is not bound, OpenJournal returns a fresh journal for want at the
+// same path instead; the first Append or Save overwrites the file through the
+// existing write path. A bound journal IS the record of a cluster that may have
+// changed, and the identity binds.
 func OpenJournal(path string, want Identity) (*Journal, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -200,7 +204,7 @@ func OpenJournal(path string, want Identity) (*Journal, error) {
 	}
 	j.path = path
 	if diffs := j.Identity.Differences(want); len(diffs) > 0 {
-		if !j.hasCompletedStage() {
+		if !j.bound() {
 			// Nothing was done under the stored identity, so there is
 			// nothing to resume and nothing to protect: start clean.
 			return &Journal{Identity: want, path: path}, nil
@@ -226,8 +230,8 @@ func OpenJournal(path string, want Identity) (*Journal, error) {
 //
 // So a journal whose stages all ran to the end is replaced, and the returned
 // note says so in one line; the caller prints it. A journal with any stage
-// unfinished goes to OpenJournal, which refuses a different operation and
-// resumes an identical one. OpenJournal's other refusal — a journal it cannot
+// unfinished goes to OpenJournal, which resumes an identical operation and
+// refuses a different one once the journal is bound. OpenJournal's other refusal — a journal it cannot
 // read at all — is never overridden: a corrupt file is a state nobody here can
 // reason about.
 func OpenJournalReplacingFinished(path string, want Identity) (*Journal, string, error) {
@@ -271,17 +275,29 @@ func finished(j *Journal) bool {
 	return completed
 }
 
-// hasCompletedStage reports whether any stage in the journal has a completed
-// last word — the same notion of completion Completed reads. A journal with
-// one is the record of a cluster that changed; a journal without one is the
-// record of a run that never got anywhere, and nothing to resume.
-func (j *Journal) hasCompletedStage() bool {
+// bound reports whether the journal records a run that may have changed
+// something, so that its identity binds the next run. Two things must hold:
+//
+//   - some stage completed, in the sense Completed reads. A run that completed
+//     nothing never got anywhere.
+//   - some recorded stage is not ReadOnly. Such a stage counts from the moment
+//     it is entered, because a write that failed or was killed may have
+//     half-happened.
+//
+// The second condition only ever frees a journal in which every recorded stage
+// declared that it reads. An entry without the declaration counts as a write,
+// so a journal written before ReadOnly existed binds exactly as it did then.
+func (j *Journal) bound() bool {
+	completed, wrote := false, false
 	for i := range j.Entries {
 		if _, ok := j.Completed(j.Entries[i].Stage); ok {
-			return true
+			completed = true
+		}
+		if !j.Entries[i].ReadOnly {
+			wrote = true
 		}
 	}
-	return false
+	return completed && wrote
 }
 
 // Append records a transition and persists immediately. Persisting on every
