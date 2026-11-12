@@ -453,13 +453,27 @@ func TestNodeLifecycleGate(t *testing.T) {
 		lab.kubectl("delete configmap kubenest-operation -n kube-system --ignore-not-found")
 		workload, keeper := "replace-dead", "replace-keep"
 		tag := fmt.Sprintf("%d", time.Now().UnixNano())
-		// Both claims of the workload that will be stranded are on the agent
-		// that dies, by pinning the workload there; the workload that must keep
-		// its data is pinned to the other agent.
-		lab.apply(s5WorkloadDocument(workload, map[string]string{"kubernetes.io/hostname": dead}, true))
+		// BOTH CLAIMS OF THE WORKLOAD THAT WILL BE STRANDED GO ON THE AGENT THAT
+		// DIES by cordoning every other node while it first schedules, and the
+		// workload names no node: its local volumes' node affinity is then all
+		// that holds it there. A hostname nodeSelector is copied into the backup,
+		// so the pod the restore brings back could only run on the node this arm
+		// removes: on lab w3 (2026-09-28) it stayed unschedulable and the restore
+		// ran out its 30-minute cap (kn-t54). TestRestoreVolumeDeadNodeFixture's
+		// dead-node arm met the same on 2026-09-27. The workload that must keep
+		// its data is never restored, so its pin to the other agent stays.
+		uncordon := lab.cordonAllBut(dead)
+		lab.apply(s5WorkloadDocument(workload, nil, true))
+		lab.waitFor(5*time.Minute, "the stranded workload's pod on the agent that dies", func() (bool, string) {
+			return lab.podRunning(workload), lab.podState(workload)
+		})
+		uncordon()
+		if node := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " -o jsonpath={.items[0].spec.nodeName}")); node != dead {
+			t.Fatalf("the stranded workload's pod runs on %q, want the agent %s that this arm takes away", node, dead)
+		}
 		lab.apply(s5WorkloadDocument(keeper, map[string]string{"kubernetes.io/hostname": keep}, true))
-		lab.waitFor(5*time.Minute, "both fixture workloads running", func() (bool, string) {
-			return lab.podRunning(workload) && lab.podRunning(keeper), lab.podState(workload) + " / " + lab.podState(keeper)
+		lab.waitFor(5*time.Minute, "the surviving workload running", func() (bool, string) {
+			return lab.podRunning(keeper), lab.podState(keeper)
 		})
 		lab.writeClaim(workload, "/a", "replace-a-"+tag)
 		lab.writeClaim(workload, "/b", "replace-b-"+tag)
@@ -469,10 +483,13 @@ func TestNodeLifecycleGate(t *testing.T) {
 		lab.writeClaim(keeper, "/a", "keep-newer-a-"+tag)
 		lab.writeClaim(keeper, "/b", "keep-newer-b-"+tag)
 
-		// The node loss. The workload is stopped first so that the drain has
-		// nothing to evict, and its CLAIMS STAY: they are the stranded volumes
-		// the printed restore command has to cover.
-		lab.kubectl("-n " + s5Namespace + " scale deployment " + workload + " --replicas=0")
+		// The node loss, as the API sees a machine that is not coming back. THE
+		// WORKLOAD IS NOT STOPPED AND ITS POD IS NOT DELETED HERE: deleting the
+		// pods a dead kubelet will never stop is `node replace`'s own work
+		// (af09db9, kn-t54-…t3dr.1), and mode 2 finds the workload it brings back
+		// through the pod its ReplicaSet recreates. A first version scaled the
+		// workload to zero and force-deleted its pod, which left no pod mounting
+		// the claims, and the printed restore refused (lab w3, 2026-09-28).
 		lab.stopAgent(dead)
 		lab.waitFor(5*time.Minute, "the agent to go NotReady", func() (bool, string) {
 			out, err := k3s.Kubectl(context.Background(), lab.nodes["node1"], "get node "+dead+" -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}'")
@@ -481,7 +498,7 @@ func TestNodeLifecycleGate(t *testing.T) {
 			}
 			return strings.TrimSpace(out) != "True", strings.TrimSpace(out)
 		})
-		lab.kubectl("-n " + s5Namespace + " delete pod -l app=" + workload + " --grace-period=0 --force --ignore-not-found")
+		deadPod := lab.podOnNode(workload, dead)
 
 		// The isolation confirmation is the operator's step: without it the
 		// command refuses and names the machine, and nothing is removed.
@@ -513,6 +530,11 @@ func TestNodeLifecycleGate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("node replace failed:\n%s\n%v", out, err)
 		}
+		// The replace deleted the dead node's pods itself, by force, because no
+		// kubelet will ever confirm an eviction there (kn-t54-…t3dr.1).
+		if !strings.Contains(out, "deleted "+s5Namespace+"/"+deadPod) {
+			t.Errorf("node replace does not report deleting %s/%s, the stranded workload's pod on the dead node:\n%s", s5Namespace, deadPod, out)
+		}
 
 		// ONE restore command per affected workload, with every stranded claim
 		// of that workload in it: restoring one claim of a pod while another
@@ -525,6 +547,13 @@ func TestNodeLifecycleGate(t *testing.T) {
 			if !strings.Contains(commands[0], "--pvc "+claim) {
 				t.Errorf("the printed restore command does not carry the stranded claim %s: %s", claim, commands[0])
 			}
+		}
+		// It names the workload holding the claims, which the replace could only
+		// read from a pod that still mounted them: with no such pod the line
+		// says "no running pod", and the restore it prints has no workload to
+		// hold at zero (lab w3, 2026-09-28).
+		if !strings.Contains(commands[0], "Deployment/"+workload) {
+			t.Errorf("the printed restore command does not name the workload Deployment/%s: %s", workload, commands[0])
 		}
 
 		// The replacement joined at the bundle's pinned k3s version, with its
@@ -579,32 +608,64 @@ func TestNodeLifecycleGate(t *testing.T) {
 			t.Errorf("the workload on the surviving agent reads %q, want the data written after the backup (keep-newer-a-%s, keep-newer-b-%s)", got, tag, tag)
 		}
 
+		// The pod the replace deleted is recreated by its ReplicaSet, mounts the
+		// claims nothing can give it, and stays Pending: that pod is how mode 2
+		// finds the workload it holds at zero and brings back.
+		lab.waitFor(5*time.Minute, "the ReplicaSet's replacement pod to stay Pending on the stranded claims", lab.pendingHolder(workload))
+		before := lab.claimIdentities(workload+"-a", workload+"-b")
+		replicas := lab.replicas(workload)
+
 		// The command the replace printed is the one that brings the data back,
-		// run now that the replacement is live, and activation lets the
-		// namespace run again.
-		restoreArgs := append(strings.Fields(strings.TrimSpace(strings.SplitN(commands[0], "   #", 2)[0]))[1:], lab.verbArgs()...)
-		restoreArgs = append(restoreArgs, "--confirm")
+		// run AS PRINTED now that the replacement is live: only the operator's
+		// own SSH user and key are added. The server and the bundle come from
+		// the cluster record, as they did for the replace (kn-t54's first cause).
+		printedArgs := strings.Fields(strings.TrimSpace(strings.SplitN(commands[0], "   #", 2)[0]))[1:]
 		var restoreOut strings.Builder
-		if err := lab.runCLI(&restoreOut, restoreArgs...); err != nil {
+		if err := lab.runCLI(&restoreOut, withSSH(env, append(printedArgs, "--confirm")...)...); err != nil {
 			t.Fatalf("the restore command the replace printed failed: %v\n%s", err, restoreOut.String())
 		}
 		operationID := s4OperationID(restoreOut.String())
 		if operationID == "" {
 			t.Fatalf("the printed restore command named no operation to activate:\n%s", restoreOut.String())
 		}
-		var activateOut strings.Builder
-		if err := lab.runCLI(&activateOut, append([]string{"backup", "restore", "--activate", operationID}, lab.verbArgs()...)...); err != nil {
-			t.Fatalf("activating the restored namespace failed: %v\n%s", err, activateOut.String())
+		if got := lab.replicas(workload); got != "0" {
+			t.Errorf("the restore left %s at %s replicas, want it held at 0 until activation (plan 7.5 mode 2, step 3)", workload, got)
 		}
-		lab.waitFor(10*time.Minute, "both stranded claims refilled and Bound on a live node", func() (bool, string) {
-			out := lab.kubectl("-n " + s5Namespace + " get pvc -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{\" \"}{end}'")
-			for _, claim := range []string{workload + "-a", workload + "-b"} {
-				if !strings.Contains(out, claim+"=Bound") {
-					return false, out
+		// THE REFILL IS THE CLAIMS BEING NEW OBJECTS ON FRESH VOLUMES: both were
+		// Bound before the restore too, to the volumes the removed machine held.
+		lab.waitFor(10*time.Minute, "both stranded claims replaced by fresh volumes", func() (bool, string) {
+			for claim, was := range before {
+				now, err := lab.claimIdentity(claim)
+				if err != nil {
+					return false, err.Error()
+				}
+				if now.uid == was.uid || now.volume == "" || now.volume == was.volume {
+					return false, fmt.Sprintf("%s is uid %s on volume %q, and was uid %s on %s", claim, now.uid, now.volume, was.uid, was.volume)
 				}
 			}
-			return true, out
+			return true, "both claims are new objects bound to fresh volumes"
 		})
+
+		// Activation brings the workload back to its recorded replica count, and
+		// its OWN pod then reads the backup's data on a live node. --keep-desired
+		// answers activation's question the way the dead-node arm does: without
+		// an answer a run with no terminal refuses.
+		var activateOut strings.Builder
+		if err := lab.runCLI(&activateOut, append([]string{"backup", "restore", "--activate", operationID, "--keep-desired"}, lab.verbArgs()...)...); err != nil {
+			t.Fatalf("activating the restored namespace failed: %v\n%s", err, activateOut.String())
+		}
+		if got := lab.replicas(workload); got != replicas {
+			t.Errorf("activation put %s at %s replicas, want the recorded %s", workload, got, replicas)
+		}
+		lab.waitFor(5*time.Minute, "the stranded workload's own pod to run on the refilled volumes", func() (bool, string) {
+			return lab.podRunning(workload), lab.podState(workload)
+		})
+		if got := lab.readClaims(workload); !strings.Contains(got, "replace-a-"+tag) || !strings.Contains(got, "replace-b-"+tag) {
+			t.Errorf("the restored workload reads %q, want the backup's replace-a-%s and replace-b-%s", got, tag, tag)
+		}
+		if node := strings.TrimSpace(lab.kubectl("-n " + s5Namespace + " get pods -l app=" + workload + " -o jsonpath={.items[0].spec.nodeName}")); node == "" || node == dead {
+			t.Errorf("the restored workload runs on %q, want a live node, not the removed %s", node, dead)
+		}
 	})
 }
 
