@@ -623,10 +623,12 @@ func TestVolumeRestoreResumeDoesNotRepeatACompletedStep(t *testing.T) {
 	resumed.cluster.annotations = f.cluster.annotations
 	before := resumed.kube.commandCount("delete persistentvolumeclaim a")
 	var resumedOut strings.Builder
+	// THE RESUME CARRIES ONLY THE OPERATION ID, as the command does: `--resume`
+	// is refused alongside --namespace and takes no --pvc, so the mode is the
+	// record's. Passing the claims here hid a nil plan on hardware (S5,
+	// 2026-11-12): the bare resume ran the namespace steps on a volume record.
 	if err := RunRestore(context.Background(), &resumedOut, strings.NewReader(""), resumed.options(t, RestoreOptions{
-		Namespace: "payments",
-		PVCs:      []string{"a"},
-		Resume:    opID,
+		Resume: opID,
 	}), resumed.deps()); err != nil {
 		t.Fatalf("--resume failed: %v\n%s", err, resumedOut.String())
 	}

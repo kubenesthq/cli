@@ -717,7 +717,15 @@ func (r *restoreRun) runNamespaceRestore(ctx context.Context) error {
 	if err := r.openRecord(ctx); err != nil {
 		return err
 	}
-	runErr := r.execute(ctx)
+	// A RESUME'S MODE IS THE RECORD'S. `--resume` takes no --pvc, so a resumed
+	// volume restore arrives here, and the record rebuilt a volume plan rather
+	// than a namespace plan. Running the namespace steps on it dereferenced a
+	// nil plan on hardware (S5, 2026-11-12).
+	run := r.execute
+	if r.volumePlan != nil {
+		run = r.executeVolumeRestore
+	}
+	runErr := run(ctx)
 	r.release(ctx, runErr)
 	return runErr
 }
@@ -1380,6 +1388,13 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 	backup := plan.Record.Request.Versions["backup"]
 	switch plan.Record.Request.Kind {
 	case operation.KindRestoreVolume:
+		// The drill holds Velero's only restore worker, and a resumed volume
+		// restore queues behind it exactly as a new one does. Refused here,
+		// before the record is re-claimed, because the bare `--resume` reaches
+		// this point without passing runVolumeRestore's own check.
+		if err := r.refuseWhileDrillRuns(ctx); err != nil {
+			return err
+		}
 		volumePlan, err := r.volumePlanFromRecord(ctx, recorded)
 		if err != nil {
 			return err
