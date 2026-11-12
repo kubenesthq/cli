@@ -1023,7 +1023,7 @@ func (r *restoreRun) renderPlan() {
 	} else {
 		fmt.Fprintf(r.out, "  mode:          namespace — the namespace is deleted and restored; its CronJobs and any Job still running are suspended as soon as the pause is written, Jobs are %s, and every CronJob the restore creates is suspended by the restore itself (a Velero resource modifier), so none can fire before activation\n", includeJobsWord(r.opts.IncludeJobs))
 		fmt.Fprintf(r.out, "  job pods:      excluded (pods carrying %s), so the pod of a Job that was running when the backup was taken is not restored and its work does not run again before activation\n", JobPodLabelKey)
-		fmt.Fprintf(r.out, "  restored pods: every ReplicaSet the backup holds at 0 replicas comes back with its pod-template-hash renamed, in the selector and the template both, so it cannot adopt and delete the pod the backup copied a volume for before that pod's PodVolumeRestore fills the volume (a backup taken mid-rollout). A ReplicaSet the backup holds with replicas keeps its selector and adopts its restored pod, so that pod is the workload's own; activation deletes only the restored pods no controller owns, and the workload's own controller creates the pods that take the claims over\n")
+		fmt.Fprintf(r.out, "  restored pods: the resource modifier changes pod-template-hash in the selector and template of ReplicaSets the backup holds at 0 replicas; it leaves pods and ReplicaSets with replicas untouched. This rule alone does not make a backup taken mid-rollout safe to restore\n")
 	}
 }
 
@@ -1377,6 +1377,11 @@ func (r *restoreRun) resumeRecord(ctx context.Context, recovery operation.Recove
 	}
 	if kind := plan.Record.Request.Kind; kind != operation.KindRestoreNamespace && kind != operation.KindRestoreVolume {
 		return fmt.Errorf("operation %s is a %s, not a restore: it cannot be resumed by this command", opID, kind)
+	}
+	for _, action := range plan.Record.Actions {
+		if strings.HasPrefix(action.Stage, "free-volume-restore/") && action.Status == operation.ActionSucceeded {
+			return fmt.Errorf("operation %s cannot resume: its missing-pod PodVolumeRestore %s was deleted to free Velero's restore worker. Retrying this Restore cannot fill the lost pod; use the safety backup or an earlier backup", opID, strings.TrimPrefix(action.Stage, "free-volume-restore/"))
+		}
 	}
 	// THE OPERATOR HAS TO BE ABLE TO ANSWER the pause this operation already
 	// wrote, AND THIS IS DECIDED BEFORE THE RECORD IS RE-CLAIMED: a resume whose
@@ -2260,7 +2265,7 @@ func partialNote(volumeRestores int) string {
 // IT ALSO REFUSES A RESTORE THAT CANNOT FINISH, WITHIN A POLL OR TWO. A Velero
 // Restore waits for every PodVolumeRestore it created, and a PodVolumeRestore
 // whose pod the cluster no longer has waits for ever — Velero's own
-// itemOperationTimeout is four hours, and it holds Velero's only restore worker
+// pod-volume timeout is four hours, and it holds Velero's only restore worker
 // the whole time (measured on lab w3, 2026-09-27, kn-x0wv.2). So each poll also
 // asks whether the pod any outstanding PodVolumeRestore targets is still there
 // and still wanted, and stops with a refusal that names it.
@@ -2294,20 +2299,16 @@ func (r *restoreRun) waitRestore(ctx context.Context, name string) (*RestoreOutc
 
 // refuseRestoresWhosePodsCannotBeFilled stops a wait that can never end.
 //
-// TWO SHAPES, ONE OUTCOME. Either the pod a PodVolumeRestore targets is not in
-// the namespace any more — the restore's own pod, adopted and deleted by a
-// zero-replica ReplicaSet, is the measured case — or it is there and already
-// owned by a ReplicaSet whose desired count is zero, which will delete it on
-// its next reconcile. In both, the volume cannot be filled and the restore
-// cannot finish, so the wait ends with a refusal instead of after hours.
+// TWO SHAPES, ONE OUTCOME. Either the pod a PodVolumeRestore targets is gone,
+// or it is present under a ReplicaSet already at zero replicas. In both, the
+// volume cannot be filled and the wait ends with a refusal. Only a pod gone on
+// two consecutive polls makes its PodVolumeRestore eligible for deletion.
 //
-// THE MEASURED CAUSE IS NOW REMOVED BEFORE IT CAN ARISE: the restore's own
-// resource modifier renames a zero-replica ReplicaSet's selector out of the way
-// as Velero creates it (heldReplicaSetRule, namespaceModifierDocument), so that
-// ReplicaSet no longer selects the restored pod it would have deleted. This
-// guard is kept as the last line of defence, because a pod can go another way —
-// deleted by hand, rescheduled elsewhere — and a wait that can never end must
-// still end with a refusal and a name rather than after hours.
+// The modifier renames only a ReplicaSet the backup holds at zero. It does not
+// protect a backup caught mid-rollout while the old ReplicaSet still had a
+// replica: the restored Deployment can later scale that ReplicaSet down and
+// delete the pod Velero was filling. The guard reads the live selector to say
+// which shape occurred instead of guessing from the current replica count.
 //
 // ONLY OUTSTANDING RESTORES COUNT: a Completed PodVolumeRestore has its data,
 // and a Failed one is Velero's own verdict, which checkVolumeRestores reports
@@ -2319,7 +2320,7 @@ func (r *restoreRun) refuseRestoresWhosePodsCannotBeFilled(ctx context.Context, 
 	}
 	outstanding := make([]VolumeRestoreState, 0, len(volumes))
 	for _, volume := range volumes {
-		if volume.Pod == "" || podVolumeRestoreSettled(volume.Phase) {
+		if volume.RestoreName != restore || volume.Pod == "" || podVolumeRestoreSettled(volume.Phase) {
 			delete(missingPods, volume.Name)
 			continue
 		}
@@ -2337,6 +2338,8 @@ func (r *restoreRun) refuseRestoresWhosePodsCannotBeFilled(ctx context.Context, 
 		live[pod.Name] = pod
 	}
 	var sets []ReplicaSetState
+	var refusal error
+	var missing []VolumeRestoreState
 	for _, volume := range outstanding {
 		pod, present := live[volume.Pod]
 		if present {
@@ -2354,7 +2357,9 @@ func (r *restoreRun) refuseRestoresWhosePodsCannotBeFilled(ctx context.Context, 
 				}
 			}
 			if set, found := replicaSetByName(sets, owner.Name); found && set.Replicas == 0 {
-				return r.refuseUnfillableVolume(restore, volume, set, "the pod is still there, adopted by a ReplicaSet whose desired count is 0, which deletes what it adopts")
+				if refusal == nil {
+					refusal = r.refuseUnfillableVolume(restore, volume, set, "the pod is still there, owned by a ReplicaSet whose desired count is 0")
+				}
 			}
 			continue
 		}
@@ -2369,31 +2374,59 @@ func (r *restoreRun) refuseRestoresWhosePodsCannotBeFilled(ctx context.Context, 
 			}
 		}
 		set, found := replicaSetByName(sets, replicaSetOfPodName(volume.Pod))
-		return r.refuseUnfillableVolume(restore, volume, set,
-			fmt.Sprintf("the pod is gone from namespace %s%s", r.opts.Namespace, replicaSetEvidence(set, found)))
+		missing = append(missing, volume)
+		if refusal == nil {
+			refusal = r.refuseUnfillableVolume(restore, volume, set,
+				fmt.Sprintf("the pod is gone from namespace %s%s", r.opts.Namespace, replicaSetEvidence(set, found)))
+		}
 	}
-	return nil
+	if refusal == nil {
+		return nil
+	}
+	var deleteErrors []error
+	for _, volume := range missing {
+		args := "podvolumerestores.velero.io " + volume.Name + " -n " + Namespace + " --wait=false"
+		if err := r.stage("free-volume-restore/"+volume.Name).Delete(ctx, args); err != nil {
+			deleteErrors = append(deleteErrors, fmt.Errorf("could not delete PodVolumeRestore %s of Velero Restore %s: %w", volume.Name, restore, err))
+			continue
+		}
+		fmt.Fprintf(r.out, "  Velero:        deletion requested for PodVolumeRestore %s of Restore %s because pod %s/%s was confirmed missing on two polls; Velero will cancel that volume restore and settle its Restore\n", volume.Name, restore, r.opts.Namespace, volume.Pod)
+	}
+	return errors.Join(append([]error{refusal}, deleteErrors...)...)
 }
 
-// refuseUnfillableVolume is the refusal for a PodVolumeRestore whose volume
-// cannot be filled, naming the pod, the ReplicaSet the pod belonged to and what
-// did it, and ending with the two ways out.
+// refuseUnfillableVolume names the pod and the live ReplicaSet selector. A
+// ReplicaSet's current replica count alone cannot tell whether our hold rule
+// matched the backup or whether a Deployment scaled it down after the restore.
 func (r *restoreRun) refuseUnfillableVolume(restore string, volume VolumeRestoreState, set *ReplicaSetState, shape string) error {
 	owner := ""
+	hold := "No matching ReplicaSet remains, so the selector hold cannot be checked on the cluster."
 	if set != nil {
 		owner = fmt.Sprintf(" ReplicaSet %s is on the cluster at %d replica(s)%s.", set.Name, set.Replicas, ownerPhrase(set))
+		selectorHash := orUnknown(set.Selector["pod-template-hash"])
+		switch {
+		case replicaSetHoldApplied(set):
+			hold = fmt.Sprintf("Its live selector has pod-template-hash=%s: the zero-replica hold applied, so this ReplicaSet cannot select the restored pod's original hash.", selectorHash)
+		case set.Replicas == 0 && set.Owner != nil && strings.EqualFold(set.Owner.Kind, "deployment"):
+			hold = fmt.Sprintf("Its live selector has pod-template-hash=%s: the hold did not apply. The restored Deployment scaled this ReplicaSet down to finish the rollout the backup caught.", selectorHash)
+		default:
+			hold = fmt.Sprintf("Its live selector has pod-template-hash=%s: the hold did not apply; the live objects do not establish why this pod disappeared.", selectorHash)
+		}
 	}
-	return fmt.Errorf("Velero Restore %s cannot finish: PodVolumeRestore %s was created for pod %s (volume %s of claim %s), and %s.%s The backup was taken while the workload was rolling out — the pod it holds a volume copy for belongs to a ReplicaSet the backup holds at zero, and a restored pod is adopted by its ReplicaSet's SELECTOR, not by its owner, so the adoption happens even though Velero strips owner references. That is the usual cause: if it is not this one, the pod went another way. Nothing is reported as done, and the operation is resumable (`kubenest backup restore --resume %s`) or can be given up (`--abort %s`); this run has stopped waiting, but Velero Restore %s still holds Velero's only restore worker until its own timeout. Restoring this backup will run into the same adoption: take a fresh backup once the rollout has settled, or restore one taken when it was not in progress",
-		restore, volume.Name, volume.Pod, orUnknown(volume.Volume), orUnknown(volume.ClaimName), shape, owner,
-		r.handle.OperationID(), r.handle.OperationID(), restore)
+	return fmt.Errorf("Velero Restore %s cannot finish: PodVolumeRestore %s was created for pod %s (volume %s of claim %s), and %s.%s %s Nothing is reported as done. The operation can be given up with `kubenest backup restore --abort %s`; a resume cannot refill a pod this Restore lost. Restore from the safety backup or an earlier backup. On kubenest-local, a Deployment rollout sharing one claim does not settle by itself: switch the Deployment to Recreate or roll it back before taking another backup",
+		restore, volume.Name, volume.Pod, orUnknown(volume.Volume), orUnknown(volume.ClaimName), shape, owner, hold, r.handle.OperationID())
+}
+
+func replicaSetHoldApplied(set *ReplicaSetState) bool {
+	return set != nil && set.Selector["pod-template-hash"] == HeldReplicaSetHash
 }
 
 // podVolumeRestoreSettled reports whether a PodVolumeRestore has an outcome the
-// run does not wait on: Completed (the volume is filled) or Failed (Velero's own
-// verdict, which checkVolumeRestores reports in full).
+// run does not wait on: Completed (the volume is filled), Failed, or Canceled
+// (Velero's deletion path reports the latter before removing the finalizer).
 func podVolumeRestoreSettled(phase string) bool {
 	switch phase {
-	case "Completed", "Failed", "FailedValidation":
+	case "Completed", "Failed", "FailedValidation", "Canceled":
 		return true
 	}
 	return false
@@ -2442,9 +2475,9 @@ func replicaSetEvidence(set *ReplicaSetState, found bool) string {
 	case !found:
 		return ", and no ReplicaSet its name is built from is on the cluster either, so it went with the pod"
 	case set.Replicas == 0:
-		return fmt.Sprintf(", and ReplicaSet %s — the one its name is built from — is on the cluster at 0 replicas: it adopted the pod and deleted it", set.Name)
+		return fmt.Sprintf(", and ReplicaSet %s — the one its name is built from — is on the cluster at 0 replicas", set.Name)
 	default:
-		return fmt.Sprintf(", and ReplicaSet %s — the one its name is built from — is on the cluster at %d replica(s), so something other than its own rollout deleted it", set.Name, set.Replicas)
+		return fmt.Sprintf(", and ReplicaSet %s — the one its name is built from — is on the cluster at %d replica(s)", set.Name, set.Replicas)
 	}
 }
 
@@ -2454,7 +2487,7 @@ func ownerPhrase(set *ReplicaSetState) string {
 	if set.Owner == nil {
 		return ""
 	}
-	return fmt.Sprintf(" %s %s owns it.", set.Owner.Kind, set.Owner.Name)
+	return fmt.Sprintf("; %s %s owns it", set.Owner.Kind, set.Owner.Name)
 }
 
 // volumeNotFoundInPod is Velero's own wording for the one error a mode-2 restore
@@ -3299,6 +3332,16 @@ func restoreSpecs(stage, command string) (operation.Spec, bool) {
 			Postcondition: kind + " " + name + " in " + namespace + " has 0 replicas",
 			Observe: fmt.Sprintf(`test "$(sudo -n k3s kubectl get %s %s -n %s -o jsonpath='{.spec.replicas}')" = 0`,
 				kind, name, namespace),
+		}, true
+	case strings.HasPrefix(stage, "free-volume-restore/"):
+		name := strings.TrimPrefix(stage, "free-volume-restore/")
+		if !strings.Contains(command, "delete podvolumerestores.velero.io "+name+" ") {
+			return operation.Spec{}, false
+		}
+		return operation.Spec{
+			Kind:          operation.ActionSSH,
+			Postcondition: "deletion requested for PodVolumeRestore " + Namespace + "/" + name,
+			Observe:       fmt.Sprintf(`pvr=$(sudo -n k3s kubectl get podvolumerestores.velero.io %s -n %s --ignore-not-found -o name) || exit 1; test -z "$pvr" || test -n "$(sudo -n k3s kubectl get podvolumerestores.velero.io %s -n %s -o jsonpath='{.metadata.deletionTimestamp}')"`, name, Namespace, name, Namespace),
 		}, true
 	case strings.HasPrefix(stage, "delete-namespace/"):
 		name := strings.TrimPrefix(stage, "delete-namespace/")

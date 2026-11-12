@@ -27,7 +27,9 @@ package e2e
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -378,6 +380,41 @@ func (c *s4Cluster) verbArgs(extra ...string) []string {
 	return append(args, extra...)
 }
 
+// refusePreviousWorkload is read-only. Reapplying this run's changed pod
+// template over an older s4-web starts a rollout that cannot mount the RWO
+// claim while the old pod holds it.
+func (c *s4Cluster) refusePreviousWorkload(namespace string) {
+	c.t.Helper()
+	deployment, err := c.kubectlStatus("get deployment s4-web -n " + namespace + " --ignore-not-found -o name")
+	if err != nil {
+		c.t.Fatalf("checking for an earlier S4 Deployment in %s: %v", namespace, err)
+	}
+	pods, err := c.kubectlStatus("get pods -n " + namespace + " -l app=s4-web -o name")
+	if err != nil {
+		c.t.Fatalf("checking for earlier S4 pods in %s: %v", namespace, err)
+	}
+	if err := s4ExistingWorkload(namespace, deployment, pods); err != nil {
+		c.t.Fatal(err)
+	}
+}
+
+type s4LeftoverError struct {
+	Namespace  string
+	Deployment string
+	Pods       string
+}
+
+func (e *s4LeftoverError) Error() string {
+	return fmt.Sprintf("S4 cannot start: namespace %s still holds %q and pod(s) %q from an earlier run; delete the Project / namespace and wait for a clean namespace before rerunning S4", e.Namespace, e.Deployment, e.Pods)
+}
+
+func s4ExistingWorkload(namespace, deployment, pods string) error {
+	if strings.TrimSpace(deployment) == "" && strings.TrimSpace(pods) == "" {
+		return nil
+	}
+	return &s4LeftoverError{Namespace: namespace, Deployment: strings.TrimSpace(deployment), Pods: strings.TrimSpace(pods)}
+}
+
 // TestRestoreNamespaceScenarioS4 is the scenario gate.
 func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	env := gateEnvironment(t)
@@ -389,6 +426,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	c := s4Open(t, env)
 
 	namespace := c.createProject(s4Project)
+	c.refusePreviousWorkload(namespace)
 	// A RUN FROM A PREVIOUS ATTEMPT MUST NOT BE MISTAKEN FOR THIS ONE: the
 	// restore verb refuses to start while another operation holds the record,
 	// which is the lock working, and a stale record would fail the gate for the
@@ -399,13 +437,16 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 	proof := fmt.Sprintf("s4-%d", time.Now().UnixNano())
 	c.apply(s4WorkloadDocument(namespace, proof))
 	c.waitFor(5*time.Minute, "the workload's PVC and pod", func() (bool, string) {
-		out, err := k3s.Kubectl(context.Background(), c.runner, "get pods -n "+namespace+" -l app=s4-web -o jsonpath={.items[0].status.phase}")
+		pod, err := c.currentWorkloadPodOf(namespace)
 		if err != nil {
 			return false, err.Error()
 		}
-		return strings.TrimSpace(out) == "Running", strings.TrimSpace(out)
+		return pod.Ready, fmt.Sprintf("current ReplicaSet pod %s is %s (Ready=%t)", pod.Name, pod.Phase, pod.Ready)
 	})
 	written := c.waitForProof(namespace, proofPath)
+	if err := s4RequireCurrentProof(proof, written); err != nil {
+		t.Fatal(err)
+	}
 
 	// THE POSITIVE CONTROL: the sentinel path is proven to work BEFORE the
 	// assertion that it stays silent means anything.
@@ -488,7 +529,7 @@ func TestRestoreNamespaceScenarioS4(t *testing.T) {
 		}
 		return len(phases) > 0, strings.Join(phases, ",")
 	})
-	if restored := c.sha256OfProof(namespace, proofPath); restored != written {
+	if restored := c.waitForProof(namespace, proofPath); restored != written {
 		t.Errorf("the restored file's SHA-256 is %s, want the %s written before the backup", restored, written)
 	}
 	// The Job is NOT restored, and the CronJob is suspended.
@@ -660,18 +701,14 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 }
 
 // ---------------------------------------------------------------------------
-// kn-x0wv.2: the restore of a backup taken mid-rollout.
+// kn-x0wv.2: the hand-built zero-replica restore arm.
 //
-// WHAT THE BACKUP HELD ON HARDWARE. On lab w3 (2026-09-27) the gate re-applied
-// its Deployment while an earlier run's workload was still there, so a rollout
-// from s4-web-5df4c559 to s4-web-6b4c7c8567 was in progress when the backup was
-// taken. The backup held ONE PodVolumeBackup of the claim, and it named the OLD
-// pod (s4-web-5df4c559-qcqqp), while the old ReplicaSet (s4-web-5df4c559) was
-// held at 0 replicas. Velero restored that pod, stripped its owner references
-// (pkg/restore/restore.go, resetMetadata), the ReplicaSet adopted it BY ITS
-// SELECTOR and deleted it, and the PodVolumeRestore created for it never ran:
-// the Restore stayed InProgress until Velero's itemOperationTimeout (4h) while
-// the CLI waited its own restore timeout (2h).
+// WHAT A REAL STUCK ROLLOUT BACKUP HELD. The stored backup
+// manual-20261112-181904 was measured on 2026-11-12: BOTH the old and new
+// ReplicaSets were at 1 replica, with the new pod Pending because it could not
+// mount the old pod's ReadWriteOnce claim. The earlier claim that a real
+// mid-rollout backup held the old ReplicaSet at 0 was wrong. This arm covers
+// only the hand-built zero-replica state below (kn-ship-1-2-closeout-lzjb.8).
 //
 // kn-x0wv.8: WHAT THE FIRST FIX GOT WRONG. cf35f8f renamed every restored pod
 // the backup had copied a volume for, and that renamed too much. A ReplicaSet
@@ -681,9 +718,10 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 // the claim first, so the restored pod could never mount it (lab w1, 2026-09-28:
 // "MountVolume.SetUp failed ... verifyMount: device already mounted", OpenEBS LVM
 // refusing a second mount of one volume). An ORDINARY one-replica Deployment
-// hung that way. The danger is only ever the ReplicaSet the backup holds at ZERO
-// replicas, so the restore now renames THAT ReplicaSet's selector and template
-// (backup.HeldReplicaSetHash) and leaves every pod's labels alone.
+// hung that way. The restore now renames a ReplicaSet the backup holds at ZERO
+// replicas (backup.HeldReplicaSetHash), and leaves every pod's labels alone.
+// This protects the state this arm constructs; it does not protect the real
+// two-ReplicaSet rollout described above.
 //
 // WHAT THIS ARM THEREFORE EXPECTS AFTER THE RESTORE: the restored hold pod keeps
 // its ORIGINAL pod-template-hash and has NO controller owner (the renamed
@@ -691,9 +729,8 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 // replicas with backup.HeldReplicaSetHash in its selector AND in its template.
 // Activation then deletes that orphan — and leaves the workload's own pod alone.
 //
-// WHY THE FIXTURE CANNOT SIMPLY RACE A ROLLOUT FOR THAT STATE. Three rules of
-// Velero and Kubernetes leave the live cluster almost no window in which to
-// catch it:
+// WHY THE FIXTURE BUILDS ITS ZERO-REPLICA STATE. Three rules of Velero and
+// Kubernetes leave the live cluster almost no window in which to catch it:
 //
 //   - Velero does not back up an item that is being deleted (pkg/backup/
 //     item_backupper.go, itemInclusionChecks: a deletionTimestamp fails the
@@ -712,13 +749,10 @@ func s4InterruptedResume(t *testing.T, c *s4Cluster, namespace, proof, proofPath
 // reference names the workload's Deployment (which manages no pods) instead of
 // the ReplicaSet, and a ReplicaSet ignores an object whose controller reference
 // is not its own (client-go, controller_ref_manager.ClaimObject: "Owned by
-// someone else. Ignore."), so the pod stays Running beside the ReplicaSet at 0 —
-// which is what w3's backup caught in the instant before that pod's own deletion
-// landed. The garbage collector keeps it because the Deployment is really there,
-// and the ReplicaSet still selects the pod by its labels. What the RESTORE sees
-// is indistinguishable from w3's backup, because Velero strips owner references
-// on restore anyway: a pod with a PodVolumeBackup, carrying the ReplicaSet's
-// selector labels, and a ReplicaSet at 0 replicas that selects it.
+// someone else. Ignore."), so the pod stays Running beside the ReplicaSet at 0.
+// The garbage collector keeps it because the Deployment is really there, and
+// the ReplicaSet still selects the pod by its labels. After Velero strips owner
+// references, this hand-built state tests the zero-replica selector hold only.
 //
 // The fixture's claim (s4-hold-data) is deliberately separate from the S4
 // workload's, because Velero copies a claim ONCE and skips every other pod that
@@ -761,9 +795,9 @@ const (
 // kn-x0wv.2 describes rather than the work.
 const s4MidRolloutBound = 20 * time.Minute
 
-// s4MidRollout is kn-x0wv.2's hardware arm as kn-x0wv.8 reshaped the fix: the
-// namespace is restored from a backup taken in the state a rollout leaves between
-// "the old ReplicaSet is at 0" and "the old pod is gone".
+// s4MidRollout covers only the hand-built zero-replica state of kn-x0wv.8. It
+// does not exercise a real mid-rollout backup, which can hold both ReplicaSets
+// at 1 while the new pod is Pending (manual-20261112-181904).
 //
 // It runs after the arms above — it needs a live namespace and a workload — and
 // it leaves the namespace as it found it: it clears what the interrupt arm left
@@ -1389,9 +1423,140 @@ func (c *s4Cluster) runningWorkloadPodOf(namespace string) (string, error) {
 	return "", fmt.Errorf("no Running pod of the S4 workload: %s", strings.TrimSpace(out))
 }
 
-// waitForProof reads the known file's digest through the pod that mounts it,
-// waiting for the workload to be there. The digest is what makes "the same
-// bytes came back" a fact rather than a hope.
+type s4WorkloadPod struct {
+	Name  string
+	Phase string
+	Ready bool
+}
+
+type s4OwnerReference struct {
+	UID        string `json:"uid"`
+	Controller bool   `json:"controller"`
+}
+
+type s4ObjectMetadata struct {
+	Name              string             `json:"name"`
+	UID               string             `json:"uid"`
+	DeletionTimestamp string             `json:"deletionTimestamp"`
+	Labels            map[string]string  `json:"labels"`
+	Annotations       map[string]string  `json:"annotations"`
+	OwnerReferences   []s4OwnerReference `json:"ownerReferences"`
+}
+
+func s4OwnedBy(refs []s4OwnerReference, uid string) bool {
+	for _, ref := range refs {
+		if ref.Controller && ref.UID == uid {
+			return true
+		}
+	}
+	return false
+}
+
+// s4CurrentWorkloadPod selects the pod owned by the newest ReplicaSet of this
+// Deployment. The old ReplicaSet's Running pod must never satisfy readiness or
+// supply a digest while a changed template's pod is Pending.
+func s4CurrentWorkloadPod(deploymentJSON, replicaSetsJSON, podsJSON string) (s4WorkloadPod, error) {
+	var deployment struct {
+		Metadata s4ObjectMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal([]byte(deploymentJSON), &deployment); err != nil {
+		return s4WorkloadPod{}, fmt.Errorf("reading the S4 Deployment: %w", err)
+	}
+	if deployment.Metadata.UID == "" {
+		return s4WorkloadPod{}, fmt.Errorf("the S4 Deployment has no UID")
+	}
+	var replicaSets struct {
+		Items []struct {
+			Metadata s4ObjectMetadata `json:"metadata"`
+			Spec     struct {
+				Selector struct {
+					MatchLabels map[string]string `json:"matchLabels"`
+				} `json:"selector"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(replicaSetsJSON), &replicaSets); err != nil {
+		return s4WorkloadPod{}, fmt.Errorf("reading the S4 ReplicaSets: %w", err)
+	}
+	newestRevision := -1
+	newestUID, newestName, newestHash := "", "", ""
+	for _, rs := range replicaSets.Items {
+		if !s4OwnedBy(rs.Metadata.OwnerReferences, deployment.Metadata.UID) {
+			continue
+		}
+		revision, err := strconv.Atoi(rs.Metadata.Annotations["deployment.kubernetes.io/revision"])
+		if err != nil || revision < 1 {
+			return s4WorkloadPod{}, fmt.Errorf("Deployment ReplicaSet %s has no usable revision", rs.Metadata.Name)
+		}
+		if revision == newestRevision {
+			return s4WorkloadPod{}, fmt.Errorf("Deployment ReplicaSets %s and %s both claim newest revision %d", newestName, rs.Metadata.Name, revision)
+		}
+		if revision > newestRevision {
+			newestRevision = revision
+			newestUID = rs.Metadata.UID
+			newestName = rs.Metadata.Name
+			newestHash = rs.Spec.Selector.MatchLabels["pod-template-hash"]
+		}
+	}
+	if newestUID == "" || newestHash == "" {
+		return s4WorkloadPod{}, fmt.Errorf("the S4 Deployment has no current ReplicaSet with a pod-template-hash")
+	}
+	var pods struct {
+		Items []struct {
+			Metadata s4ObjectMetadata `json:"metadata"`
+			Status   struct {
+				Phase      string `json:"phase"`
+				Conditions []struct {
+					Type   string `json:"type"`
+					Status string `json:"status"`
+				} `json:"conditions"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(podsJSON), &pods); err != nil {
+		return s4WorkloadPod{}, fmt.Errorf("reading the S4 pods: %w", err)
+	}
+	var selected s4WorkloadPod
+	for _, pod := range pods.Items {
+		if pod.Metadata.DeletionTimestamp != "" || pod.Metadata.Labels["pod-template-hash"] != newestHash || !s4OwnedBy(pod.Metadata.OwnerReferences, newestUID) {
+			continue
+		}
+		if selected.Name != "" {
+			return s4WorkloadPod{}, fmt.Errorf("current ReplicaSet %s has more than one live pod; refusing to choose one by list order", newestName)
+		}
+		selected.Name = pod.Metadata.Name
+		selected.Phase = pod.Status.Phase
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == "Ready" && condition.Status == "True" && pod.Status.Phase == "Running" {
+				selected.Ready = true
+			}
+		}
+	}
+	if selected.Name == "" {
+		return s4WorkloadPod{}, fmt.Errorf("current ReplicaSet %s (pod-template-hash %s) has no live pod", newestName, newestHash)
+	}
+	return selected, nil
+}
+
+func (c *s4Cluster) currentWorkloadPodOf(namespace string) (s4WorkloadPod, error) {
+	deployment, err := c.kubectlStatus("get deployment s4-web -n " + namespace + " -o json")
+	if err != nil {
+		return s4WorkloadPod{}, err
+	}
+	replicaSets, err := c.kubectlStatus("get replicasets -n " + namespace + " -l app=s4-web -o json")
+	if err != nil {
+		return s4WorkloadPod{}, err
+	}
+	pods, err := c.kubectlStatus("get pods -n " + namespace + " -l app=s4-web -o json")
+	if err != nil {
+		return s4WorkloadPod{}, err
+	}
+	return s4CurrentWorkloadPod(deployment, replicaSets, pods)
+}
+
+// waitForProof reads the known file's digest through the current ReplicaSet's
+// pod, waiting for that workload to be there. The digest is what makes "the
+// same bytes came back" a fact rather than a hope.
 func (c *s4Cluster) waitForProof(namespace, path string) string {
 	c.t.Helper()
 	var digest string
@@ -1405,17 +1570,75 @@ func (c *s4Cluster) waitForProof(namespace, path string) string {
 	return digest
 }
 
-// sha256OfProof reads the file's digest through the pod that mounts it, or ""
-// when the pod or the file is not there yet.
+// sha256OfProof reads the file through the current ReplicaSet's pod, or ""
+// when that pod or its file is not there yet.
 func (c *s4Cluster) sha256OfProof(namespace, path string) string {
 	c.t.Helper()
-	out, err := k3s.Kubectl(context.Background(), c.runner, "get pods -n "+namespace+" -l app=s4-web -o jsonpath={.items[0].metadata.name}")
+	pod, err := c.currentWorkloadPodOf(namespace)
 	if err != nil {
 		return ""
 	}
-	pod := strings.TrimSpace(out)
-	if pod == "" {
-		return ""
+	return c.sha256InPod(namespace, pod.Name, path)
+}
+
+func s4RequireCurrentProof(proof, digest string) error {
+	want := fmt.Sprintf("%x", sha256.Sum256([]byte(proof+"\n")))
+	if digest != want {
+		return fmt.Errorf("the current ReplicaSet's pod reads proof digest %s, want %s from this run; an earlier run's pod or stale claim cannot prove S4", digest, want)
 	}
-	return c.sha256InPod(namespace, pod, path)
+	return nil
+}
+
+func TestS4RefusesWorkloadLeftByAnEarlierRun(t *testing.T) {
+	if err := s4ExistingWorkload("e2e-restore-ns", "", ""); err != nil {
+		t.Fatalf("an empty namespace was refused: %v", err)
+	}
+	for _, tc := range []struct {
+		name       string
+		deployment string
+		pods       string
+	}{
+		{"deployment remains", "deployment.apps/s4-web", ""},
+		{"only a pod remains", "", "pod/s4-web-old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := s4ExistingWorkload("e2e-restore-ns", tc.deployment, tc.pods)
+			var leftover *s4LeftoverError
+			if !errors.As(err, &leftover) || leftover.Namespace != "e2e-restore-ns" || leftover.Deployment != tc.deployment || leftover.Pods != tc.pods {
+				t.Fatalf("leftover Deployment=%q pods=%q returned %v, want a refusal with the leftover identities", tc.deployment, tc.pods, err)
+			}
+		})
+	}
+}
+
+func TestS4SelectsTheCurrentReplicaSetPod(t *testing.T) {
+	deployment := `{"metadata":{"uid":"deployment-1"}}`
+	replicaSets := `{"items":[
+		{"metadata":{"name":"s4-web-old","uid":"rs-old","annotations":{"deployment.kubernetes.io/revision":"3"},"ownerReferences":[{"uid":"deployment-1","controller":true}]},"spec":{"selector":{"matchLabels":{"pod-template-hash":"old"}}}},
+		{"metadata":{"name":"s4-web-new","uid":"rs-new","annotations":{"deployment.kubernetes.io/revision":"4"},"ownerReferences":[{"uid":"deployment-1","controller":true}]},"spec":{"selector":{"matchLabels":{"pod-template-hash":"new"}}}},
+		{"metadata":{"name":"other-project","uid":"rs-other","annotations":{"deployment.kubernetes.io/revision":"99"},"ownerReferences":[{"uid":"another-deployment","controller":true}]},"spec":{"selector":{"matchLabels":{"pod-template-hash":"other"}}}}
+	]}`
+	pods := `{"items":[
+		{"metadata":{"name":"s4-web-old-pod","labels":{"pod-template-hash":"old"},"ownerReferences":[{"uid":"rs-old","controller":true}]},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},
+		{"metadata":{"name":"s4-web-new-pod","labels":{"pod-template-hash":"new"},"ownerReferences":[{"uid":"rs-new","controller":true}]},"status":{"phase":"Pending"}},
+		{"metadata":{"name":"other-project-pod","labels":{"pod-template-hash":"other"},"ownerReferences":[{"uid":"rs-other","controller":true}]},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}
+	]}`
+	pod, err := s4CurrentWorkloadPod(deployment, replicaSets, pods)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Name != "s4-web-new-pod" || pod.Ready {
+		t.Fatalf("selected %+v; the old Running pod must not satisfy readiness for the new ReplicaSet", pod)
+	}
+}
+
+func TestS4RejectsThePreviousRunsProof(t *testing.T) {
+	current := fmt.Sprintf("%x", sha256.Sum256([]byte("s4-current\n")))
+	old := fmt.Sprintf("%x", sha256.Sum256([]byte("s4-old\n")))
+	if err := s4RequireCurrentProof("s4-current", current); err != nil {
+		t.Fatalf("this run's proof was refused: %v", err)
+	}
+	if err := s4RequireCurrentProof("s4-current", old); err == nil {
+		t.Fatal("the previous run's digest was accepted as this run's proof")
+	}
 }

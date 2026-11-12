@@ -294,8 +294,17 @@ func (c *fakeCluster) DrillRestore(_ context.Context) (*DrillRestore, error) {
 	return c.drill, nil
 }
 
-func (c *fakeCluster) VolumeRestores(_ context.Context, _ string) ([]VolumeRestoreState, error) {
-	return c.volumes, nil
+func (c *fakeCluster) VolumeRestores(_ context.Context, restore string) ([]VolumeRestoreState, error) {
+	var selected []VolumeRestoreState
+	for _, volume := range c.volumes {
+		if volume.RestoreName == "" {
+			volume.RestoreName = restore
+		}
+		if volume.RestoreName == restore {
+			selected = append(selected, volume)
+		}
+	}
+	return selected, nil
 }
 
 func (c *fakeCluster) RestoreOutcome(_ context.Context, name string) (*RestoreOutcome, error) {
@@ -544,17 +553,31 @@ func (c *fakeCluster) applyDocument(ctx context.Context, name string, doc []byte
 }
 
 func (c *fakeCluster) Delete(ctx context.Context, args string) error {
-	return c.command(ctx, "delete "+args)
+	if err := c.command(ctx, "delete "+args); err != nil {
+		return err
+	}
+	if fields := strings.Fields(args); len(fields) >= 2 && fields[0] == "podvolumerestores.velero.io" {
+		kept := c.volumes[:0]
+		for _, volume := range c.volumes {
+			if volume.Name != fields[1] {
+				kept = append(kept, volume)
+			}
+		}
+		c.volumes = kept
+	}
+	return nil
 }
 
 // fakeOpKube is an in-memory `kube-system` for the operation record, and a
 // transport that answers every other command successfully. It exists so a
 // resume and an activation drive the real pkg/operation path.
 type fakeOpKube struct {
-	mu       sync.Mutex
-	objects  map[string]map[string]any
-	rev      int
-	commands []string
+	mu              sync.Mutex
+	objects         map[string]map[string]any
+	rev             int
+	commands        []string
+	replicaSetsJSON string
+	failCommand     string
 	// safetyPhase is the phase this fake answers for a safety backup
 	// (kubenest-safety-*), and safetyFailure is the reason it gives with it.
 	// Empty means Completed, which is what it answers for every other backup.
@@ -583,6 +606,12 @@ func (k *fakeOpKube) Run(ctx context.Context, command string) (sshx.Result, erro
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.commands = append(k.commands, command)
+	if k.failCommand != "" && strings.Contains(command, k.failCommand) {
+		return sshx.Result{ExitCode: 1, Stderr: "injected command failure"}, nil
+	}
+	if strings.Contains(command, "get replicasets -n payments -o json") && k.replicaSetsJSON != "" {
+		return sshx.Result{Stdout: k.replicaSetsJSON}, nil
+	}
 	if name, ok := backupNameIn(command); ok {
 		// The safety backup's settle probe reads Velero's own object; every
 		// other backup this fake is asked about is Completed as soon as it
@@ -2293,10 +2322,10 @@ func TestOperatorChartVersionReadsTheLabel(t *testing.T) {
 // TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled is
 // kn-x0wv.2's first half. A Velero Restore waits for every PodVolumeRestore it
 // created, and one whose pod the cluster no longer has waits for ever: Velero's
-// own itemOperationTimeout is four hours and it holds Velero's only restore
+// own pod-volume timeout is four hours and it holds Velero's only restore
 // worker the whole time, while the CLI waits its own restore timeout (measured
 // on lab w3, 2026-09-27). The wait must end within a poll or two, naming the pod
-// and the ReplicaSet that took it.
+// and the live ReplicaSet evidence without guessing from its replica count.
 //
 // THE PLANTED NEGATIVE IS TODAY'S WAIT, which returns the timeout error after
 // the whole restore deadline.
@@ -2304,14 +2333,14 @@ func TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled(t *tes
 	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
 	f := newRestoreFixture(t, facts)
 	// The Restore never reaches a terminal phase, and its PodVolumeRestore names
-	// the pod of the OLD ReplicaSet — the one the backup holds at zero, which
-	// adopted the restored pod and deleted it.
+	// a missing pod whose ReplicaSet is now at zero.
 	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
 	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-rg84r", Pod: "s4-web-5df4c559-qcqqp", Volume: "data-0", ClaimName: "data-0", Phase: "New"}}
 	f.cluster.pods = nil
 	f.cluster.replicasets = []ReplicaSetState{{
 		Name:     "s4-web-5df4c559",
 		Replicas: 0,
+		Selector: map[string]string{"pod-template-hash": "original"},
 		Owner:    &OwnerRef{Kind: "Deployment", Name: "s4-web", Controller: true},
 	}}
 
@@ -2344,6 +2373,90 @@ func TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled(t *tes
 	}
 }
 
+func TestNamespaceRestoreFreesOnlyItsMissingPodsVolumeRestore(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	f.cluster.volumes = []VolumeRestoreState{
+		{Name: "pvr-foreign", RestoreName: "another-restore", Pod: "foreign-abcde", Volume: "data-0", Phase: "New"},
+		{Name: "pvr-missing", Pod: "web-old-abcde", Volume: "data-0", ClaimName: "data-0", Phase: "New"},
+		{Name: "pvr-missing-2", Pod: "web-old-abcde", Volume: "config", Phase: "New"},
+	}
+	f.cluster.pods = nil
+	f.cluster.replicasets = []ReplicaSetState{{Name: "web-old", Replicas: 0, Selector: map[string]string{"pod-template-hash": "original"}, Owner: &OwnerRef{Kind: "Deployment", Name: "web", Controller: true}}}
+
+	out, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil {
+		t.Fatal("the missing-pod restore must refuse")
+	}
+	for _, fact := range []string{"pvr-missing", "pvr-missing-2", "web-old-abcde"} {
+		if !strings.Contains(out, fact) {
+			t.Errorf("the deletion output lacks %s: %s", fact, out)
+		}
+	}
+	if got := f.kube.commandCount("delete podvolumerestores.velero.io pvr-missing -n velero --wait=false"); got != 1 {
+		t.Fatalf("deleted the missing pod's PodVolumeRestore %d times, want once; refusal: %v", got, err)
+	}
+	if got := f.kube.commandCount("delete podvolumerestores.velero.io pvr-missing-2 -n velero --wait=false"); got != 1 {
+		t.Fatalf("deleted the second missing pod's PodVolumeRestore %d times, want once", got)
+	}
+	if got := f.kube.commandCount("delete podvolumerestores.velero.io pvr-foreign"); got != 0 {
+		t.Fatalf("deleted another restore's PodVolumeRestore %d times", got)
+	}
+	opID := f.kube.recordFor(operation.Name).OperationID
+	_, resumedErr := runRestorePlan(t, f, RestoreOptions{Resume: opID}, "")
+	if resumedErr == nil || !strings.Contains(resumedErr.Error(), "pvr-missing") {
+		t.Fatalf("--resume after deleting the missing-pod PVR did not clearly refuse: %v", resumedErr)
+	}
+
+	// A PVR with a pod that still exists is not a worker leak. Exercise the
+	// guard directly so this case does not depend on a destructive restore.
+	f.cluster.deleted = false
+	f.cluster.pods = []PodState{{Name: "web-live-abcde", Namespace: "payments"}}
+	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-live", Pod: "web-live-abcde", Volume: "data-0", Phase: "New"}}
+	r := &restoreRun{deps: f.deps(), opts: RestoreOptions{Namespace: "payments"}}
+	if err := r.refuseRestoresWhosePodsCannotBeFilled(context.Background(), "restore-live", map[string]bool{}); err != nil {
+		t.Fatalf("a PVR whose pod exists was refused: %v", err)
+	}
+	if got := f.kube.commandCount("delete podvolumerestores.velero.io pvr-live"); got != 0 {
+		t.Fatalf("deleted a PVR whose pod still exists %d times", got)
+	}
+}
+
+func TestNamespaceRestoreDeleteFailureKeepsTheOriginalRefusal(t *testing.T) {
+	facts := eligibleFacts(t, "daily-good", at(-2*time.Hour), at(-time.Hour), "data-0")
+	f := newRestoreFixture(t, facts)
+	f.cluster.outcome = &RestoreOutcome{Name: "r", Phase: "InProgress"}
+	f.cluster.volumes = []VolumeRestoreState{{Name: "pvr-missing", Pod: "web-old-abcde", Volume: "data-0", Phase: "New"}}
+	f.cluster.pods = nil
+	f.kube.failCommand = "delete podvolumerestores.velero.io pvr-missing"
+	_, err := runRestorePlan(t, f, RestoreOptions{Namespace: "payments", Latest: true, Confirm: true, Replace: true}, "")
+	if err == nil || !strings.Contains(err.Error(), "pvr-missing") || !strings.Contains(err.Error(), "web-old-abcde") || !strings.Contains(err.Error(), "injected command failure") {
+		t.Fatalf("delete failure hid the missing-pod refusal: %v", err)
+	}
+	if got := f.kube.commandCount(f.kube.failCommand); got != 1 {
+		t.Fatalf("delete was attempted %d times, want once", got)
+	}
+}
+
+func TestReplicaSetHoldEvidenceUsesTheClusterSelector(t *testing.T) {
+	kube := newFakeOpKube()
+	kube.replicaSetsJSON = `{"items":[{"metadata":{"name":"held"},"spec":{"replicas":0,"selector":{"matchLabels":{"pod-template-hash":"kubenest-held"}}}},{"metadata":{"name":"rollout"},"spec":{"replicas":0,"selector":{"matchLabels":{"pod-template-hash":"original"}}}}]}`
+	sets, err := NewK3sCluster(kube).ReplicaSets(context.Background(), "payments")
+	if err != nil || len(sets) != 2 {
+		t.Fatalf("read ReplicaSets: %v, %v", sets, err)
+	}
+	if !replicaSetHoldApplied(&sets[0]) || replicaSetHoldApplied(&sets[1]) {
+		t.Fatalf("hold must follow each live selector, got held=%t rollout=%t", replicaSetHoldApplied(&sets[0]), replicaSetHoldApplied(&sets[1]))
+	}
+}
+
+func TestCanceledPodVolumeRestoreIsSettled(t *testing.T) {
+	if !podVolumeRestoreSettled("Canceled") {
+		t.Fatal("a canceled PodVolumeRestore must not be treated as still waiting for its missing pod")
+	}
+}
+
 // TestNamespaceRestoreHoldsZeroReplicaSetsOutOfTheRestoredPodsSelector is
 // kn-x0wv.8: the decision for a backup taken mid-rollout, moved from the pods to
 // the ReplicaSet the backup holds at ZERO replicas.
@@ -2355,9 +2468,9 @@ func TestNamespaceRestoreRefusesWhenTheRestoredPodsVolumeCanNeverBeFilled(t *tes
 // same second, that pod mounted the claim first, and the restored pod's
 // PodVolumeRestore could never fill it — an ORDINARY one-replica Deployment,
 // hung on lab w1 on 2026-09-28 (OpenEBS LVM refuses a second mount of one
-// volume). The danger only ever exists for the ReplicaSet the backup holds at
-// zero replicas: that one adopts the restored pod by its selector and deletes it
-// at once, because its desired count is zero.
+// volume). The rule handles the zero-replica case; a backup taken while both
+// old and new ReplicaSets have replicas can still lose the old pod when the
+// restored Deployment completes its rollout.
 //
 // THE PLANTED NEGATIVE IS A RULE THAT CHANGES A POD'S OWN LABELS — the pods rule
 // kn-x0wv.2 shipped. It is exactly what makes a ReplicaSet with replicas start a

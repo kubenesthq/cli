@@ -237,13 +237,16 @@ type DrillRestore struct {
 // actually filled. "Completed with 0 errors" on the Restore is not that proof
 // (probe P5, run 4).
 type VolumeRestoreState struct {
-	Name      string
-	Pod       string
-	Volume    string
-	ClaimName string
-	ClaimUID  string
-	Phase     string
-	Message   string
+	Name string
+	// RestoreName is Velero's restore-name label; the missing-pod guard only
+	// deletes a PVR carrying the current Restore's name.
+	RestoreName string
+	Pod         string
+	Volume      string
+	ClaimName   string
+	ClaimUID    string
+	Phase       string
+	Message     string
 }
 
 // RemovedVolume is one volume a mode-2 restore DELIBERATELY took out of a
@@ -286,16 +289,14 @@ func (o RestoreOutcome) Terminal() bool {
 // ReplicaSetState is one ReplicaSet of the namespace, and the controller that
 // owns it.
 //
-// IT EXISTS FOR THE HANG GUARD and for nothing else. A namespace restore hangs
-// when the pod Velero restored is adopted by a ReplicaSet whose desired count
-// is zero, which deletes it at once, so the PodVolumeRestore that targets that
-// pod never runs (kn-x0wv.2, lab w3, 2026-09-27). The pod is gone by then and
-// its own owner reference went with it, so the ReplicaSet — matched by the
-// name the pod carries — is the only object that can still say which rollout
-// the pod belonged to.
+// The hang guard reads the count, selector and owner of the ReplicaSet whose
+// name matches the missing pod. The selector says whether the zero-replica
+// hold actually applied; the current count alone cannot say what the backup
+// held before the restored Deployment resumed its rollout.
 type ReplicaSetState struct {
 	Name     string
 	Replicas int32
+	Selector map[string]string // spec.selector.matchLabels, read for the refusal's hold diagnosis
 	// Owner is the ReplicaSet's controller owner: the Deployment of a rollout,
 	// or nothing for one helm or a test made by hand.
 	Owner *OwnerRef
@@ -870,13 +871,14 @@ func (c *k3sCluster) VolumeRestores(ctx context.Context, restoreName string) ([]
 			claim = item.Spec.Volume
 		}
 		restores = append(restores, VolumeRestoreState{
-			Name:      item.Metadata.Name,
-			Pod:       item.Spec.Pod.Name,
-			Volume:    item.Spec.Volume,
-			ClaimName: claim,
-			ClaimUID:  item.Metadata.Labels["velero.io/pvc-uid"],
-			Phase:     item.Status.Phase,
-			Message:   item.Status.Message,
+			Name:        item.Metadata.Name,
+			RestoreName: item.Metadata.Labels["velero.io/restore-name"],
+			Pod:         item.Spec.Pod.Name,
+			Volume:      item.Spec.Volume,
+			ClaimName:   claim,
+			ClaimUID:    item.Metadata.Labels["velero.io/pvc-uid"],
+			Phase:       item.Status.Phase,
+			Message:     item.Status.Message,
 		})
 	}
 	sort.Slice(restores, func(i, j int) bool { return restores[i].Name < restores[j].Name })
@@ -1131,10 +1133,8 @@ func (c *k3sCluster) ControllerOwner(ctx context.Context, namespace, kind, name 
 
 // ReplicaSets reads the namespace's ReplicaSets.
 //
-// The reader is deliberately narrow: the name (which is what a pod's name is
-// built from), the desired replica count (a ReplicaSet at zero deletes the pods
-// it adopts) and the controller that owns it. Nothing here is used to CHANGE
-// anything — mode 1 never scales a ReplicaSet.
+// The reader is deliberately narrow: name, desired replica count, selector
+// labels and controller owner. Nothing here changes a ReplicaSet.
 func (c *k3sCluster) ReplicaSets(ctx context.Context, namespace string) ([]ReplicaSetState, error) {
 	out, err := c.kubectl(ctx, "get replicasets -n "+namespace+" -o json")
 	if err != nil {
@@ -1155,6 +1155,9 @@ func (c *k3sCluster) ReplicaSets(ctx context.Context, namespace string) ([]Repli
 			} `json:"metadata"`
 			Spec struct {
 				Replicas *int32 `json:"replicas"`
+				Selector struct {
+					MatchLabels map[string]string `json:"matchLabels"`
+				} `json:"selector"`
 			} `json:"spec"`
 		} `json:"items"`
 	}
@@ -1167,7 +1170,7 @@ func (c *k3sCluster) ReplicaSets(ctx context.Context, namespace string) ([]Repli
 		if item.Spec.Replicas != nil {
 			replicas = *item.Spec.Replicas
 		}
-		set := ReplicaSetState{Name: item.Metadata.Name, Replicas: replicas}
+		set := ReplicaSetState{Name: item.Metadata.Name, Replicas: replicas, Selector: item.Spec.Selector.MatchLabels}
 		for _, owner := range item.Metadata.OwnerReferences {
 			if owner.Controller != nil && *owner.Controller {
 				set.Owner = &OwnerRef{Kind: owner.Kind, Name: owner.Name, Controller: true}

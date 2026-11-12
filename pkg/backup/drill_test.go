@@ -179,3 +179,147 @@ func TestDrillDeclinedWithoutDetailStillOffersTheRemedy(t *testing.T) {
 		t.Errorf("the fallback refusal does not offer the fix: %q", err.Error())
 	}
 }
+
+func drillWaitJSON(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode drill wait fixture: %v", err)
+	}
+	return string(raw)
+}
+
+func pendingDrillRunner(t *testing.T, restores []any, volumes map[string][]any) *fakeRunner {
+	t.Helper()
+	result := drillWaitJSON(t, map[string]any{
+		"metadata": map[string]any{"annotations": map[string]string{}},
+		"data":     map[string]string{DrillResultDataKey: `{"status":"never_run"}`},
+	})
+	restoreList := drillWaitJSON(t, map[string]any{"items": restores})
+	return &fakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.HasPrefix(command, "sudo -n k3s kubectl patch configmap "+DrillConfigName):
+			return sshx.Result{}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl get configmap "+DrillResultName):
+			return sshx.Result{Stdout: result}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl get restores.velero.io -n "+Namespace):
+			return sshx.Result{Stdout: restoreList}, nil
+		case strings.HasPrefix(command, "sudo -n k3s kubectl get podvolumerestores.velero.io -n "+Namespace):
+			for name, items := range volumes {
+				if strings.Contains(command, "velero.io/restore-name="+name+" ") {
+					return sshx.Result{Stdout: drillWaitJSON(t, map[string]any{"items": items})}, nil
+				}
+			}
+		}
+		t.Fatalf("unscripted drill wait command: %q", command)
+		return sshx.Result{}, nil
+	}}
+}
+
+func drillWaitRestore(name, phase string, created time.Time, drill bool) any {
+	labels := map[string]string{}
+	if drill {
+		labels[DrillRestoreLabelKey] = DrillRestoreLabelValue
+	}
+	return map[string]any{
+		"metadata": map[string]any{
+			"name": name, "labels": labels,
+			"creationTimestamp": created.UTC().Format(time.RFC3339),
+		},
+		"status": map[string]any{"phase": phase},
+	}
+}
+
+func drillWaitVolume(name, phase string) any {
+	return map[string]any{
+		"metadata": map[string]any{"name": name},
+		"spec": map[string]any{
+			"pod":    map[string]string{"namespace": "e2e-restore-ns", "name": "restored-web"},
+			"volume": "data",
+		},
+		"status": map[string]string{"phase": phase},
+	}
+}
+
+func runPendingDrillWait(t *testing.T, r *fakeRunner) ([]converge.Event, error) {
+	t.Helper()
+	bundle := testManifest()
+	bundle.Limits.Timeouts["restore-drill"] = 20 * time.Millisecond
+	var events []converge.Event
+	rep := converge.ReporterFunc(func(e converge.Event) { events = append(events, e) })
+	_, err := RequestDrill(context.Background(), r, bundle, rep)
+	return events, err
+}
+
+func TestDrillWaitReportsTheRestoreThatHoldsVelerosWorker(t *testing.T) {
+	const drill = "kubenest-restore-drill-queued"
+	const foreign = "kubenest-restore-stuck"
+	const stuckVolume = "kubenest-restore-stuck-pvr"
+	r := pendingDrillRunner(t, []any{
+		drillWaitRestore(foreign, "InProgress", time.Now().Add(-23*time.Minute), false),
+		drillWaitRestore(drill, "", time.Now(), true),
+	}, map[string][]any{
+		foreign: {drillWaitVolume(stuckVolume, "New")},
+		drill:   {},
+	})
+
+	events, err := runPendingDrillWait(t, r)
+	if err == nil {
+		t.Fatal("the unanswered drill request must expire at its bundle deadline")
+	}
+	var sawQueued bool
+	for _, event := range events {
+		if event.Outcome != converge.Converging && event.Outcome != converge.Fail {
+			continue
+		}
+		state := event.State.String()
+		if strings.Contains(strings.ToLower(state), "queued") &&
+			strings.Contains(state, foreign) && strings.Contains(state, "InProgress") &&
+			strings.Contains(state, "23m") && strings.Contains(state, stuckVolume) &&
+			strings.Contains(state, "New") && strings.Contains(state, "restored-web") &&
+			strings.Contains(strings.ToLower(state), "worker") {
+			sawQueued = true
+		}
+	}
+	if !sawQueued {
+		t.Errorf("no progress event reported the queued drill and worker holder: %+v", events)
+	}
+	for _, want := range []string{foreign, "InProgress", stuckVolume, "New", "delete", "drill"} {
+		if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+			t.Errorf("deadline error %q does not carry %q", err, want)
+		}
+	}
+}
+
+func TestDrillWaitReportsItsOwnRestoreAndUnfinishedVolumes(t *testing.T) {
+	const drill = "kubenest-restore-drill-working"
+	const volume = "kubenest-restore-drill-working-pvr"
+	r := pendingDrillRunner(t, []any{
+		drillWaitRestore(drill, "InProgress", time.Now().Add(-time.Minute), true),
+	}, map[string][]any{
+		drill: {drillWaitVolume(volume, "New")},
+	})
+
+	events, err := runPendingDrillWait(t, r)
+	if err == nil {
+		t.Fatal("the unanswered drill request must expire at its bundle deadline")
+	}
+	var sawDrill bool
+	for _, event := range events {
+		state := event.State.String()
+		if strings.Contains(state, drill) && strings.Contains(state, "InProgress") &&
+			strings.Contains(state, volume) && strings.Contains(state, "New") &&
+			!strings.Contains(strings.ToLower(state), "queued") {
+			sawDrill = true
+		}
+	}
+	if !sawDrill {
+		t.Errorf("no progress event reported the active drill and its volume: %+v", events)
+	}
+	if !strings.Contains(err.Error(), drill) || !strings.Contains(err.Error(), volume) {
+		t.Errorf("deadline error does not carry the drill's last state: %v", err)
+	}
+	if strings.Contains(err.Error(), "kubenest-restore-stuck") {
+		t.Errorf("ordinary drill was attributed to a foreign restore: %v", err)
+	}
+}
