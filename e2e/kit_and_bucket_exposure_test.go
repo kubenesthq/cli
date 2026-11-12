@@ -9,7 +9,7 @@
 //     recovery key exactly once;
 //  2. a second cluster from a second laptop that holds ONLY the public
 //     recipient — the private key never exists there;
-//  3. a workload with a PLANTED Secret on each cluster, mounted into a pod
+//  3. a workload with a PLANTED Secret on the first cluster, mounted into a pod
 //     volume so the value is in the volume data as well as in the objects;
 //  4. the first backup through `kubenest backup now`, then the exposure
 //     matrix read out of the bucket itself.
@@ -18,16 +18,16 @@
 //
 //   - the fleet key was printed once, in the control-plane install's output;
 //   - the control-plane kit was DECRYPTED from both its local and its uploaded
-//     copy, and the kit stage finished before any backup completed (timestamp
-//     ordering against the journal, not a re-run);
+//     copy, and the kit stage finished before checkpoint Jobs or backups;
 //   - the second cluster's kit was uploaded and DIGEST-verified before its
 //     first backup could exist, and that install never held or printed a
 //     private key;
 //   - the planted Secret is not readable from the volume backup or the
 //     datastore snapshot and IS readable from Velero's resource archive —
 //     the exposure the docs state, measured rather than assumed;
-//   - `backup set-target` refuses a credential that can read the control-plane
-//     prefix.
+//   - each cluster has its own scoped S3 principal; `backup set-target`'s
+//     scope check refuses principals reaching the control-plane prefix or
+//     both cluster prefixes.
 //
 // Run from the umbrella workspace:
 //
@@ -37,9 +37,11 @@
 //	export KUBENEST_LAB_NODE2_IP=<second host>
 //	export KUBENEST_BACKUP_TARGET='s3://bucket?endpoint=minio:9000&region=main'
 //	export KUBENEST_BACKUP_ACCESS_KEY_ID=... KUBENEST_BACKUP_SECRET_ACCESS_KEY=...
+//	export KUBENEST_BACKUP_CLUSTER_B_ACCESS_KEY_ID=... KUBENEST_BACKUP_CLUSTER_B_SECRET_ACCESS_KEY=...
 //	export KUBENEST_BACKUP_CLUSTER_A_PREFIX=cluster-a
 //	export KUBENEST_BACKUP_CLUSTER_B_PREFIX=cluster-b
 //	export KUBENEST_BACKUP_WIDE_KEY_ID=... KUBENEST_BACKUP_WIDE_SECRET=...
+//	export KUBENEST_BACKUP_CROSS_KEY_ID=... KUBENEST_BACKUP_CROSS_SECRET=...
 //	cd kubenest-cli && go test -tags e2e -v -timeout 90m ./e2e/ -run TestKitAndBucketExposure
 package e2e
 
@@ -51,6 +53,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -64,6 +67,7 @@ import (
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/cmd"
 	"kubenest.io/cli/pkg/config"
+	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/converge"
 	"kubenest.io/cli/pkg/install"
 	"kubenest.io/cli/pkg/k3s"
@@ -87,11 +91,32 @@ type kitEnv struct {
 	prefixB       string
 	accessKeyID   string
 	accessSecret  string
+	accessKeyIDB  string
+	accessSecretB string
 	wideKeyID     string
 	wideSecret    string
+	crossKeyID    string
+	crossSecret   string
 	plantedSecret string
 	plantedNS     string
 	secondStorage string
+}
+
+func TestS1ReadsDistinctCredentialsForEachCluster(t *testing.T) {
+	t.Setenv("KUBENEST_LAB_NODE2_IP", "192.0.2.2")
+	t.Setenv("KUBENEST_BACKUP_TARGET", "s3://fixture")
+	t.Setenv("KUBENEST_BACKUP_ACCESS_KEY_ID", "cluster-a-key")
+	t.Setenv("KUBENEST_BACKUP_SECRET_ACCESS_KEY", "cluster-a-secret")
+	t.Setenv("KUBENEST_BACKUP_CLUSTER_B_ACCESS_KEY_ID", "cluster-b-key")
+	t.Setenv("KUBENEST_BACKUP_CLUSTER_B_SECRET_ACCESS_KEY", "cluster-b-secret")
+	t.Setenv("KUBENEST_BACKUP_WIDE_KEY_ID", "wide-key")
+	t.Setenv("KUBENEST_BACKUP_WIDE_SECRET", "wide-secret")
+	t.Setenv("KUBENEST_BACKUP_CROSS_KEY_ID", "cross-key")
+	t.Setenv("KUBENEST_BACKUP_CROSS_SECRET", "cross-secret")
+	kit := kitEnvironment(t)
+	if kit.accessKeyIDB != "cluster-b-key" || kit.accessSecretB != "cluster-b-secret" {
+		t.Fatal("the second install must receive its own configured S3 principal")
+	}
 }
 
 func kitEnvironment(t *testing.T) kitEnv {
@@ -103,8 +128,12 @@ func kitEnvironment(t *testing.T) kitEnv {
 		prefixB:       envOr("KUBENEST_BACKUP_CLUSTER_B_PREFIX", "cluster-b"),
 		accessKeyID:   os.Getenv("KUBENEST_BACKUP_ACCESS_KEY_ID"),
 		accessSecret:  os.Getenv("KUBENEST_BACKUP_SECRET_ACCESS_KEY"),
+		accessKeyIDB:  os.Getenv("KUBENEST_BACKUP_CLUSTER_B_ACCESS_KEY_ID"),
+		accessSecretB: os.Getenv("KUBENEST_BACKUP_CLUSTER_B_SECRET_ACCESS_KEY"),
 		wideKeyID:     os.Getenv("KUBENEST_BACKUP_WIDE_KEY_ID"),
 		wideSecret:    os.Getenv("KUBENEST_BACKUP_WIDE_SECRET"),
+		crossKeyID:    os.Getenv("KUBENEST_BACKUP_CROSS_KEY_ID"),
+		crossSecret:   os.Getenv("KUBENEST_BACKUP_CROSS_SECRET"),
 		plantedNS:     "kit-exposure",
 		secondStorage: os.Getenv("KUBENEST_LAB_NODE2_STORAGE_DEVICE"),
 	}
@@ -116,6 +145,21 @@ func kitEnvironment(t *testing.T) kitEnv {
 	}
 	if env.targetFlag == "" || env.accessKeyID == "" || env.accessSecret == "" {
 		t.Skip("KUBENEST_BACKUP_TARGET and KUBENEST_BACKUP_ACCESS_KEY_ID / KUBENEST_BACKUP_SECRET_ACCESS_KEY not set: the bucket arms cannot be checked without a real S3-compatible store")
+	}
+	if env.accessKeyIDB == "" || env.accessSecretB == "" {
+		t.Fatal("KUBENEST_BACKUP_CLUSTER_B_ACCESS_KEY_ID and KUBENEST_BACKUP_CLUSTER_B_SECRET_ACCESS_KEY are required for S1's second scoped principal")
+	}
+	if env.accessKeyID == env.accessKeyIDB {
+		t.Fatal("S1 needs distinct S3 principals for the two clusters")
+	}
+	if env.prefixA == env.prefixB || env.prefixA == "" || env.prefixB == "" {
+		t.Fatal("S1 needs two distinct nonempty cluster prefixes")
+	}
+	if env.wideKeyID == "" || env.wideSecret == "" {
+		t.Fatal("KUBENEST_BACKUP_WIDE_KEY_ID and KUBENEST_BACKUP_WIDE_SECRET are required for S1's planted negative")
+	}
+	if env.crossKeyID == "" || env.crossSecret == "" {
+		t.Fatal("KUBENEST_BACKUP_CROSS_KEY_ID and KUBENEST_BACKUP_CROSS_SECRET are required for the other-cluster planted negative")
 	}
 	return env
 }
@@ -171,8 +215,9 @@ func TestKitAndBucketExposure(t *testing.T) {
 	}, &firstOut)
 	defer sessionOne.Close()
 	if _, err := install.Execute(ctx, sessionOne, install.Plan(sessionOne)); err != nil {
-		t.Fatalf("the control-plane install failed: %v\n%s", err, firstOut.String())
+		t.Fatalf("the control-plane install failed: %v", err)
 	}
+	assertKitStages(t, sessionOne)
 	installElapsed := time.Since(started)
 	t.Logf("control-plane install finished in %s (S1's budget is %s)", installElapsed.Round(time.Second), Budget)
 	if installElapsed > Budget {
@@ -180,10 +225,56 @@ func TestKitAndBucketExposure(t *testing.T) {
 			installElapsed.Round(time.Second), Budget)
 	}
 	output := firstOut.String()
+	cfgOne, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runnerOne, err := sessionOne.Server()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("the control-plane kit predates every checkpoint Job", func(t *testing.T) {
+		kitAt, ok := sessionOne.Jnl.Completed(install.StageRecoveryKit)
+		if !ok {
+			t.Fatal("the control-plane kit stage has no completion time")
+		}
+		out, err := k3s.Kubectl(ctx, runnerOne, "get jobs -n "+controlplane.Namespace+" -o json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var jobs struct {
+			Items []struct {
+				Metadata struct {
+					Name    string    `json:"name"`
+					Created time.Time `json:"creationTimestamp"`
+				} `json:"metadata"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(out), &jobs); err != nil {
+			t.Fatal(err)
+		}
+		for _, job := range jobs.Items {
+			if strings.HasPrefix(job.Metadata.Name, controlplane.CheckpointCronJobName+"-") {
+				if job.Metadata.Created.IsZero() || !job.Metadata.Created.After(kitAt) {
+					t.Errorf("checkpoint Job %s cannot be shown to start after the kit stage", job.Metadata.Name)
+				}
+			}
+		}
+		checkpoint, err := controlplane.ReadEligibleCheckpoint(ctx, runnerOne)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checkpoint != nil {
+			at, err := time.Parse(time.RFC3339, checkpoint.At)
+			if err != nil || !at.After(kitAt) {
+				t.Errorf("the eligible checkpoint cannot be shown to postdate the kit stage (timestamp error %v)", err)
+			}
+		}
+	})
 
 	t.Run("the fleet recovery key is printed exactly once", func(t *testing.T) {
 		if got := strings.Count(output, "AGE-SECRET-KEY-1"); got != 1 {
-			t.Errorf("the fleet recovery key appears %d times in the install output, want exactly 1:\n%s", got, output)
+			t.Errorf("the fleet recovery key appears %d times in the install output, want exactly 1", got)
 		}
 		key := extractFleetKey(t, output)
 		fleet, err := recoverykit.ParseFleetKey(key)
@@ -209,10 +300,10 @@ func TestKitAndBucketExposure(t *testing.T) {
 
 	t.Run("the control-plane install decrypted both copies of its kit", func(t *testing.T) {
 		if !strings.Contains(output, "decrypted from both the local and the uploaded copy") {
-			t.Errorf("the first control-plane install holds the identity, so it must open both copies and say so:\n%s", output)
+			t.Error("the first control-plane install must report opening both kit copies")
 		}
 		if !strings.Contains(output, "control-plane recovery kit") {
-			t.Errorf("the instance's own kit must be written too:\n%s", output)
+			t.Error("the first install did not report its control-plane recovery kit")
 		}
 	})
 
@@ -245,20 +336,82 @@ func TestKitAndBucketExposure(t *testing.T) {
 		BackupTarget:   kitTargetFlag(kit.targetFlag, kit.prefixB),
 	}, &secondOut)
 	defer sessionTwo.Close()
+	t.Setenv("KUBENEST_BACKUP_ACCESS_KEY_ID", kit.accessKeyIDB)
+	t.Setenv("KUBENEST_BACKUP_SECRET_ACCESS_KEY", kit.accessSecretB)
 	if _, err := install.Execute(ctx, sessionTwo, install.Plan(sessionTwo)); err != nil {
-		t.Fatalf("the second cluster's install failed: %v\n%s", err, secondOut.String())
+		t.Fatalf("the second cluster's install failed: %v", err)
 	}
+	assertKitStages(t, sessionTwo)
 	second := secondOut.String()
+	runnerTwo, err := sessionTwo.Server()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("both clusters connect and reconcile a project", func(t *testing.T) {
+		for _, cluster := range []struct {
+			id     string
+			runner k3s.Runner
+		}{
+			{sessionOne.Jnl.ClusterID, runnerOne},
+			{sessionTwo.Jnl.ClusterID, runnerTwo},
+		} {
+			waitKitConnected(t, fleet, cluster.id)
+		}
+		password := kitAdminPassword(t, output)
+		anonymous, err := api.New(cfgOne.ControlPlaneURL, api.WithCACert([]byte(cfgOne.ControlPlaneCA)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		token, err := anonymous.PasswordLogin(ctx, "admin@"+env.server+".sslip.io", password)
+		if err != nil {
+			t.Fatalf("logging in to the new control plane to create S1 projects: %v", err)
+		}
+		admin, err := api.New(cfgOne.ControlPlaneURL, api.WithToken(token), api.WithCACert([]byte(cfgOne.ControlPlaneCA)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, cluster := range []struct {
+			id     string
+			runner k3s.Runner
+		}{
+			{sessionOne.Jnl.ClusterID, runnerOne},
+			{sessionTwo.Jnl.ClusterID, runnerTwo},
+		} {
+			project, err := admin.CreateProject(ctx, cluster.id, "s1-project-"+randomSuffix())
+			if err != nil {
+				t.Fatalf("creating a project through the control plane for %s: %v", cluster.id, err)
+			}
+			if project == nil || project.Namespace == "" {
+				t.Fatalf("the control plane returned no namespace for %s's project", cluster.id)
+			}
+			waitKitNamespace(t, cluster.runner, project.Namespace)
+		}
+	})
+	t.Run("an occupied k3s host is refused at preflight", func(t *testing.T) {
+		probe := kitSession(t, fleet, bundle, filepath.Join(t.TempDir(), "occupied-journal.json"), install.Options{
+			Bundle: env.bundle, Name: clusterTwo + "-occupied", Servers: []string{kit.secondServer}, HATier: "single-server",
+			SSHUser: env.sshUser, SSHKey: env.sshKey, StorageDevices: storage.Devices{All: kit.secondStorage},
+		}, new(bytes.Buffer))
+		defer probe.Close()
+		plan := install.Plan(probe)
+		if len(plan) == 0 || plan[0].Name != install.StagePreflight {
+			t.Fatal("the fresh install does not start at preflight")
+		}
+		err := plan[0].Run(ctx)
+		if err == nil || !strings.Contains(err.Error(), "Existing Kubernetes") {
+			t.Errorf("preflight must refuse the occupied host as Existing Kubernetes; got %v", err)
+		}
+	})
 
 	t.Run("a later install verifies by digest and never holds the key", func(t *testing.T) {
 		if strings.Contains(second, "AGE-SECRET-KEY-1") {
-			t.Errorf("the second laptop must never see or print a private key:\n%s", second)
+			t.Error("the second laptop saw a private fleet key")
 		}
 		if !strings.Contains(second, "digest-verified against the local copy") {
-			t.Errorf("every later install must verify the upload by digest and say so:\n%s", second)
+			t.Error("the second install did not report digest verification")
 		}
 		if strings.Contains(second, "decrypted from both") {
-			t.Errorf("a later install must not claim to have decrypted anything:\n%s", second)
+			t.Error("the second install claimed to decrypt a recovery kit")
 		}
 		// The local kit really is there, and really is the object in the
 		// bucket: the digest check is a comparison, not a claim.
@@ -274,13 +427,27 @@ func TestKitAndBucketExposure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		clientB := bucketClient(t, kit.targetFlag, kit.prefixB, kit.accessKeyID, kit.accessSecret)
+		clientB := bucketClient(t, kit.targetFlag, kit.prefixB, kit.accessKeyIDB, kit.accessSecretB)
 		uploaded, err := clientB.Get(ctx, recoverykit.KitKey(kit.prefixB, sessionTwo.Jnl.ClusterID, recoverykit.KindCluster, localKit.ArtifactID))
 		if err != nil {
 			t.Fatalf("the second cluster's kit is not in the bucket: %v", err)
 		}
 		if recoverykit.Digest(uploaded) != recoverykit.Digest(localDoc) {
 			t.Errorf("the uploaded kit is not the local one: uploaded %s, local %s", recoverykit.Digest(uploaded), recoverykit.Digest(localDoc))
+		}
+		sealed, err := recoverykit.Load(uploaded)
+		if err != nil {
+			t.Fatalf("the uploaded second-cluster kit is not a recovery kit: %v", err)
+		}
+		if _, err := sealed.Secrets(""); err == nil {
+			t.Error("the uploaded second-cluster kit opened without the fleet key")
+		}
+		fleetKey, err := recoverykit.ParseFleetKey(extractFleetKey(t, output))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sealed.Secrets(fleetKey.SecretKeyString()); err != nil {
+			t.Errorf("the uploaded second-cluster kit did not open with the first laptop's fleet key: %v", err)
 		}
 	})
 
@@ -295,6 +462,8 @@ func TestKitAndBucketExposure(t *testing.T) {
 	// The first backup, through the real command, so the recovery set is
 	// written by the path an operator would use.
 	t.Setenv("HOME", homeOne)
+	t.Setenv("KUBENEST_BACKUP_ACCESS_KEY_ID", kit.accessKeyID)
+	t.Setenv("KUBENEST_BACKUP_SECRET_ACCESS_KEY", kit.accessSecret)
 	nowCmd := cmd.NewBackupCommand()
 	var nowOut bytes.Buffer
 	nowCmd.SetOut(&nowOut)
@@ -309,17 +478,13 @@ func TestKitAndBucketExposure(t *testing.T) {
 	})
 	nowCmd.SetContext(ctx)
 	if err := nowCmd.Execute(); err != nil {
-		t.Fatalf("`kubenest backup now` failed: %v\n%s", err, nowOut.String())
+		t.Fatalf("`kubenest backup now` failed: %v", err)
 	}
 
-	runnerOne, err := sessionOne.Server()
-	if err != nil {
-		t.Fatal(err)
-	}
 	clientA := bucketClient(t, kit.targetFlag, kit.prefixA, kit.accessKeyID, kit.accessSecret)
-	set, setDoc := readSet(t, clientA, kit.prefixA, sessionOne.Jnl.ClusterID)
+	set, _ := readSet(t, clientA, kit.prefixA, sessionOne.Jnl.ClusterID)
 	if set.ArtifactID == "" {
-		t.Fatalf("`backup now` wrote no recovery set, so the backup it took cannot be selected by a recovery:\n%s", nowOut.String())
+		t.Fatal("`backup now` wrote no recovery set, so the backup cannot be selected by a recovery")
 	}
 
 	t.Run("nothing that can back up ran before the kit stage finished", func(t *testing.T) {
@@ -343,10 +508,10 @@ func TestKitAndBucketExposure(t *testing.T) {
 				b.Name, b.CompletedAt.Format(time.RFC3339), kitAt.Format(time.RFC3339))
 		}
 		if !set.Complete {
-			t.Errorf("the recovery set is not marked complete, so no recovery may select it: %s", setDoc)
+			t.Error("the recovery set is not marked complete, so no recovery may select it")
 		}
 		if len(set.Backups) == 0 {
-			t.Errorf("the recovery set names no backup: %s", setDoc)
+			t.Error("the recovery set names no backup")
 		}
 		for _, b := range set.Backups {
 			if b.Completed() && !b.CompletedAt.After(kitAt) {
@@ -372,7 +537,7 @@ func TestKitAndBucketExposure(t *testing.T) {
 	})
 
 	t.Run("the second cluster's kit was verified before it could back up", func(t *testing.T) {
-		setB, _ := readSet(t, bucketClient(t, kit.targetFlag, kit.prefixB, kit.accessKeyID, kit.accessSecret), kit.prefixB, sessionTwo.Jnl.ClusterID)
+		setB, _ := readSet(t, bucketClient(t, kit.targetFlag, kit.prefixB, kit.accessKeyIDB, kit.accessSecretB), kit.prefixB, sessionTwo.Jnl.ClusterID)
 		if setB.ArtifactID == "" {
 			t.Fatal("no recovery set was written for the second cluster")
 		}
@@ -386,6 +551,16 @@ func TestKitAndBucketExposure(t *testing.T) {
 		}
 		if targetAt.Before(kitAt) {
 			t.Errorf("the second cluster's target was configured at %s, before its kit finished at %s", targetAt.Format(time.RFC3339), kitAt.Format(time.RFC3339))
+		}
+		for _, backup := range veleroBackups(t, runnerTwo) {
+			if !backup.CompletedAt.IsZero() && !backup.CompletedAt.After(kitAt) {
+				t.Errorf("second-cluster backup %s existed at or before its kit stage completed", backup.Name)
+			}
+		}
+		for _, backup := range setB.Backups {
+			if backup.Completed() && !backup.CompletedAt.After(kitAt) {
+				t.Errorf("second-cluster recovery set includes backup %s from before its kit completed", backup.Name)
+			}
 		}
 	})
 
@@ -484,13 +659,13 @@ func TestKitAndBucketExposure(t *testing.T) {
 	})
 
 	// ------------------------------------------------- set-target's scope arm
-	t.Run("the scope check refuses a credential that reaches the control plane", func(t *testing.T) {
-		if kit.wideKeyID == "" {
-			t.Skip("KUBENEST_BACKUP_WIDE_KEY_ID / KUBENEST_BACKUP_WIDE_SECRET not set: there is no over-broad credential to prove the refusal with")
-		}
+	t.Run("set-target scope refuses access to the control plane or the other cluster", func(t *testing.T) {
 		wide, err := backup.ParseTarget(kitTargetFlag(kit.targetFlag, kit.prefixA), kit.wideKeyID, kit.wideSecret)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if _, _, err := wide.Client.List(ctx, backup.ControlPlanePrefix); err != nil {
+			t.Fatalf("the planted wide credential does not actually reach the control-plane prefix: %v", err)
 		}
 		_, err = wide.VerifyScope(ctx, wide.Client)
 		if err == nil {
@@ -512,7 +687,110 @@ func TestKitAndBucketExposure(t *testing.T) {
 		if _, err := narrow.VerifyScope(ctx, narrow.Client); err != nil {
 			t.Errorf("the cluster's own scoped credential must pass: %v", err)
 		}
+		other, err := backup.ParseTarget(kitTargetFlag(kit.targetFlag, kit.prefixB), kit.accessKeyIDB, kit.accessSecretB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.VerifyScope(ctx, other.Client); err != nil {
+			t.Errorf("the second cluster's own scoped credential must pass: %v", err)
+		}
+		cross, err := backup.ParseTarget(kitTargetFlag(kit.targetFlag, kit.prefixA), kit.crossKeyID, kit.crossSecret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, prefix := range []string{kit.prefixA, kit.prefixB} {
+			if _, _, err := cross.Client.List(ctx, prefix+"/"); err != nil {
+				t.Fatalf("the planted cross-cluster credential cannot actually list %s: %v", prefix, err)
+			}
+		}
+		if _, _, err := cross.Client.List(ctx, backup.ControlPlanePrefix); !errors.Is(err, s3.ErrAccessDenied) {
+			t.Fatalf("the cross-cluster credential also reaches the control-plane prefix, obscuring which boundary refused it: %v", err)
+		}
+		if _, err := cross.VerifyScope(ctx, cross.Client); err == nil {
+			t.Error("set-target accepted a credential demonstrated to reach both cluster prefixes")
+		} else if !strings.Contains(err.Error(), "ListObjectsV2") && !strings.Contains(err.Error(), "GetObject") {
+			t.Errorf("the cross-cluster refusal did not identify a successful foreign-prefix probe: %v", err)
+		}
+		for _, crossing := range []struct {
+			name    string
+			client  *s3.Client
+			owner   *s3.Client
+			foreign string
+		}{
+			{"A reads B", narrow.Client.(*s3.Client), other.Client.(*s3.Client), kit.prefixB},
+			{"B reads A", other.Client.(*s3.Client), narrow.Client.(*s3.Client), kit.prefixA},
+		} {
+			t.Run(crossing.name, func(t *testing.T) {
+				keys, _, err := crossing.owner.List(ctx, crossing.foreign+"/recovery-kits/")
+				if err != nil || len(keys) == 0 {
+					t.Fatalf("the foreign cluster has no readable kit to use as the planted object (error %v)", err)
+				}
+				if _, _, err := crossing.client.List(ctx, crossing.foreign+"/"); !errors.Is(err, s3.ErrAccessDenied) {
+					t.Errorf("listing another cluster's prefix must be AccessDenied; got %v", err)
+				}
+				if _, err := crossing.client.Get(ctx, keys[0]); !errors.Is(err, s3.ErrAccessDenied) {
+					t.Errorf("reading another cluster's prefix must be AccessDenied; got %v", err)
+				}
+			})
+		}
 	})
+}
+
+func assertKitStages(t *testing.T, session *install.Session) {
+	t.Helper()
+	for _, stage := range install.Plan(session) {
+		if _, ok := session.Jnl.Completed(stage.Name); !ok {
+			t.Errorf("install stage %s has no completed journal entry", stage.Name)
+		}
+	}
+}
+
+func kitAdminPassword(t *testing.T, output string) string {
+	t.Helper()
+	const marker = "admin password: "
+	var password string
+	for _, line := range strings.Split(output, "\n") {
+		if i := strings.Index(line, marker); i >= 0 {
+			if password != "" {
+				t.Fatal("the first install printed the administrator password more than once")
+			}
+			password = strings.TrimSpace(line[i+len(marker):])
+		}
+	}
+	if password == "" {
+		t.Fatal("the first install did not print the administrator password")
+	}
+	return password
+}
+
+func waitKitConnected(t *testing.T, control *api.Client, clusterID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		cluster, err := control.GetCluster(context.Background(), clusterID)
+		if err == nil && cluster.Status == "connected" && cluster.LastHeartbeat != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cluster %s did not become connected with a heartbeat (status %q, error %v)", clusterID, cluster.Status, err)
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func waitKitNamespace(t *testing.T, runner k3s.Runner, namespace string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		out, err := k3s.Kubectl(context.Background(), runner, "get namespace "+namespace+" -o name")
+		if err == nil && strings.TrimSpace(out) == "namespace/"+namespace {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("project namespace %s never reconciled (error %v)", namespace, err)
+		}
+		time.Sleep(5 * time.Second)
+	}
 }
 
 // kitTargetFlag puts one cluster's prefix into the shared target.
@@ -556,7 +834,7 @@ func extractFleetKey(t *testing.T, output string) string {
 			return field
 		}
 	}
-	t.Fatalf("the install printed no fleet recovery key:\n%s", output)
+	t.Fatal("the install printed no fleet recovery key")
 	return ""
 }
 
