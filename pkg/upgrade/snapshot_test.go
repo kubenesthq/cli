@@ -28,7 +28,7 @@ metadata:
   namespace: kube-system
 spec:
   chart: oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2
-  version: 2.7.0-rc.5
+  version: 2.7.0-rc.6
   valuesContent: |
     kubenest:
       jwtSecret: unchanged
