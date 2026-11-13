@@ -24,13 +24,12 @@
 //	  not applicable, `kubenest health` exits 0 within 30 s of a report, its
 //	  --json carries the table's clusters, states and reasons, and with an empty
 //	  outbox the live worker keeps the heartbeat beating;
-//	then, one at a time with recovery in between, each of the plan's seven faults
+//	then, one at a time with recovery in between, each of the plan's six faults
 //	  produces ONE alert and ONE resolve on its check at the receiver, in order,
 //	  with one stable incident_id,
 //	  each within three delivery cycles of the verdict behind it (a retry of the
 //	  same intent is allowed: S10 does not prove exactly-once delivery):
 //	    stop the agent                  reporting/CLUSTER_SILENT, critical
-//	    fill the data disk              NOT RUNNABLE, fails by name (see below)
 //	    age the restore drill           backup/RESTORE_DRILL_STALE
 //	    break the S3 snapshot upload    datastore/DATASTORE_SNAPSHOT_FAILED while
 //	                                    the local snapshot stays fresh
@@ -50,12 +49,13 @@
 // WHERE THE PLAN AND THE PRODUCT DISAGREE (measured at kubenest-backend d1e9029,
 // op3 d07b8e5, kubenest-cli 99b73c4):
 //
-//   - THE DISK BRANCH HAS NO PRODUCT BEHIND IT. Bundle 1.2 declares no data-disk
-//     usage threshold (the health block of platform-1.2.yaml) and the operator
-//     measures no disk usage. The only disk verdict is the kubelet's DiskPressure
-//     flag (nodes/NODE_DISK_PRESSURE, app/services/health/evaluate.py), and
-//     reaching it means the kubelet evicting the cluster's workloads, the agent
-//     with them. That subtest fails by name until a threshold exists.
+//   - THERE IS NO DISK BRANCH. Bundle 1.2 declares no data-disk usage threshold
+//     (the health block of platform-1.2.yaml) and the operator measures no disk
+//     usage. The only disk verdict is the kubelet's DiskPressure flag
+//     (nodes/NODE_DISK_PRESSURE, app/services/health/evaluate.py), and reaching
+//     it means the kubelet evicting the cluster's workloads, the agent with
+//     them. The plan's "fill the data disk" step left the 1.2 acceptance on
+//     2026-11-13 and returns with the capability in 1.3 (kn-1f91).
 //   - THE DELIVERY WORKER IS NOT A PROCESS OF ITS OWN: it is an asyncio task in
 //     the backend (app/main.py), so nothing outside stops it alone. This gate
 //     restarts the backend with HEALTH_DELIVERY_INTERVAL_SECONDS far past the
@@ -104,7 +104,7 @@
 // PASS LIMITS (plan section 4, bead kn-9pgx): exit codes exact; `kubenest health`
 // exits 0 within 30 s of the last report; each alert and resolve within three
 // delivery cycles of its verdict; the heartbeat stops within two sweep
-// intervals; one alert and one resolve per check for the seven faults; the whole gate under 60
+// intervals; one alert and one resolve per check for the six faults; the whole gate under 60
 // minutes. The intervals are the backend's defaults, which the chart does not
 // override (app/core/config.py).
 //
@@ -581,7 +581,6 @@ func TestHealthAlertingS10(t *testing.T) {
 
 	t.Run("the healthy cluster reads ok on fresh evidence and a live idle worker keeps the heartbeat", s.healthy)
 	t.Run("stop the agent", s.stopTheAgent)
-	t.Run("fill the data disk past the manifest threshold", s10DiskBranchNotRunnable)
 	t.Run("let the restore drill age past its limit", s.ageTheDrill)
 	t.Run("a collector that fails reports unknown with its reason and kubenest health exits 3", s.failACollector)
 	t.Run("break the S3 upload of datastore snapshots", s.breakTheSnapshotUpload)
@@ -1063,10 +1062,6 @@ func (s *s10Run) stopTheAgent(t *testing.T) {
 		fireWithin:    s10SilenceWindow + 2*s10SweepInterval + s10DeliveryLimit + 2*time.Minute,
 		resolveWithin: 2*time.Minute + s10ReportInterval + s10DeliveryLimit + time.Minute,
 	})
-}
-
-func s10DiskBranchNotRunnable(t *testing.T) {
-	t.Fatal("NOT RUN: no product behaviour exists behind this step. Bundle 1.2 declares no data-disk usage threshold (the health block of platform-1.2.yaml has none) and the operator measures no data-disk usage, so there is no threshold to fill past and nothing that would alert. The only disk verdict is the kubelet's DiskPressure flag (nodes/NODE_DISK_PRESSURE, kubenest-backend app/services/health/evaluate.py), and reaching it means the kubelet evicting this cluster's workloads, the agent with them. This branch needs a disk threshold and a producer, or a plan change, before it can run.")
 }
 
 // drillResult reads the restore-drill result the operator reports from.
