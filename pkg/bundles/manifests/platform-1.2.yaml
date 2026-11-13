@@ -4,7 +4,7 @@
 #   core.k3s             v1.35.7+k3s1 -> v1.35.8+k3s1   (the same minor: F18
 #                        grants a temporary exception instead of moving to 1.36;
 #                        see the `kubernetes:` block below)
-#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.6           (the candidate chart,
+#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.7          (the candidate chart,
 #                        from the candidate channel and by digest — see
 #                        `sources:` and `digests:` below. It is the chart that
 #                        carries 1.2's new health producers, the reboot-hold
@@ -122,9 +122,9 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.7.0-rc.6           # kubenest-operator-2 chart (the agent IS the operator, decision G).
+  kubenest-agent: 2.7.0-rc.7          # kubenest-operator-2 chart (the agent IS the operator, decision G).
                                        # 1.2's pin, and the catalog's first candidate pin.
-                                       # The chart is cut from op3 e61366b (its appVersion) and
+                                       # The chart is cut from op3 123bcd0 (its appVersion) and
                                        # published to the CANDIDATE channel — a separate OCI
                                        # repository, oci://ghcr.io/kubenesthq/candidate/
                                        # kubenest-operator-2 — never to the stable path, so a
@@ -183,6 +183,15 @@ core:
                                        # blamed on the local snapshot. rc.6 (image e61366b, op3
                                        # 605707b is the cut) fixes the three
                                        # (kn-ship-1-2-closeout-lzjb.7, .10, kn-t21). No template
+                                       # changes.
+                                       #
+                                       # WHY rc.7 AND NOT rc.6. Found on hardware 2026-11-13:
+                                       # a backup that overlapped rc.6's restore drill settled
+                                       # Completed but was judged incomplete, because the
+                                       # expected-coverage record named the drill's scratch
+                                       # volume. rc.7 (image 123bcd0, op3 483ac4d is the cut)
+                                       # leaves out of that record what Velero is told not to
+                                       # back up (kn-ship-1-2-closeout-lzjb.11). No template
                                        # changes.
                                        #
                                        # The history below is 1.1's pin comment, unchanged. It
@@ -413,10 +422,10 @@ sources:
 
 # WHAT THE BUNDLE WAS CUT FROM, BY DIGEST. A version names a release; a digest
 # names bytes. The candidate chart's digest, read back from the publish run (op3
-# chart workflow run 43348417809, 2026-11-13) and matched by an anonymous
-# registry read, is the only record of which bytes 2.7.0-rc.6 is in this catalog.
+# chart workflow run 43440694261, 2026-11-13) and matched by an anonymous
+# registry read, is the only record of which bytes 2.7.0-rc.7 is in this catalog.
 digests:
-  kubenest-agent: sha256:37ef1e90c759e071b1ccff4fa819504406ec9f9e213e4899f94759baabba4b91
+  kubenest-agent: sha256:8ccb2797086637d66d9a28dd3880fc5b149757ae7789ceb13797cb9fe3f8764e
 
 # THE KUBERNETES MINOR, AND WHY IT IS NOT MOVING. Decision B (2026-08-20) says
 # track upstream stable minus one minor. Upstream stable is 1.37 (released

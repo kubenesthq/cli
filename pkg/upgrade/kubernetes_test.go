@@ -126,7 +126,7 @@ func TestTheAgentUpgradeMovesTheChartSourceAsWellAsTheVersion(t *testing.T) {
 		wantVersion string
 	}{
 		{"1.1", "oci://ghcr.io/kubenesthq/charts/kubenest-operator-2", "2.6.17"},
-		{"1.2", "oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2", "2.7.0-rc.6"},
+		{"1.2", "oci://ghcr.io/kubenesthq/candidate/kubenest-operator-2", "2.7.0-rc.7"},
 	} {
 		t.Run(tc.bundle, func(t *testing.T) {
 			m, err := bundles.Manifest(tc.bundle)
@@ -210,7 +210,7 @@ func TestARollbackRewritesTheAgentManifestToTheStartingBundle(t *testing.T) {
 	}
 	want, _ := from.Core.Version("kubenest-agent")
 	movedTo12 := strings.Replace(strings.Replace(agentManifest11,
-		"oci://ghcr.io/kubenesthq/charts/", "oci://ghcr.io/kubenesthq/candidate/", 1), "version: 2.6.17", "version: 2.7.0-rc.6", 1)
+		"oci://ghcr.io/kubenesthq/charts/", "oci://ghcr.io/kubenesthq/candidate/", 1), "version: 2.6.17", "version: 2.7.0-rc.7", 1)
 	r := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
 		switch {
 		case command == "sudo -n cat "+agent.ManifestPath:
