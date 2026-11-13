@@ -1266,8 +1266,9 @@ func (s *s10Run) breakTheSnapshotUpload(t *testing.T) {
 				t.Errorf("the off-cluster snapshot (%s) is not older than the local one (%s)", off.Format(time.RFC3339), local.Format(time.RFC3339))
 			}
 			failure, _ := c.Detail["last_failure"].(map[string]any)
-			if location, _ := failure["location"].(string); location == "" || strings.HasPrefix(location, "file://") {
-				t.Errorf("the recorded failure's location is %q, want the off-cluster upload's", location)
+			// k3s records a failed upload with no location, so the operator names the side.
+			if side, _ := failure["side"].(string); side != "offcluster" {
+				t.Errorf("the recorded failure's side is %q, want offcluster (failure: %v)", side, failure)
 			}
 		},
 		recover: func(t *testing.T) {
