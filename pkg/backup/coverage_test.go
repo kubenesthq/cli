@@ -97,3 +97,58 @@ func TestRecoverableNamespacesFailsWhenTheProjectsListingFails(t *testing.T) {
 		t.Error("a Projects listing that fails must not be read as 'nothing to restore'")
 	}
 }
+
+// kn-ship-1-2-closeout-lzjb.11. The restore drill labels its scratch namespace
+// and the claim it restores velero.io/exclude-from-backup=true, and Velero backs
+// up nothing that carries that label. A backup that overlapped a drill was judged
+// incomplete because the expected set still listed the drill's proof claim, which
+// no copy could ever cover (lab s6, 2026-11-13). So a namespace with the label,
+// with every claim in it, and a claim with the label are not expected.
+//
+// PLANTED NEGATIVES: shop has no label, and ledger has the label with the value
+// "false", which Velero backs up. Both stay, with their claims.
+func TestExpectedCoverageLeavesOutWhatVeleroIsToldNotToBackUp(t *testing.T) {
+	namespaces := `{"items":[` +
+		`{"metadata":{"name":"kubenest-restore-drill-1","uid":"ns-drill","labels":{"velero.io/exclude-from-backup":"true"}}},` +
+		`{"metadata":{"name":"ledger","uid":"ns-ledger","labels":{"velero.io/exclude-from-backup":"false"}}},` +
+		`{"metadata":{"name":"shop","uid":"ns-shop"}}]}`
+	claims := `{"items":[` +
+		`{"metadata":{"namespace":"kubenest-restore-drill-1","name":"kubenest-restore-proof","uid":"pvc-proof"}},` +
+		`{"metadata":{"namespace":"ledger","name":"books","uid":"pvc-books"}},` +
+		`{"metadata":{"namespace":"shop","name":"data","uid":"pvc-data"}},` +
+		`{"metadata":{"namespace":"shop","name":"scratch","uid":"pvc-scratch","labels":{"velero.io/exclude-from-backup":"true"}}}]}`
+	runner := &componenttest.FakeRunner{Respond: func(command string) (sshx.Result, error) {
+		switch {
+		case strings.Contains(command, "get namespaces -o json"):
+			return sshx.Result{Stdout: namespaces}, nil
+		case strings.Contains(command, "get persistentvolumeclaims --all-namespaces -o json"):
+			return sshx.Result{Stdout: claims}, nil
+		}
+		return sshx.Result{ExitCode: 1, Stderr: "unexpected: " + command}, nil
+	}}
+
+	got, err := expectedCoverage(context.Background(), runner, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := map[string][]string{}
+	for _, namespace := range got {
+		names := []string{}
+		for _, volume := range namespace.Volumes {
+			names = append(names, volume.Name)
+		}
+		expected[namespace.Name] = names
+	}
+	if _, ok := expected["kubenest-restore-drill-1"]; ok {
+		t.Errorf("namespace kubenest-restore-drill-1 is labelled velero.io/exclude-from-backup=true and must not be expected: %v", expected)
+	}
+	if contains(expected["shop"], "scratch") {
+		t.Errorf("claim shop/scratch is labelled velero.io/exclude-from-backup=true and must not be expected: %v", expected)
+	}
+	if !contains(expected["shop"], "data") {
+		t.Errorf("shop and its unlabelled claim data must stay expected: %v", expected)
+	}
+	if !contains(expected["ledger"], "books") {
+		t.Errorf("ledger is labelled with the value false, which Velero backs up, so it and its claim books must stay expected: %v", expected)
+	}
+}

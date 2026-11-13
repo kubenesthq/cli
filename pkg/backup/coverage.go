@@ -84,8 +84,9 @@ type coverageVolume struct {
 type namespaceInventory struct {
 	Items []struct {
 		Metadata struct {
-			Name string `json:"name"`
-			UID  string `json:"uid"`
+			Name   string            `json:"name"`
+			UID    string            `json:"uid"`
+			Labels map[string]string `json:"labels"`
 		} `json:"metadata"`
 	} `json:"items"`
 }
@@ -109,10 +110,11 @@ type projectInventory struct {
 type claimInventory struct {
 	Items []struct {
 		Metadata struct {
-			Namespace         string `json:"namespace"`
-			Name              string `json:"name"`
-			UID               string `json:"uid"`
-			CreationTimestamp string `json:"creationTimestamp"`
+			Namespace         string            `json:"namespace"`
+			Name              string            `json:"name"`
+			UID               string            `json:"uid"`
+			CreationTimestamp string            `json:"creationTimestamp"`
+			Labels            map[string]string `json:"labels"`
 		} `json:"metadata"`
 	} `json:"items"`
 }
@@ -208,9 +210,18 @@ func coverageRecordDoc(name, uid, payload string) ([]byte, error) {
 	})
 }
 
+// excludeFromBackupLabel is Velero's opt-out label: Velero skips an item that
+// carries it with the value "true". The restore drill sets it on its scratch
+// namespace and on the claim it restores.
+const excludeFromBackupLabel = "velero.io/exclude-from-backup"
+
 // expectedCoverage enumerates the namespaces and claims a backup is expected to
 // cover. A claim created after captureStartedAt is left out: the backup never
-// claimed it, so its absence from the copies is not a failure.
+// claimed it, so its absence from the copies is not a failure. A namespace
+// labelled excludeFromBackupLabel=true is left out with every claim in it, and
+// so is a claim with that label: no copy of them is expected, and listing them
+// judged every backup that overlapped a restore drill incomplete
+// (kn-ship-1-2-closeout-lzjb.11).
 func expectedCoverage(ctx context.Context, r k3s.Runner, captureStartedAt string) ([]coverageNamespace, error) {
 	out, err := k3s.Kubectl(ctx, r, "get namespaces -o json")
 	if err != nil {
@@ -233,10 +244,15 @@ func expectedCoverage(ctx context.Context, r k3s.Runner, captureStartedAt string
 	for _, name := range workloadExcludedNamespaces {
 		excluded[name] = true
 	}
+	for _, item := range namespaces.Items {
+		if item.Metadata.Labels[excludeFromBackupLabel] == "true" {
+			excluded[item.Metadata.Name] = true
+		}
+	}
 	byNamespace := map[string][]coverageVolume{}
 	for _, item := range claims.Items {
 		claim := item.Metadata
-		if excluded[claim.Namespace] {
+		if excluded[claim.Namespace] || claim.Labels[excludeFromBackupLabel] == "true" {
 			continue
 		}
 		switch {
