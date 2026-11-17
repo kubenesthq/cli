@@ -259,11 +259,14 @@ func (r *Remove) hostByNodeName(ctx context.Context) (api.HostRecord, error) {
 // that means in as many words: the data is gone, and nothing here certifies
 // that a backup of it exists.
 func (r *Remove) stageVolumes(ctx context.Context) error {
-	volumes, err := BoundLocalVolumes(ctx, r.ServerConn, r.Node.Name)
+	volumes, proofExcluded, err := boundLocalVolumes(ctx, r.ServerConn, r.Node.Name)
 	if err != nil {
 		return err
 	}
 	r.volumes = volumes
+	if proofExcluded {
+		r.Logf("  volumes:   the operator rebuilds its restore-drill volume; nothing needs restoring for it")
+	}
 	if len(volumes) == 0 {
 		r.Logf("  volumes:   %s holds no bound local volume, so removing it destroys no data on this node's disks", r.Node.Name)
 		return nil

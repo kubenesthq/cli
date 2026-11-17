@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -17,9 +18,12 @@ import (
 // the claims that must come back TOGETHER, because restoring one claim of a pod
 // while another stays stranded leaves the pod unable to start.
 type strandedClaim struct {
-	Namespace string
-	Workload  string
-	PVCs      []string
+	Namespace  string
+	Workload   string
+	PVCs       []string
+	Deployment bool
+	NoPod      bool
+	Labels     map[string]string
 }
 
 // strands makes the cluster report BOUND local volumes on node, held by the
@@ -30,7 +34,7 @@ type strandedClaim struct {
 // gives it.
 func (f *nodeFixture) strands(t *testing.T, node string, claims ...strandedClaim) {
 	t.Helper()
-	var pvs, pods []string
+	var pvs, pods, pvcs []string
 	for _, claim := range claims {
 		var mounted []string
 		for _, pvc := range claim.PVCs {
@@ -41,12 +45,24 @@ func (f *nodeFixture) strands(t *testing.T, node string, claims ...strandedClaim
 				`{"key":"kubernetes.io/hostname","operator":"In","values":["`+node+`"]}]}]}}},`+
 				`"status":{"phase":"Bound"}}`)
 			mounted = append(mounted, `{"persistentVolumeClaim":{"claimName":"`+pvc+`"}}`)
+			labels, err := json.Marshal(claim.Labels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pvcs = append(pvcs, `{"metadata":{"namespace":"`+claim.Namespace+`","name":"`+pvc+`","labels":`+string(labels)+`}}`)
 		}
-		pods = append(pods, `{"metadata":{"namespace":"`+claim.Namespace+`",`+
-			`"ownerReferences":[{"kind":"StatefulSet","name":"`+claim.Workload+`"}]},`+
-			`"spec":{"volumes":[`+strings.Join(mounted, ",")+`]}}`)
+		if !claim.NoPod {
+			ownerKind, ownerName := "StatefulSet", claim.Workload
+			if claim.Deployment {
+				ownerKind, ownerName = "ReplicaSet", claim.Workload+"-abc123"
+			}
+			pods = append(pods, `{"metadata":{"namespace":"`+claim.Namespace+`",`+
+				`"ownerReferences":[{"kind":"`+ownerKind+`","name":"`+ownerName+`"}]},`+
+				`"spec":{"volumes":[`+strings.Join(mounted, ",")+`]}}`)
+		}
 	}
 	f.server.on("get pv -o json", ok(`{"items":[`+strings.Join(pvs, ",")+`]}`))
+	f.server.on("get persistentvolumeclaims --all-namespaces -o json", ok(`{"items":[`+strings.Join(pvcs, ",")+`]}`))
 	f.server.on("get pods --all-namespaces -o json", ok(`{"items":[`+strings.Join(pods, ",")+`]}`))
 }
 
@@ -501,6 +517,58 @@ func TestReplacePrintsOneRestoreCommandPerWorkloadWithEveryStrandedClaimGrouped(
 	}
 	if f.log.indexOf("get.k3s.io") < 0 {
 		t.Fatal("the replacement was never joined")
+	}
+}
+
+func TestReplaceLeavesRestoreDrillProofOutOfStrandedClaims(t *testing.T) {
+	f := replaceFixture(t, false, false)
+	f.joins(t, "prod-1-agt-2")
+	f.strands(t, testAgentNode,
+		strandedClaim{Namespace: "db", Workload: "pg", Deployment: true, PVCs: []string{"data-pg-a", "data-pg-b"}},
+		strandedClaim{Namespace: "kubenest-restore-drill-source", PVCs: []string{"kubenest-restore-proof"}, NoPod: true,
+			Labels: map[string]string{"kubenest.io/restore-drill": "proof"}},
+	)
+	r := f.newReplace(ReplaceOptions{ConfirmIsolated: true})
+	if _, err := f.runReplace(r); err != nil {
+		t.Fatalf("the replace failed: %v\n%s", err, f.out.String())
+	}
+	if len(r.volumes) != 2 {
+		t.Errorf("stranded user claim count = %d, want 2", len(r.volumes))
+	}
+	out := f.out.String()
+	if n := strings.Count(out, "kubenest backup restore"); n != 1 {
+		t.Errorf("%d restore commands, want one for the Deployment:\n%s", n, out)
+	}
+	if !strings.Contains(out, "--namespace db --pvc data-pg-a --pvc data-pg-b") {
+		t.Errorf("the Deployment's two claims are not grouped:\n%s", out)
+	}
+	if strings.Contains(out, "--pvc kubenest-restore-proof") {
+		t.Errorf("the operator's proof claim received a restore command:\n%s", out)
+	}
+}
+
+func TestReplaceStillRestoresAnotherNamespaceAfterExcludingProof(t *testing.T) {
+	f := replaceFixture(t, false, false)
+	f.joins(t, "prod-1-agt-2")
+	f.strands(t, testAgentNode,
+		strandedClaim{Namespace: "db", Workload: "pg", Deployment: true, PVCs: []string{"data-pg-a", "data-pg-b"}},
+		strandedClaim{Namespace: "kubenest-restore-drill-source", PVCs: []string{"kubenest-restore-proof"}, NoPod: true,
+			Labels: map[string]string{"kubenest.io/restore-drill": "proof"}},
+		strandedClaim{Namespace: "web", Workload: "cache", PVCs: []string{"cache-0"}},
+	)
+	r := f.newReplace(ReplaceOptions{ConfirmIsolated: true})
+	if _, err := f.runReplace(r); err != nil {
+		t.Fatalf("the replace failed: %v\n%s", err, f.out.String())
+	}
+	if len(r.volumes) != 3 {
+		t.Errorf("stranded user claim count = %d, want 3", len(r.volumes))
+	}
+	out := f.out.String()
+	if n := strings.Count(out, "kubenest backup restore"); n != 2 {
+		t.Errorf("%d restore commands, want one for each user workload:\n%s", n, out)
+	}
+	if !strings.Contains(out, "--namespace web --pvc cache-0") {
+		t.Errorf("the other namespace's workload received no restore command:\n%s", out)
 	}
 }
 

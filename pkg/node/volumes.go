@@ -32,16 +32,30 @@ type BoundLocalVolume struct {
 	Driver string
 }
 
-// BoundLocalVolumes reads every BOUND PersistentVolume whose node affinity
-// names node, with the claim and the workload that holds it.
+// BoundLocalVolumes reads BOUND PersistentVolumes whose node affinity names
+// node, with the claim and the workload that holds it. The operator's labelled
+// restore-drill proof claim is excluded because the operator rebuilds it.
 //
 // It reads the cluster's own objects rather than the storage class: a PV
 // pinned to a node by affinity is stranded by removing that node whatever
 // provisioned it, and a PV that is not bound holds nothing anybody would miss.
 func BoundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]BoundLocalVolume, error) {
+	volumes, _, err := boundLocalVolumes(ctx, server, node)
+	return volumes, err
+}
+
+// The restore-drill operator marks its disposable proof PVC with this label
+// (op3/pkg/restoredrill). It rebuilds that PVC after a node loss.
+const restoreDrillProofLabelKey = "kubenest.io/restore-drill"
+const restoreDrillProofLabelValue = "proof"
+const restoreDrillSourceNamespace = "kubenest-restore-drill-source"
+
+// boundLocalVolumes also reports whether it excluded a restore-drill proof
+// claim, so node verbs can tell the operator why it needs no restore command.
+func boundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]BoundLocalVolume, bool, error) {
 	out, err := k3s.Kubectl(ctx, server, "get pv -o json")
 	if err != nil {
-		return nil, fmt.Errorf("reading the cluster's persistent volumes: %w", err)
+		return nil, false, fmt.Errorf("reading the cluster's persistent volumes: %w", err)
 	}
 	var list struct {
 		Items []struct {
@@ -61,20 +75,29 @@ func BoundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]B
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		return nil, fmt.Errorf("parsing `kubectl get pv -o json`: %w", err)
+		return nil, false, fmt.Errorf("parsing `kubectl get pv -o json`: %w", err)
 	}
 
 	holders, err := claimHolders(ctx, server)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	proofClaims, err := restoreDrillProofClaims(ctx, server)
+	if err != nil {
+		return nil, false, err
 	}
 
 	var found []BoundLocalVolume
+	proofExcluded := false
 	for _, item := range list.Items {
 		if item.Status.Phase != "Bound" || item.Spec.ClaimRef == nil {
 			continue
 		}
 		if !pinnedTo(item.Spec.NodeAffinity, node) {
+			continue
+		}
+		if proofClaims[claimKey{item.Spec.ClaimRef.Namespace, item.Spec.ClaimRef.Name}] {
+			proofExcluded = true
 			continue
 		}
 		v := BoundLocalVolume{
@@ -94,7 +117,36 @@ func BoundLocalVolumes(ctx context.Context, server k3s.Runner, node string) ([]B
 		}
 		return found[i].PVC < found[j].PVC
 	})
-	return found, nil
+	return found, proofExcluded, nil
+}
+
+func restoreDrillProofClaims(ctx context.Context, server k3s.Runner) (map[claimKey]bool, error) {
+	out, err := k3s.Kubectl(ctx, server, "get persistentvolumeclaims --all-namespaces -o json")
+	if err != nil {
+		return nil, fmt.Errorf("reading the cluster's persistent volume claims: %w", err)
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Namespace string            `json:"namespace"`
+				Name      string            `json:"name"`
+				Labels    map[string]string `json:"labels"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, fmt.Errorf("parsing `kubectl get persistentvolumeclaims --all-namespaces -o json`: %w", err)
+	}
+	proof := make(map[claimKey]bool)
+	for _, item := range list.Items {
+		// Both must hold: the label alone would let any workload's claim
+		// opt out of the stranded-data refusal.
+		if item.Metadata.Namespace == restoreDrillSourceNamespace &&
+			item.Metadata.Labels[restoreDrillProofLabelKey] == restoreDrillProofLabelValue {
+			proof[claimKey{item.Metadata.Namespace, item.Metadata.Name}] = true
+		}
+	}
+	return proof, nil
 }
 
 // claimRef is the claim a volume is bound to.

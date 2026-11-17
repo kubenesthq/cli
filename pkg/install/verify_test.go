@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/component/agent"
 	"kubenest.io/cli/pkg/manifest"
@@ -23,6 +24,27 @@ func verifySession(t *testing.T) *Session {
 		t.Fatal(err)
 	}
 	return &Session{ID: "run-1", Bundle: m, Out: io.Discard}
+}
+
+// The verify claim can still exist when install returns. A backup that starts
+// then must exclude its namespace before expected coverage is enumerated.
+func TestVerifyStorageNamespaceIsExcludedFromBackup(t *testing.T) {
+	var namespace struct {
+		Kind     string `yaml:"kind"`
+		Metadata struct {
+			Name   string            `yaml:"name"`
+			Labels map[string]string `yaml:"labels"`
+		} `yaml:"metadata"`
+	}
+	if err := yaml.NewDecoder(strings.NewReader(verifyStorageManifest())).Decode(&namespace); err != nil {
+		t.Fatalf("reading the storage probe's namespace manifest: %v", err)
+	}
+	if namespace.Kind != "Namespace" || namespace.Metadata.Name != verifyNamespace {
+		t.Fatalf("the storage probe starts with %s/%s, want the verify Namespace", namespace.Kind, namespace.Metadata.Name)
+	}
+	if got := namespace.Metadata.Labels["velero.io/exclude-from-backup"]; got != "true" {
+		t.Fatalf("the verify Namespace has velero.io/exclude-from-backup=%q, want true so its claim is not expected in a backup started before cleanup finishes", got)
+	}
 }
 
 // The agent's row in the record check used to be derived from the minted

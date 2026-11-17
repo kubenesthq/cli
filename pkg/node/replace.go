@@ -487,11 +487,14 @@ func (r *Replace) oldNode(ctx context.Context) (ClusterNode, error) {
 // this cluster's reach, and what is left to do is restore it. It is read here so
 // that the restore command can be printed after the replacement joins.
 func (r *Replace) stageVolumes(ctx context.Context) error {
-	volumes, err := BoundLocalVolumes(ctx, r.ServerConn, r.node.Name)
+	volumes, proofExcluded, err := boundLocalVolumes(ctx, r.ServerConn, r.node.Name)
 	if err != nil {
 		return err
 	}
 	r.volumes = volumes
+	if proofExcluded {
+		r.Logf("  volumes:   the operator rebuilds its restore-drill volume; nothing needs restoring for it")
+	}
 	if len(volumes) == 0 {
 		r.Logf("  volumes:   %s holds no bound local volume, so no workload's data is stranded by this replace", r.node.Name)
 	} else {

@@ -47,6 +47,11 @@ func platformNamespaces() []string {
 // verifyNamespace holds the storage acceptance check's throwaway workload.
 const verifyNamespace = "kubenest-verify"
 
+// verifyBackupExclusionLabel must equal backup.excludeFromBackupLabel, which is
+// unexported in pkg/backup. Both coverage writers and Velero use this label to
+// exclude the throwaway verify namespace while its asynchronous cleanup runs.
+const verifyBackupExclusionLabel = "velero.io/exclude-from-backup"
+
 // verifyImage is the smallest thing that can mount a volume and stay running.
 // It is a test workload, not a platform component, which is why it is not a
 // bundle pin — but it is pinned here rather than :latest so a verify run is
@@ -161,10 +166,42 @@ func verifyStorageProvisions(ctx context.Context, s *Session) error {
 		return err
 	}
 
-	doc := fmt.Sprintf(`apiVersion: v1
+	doc := verifyStorageManifest()
+
+	// The previous run deleted this namespace without waiting for it
+	// (cleanupVerifyNamespace), so a run started soon after can find it still
+	// terminating, and Kubernetes refuses to create anything inside it. Delete
+	// a leftover and wait until it is gone first. Re-running `platform install
+	// --control-plane` is how the control plane is upgraded, so back-to-back
+	// runs are routine rather than rare.
+	if _, err := k3s.Kubectl(ctx, server, "delete namespace "+verifyNamespace+" --ignore-not-found --wait=true --timeout="+deadline.String()); err != nil {
+		return fmt.Errorf("the previous storage probe's namespace %s is still being removed: %w", verifyNamespace, err)
+	}
+
+	// Applied directly rather than through the auto-deploy directory: this is
+	// a throwaway probe, and a file left in the auto-deploy directory would be
+	// reconciled back after deletion.
+	if err := kubectlApply(ctx, server, doc); err != nil {
+		return err
+	}
+	defer cleanupVerifyNamespace(context.WithoutCancel(ctx), server)
+
+	res, err := converge.Wait(ctx, boundVolumeProbe(server), converge.Options{
+		Name: "storage-provisions", Deadline: deadline, Reporter: s.Reporter,
+	})
+	if err != nil {
+		return err
+	}
+	return res.Err()
+}
+
+func verifyStorageManifest() string {
+	return fmt.Sprintf(`apiVersion: v1
 kind: Namespace
 metadata:
   name: %[1]s
+  labels:
+    %[4]s: "true"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -196,33 +233,7 @@ spec:
     - name: data
       persistentVolumeClaim:
         claimName: verify
-`, verifyNamespace, storage.StorageClassName, verifyImage)
-
-	// The previous run deleted this namespace without waiting for it
-	// (cleanupVerifyNamespace), so a run started soon after can find it still
-	// terminating, and Kubernetes refuses to create anything inside it. Delete
-	// a leftover and wait until it is gone first. Re-running `platform install
-	// --control-plane` is how the control plane is upgraded, so back-to-back
-	// runs are routine rather than rare.
-	if _, err := k3s.Kubectl(ctx, server, "delete namespace "+verifyNamespace+" --ignore-not-found --wait=true --timeout="+deadline.String()); err != nil {
-		return fmt.Errorf("the previous storage probe's namespace %s is still being removed: %w", verifyNamespace, err)
-	}
-
-	// Applied directly rather than through the auto-deploy directory: this is
-	// a throwaway probe, and a file left in the auto-deploy directory would be
-	// reconciled back after deletion.
-	if err := kubectlApply(ctx, server, doc); err != nil {
-		return err
-	}
-	defer cleanupVerifyNamespace(context.WithoutCancel(ctx), server)
-
-	res, err := converge.Wait(ctx, boundVolumeProbe(server), converge.Options{
-		Name: "storage-provisions", Deadline: deadline, Reporter: s.Reporter,
-	})
-	if err != nil {
-		return err
-	}
-	return res.Err()
+`, verifyNamespace, storage.StorageClassName, verifyImage, verifyBackupExclusionLabel)
 }
 
 // boundVolumeProbe reports whether the claim bound AND its consumer is
