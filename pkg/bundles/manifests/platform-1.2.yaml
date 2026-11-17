@@ -4,7 +4,7 @@
 #   core.k3s             v1.35.7+k3s1 -> v1.35.8+k3s1   (the same minor: F18
 #                        grants a temporary exception instead of moving to 1.36;
 #                        see the `kubernetes:` block below)
-#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.8          (the candidate chart,
+#   core.kubenest-agent  2.6.17 -> 2.7.0-rc.9         (the candidate chart,
 #                        from the candidate channel and by digest — see
 #                        `sources:` and `digests:` below. It is the chart that
 #                        carries 1.2's new health producers, the reboot-hold
@@ -122,9 +122,9 @@ core:
   velero: 12.1.0                       # chart; ships Velero 1.18.1
   system-upgrade-controller: v0.20.1   # release manifests, not a chart
   kured: 6.1.0                         # chart; ships kured 1.23.0
-  kubenest-agent: 2.7.0-rc.8          # kubenest-operator-2 chart (the agent IS the operator, decision G).
+  kubenest-agent: 2.7.0-rc.9        # kubenest-operator-2 chart (the agent IS the operator, decision G).
                                        # 1.2's pin, and the catalog's first candidate pin.
-                                       # The chart is cut from op3 eb0ca4b (its appVersion) and
+                                       # The chart is cut from op3 e42bec1 (its appVersion) and
                                        # published to the CANDIDATE channel — a separate OCI
                                        # repository, oci://ghcr.io/kubenesthq/candidate/
                                        # kubenest-operator-2 — never to the stable path, so a
@@ -203,6 +203,14 @@ core:
                                        # eb0ca4b, op3 515d4cf is the cut) fixes both. One
                                        # template changes: rbac.yaml grants get, list and watch
                                        # on persistentvolumes.
+                                       #
+                                       # WHY rc.9 AND NOT rc.8. Found on hardware 2026-11-17, in
+                                       # rc.8's release-gate run: the drill read the proof
+                                       # volume's node from kubernetes.io/hostname, a key an
+                                       # OpenEBS LVM volume does not carry, so the volume was
+                                       # never rebuilt after a node replace (kn-3czn). rc.9
+                                       # (image e42bec1, op3 46f5454 is the cut) reads
+                                       # openebs.io/nodename. No template changes.
                                        #
                                        # The history below is 1.1's pin comment, unchanged. It
                                        # describes 2.6.17 and the charts before it; read it as the
@@ -432,10 +440,10 @@ sources:
 
 # WHAT THE BUNDLE WAS CUT FROM, BY DIGEST. A version names a release; a digest
 # names bytes. The candidate chart's digest, read back from the publish run (op3
-# chart workflow run 43986304373, 2026-11-17) and matched by an anonymous
-# registry read, is the only record of which bytes 2.7.0-rc.8 is in this catalog.
+# chart workflow run 44072518976, 2026-11-17) and matched by an anonymous
+# registry read, is the only record of which bytes 2.7.0-rc.9 is in this catalog.
 digests:
-  kubenest-agent: sha256:225cfbcd4ff2787fb8e202f976dc4a7275818a566ca70d85888b450d02d6081e
+  kubenest-agent: sha256:1e2a310b15495d4c2164e3dfe901e6ac1b6c904fd3f080158fc13e8d4e5ff285
 
 # THE KUBERNETES MINOR, AND WHY IT IS NOT MOVING. Decision B (2026-08-20) says
 # track upstream stable minus one minor. Upstream stable is 1.37 (released
