@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"kubenest.io/cli/pkg/api"
 	"kubenest.io/cli/pkg/backup"
 	"kubenest.io/cli/pkg/component/agent"
+	"kubenest.io/cli/pkg/controlplane"
 	"kubenest.io/cli/pkg/manifest"
 	"kubenest.io/cli/pkg/operation"
 	"kubenest.io/cli/pkg/recovery"
@@ -1999,6 +2001,62 @@ func revisionOf(runner *recordingRunner) string {
 		}
 	}
 	return out
+}
+
+// TestTheCheckpointLoadIsTriedAgainOnlyWhenItNeverConnected: a database pod on
+// its first boot reads Ready before it serves for good, and on hardware on
+// 2026-11-17 the checkpoint load arrived in the gap and the recovery stopped
+// (kn-ship-1-2-closeout-lzjb.12).
+func TestTheCheckpointLoadIsTriedAgainOnlyWhenItNeverConnected(t *testing.T) {
+	s, _ := recoverySession(t, Options{Bundle: "1.1", Servers: []string{"10.0.9.9"}, HATier: "single-server"})
+	notAccepting := fmt.Errorf("%w: pg_restore could not connect", controlplane.ErrDatabaseNotAccepting)
+
+	// Two loads meet no connection, the third loads.
+	calls := 0
+	err := s.loadWhenDatabaseAccepts(context.Background(), 10*time.Second, 20*time.Millisecond, func(context.Context) error {
+		calls++
+		if calls < 3 {
+			return notAccepting
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("the database accepted the third load and the stage gave up: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("the load ran %d time(s), want 3: twice with no connection, then once more", calls)
+	}
+
+	// The planted negative: a load that connected and failed has written part
+	// of the dump. It is returned at once and never run a second time.
+	calls = 0
+	halfLoaded := errors.New("pg_restore refused the checkpoint: neither the checkpoint nor empty")
+	err = s.loadWhenDatabaseAccepts(context.Background(), 10*time.Second, 20*time.Millisecond, func(context.Context) error {
+		calls++
+		return halfLoaded
+	})
+	if !errors.Is(err, halfLoaded) {
+		t.Fatalf("a half-loaded checkpoint was not returned as it was: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("a load that had already written rows ran %d time(s): a second run loads over its own rows", calls)
+	}
+
+	// A database that never accepts fails at the deadline and says nothing was
+	// written.
+	err = s.loadWhenDatabaseAccepts(context.Background(), 150*time.Millisecond, 20*time.Millisecond, func(context.Context) error {
+		return notAccepting
+	})
+	if err == nil {
+		t.Fatal("a database that never accepted a connection was reported as loaded")
+	}
+	if !strings.Contains(err.Error(), "never accepted a connection") {
+		t.Fatalf("the failure does not say the database never accepted a connection: %v", err)
+	}
+
+	if err := s.loadWhenDatabaseAccepts(context.Background(), 0, time.Second, func(context.Context) error { return nil }); err == nil {
+		t.Fatal("a load with no deadline was accepted: every wait in this CLI is bounded by the bundle's limits")
+	}
 }
 
 // tailOf is the last n characters, so a failure shows the end of an applied

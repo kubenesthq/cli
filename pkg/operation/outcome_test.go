@@ -3,6 +3,7 @@ package operation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -273,4 +274,74 @@ func mustAction(t *testing.T, k *fakeKube, id string) Action {
 		t.Fatalf("action %s is not in the record", id)
 	}
 	return a
+}
+
+// landedButUnheardRunner lets one record write reach the cluster and then
+// reports the run's cancellation instead of the write's result: the interrupt
+// that lands while a write is on the wire (hardware, kn-ship-1-2-closeout-lzjb.13,
+// S5 on lab w3, 2026-11-17 — the killed restore's record stayed `running` and
+// `--resume` was refused).
+type landedButUnheardRunner struct {
+	*fakeKube
+	cancel context.CancelFunc
+	armed  bool
+}
+
+func (r *landedButUnheardRunner) RunInput(ctx context.Context, command string, stdin io.Reader) (sshx.Result, error) {
+	res, err := r.fakeKube.RunInput(ctx, command, stdin)
+	if r.armed && err == nil {
+		r.armed = false
+		r.cancel()
+		return sshx.Result{}, context.Canceled
+	}
+	return res, err
+}
+
+// TestAStopLandsAfterAWriteWhoseResultTheInterruptSwallowed.
+//
+// The write before an action reached the cluster and the interrupt took its
+// answer, so the handle holds the revision before it. The executor's own stop
+// must still land: the record carries this executor's token, and the only
+// writer that could have moved it is this executor's unheard write.
+//
+// Planted negative: a record that moved while every one of this handle's
+// writes was answered is still refused as stale.
+//
+// What a green run does NOT prove: that a real SSH transport completes a write
+// whose session the interrupt closes; S5's resume arm on hosts says that.
+func TestAStopLandsAfterAWriteWhoseResultTheInterruptSwallowed(t *testing.T) {
+	k := newFakeKube(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &landedButUnheardRunner{fakeKube: k, cancel: cancel}
+	s := newStore(t, k, "ana@laptop")
+	s.Runner = r
+	h := acquire(t, s, testRequest("host-1"))
+
+	r.armed = true
+	err := h.RecordAction(ctx, "a-1", "restore", Spec{Kind: "restore", Postcondition: "the Restore exists", Observe: "true"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("the swallowed write returned %v, want the cancellation", err)
+	}
+	if _, ok := k.liveRecord(Name).ActionByID("a-1"); !ok {
+		t.Fatal("the fixture is wrong: the write did not reach the cluster")
+	}
+	if err := s.Stop(ctx, h); err != nil {
+		t.Fatalf("the stop after a swallowed write was refused: %v", err)
+	}
+	if got := k.liveRecord(Name).Executor.State; got != ExecutorStopped {
+		t.Fatalf("the record says %q, want stopped", got)
+	}
+
+	// The negative: every write answered, and the object moved underneath.
+	k2 := newFakeKube(t)
+	s2 := newStore(t, k2, "ana@laptop")
+	h2 := acquire(t, s2, testRequest("host-2"))
+	k2.mu.Lock()
+	k2.nextRV++
+	k2.objects[Name]["metadata"].(map[string]any)["resourceVersion"] = fmt.Sprintf("%d", k2.nextRV)
+	k2.mu.Unlock()
+	if err := s2.Stop(context.Background(), h2); !errors.Is(err, ErrStale) {
+		t.Fatalf("a record that moved under an answered handle returned %v, want ErrStale", err)
+	}
 }

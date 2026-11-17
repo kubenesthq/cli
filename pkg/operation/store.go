@@ -130,6 +130,9 @@ type Handle struct {
 	rec   *Record
 	rv    string
 	token string
+	// unheard says this handle's last write was sent and its answer never
+	// read, so the cluster may be one revision ahead of rv. Guarded by mu.
+	unheard bool
 	// mirrorErr is the last mirror write's failure, or nil when the last one
 	// succeeded. Guarded by mu, because writes through one handle may come from
 	// more than one place.
@@ -331,9 +334,19 @@ func (s *Store) update(ctx context.Context, h *Handle, mutate func(*Record) erro
 	if live.Record.Executor.Token != h.token {
 		return fmt.Errorf("%w: operation %s is held by %s, not by this executor", ErrNotOwner, live.Record.OperationID, holder(live.Record))
 	}
-	if live.ResourceVersion != h.rv {
+	switch {
+	case live.ResourceVersion == h.rv:
+	case h.unheard:
+		// THIS HANDLE'S LAST WRITE WAS SENT AND NEVER ANSWERED, and the record
+		// still carries this executor's token: the write landed, and the
+		// revision it produced is the one this handle should have been told
+		// (kn-ship-1-2-closeout-lzjb.13 — an interrupt during the write before
+		// an action left the stop refused as stale and the record `running`).
+		h.rv = live.ResourceVersion
+	default:
 		return fmt.Errorf("%w: this executor read resourceVersion %s and the cluster is at %s", ErrStale, h.rv, live.ResourceVersion)
 	}
+	h.unheard = false
 	rec := live.Record
 	if err := mutate(rec); err != nil {
 		return err
@@ -344,6 +357,9 @@ func (s *Store) update(ctx context.Context, h *Handle, mutate func(*Record) erro
 	rec.UpdatedAt = s.now()
 	rv, err := s.replace(ctx, Name, rec, h.rv)
 	if err != nil {
+		// A refused write did not land. Any other failure is a write that may
+		// have: the next update settles which from the record itself.
+		h.unheard = !errors.Is(err, ErrStale)
 		return err
 	}
 	rec.Revision = rv

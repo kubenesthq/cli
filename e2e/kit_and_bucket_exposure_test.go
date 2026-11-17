@@ -580,6 +580,14 @@ func TestKitAndBucketExposure(t *testing.T) {
 		for _, key := range keys {
 			body, err := clientA.Get(ctx, key)
 			if err != nil {
+				// An object listed and then gone is not an exposure: the
+				// operator's restore drill deletes its Restore's files when it
+				// ends, and on 2026-11-17 one went between this listing and
+				// this read. Anything else that cannot be read still fails.
+				if strings.Contains(err.Error(), "NoSuchKey") {
+					t.Logf("%s was listed and deleted before it could be read; skipped", key)
+					continue
+				}
 				t.Fatalf("reading %s: %v", key, err)
 			}
 			if blobContains(body, kit.plantedSecret) {
@@ -642,6 +650,14 @@ func TestKitAndBucketExposure(t *testing.T) {
 		for _, key := range keys {
 			body, err := clientA.Get(ctx, key)
 			if err != nil {
+				// An object listed and then gone is not an exposure: the
+				// operator's restore drill deletes its Restore's files when it
+				// ends, and on 2026-11-17 one went between this listing and
+				// this read. Anything else that cannot be read still fails.
+				if strings.Contains(err.Error(), "NoSuchKey") {
+					t.Logf("%s was listed and deleted before it could be read; skipped", key)
+					continue
+				}
 				t.Fatalf("reading %s: %v", key, err)
 			}
 			kit, err := recoverykit.Load(body)

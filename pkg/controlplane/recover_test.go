@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -265,6 +266,70 @@ func (r *psqlRunner) RunInput(_ context.Context, command string, _ io.Reader) (s
 			return sshx.Result{ExitCode: 1, Stderr: r.failWith}, nil
 		}
 		return sshx.Result{Stdout: r.rows}, nil
+	}
+	return sshx.Result{}, nil
+}
+
+// TestALoadThatNeverConnectedSaysNothingWasLoaded: on hardware on 2026-11-17
+// pg_restore met a database pod between its image's set-up server and its real
+// one, and the failure was reported as a half-loaded database
+// (kn-ship-1-2-closeout-lzjb.12). A connection failure loaded nothing and must
+// say so; any other pg_restore failure keeps the stop-and-look.
+func TestALoadThatNeverConnectedSaysNothingWasLoaded(t *testing.T) {
+	noSocket := &pgRestoreRunner{stderr: `pg_restore: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such file or directory` + "\n\tIs the server running locally and accepting connections on that socket?"}
+	err := loadDump(context.Background(), noSocket, "control-plane/x/control-plane.dump.age", []byte("dump"))
+	if !errors.Is(err, ErrDatabaseNotAccepting) {
+		t.Fatalf("a pg_restore that could not connect was not reported as the database not accepting connections: %v", err)
+	}
+	if strings.Contains(err.Error(), "neither the checkpoint nor empty") {
+		t.Fatalf("a load that never connected is described as a half-loaded database: %v", err)
+	}
+
+	// The emptiness question can meet the same gap, and must read the same way
+	// rather than as a database that could not be asked at all.
+	unreachable := &psqlRunner{failWith: `psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such file or directory`}
+	if _, _, err := DatabaseHasControlPlaneData(context.Background(), unreachable); !errors.Is(err, ErrDatabaseNotAccepting) {
+		t.Fatalf("a psql that could not connect was not reported as the database not accepting connections: %v", err)
+	}
+
+	startingUp := &pgRestoreRunner{stderr: `pg_restore: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: FATAL:  the database system is starting up`}
+	if err := loadDump(context.Background(), startingUp, "k", []byte("dump")); !errors.Is(err, ErrDatabaseNotAccepting) {
+		t.Fatalf("a server that is starting up was not reported as not accepting connections: %v", err)
+	}
+
+	// The planted negative: pg_restore connected and failed at a statement.
+	// Part of the dump is in the database, and that must never read as safe
+	// to load again.
+	halfLoaded := &pgRestoreRunner{stderr: `pg_restore: error: could not execute query: ERROR:  relation "organization" already exists`}
+	err = loadDump(context.Background(), halfLoaded, "k", []byte("dump"))
+	if err == nil {
+		t.Fatal("a pg_restore that failed at a statement was reported as a success")
+	}
+	if errors.Is(err, ErrDatabaseNotAccepting) {
+		t.Fatalf("a pg_restore that connected and failed at a statement is reported as safe to load again: %v", err)
+	}
+	if !strings.Contains(err.Error(), "neither the checkpoint nor empty") {
+		t.Fatalf("a half-loaded database lost its stop-and-look: %v", err)
+	}
+
+	if err := loadDump(context.Background(), &pgRestoreRunner{}, "k", []byte("dump")); err != nil {
+		t.Fatalf("a pg_restore that exited 0 was reported as a failure: %v", err)
+	}
+}
+
+// pgRestoreRunner answers the pod lookup and fails pg_restore with stderr.
+type pgRestoreRunner struct{ stderr string }
+
+func (r *pgRestoreRunner) Run(_ context.Context, command string) (sshx.Result, error) {
+	if strings.Contains(command, "get pods") {
+		return sshx.Result{Stdout: "kubenest-cp-postgresql-0"}, nil
+	}
+	return sshx.Result{}, nil
+}
+
+func (r *pgRestoreRunner) RunInput(_ context.Context, command string, _ io.Reader) (sshx.Result, error) {
+	if strings.Contains(command, "pg_restore") && r.stderr != "" {
+		return sshx.Result{ExitCode: 1, Stderr: r.stderr}, nil
 	}
 	return sshx.Result{}, nil
 }

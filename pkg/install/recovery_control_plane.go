@@ -533,18 +533,29 @@ func stageRecoveryCheckpoint(ctx context.Context, s *Session) error {
 	// into a database that already has the schema fails at its first table, so
 	// a run that loaded the checkpoint and then failed before starting the
 	// backend would never get past this point again.
-	loaded, detail, err := controlplane.DatabaseHasControlPlaneData(ctx, server)
-	if err != nil {
-		return err
-	}
-	if loaded {
-		s.Logf("  the checkpoint was already loaded by an earlier attempt (%s): not loading it again over its own rows", detail)
-	} else {
+	//
+	// THE QUESTION AND THE LOAD ARE ONE ATTEMPT, tried again only while the
+	// database takes no connection: a pod on its first boot reads Ready while
+	// the image's set-up server is up, and either command can arrive after that
+	// server stops and before the real one listens. Asking again before each
+	// load is also what keeps a second attempt from loading over the first.
+	if err := s.loadWhenDatabaseAccepts(ctx, deadline, 5*time.Second, func(ctx context.Context) error {
+		loaded, detail, err := controlplane.DatabaseHasControlPlaneData(ctx, server)
+		if err != nil {
+			return err
+		}
+		if loaded {
+			s.Logf("  the checkpoint was already loaded by an earlier attempt (%s): not loading it again over its own rows", detail)
+			return nil
+		}
 		s.Logf("  the database is empty (%s): loading %s", detail, s.recoveryCheckpoint.Key)
 		if err := controlplane.RestoreCheckpoint(ctx, server, s.recoveryCheckpoint.DumpKey, s.recoveryCheckpointDump, s.Opts.Recovery.FleetKey, s.Reporter); err != nil {
 			return err
 		}
 		s.Logf("  checkpoint %s loaded into the held database", s.recoveryCheckpoint.Key)
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	revision, migrated, err := controlplane.MigrateIfNewer(ctx, server, s.recoveryValues, s.Bundle,
@@ -672,6 +683,46 @@ func (s *Session) waitForDatabasePod(ctx context.Context, r k3s.Runner, deadline
 		return fmt.Errorf("the control plane's database is not serving, so the checkpoint is not loaded into it: %w. The chart is applied and its Postgres is not Ready; a resume re-runs this stage and waits again", err)
 	}
 	return nil
+}
+
+// loadWhenDatabaseAccepts runs load, and runs it again while it reports that
+// the database took no connection, bounded by the deadline its caller took from
+// the bundle manifest.
+//
+// ONLY A LOAD THAT NEVER CONNECTED IS TRIED AGAIN. A database pod on its first
+// boot reads Ready while the image's set-up server is up, and that server is
+// stopped before the real one starts (kn-ship-1-2-closeout-lzjb.12). A load
+// that connected and then failed has written part of the dump, and is returned
+// at once: trying it again would load over its own rows.
+func (s *Session) loadWhenDatabaseAccepts(ctx context.Context, deadline, interval time.Duration, load func(context.Context) error) error {
+	// The probe ends the wait on any answer that is not "no connection", and
+	// the answer is kept here: converge.Wait treats a probe's error as one more
+	// observation and would keep going.
+	var final error
+	result, err := converge.Wait(ctx, func(ctx context.Context) (bool, converge.State, error) {
+		loadErr := load(ctx)
+		if errors.Is(loadErr, controlplane.ErrDatabaseNotAccepting) {
+			return false, converge.State{
+				Object: "the control plane's database",
+				Status: "not accepting connections yet",
+				Detail: loadErr.Error(),
+			}, nil
+		}
+		final = loadErr
+		return true, converge.State{Object: "the control plane's database", Status: "answered"}, nil
+	}, converge.Options{
+		Name:     "checkpoint load",
+		Deadline: deadline,
+		Interval: interval,
+		Reporter: s.Reporter,
+	})
+	if err != nil {
+		return fmt.Errorf("loading the checkpoint into the control plane's database: %w", err)
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("the control plane's database never accepted a connection, so the checkpoint is not loaded: %w. Nothing was written; a resume re-runs this stage and loads it", err)
+	}
+	return final
 }
 
 // checkpointWithDump is one checkpoint and the sealed dump it names.

@@ -316,6 +316,9 @@ func DatabaseHasControlPlaneData(ctx context.Context, r k3s.Runner) (bool, strin
 		if strings.Contains(text, "does not exist") || strings.Contains(text, "relation") {
 			return false, "the database has no control-plane schema yet", nil
 		}
+		if pgRestoreNeverConnected(text) {
+			return false, "", fmt.Errorf("%w: psql could not connect to ask whether it already holds a restored control plane (%s)", ErrDatabaseNotAccepting, firstLineOf(text))
+		}
 		return false, "", fmt.Errorf("asking the control plane's database whether it already holds a restored control plane: exit %d: %s", res.ExitCode, firstLineOf(text))
 	}
 	trimmed := strings.TrimSpace(res.Stdout)
@@ -458,6 +461,21 @@ func RestoreCheckpoint(ctx context.Context, r k3s.Runner, checkpointKey string, 
 	if err != nil {
 		return fmt.Errorf("opening the checkpoint at %s with the fleet key supplied: %w. A checkpoint that does not open is not restored by retrying it: this key is not the one the checkpoint was sealed to, or it was mistyped", checkpointKey, err)
 	}
+	return loadDump(ctx, r, checkpointKey, plaintext)
+}
+
+// ErrDatabaseNotAccepting says pg_restore never reached the database, so
+// nothing was loaded and the same load may be tried again.
+//
+// It exists because a database pod on its FIRST boot is Ready before it is
+// serving for good: the Postgres image starts a set-up server, stops it, and
+// starts the real one. On hardware on 2026-11-17 the pod read Ready and
+// answered the emptiness query from the set-up server, and pg_restore arrived
+// in the two seconds between the two (kn-ship-1-2-closeout-lzjb.12).
+var ErrDatabaseNotAccepting = errors.New("the control plane's database is not accepting connections")
+
+// loadDump runs pg_restore with the opened dump on its standard input.
+func loadDump(ctx context.Context, r k3s.Runner, checkpointKey string, plaintext []byte) error {
 	pod, err := DatabasePod(ctx, r)
 	if err != nil {
 		return err
@@ -467,10 +485,22 @@ func RestoreCheckpoint(ctx context.Context, r k3s.Runner, checkpointKey string, 
 	if err != nil {
 		return fmt.Errorf("loading the checkpoint at %s into %s: %w", checkpointKey, pod, err)
 	}
-	if res.ExitCode != 0 {
-		return fmt.Errorf("pg_restore refused the checkpoint at %s (exit %d): %s. The database is now neither the checkpoint nor empty, so this is a stop-and-look, not a retry: the dump and the Postgres major are what to compare", checkpointKey, res.ExitCode, firstLineOf(res.Stderr))
+	if res.ExitCode == 0 {
+		return nil
 	}
-	return nil
+	if pgRestoreNeverConnected(res.Stderr) {
+		return fmt.Errorf("%w: pg_restore could not connect to load %s (%s). Nothing was loaded, so the database is still empty and loading again is safe", ErrDatabaseNotAccepting, checkpointKey, firstLineOf(res.Stderr))
+	}
+	return fmt.Errorf("pg_restore refused the checkpoint at %s (exit %d): %s. The database is now neither the checkpoint nor empty, so this is a stop-and-look, not a retry: the dump and the Postgres major are what to compare", checkpointKey, res.ExitCode, firstLineOf(res.Stderr))
+}
+
+// pgRestoreNeverConnected reports whether a pg_restore or psql failure is its
+// connection attempt. libpq words every such failure "connection to server
+// ... failed", whether the socket is missing, the server is starting up or it
+// is shutting down. A client that failed this way sent no statement.
+func pgRestoreNeverConnected(stderr string) bool {
+	first := firstLineOf(stderr)
+	return strings.Contains(first, "connection to server") && strings.Contains(first, "failed")
 }
 
 // DatabasePod finds the database pod the recovery works inside, by the labels
